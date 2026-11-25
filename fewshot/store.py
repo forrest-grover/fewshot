@@ -163,15 +163,22 @@ class _NewImage(NamedTuple):
     source: str
 
 
+def image_ext(data: bytes) -> str:
+    """File extension for image bytes from their actual format (e.g. "jpg", "png"), after decoding
+    them in full; raises ``ValueError`` if they aren't a readable image."""
+    load_image(data)
+    fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
+    return {"jpeg": "jpg"}.get(fmt, fmt)
+
+
 def _check_item(data: bytes, label: str, source: str) -> _NewImage | ValueError:
     """Validate one image to add (decoding it) and its label; the error instead of raising it."""
     try:
         label = check_class_name(label)
-        load_image(data)
+        ext = image_ext(data)
     except ValueError as e:
         return e
-    fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
-    return _NewImage(data, image_id(data), {"jpeg": "jpg"}.get(fmt, fmt), label, source)
+    return _NewImage(data, image_id(data), ext, label, source)
 
 
 def _copy_config(cfg: TaskConfig) -> TaskConfig:

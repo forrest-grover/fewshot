@@ -12,6 +12,10 @@ variables, read when this module is imported (``fewshot serve`` sets them from i
     arbitrary models.
 ``FEWSHOT_WARM=1``
     At startup, load the models existing tasks use (in the background).
+``FEWSHOT_ALLOWED_HOSTS``
+    Comma-separated host names the server answers to (``*``: any; default: localhost,
+    127.0.0.1 and ::1). A request with another Host header gets 400, which stops web pages
+    from reaching a local server through DNS rebinding. ``fewshot serve`` sets it from ``--host``.
 ``FEWSHOT_ALLOW_URLS=1``
     Accept image URLs (``.../predict/urls``, ``.../examples/urls``): the server downloads them,
     from public addresses only.
@@ -22,6 +26,7 @@ variables, read when this module is imported (``fewshot serve`` sets them from i
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import secrets
 import tempfile
@@ -78,6 +83,8 @@ ALLOW_ANY_MODEL = os.environ.get("FEWSHOT_ALLOW_ANY_MODEL") == "1"
 WARM = os.environ.get("FEWSHOT_WARM") == "1"
 ALLOW_URLS = os.environ.get("FEWSHOT_ALLOW_URLS") == "1"
 MAX_URLS = 100  # per request
+ALLOWED_HOSTS = {h.strip().strip("[]").lower()
+                 for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "localhost,127.0.0.1,::1").split(",") if h.strip()}
 MAX_REQUEST_BYTES = int(float(os.environ.get("FEWSHOT_MAX_REQUEST_MB", "1024")) * 1024 * 1024)
 
 ws = Workspace()
@@ -119,9 +126,35 @@ def _token_ok(given: str | None) -> bool:
     return TOKEN is None or (given is not None and secrets.compare_digest(given.encode(), TOKEN.encode()))
 
 
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _host_name(host: str) -> str:
+    """The name part of a Host header or URL authority, lower-cased, without port or brackets."""
+    host = host.strip().lower()
+    if host.startswith("["):  # [::1]:8000
+        return host[1 : host.find("]")] if "]" in host else host
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _cross_site(request: Request) -> bool:
+    """Whether a request comes from a page on another site: its Origin isn't this server, or the
+    browser says so in Sec-Fetch-Site. Requests without either (curl, the CLI) are not."""
+    origin = request.headers.get("origin")
+    if origin is not None:
+        return origin == "null" or origin.split("://", 1)[-1].lower() != request.headers.get("host", "").lower()
+    return request.headers.get("sec-fetch-site", "same-origin") not in {"same-origin", "none"}
+
+
 @app.middleware("http")
-async def _require_token(request: Request, call_next: Any) -> Response:
+async def _guard(request: Request, call_next: Any) -> Response:
+    """Refuse requests for another host name (DNS rebinding) and writes from other sites (CSRF),
+    then check the token."""
+    if "*" not in ALLOWED_HOSTS and _host_name(request.headers.get("host", "")) not in ALLOWED_HOSTS:
+        return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path
+    if request.method not in SAFE_METHODS and path.startswith("/api/") and _cross_site(request):
+        return JSONResponse({"detail": "Cross-site requests are not allowed"}, 403)
     if TOKEN is not None and path.startswith("/api/") and path not in OPEN_PATHS:
         auth = request.headers.get("authorization", "")
         given = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get(AUTH_COOKIE)
@@ -428,7 +461,7 @@ def export_task(name: str) -> StreamingResponse:
 def import_task(file: UploadFile = File(...), name: str | None = Form(None)) -> dict[str, Any]:
     """Create a task from a zip made by .../export, named ``name`` or as exported."""
     try:
-        return _detail(read_export(ws, file.file, name or None))
+        return _detail(read_export(ws, file.file, name or None, embedder_ok=_check_embedder))
     except ValueError as e:
         raise _bad(e) from e
 
@@ -665,6 +698,7 @@ def delete_examples(name: str, body: ExampleIds) -> dict[str, Any]:
 
 
 CACHE_FOREVER = {"Cache-Control": "max-age=31536000, immutable"}  # image ids are content hashes
+IMAGE_HEADERS = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox"}
 
 
 @app.get("/api/tasks/{name}/examples/{eid}/image", response_model=None)
@@ -677,14 +711,17 @@ def example_image(name: str, eid: str,
     except KeyError as e:
         raise _missing(e) from e
     if size is None:
-        return FileResponse(path, headers=CACHE_FOREVER)
+        # Only ever served as an image (never e.g. HTML from a crafted import), and never sniffed.
+        kind = mimetypes.guess_type(path.name)[0] or ""
+        safe = kind if kind.startswith("image/") and kind != "image/svg+xml" else "application/octet-stream"
+        return FileResponse(path, media_type=safe, headers={**CACHE_FOREVER, **IMAGE_HEADERS})
     try:
         data = thumbnail(path.read_bytes(), size)
     except FileNotFoundError as e:  # deleted between the lookup and the read
         raise HTTPException(404, f"No example {eid!r}") from e
     except ValueError as e:
         raise _bad(e) from e
-    return Response(data, media_type="image/jpeg", headers=CACHE_FOREVER)
+    return Response(data, media_type="image/jpeg", headers={**CACHE_FOREVER, **IMAGE_HEADERS})
 
 
 # ---- inference ----------------------------------------------------------

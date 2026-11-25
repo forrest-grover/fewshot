@@ -596,6 +596,9 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     allow_urls: bool = typer.Option(False, "--allow-urls",
                                     help="Let API callers send image URLs for the server to download "
                                          "(public addresses only)"),
+    allowed_host: list[str] = typer.Option(
+        [], "--allowed-host", help="Host name clients use to reach the server; others are refused. Repeatable. "
+                                   "[default: localhost names when serving locally, else any]"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Run the REST API and web UI."""
@@ -604,11 +607,14 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 
     if root:
         os.environ["FEWSHOT_HOME"] = str(root)
+    local = host in {"127.0.0.1", "localhost", "::1"}
+    hosts = allowed_host or (["localhost", "127.0.0.1", "::1"] if local else ["*"])
     # fewshot.api reads its settings from the environment when uvicorn imports it.
     for name, value in (("FEWSHOT_TOKEN", token or ""), ("FEWSHOT_ALLOW_ANY_MODEL", "1" if allow_any_model else ""),
-                        ("FEWSHOT_WARM", "1" if warm else ""), ("FEWSHOT_ALLOW_URLS", "1" if allow_urls else "")):
+                        ("FEWSHOT_WARM", "1" if warm else ""), ("FEWSHOT_ALLOW_URLS", "1" if allow_urls else ""),
+                        ("FEWSHOT_ALLOWED_HOSTS", ",".join(hosts))):
         os.environ[name] = value
-    if not token and host not in {"127.0.0.1", "localhost", "::1"}:
+    if not token and not local:
         typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
                     "change every task.", fg="yellow", err=True)
     uvicorn.run("fewshot.api:app", host=host, port=port)

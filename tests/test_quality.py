@@ -400,10 +400,33 @@ def test_check_public(monkeypatch):
     assert not fetch.is_url("/tmp/x.png")
 
 
-def test_fetch_public_redirect_allowed(server, monkeypatch):
-    """A redirect that passes the check is followed."""
-    monkeypatch.setattr(fetch, "check_public", lambda url: None)
-    assert fetch.fetch_url(server + "/redirect", 10_000, public_only=True) == png(RED)
+def test_fetch_connects_to_the_checked_address(server, monkeypatch):
+    """Each connection goes to the address that passed the check, looked up once: the host name
+    itself is never resolved again (here it can't be resolved at all), and redirects are pinned too."""
+    port = int(server.rsplit(":", 1)[1])
+    looked_up = []
+
+    def checked(host, _port):
+        looked_up.append(host)
+        return ["127.0.0.1"]  # pretend this passed the public-address check
+
+    monkeypatch.setattr(fetch, "public_addresses", checked)
+    url = f"http://pinned.invalid:{port}"
+    assert fetch.fetch_url(url + "/redirect", 10_000, public_only=True) == png(RED)
+    assert looked_up == ["pinned.invalid"] * 3  # the check, the first connection, the redirect's
+
+
+def test_fetch_refuses_dns_rebinding(server, monkeypatch):
+    """A host that answers the check with a public address and then with a private one is refused."""
+    port = int(server.rsplit(":", 1)[1])
+    answers = iter(["93.184.216.34", "127.0.0.1"])
+
+    def rebinding(_host, p, *_args, **_kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (next(answers), p))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding)
+    with pytest.raises(ValueError, match="not a public address"):
+        fetch.fetch_url(f"http://rebind.test:{port}/img", 10_000, public_only=True)
 
 
 def test_write_atomic_cleans_up(tmp_path, monkeypatch):
@@ -419,3 +442,19 @@ def test_write_atomic_cleans_up(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         write_atomic(tmp_path / "x", b"data")
     assert not list(tmp_path.iterdir())
+
+
+def test_fetch_https_is_pinned_too(server, monkeypatch):
+    """HTTPS connections also go to the checked address (here a plain-HTTP server, so the TLS
+    handshake fails after connecting to it)."""
+    port = int(server.rsplit(":", 1)[1])
+    looked_up: list[str] = []
+
+    def checked(host, _port):
+        looked_up.append(host)
+        return ["127.0.0.1"]
+
+    monkeypatch.setattr(fetch, "public_addresses", checked)
+    with pytest.raises(ValueError, match="Could not fetch"):
+        fetch.fetch_url(f"https://pinned.invalid:{port}/img", 10_000, public_only=True)
+    assert looked_up == ["pinned.invalid", "pinned.invalid"]

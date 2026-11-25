@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import IO, Any
+from typing import Any
 
 USER_AGENT = "fewshot/0.1"
 
@@ -17,42 +18,78 @@ def is_url(s: str) -> bool:
     return s.lower().startswith(("http://", "https://"))
 
 
-def check_public(url: str) -> None:
-    """Raise ``ValueError`` unless ``url`` is http(s) and its host resolves only to public
-    addresses, so a server can't be made to fetch from its own network (SSRF)."""
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in {"http", "https"} or not parts.hostname:
-        raise ValueError(f"Not an http(s) URL: {url}")
+def public_addresses(host: str, port: int) -> list[str]:
+    """The addresses ``host`` resolves to; ``ValueError`` unless every one is public, so a server
+    can't be made to fetch from its own network (SSRF)."""
     try:
-        infos = socket.getaddrinfo(parts.hostname, parts.port or 80, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, UnicodeError) as e:
-        raise ValueError(f"Can't resolve {parts.hostname}: {e}") from None
+        raise ValueError(f"Can't resolve {host}: {e}") from None
+    addrs = []
     for info in infos:
         addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
         if not addr.is_global:
-            raise ValueError(f"{parts.hostname} is not a public address ({addr})")
+            raise ValueError(f"{host} is not a public address ({addr})")
+        addrs.append(str(addr))
+    return addrs
 
 
-class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
-    """Re-checks every redirect target, so a public URL can't bounce the request inward."""
+def check_public(url: str) -> None:
+    """Raise ``ValueError`` unless ``url`` is http(s) and its host resolves only to public addresses."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError(f"Not an http(s) URL: {url}")
+    public_addresses(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80))
 
-    def redirect_request(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # urllib's signature
-            self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: Any, newurl: str,
-    ) -> urllib.request.Request | None:
-        check_public(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+def _pin(conn: http.client.HTTPConnection) -> None:
+    """Make ``conn`` connect to an address checked by ``public_addresses``, looked up once here:
+    checking one lookup and connecting after another would let DNS rebinding point the request
+    inward. The Host header and the TLS server name stay the URL's host name."""
+    addr = public_addresses(conn.host, conn.port)[0]
+
+    def connect(_address: Any, timeout: Any = None, source_address: Any = None) -> socket.socket:
+        return socket.create_connection((addr, conn.port), timeout, source_address)
+
+    conn._create_connection = connect  # type: ignore[attr-defined]  # pylint: disable=protected-access
+
+
+class _PinnedHTTP(http.client.HTTPConnection):
+    """An HTTP connection to the checked public address of its host."""
+
+    def connect(self) -> None:
+        _pin(self)
+        super().connect()
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    """An HTTPS connection to the checked public address of its host."""
+
+    def connect(self) -> None:
+        _pin(self)
+        super().connect()
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_PinnedHTTP, req)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_PinnedHTTPS, req)
 
 
 def fetch_url(url: str, max_bytes: int, timeout: float = 20.0, public_only: bool = False) -> bytes:
     """The body at ``url``; raises ``ValueError`` for a bad URL, an HTTP or network error, or a
-    body over ``max_bytes`` (read no further). With ``public_only``, the host and every redirect
-    must resolve to public addresses (see ``check_public``)."""
+    body over ``max_bytes`` (read no further). With ``public_only``, every connection (redirects
+    too) goes to a public address, the very one that was checked, and no proxy is used."""
     if not is_url(url):
         raise ValueError(f"Not an http(s) URL: {url}")
     handlers: list[urllib.request.BaseHandler] = []
     if public_only:
         check_public(url)
-        handlers.append(_CheckedRedirects())
+        handlers += [urllib.request.ProxyHandler({}), _PublicHTTPHandler(), _PublicHTTPSHandler()]
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:

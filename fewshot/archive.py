@@ -5,16 +5,19 @@ from __future__ import annotations
 import shutil
 import uuid
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
 from pydantic import ValidationError
 
-from .store import ClassDef, Task, TaskConfig, Workspace, check_class_name, check_settings, image_id
+from .store import ClassDef, Task, TaskConfig, Workspace, check_class_name, check_settings, image_ext, image_id
 
-# Largest image and task.json accepted from an export zip (guards against zip bombs).
-MAX_IMPORT_IMAGE = 200 * 1024 * 1024
-MAX_IMPORT_CONFIG = 256 * 1024 * 1024
+# Limits on what an export zip may unpack to (guards against zip bombs): per image, for task.json,
+# and for all images together.
+MAX_IMPORT_IMAGE = 50 * 1024 * 1024
+MAX_IMPORT_CONFIG = 64 * 1024 * 1024
+MAX_IMPORT_TOTAL = 10 * 1024 * 1024 * 1024
 
 
 def export_task(ws: Workspace, name: str, out: IO[bytes]) -> int:
@@ -36,15 +39,20 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> int:
     return len(examples)
 
 
-def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None) -> Task:
+def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,
+                embedder_ok: Callable[[str], None] | None = None) -> Task:
     """Create a task from a zip written by ``export_task``, named ``name`` or as exported.
 
-    Every image is checked against its id. Raises ``ValueError`` if the zip isn't a valid
-    export or the name is bad or taken.
+    Every image must decode, have the extension of its real format, and hash to its id; the total
+    unpacked size is limited. ``embedder_ok`` is called with the task's embedder spec before
+    anything is written, and may raise to refuse it (the server uses this to apply its model
+    allowlist). Raises ``ValueError`` if the zip isn't a valid export or the name is bad or taken.
     """
     try:
         with zipfile.ZipFile(src) as z:
             cfg, images = _read_export(z)
+            if embedder_ok is not None:
+                embedder_ok(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
             p = ws._reserve(cfg.name)  # pylint: disable=protected-access
             try:
@@ -93,10 +101,19 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
             classes.append(ClassDef(name=check_class_name(ex.label)))
             names.add(ex.label)
     members = {m.filename: m for m in z.infolist()}
+    missing = next((ex.file for ex in examples if ex.file not in members), None)
+    if missing:
+        raise ValueError(f"Not a valid task export: {missing} is missing")
+    if sum(members[ex.file].file_size for ex in examples) > MAX_IMPORT_TOTAL:
+        raise ValueError(f"Not imported: the images unpack to more than {MAX_IMPORT_TOTAL // 1024 ** 3} GB")
     for ex in examples:
-        m = members.get(ex.file)
-        if m is None:
-            raise ValueError(f"Not a valid task export: {ex.file} is missing")
-        if not image_id(_read_member(z, m)).startswith(ex.id):
+        data = _read_member(z, members[ex.file])
+        if not image_id(data).startswith(ex.id):
             raise ValueError(f"Not a valid task export: {ex.file} doesn't match its id")
+        try:
+            ext = image_ext(data)
+        except ValueError as e:
+            raise ValueError(f"Not a valid task export: {ex.file}: {e}") from None
+        if not ex.file.endswith("." + ext):
+            raise ValueError(f"Not a valid task export: {ex.file} is really a .{ext} image")
     return cfg.model_copy(update={"classes": classes, "examples": examples}), members

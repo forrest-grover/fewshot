@@ -1,13 +1,17 @@
 """Shared fixtures: a deterministic, model-free embedder and an empty workspace."""
 
 import io
+import os
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from fewshot import Workspace
-from fewshot.embedders import Embedder, register_embedder, unregister_embedder
+# TestClient sends "Host: testserver"; tests of the host check set their own list.
+os.environ.setdefault("FEWSHOT_ALLOWED_HOSTS", "*")
+
+from fewshot import Workspace  # pylint: disable=wrong-import-position
+from fewshot.embedders import Embedder, register_embedder, unregister_embedder  # pylint: disable=wrong-import-position
 
 
 # Image-only on purpose: the inherited text path raises NotImplementedError, like DINOv2.
@@ -33,6 +37,15 @@ def png(rgb, size=8, noise=0, seed=0):
     buf = io.BytesIO()
     Image.fromarray(a).save(buf, "PNG")
     return buf.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def restore_environment():
+    """Undo environment changes a test makes (``fewshot serve`` exports its settings)."""
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)
