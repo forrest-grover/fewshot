@@ -19,13 +19,23 @@ function typing(e: Event): boolean {
     && !!e.target.closest(TYPING);
 }
 
-/** Call ``onKey`` for key presses without Ctrl/Alt/Meta that aren't typed into a form field. */
+/** Controls whose own keys (Enter, Space, arrows) must keep working. */
+const CONTROL = "button, a[href], summary, [role=tab], [role=button], [role=option], [role=menuitem]";
+const CONTROL_KEYS = new Set(["Enter", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
+
+/** True when a focused button, link or tab should handle ``e`` itself. */
+function forControl(e: KeyboardEvent): boolean {
+  return CONTROL_KEYS.has(e.key) && e.target instanceof Element && !!e.target.closest(CONTROL);
+}
+
+/** Call ``onKey`` for key presses without Ctrl/Alt/Meta that aren't typed into a form field, nor
+ * Enter/Space/arrows meant for a focused button, link or tab. */
 export function useShortcuts(onKey: (e: KeyboardEvent) => void) {
   const latest = useRef(onKey);
   latest.current = onKey;
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      if (!e.ctrlKey && !e.altKey && !e.metaKey && !e.defaultPrevented && !typing(e)) latest.current(e);
+      if (!e.ctrlKey && !e.altKey && !e.metaKey && !e.defaultPrevented && !typing(e) && !forControl(e)) latest.current(e);
     };
     window.addEventListener("keydown", on);
     return () => { window.removeEventListener("keydown", on); };
@@ -57,7 +67,8 @@ export function usePasteImages(onFiles: (files: File[]) => void) {
  * so adding it reuses the embedding computed for the prediction. A result for an image URL has no
  * ``file``: its ``url`` is the remote image, which "Add as" has the server fetch again. */
 export interface Item {
-  key: number; name: string; file?: File; url: string; pred: Prediction; adding?: boolean; addedAs?: string;
+  key: number; name: string; file?: File; url: string; pred: Prediction; adding?: boolean;
+  added?: { label: string; id: string }; // set once added as an example (shown while that example exists)
 }
 
 /** Prediction results for one task, kept by the App so they survive switching tabs. */
@@ -69,16 +80,29 @@ export interface Results {
 }
 
 /** State for the Predict tab, held above it. Results (and their preview URLs) are dropped when
- * ``task`` changes and when the App unmounts. */
+ * another task is opened (not when ``rename`` moved them to the task's new name) and when the App
+ * unmounts. */
 export function usePredictResults(task: string | null) {
   const [results, setResults] = useState<Results>({ task: task ?? "", items: [], busy: false, current: null });
   const urls = useRef(new Set<string>()); // preview object URLs still in use
+  const name = task ?? "";
+  const renamed = useRef<{ from: string; to: string } | null>(null);
+  // Results already moved to the task's new name, while the route still shows the old one, stay.
+  const moving = renamed.current?.from === name && renamed.current.to === results.task;
+  if (results.task !== name && !moving) { // another task: adjust during render, as React recommends
+    revoke(urls.current);
+    setResults({ task: name, items: [], busy: false, current: null });
+  }
   useEffect(() => {
     const live = urls.current;
-    setResults({ task: task ?? "", items: [], busy: false, current: null });
     return () => { revoke(live); };
-  }, [task]);
-  return { results, setResults, urls };
+  }, []);
+  /** Keep the results when their task is renamed. */
+  const rename = (to: string) => {
+    renamed.current = { from: name, to };
+    setResults((r) => (r.task === name ? { ...r, task: to } : r));
+  };
+  return { results, setResults, urls, rename };
 }
 
 export function revoke(urls: Set<string>) {

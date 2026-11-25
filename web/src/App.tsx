@@ -43,10 +43,12 @@ export default function App() {
   const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
 
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
+    const from = currentTask.current;
     try {
       return await p;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // An error from a task the user has since left would only confuse the one now shown.
+      if (currentTask.current === from) setError(e instanceof Error ? e.message : String(e));
       return undefined;
     }
   }, []);
@@ -73,7 +75,7 @@ export default function App() {
 
   useEffect(() => {
     currentTask.current = route.task;
-    setEvalRun(null);
+    setEvalRun((s) => (s?.task === route.task ? s : null)); // kept when this is the task's new name
     setError(null);
     setTask(null);
     setLoadFailed(false);
@@ -183,7 +185,13 @@ export default function App() {
               {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun} />}
               {route.tab === "settings" && (
                 <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }}
-                  onRenamed={(t) => { void refreshTasks(); go(t.name, "settings"); }} />
+                  onRenamed={(t) => {
+                    // Results move with the task to its new name.
+                    predictState.rename(t.name);
+                    setEvalRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
+                    void refreshTasks();
+                    go(t.name, "settings");
+                  }} />
               )}
             </div>
           </>

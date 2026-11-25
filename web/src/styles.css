@@ -404,12 +404,15 @@ label.disabled {
 
 .class-card header {
   display: flex;
+  flex-wrap: wrap; /* buttons go to a second line on narrow screens instead of off the edge */
   align-items: baseline;
   gap: 10px;
 }
 
 .class-card h3 {
   margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .class-card .desc {
@@ -983,4 +986,32 @@ label.inline {
 
 .dupe.conflict {
   border-color: var(--danger);
+}
+
+.confusion td button.cell {
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-weight: inherit;
+}
+
+.chart-wrap .bin:focus {
+  outline: none;
+}
+
+.chart-wrap .bin:focus-visible rect.hit {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.threshold-input {
+  width: 7em;
+}
+
+.table td:first-child {
+  overflow-wrap: anywhere;
 }

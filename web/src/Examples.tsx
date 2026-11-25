@@ -46,6 +46,7 @@ export default function Examples({ task, setTask, run }: Props) {
   const fail = (message: string) => { void run(Promise.reject(new Error(message))); };
 
   const allTags = [...new Set(task.examples.flatMap((e) => e.tags))].sort();
+  if (tagFilter && !allTags.includes(tagFilter)) setTagFilter(""); // its tag is gone: don't revive it later
   const filter = allTags.includes(tagFilter) ? tagFilter : "";
   const byClass = new Map<string, Example[]>(task.classes.map((c) => [c.name, []]));
   for (const e of task.examples) if (!filter || e.tags.includes(filter)) byClass.get(e.label)?.push(e);
@@ -178,7 +179,10 @@ export default function Examples({ task, setTask, run }: Props) {
         <div className="row tag-filter">
           <label className="inline">
             <span>Show</span>
-            <select value={filter} onChange={(e) => { setTagFilter(e.target.value); }}>
+            <select value={filter} onChange={(e) => {
+              setTagFilter(e.target.value);
+              setPicked(new Set()); // bulk actions must not reach examples the filter hides
+            }}>
               <option value="">all examples</option>
               {allTags.map((t) => <option key={t} value={t}>tagged “{t}”</option>)}
             </select>
@@ -214,6 +218,10 @@ export default function Examples({ task, setTask, run }: Props) {
             key={c.name}
             className={`class-card ${dropOn === c.name ? "drop-target" : ""}`}
             onMouseEnter={() => { pointed.current = c.name; }}
+            onMouseLeave={(e) => {
+              // A paste then goes to the class with keyboard focus, if any, not the last one hovered.
+              if (!e.currentTarget.contains(document.activeElement)) pointed.current = null;
+            }}
             onFocus={() => { pointed.current = c.name; }}
             {...cardDrag(c.name)}
           >
@@ -249,7 +257,10 @@ export default function Examples({ task, setTask, run }: Props) {
                 onBlur={(e) => {
                   if (e.target.value !== c.description) void save(api.patchClass(task.name, c.name, { description: e.target.value }));
                 }}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); } }}
+                onKeyDown={(e) => {
+                  // Enter that confirms an input-method composition (Japanese, Chinese, Korean) isn't "save".
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.currentTarget.blur(); }
+                }}
               />
             )}
             <div className="thumbs">

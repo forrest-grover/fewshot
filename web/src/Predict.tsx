@@ -24,7 +24,9 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     setResults((r) => (r.task === task.name ? f(r) : r));
   };
   const cardRefs = useRef(new Map<number, HTMLElement>());
-  const actionable = (it: Item) => !it.pred.error && !it.addedAs;
+  // "Added" only while that example is still in the task, so an undone add can be made again.
+  const addedAs = (it: Item) => (it.added && task.examples.some((e) => e.id === it.added?.id) ? it.added.label : null);
+  const actionable = (it: Item) => !it.pred.error && !addedAs(it);
   const current = items.find((it) => it.key === results.current && actionable(it)) ?? items.find(actionable);
 
   const show = (added: Item[]) => {
@@ -77,10 +79,11 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     update((r) => ({ ...r, items: r.items.map((it) => (it.key === key ? { ...it, ...p } : it)) }));
   };
   const addAs = async (it: Item, label: string) => {
-    if (it.adding || it.addedAs) return;
+    if (it.adding || addedAs(it)) return;
     patch(it.key, { adding: true });
     const r = await run(it.file ? api.addExamples(task.name, label, [it.file]) : api.addExampleUrls(task.name, label, [it.url]));
-    patch(it.key, r ? { adding: false, addedAs: label } : { adding: false }); // a failure shows in the error box
+    const added = r?.added[0];
+    patch(it.key, added ? { adding: false, added: { label, id: added.id } } : { adding: false }); // a failure shows in the error box
     if (r) setTask(r.task);
   };
   const clear = () => {
@@ -186,8 +189,8 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
                 )}
                 {top.map(([c, v], i) => <Bar key={c} label={c} value={v} strong={i === 0} />)}
                 <div className="row add-as">
-                  {it.addedAs ? (
-                    <span className="ok">Added as {it.addedAs}</span>
+                  {addedAs(it) ? (
+                    <span className="ok">Added as {addedAs(it)}</span>
                   ) : (
                     <>
                       <button className="small" disabled={it.adding} onClick={() => { void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>

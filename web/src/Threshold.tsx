@@ -49,7 +49,7 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
         {suggested !== null && <span><i className="swatch line dashed" /> suggested</span>}
       </div>
       <div className="chart-wrap">
-        <svg viewBox={`0 0 ${String(W)} ${String(H)}`} role="img"
+        <svg viewBox={`0 0 ${String(W)} ${String(H)}`} role="group"
           aria-label={`Similarity of held-out predictions: ${String(nCorrect)} correct, ${String(nWrong)} wrong, from ${fmt(Math.min(...sims))} to ${fmt(Math.max(...sims))}`}>
           <line className="axis" x1={PAD.l} x2={W - PAD.r} y1={PAD.t + plotH} y2={PAD.t + plotH} />
           <text className="tick" x={PAD.l - 4} y={PAD.t + 8} textAnchor="end">{top}</text>
@@ -61,8 +61,15 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
             const bx = PAD.l + i * bw + 1, w = Math.max(1, bw - 2); // 2px gap between bars
             const hc = (b.correct / top) * plotH, hw = (b.wrong / top) * plotH;
             return (
-              <g key={i} className={hover === i ? "bin hover" : "bin"}
+              <g key={i} className={hover === i ? "bin hover" : "bin"} tabIndex={0} role="button"
+                aria-label={`${fmt(b.from)} to ${fmt(b.from + step)}: ${String(b.correct)} correct, ${String(b.wrong)} wrong. Use ${fmt(b.from)} as the threshold`}
                 onMouseEnter={() => { setHover(i); }} onMouseLeave={() => { setHover(null); }}
+                onFocus={() => { setHover(i); }} onBlur={() => { setHover(null); }}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  e.preventDefault();
+                  setPicked(Number(b.from.toFixed(3)));
+                }}
                 onClick={() => { setPicked(Number(b.from.toFixed(3))); }}>
                 <rect className="hit" x={PAD.l + i * bw} y={PAD.t} width={bw} height={plotH} />
                 {b.correct > 0 && <rect className="correct" x={bx} y={y(b.correct)} width={w} height={Math.max(1, hc)} rx={2} />}
@@ -82,12 +89,22 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
           </div>
         )}
       </div>
-      {value !== null && (
-        <div className="row">
+      <div className="row">
+        <label className="inline">
+          <span>Threshold</span>
+          <input type="number" min={-1} max={1} step={0.001} className="threshold-input"
+            value={value === null ? "" : String(value)} placeholder="pick a bar"
+            onChange={(e) => { setPicked(e.target.value === "" ? null : Number(e.target.value)); }} />
+        </label>
+        {value !== null && Number.isFinite(value) && (
           <span>
-            At <b>{fmt(value)}</b>{picked === null ? " (suggested)" : ""}, {below(true)} of {nCorrect} correct and {below(false)} of {nWrong} wrong
+            {picked === null ? "(suggested) " : ""}{below(true)} of {nCorrect} correct and {below(false)} of {nWrong} wrong
             predictions would become “unknown”.
           </span>
+        )}
+      </div>
+      {value !== null && Number.isFinite(value) && value >= -1 && value <= 1 && (
+        <div className="row">
           <button className="small" disabled={value === current} onClick={() => { onSet(value); }}>Set reject threshold to {fmt(value)}</button>
         </div>
       )}

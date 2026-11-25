@@ -6,7 +6,11 @@ import Threshold from "./Threshold";
 
 /** The last evaluation of a task, kept by the App so it survives switching tabs. While it runs,
  * ``job`` is the server's background job, polled for progress. */
-export interface EvalRun { task: string; report: EvalReport | null; rev: number | null; job: Job<EvalReport> | null }
+export interface EvalRun {
+  task: string;
+  report: EvalReport | null; rev: number | null; // the report shown, and the task revision it is of
+  job: Job<EvalReport> | null; jobRev: number | null; // a run in progress, and the revision it started from
+}
 
 interface Props {
   task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
@@ -27,12 +31,12 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
   const [finding, setFinding] = useState(false);
   const update = (p: Partial<EvalRun>) => {
     // A run that finishes after the user opened another task is dropped.
-    setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, job: null, ...s, ...p }));
+    setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, job: null, jobRev: null, ...s, ...p }));
   };
 
   const go = async () => {
     const j = await run(api.startEvaluation(task.name));
-    if (j) update({ job: j, rev: task.revision });
+    if (j) update({ job: j, jobRev: task.revision });
   };
   // Poll the running job until it ends. Leaving the tab stops polling; coming back resumes it.
   const jobId = job?.id;
@@ -45,7 +49,9 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
         setState((s) => {
           if (!s || s.job?.id !== jobId) return s;
           if (j.status === "running") return { ...s, job: j };
-          return { ...s, job: null, report: j.status === "done" ? j.result : s.report };
+          // Only a finished run replaces the report (and its revision): a cancelled or failed one
+          // leaves the old report, still marked as out of date if the task changed.
+          return j.status === "done" ? { ...s, job: null, report: j.result, rev: s.jobRev } : { ...s, job: null };
         });
         if (j.status === "failed") void run(Promise.reject(new Error(`Evaluation failed: ${j.error ?? "unknown error"}`)));
       }, (e: unknown) => {
@@ -112,10 +118,11 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
             Images unlike every class score low. A threshold just below most correct predictions turns outsiders into “unknown”
             while keeping real members; the suggestion keeps 95% of the correct ones.
           </p>
-          <Threshold predictions={report.predictions} current={task.reject_below} suggested={report.suggested_reject_below}
+          <Threshold key={`${task.name}\u0000${String(rev)}`} predictions={report.predictions} current={task.reject_below} suggested={report.suggested_reject_below}
             onSet={(v) => { void fix(api.updateTask(task.name, { reject_below: v })); }} />
 
           <h3>Per class</h3>
+          <div className="scroll-x">
           <table className="table">
             <thead><tr><th>Class</th><th>Examples</th><th>Recall</th><th>Precision</th></tr></thead>
             <tbody>
@@ -124,6 +131,7 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
               ))}
             </tbody>
           </table>
+          </div>
 
           <h3>Confusion matrix <span className="muted">(rows: true class, columns: predicted; click a cell to list its mistakes)</span></h3>
           <div className="scroll-x">
@@ -134,14 +142,10 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
                   <tr key={i}>
                     <th title={report.classes[i]}>{report.classes[i]}</th>
                     {row.map((v, j) => (
-                      <td key={j} className={`${i === j ? "diag" : v ? "off" : ""}${filter?.t === report.classes[i] && filter.p === report.classes[j] ? " selected" : ""}`}
-                        style={{ ["--a" as string]: v / maxCell }}
-                        onClick={() => {
-                          if (i === j || !v) return;
-                          const same = filter?.t === report.classes[i] && filter.p === report.classes[j];
-                          setCell(same ? null : { task: task.name, t: report.classes[i], p: report.classes[j] });
-                        }}
-                        title={i !== j && v ? `${String(v)} ${report.classes[i]} predicted as ${report.classes[j]}` : undefined}>{v || ""}</td>
+                      <ConfusionCell key={j} value={v} diagonal={i === j} max={maxCell}
+                        truth={report.classes[i]} pred={report.classes[j]}
+                        selected={filter?.t === report.classes[i] && filter.p === report.classes[j]}
+                        onPick={(on) => { setCell(on ? { task: task.name, t: report.classes[i], p: report.classes[j] } : null); }} />
                     ))}
                   </tr>
                 ))}
@@ -215,5 +219,24 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
         </div>
       )}
     </div>
+  );
+}
+
+/** One confusion-matrix cell; an off-diagonal cell with mistakes is a toggle button listing them. */
+function ConfusionCell({ value, diagonal, max, truth, pred, selected, onPick }: {
+  value: number; diagonal: boolean; max: number; truth: string; pred: string; selected: boolean;
+  onPick: (on: boolean) => void;
+}) {
+  const kind = diagonal ? "diag" : value ? "off" : "";
+  const style = { ["--a" as string]: value / max };
+  if (diagonal || !value) return <td className={kind} style={style}>{value || ""}</td>;
+  return (
+    <td className={`${kind}${selected ? " selected" : ""}`} style={style}>
+      <button className="cell" aria-pressed={selected} onClick={() => { onPick(!selected); }}
+        title={`${String(value)} ${truth} predicted as ${pred}: list them`}
+        aria-label={`${String(value)} ${truth} predicted as ${pred}`}>
+        {value}
+      </button>
+    </td>
   );
 }
