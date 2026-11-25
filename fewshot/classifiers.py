@@ -10,11 +10,17 @@ the logit level beats averaging text and image vectors: on Oxford Pets 5-way
 1-shot it scores 97.3% vs 95.3%. See ``fewshot bench``.
 
 CLIP text and image vectors occupy different regions (the "modality gap").
-Where a class lacks one side we move the other across by the difference of
-modality means: a text-only class gets a shifted text vector as its image-side
-anchor; an image-only class (in a task where others have text) gets its shifted
-image centroid as its text-side vector. A task with no images at all is pure
-CLIP zero-shot.
+Where a class lacks one side we move the other across by a gap vector: a
+text-only class gets its text vector minus the gap as its image-side anchor; an
+image-only class (in a task where others have text) gets its image centroid plus
+the gap as its text-side vector. A task with no images at all is pure CLIP
+zero-shot.
+
+The gap is the mean of (text - image centroid) over the classes with images,
+taking each class's description, or else the embedding of its name
+(``ClassData.name_text``). Without names it falls back to the difference of the
+modality means, which degenerates when only one class has text: that text
+vector *is* the text mean, so the shift erases every class difference.
 """
 
 from __future__ import annotations
@@ -45,6 +51,9 @@ class ClassData:
     X: Vectors  # (n, d) image embeddings
     y: Labels  # (n,) int class indices into ``classes``
     text: dict[int, Vectors] = field(default_factory=dict)  # class index -> (d,) text embedding
+    # Class index -> (d,) embedding of the class name, for classes without ``text``. Only used to
+    # estimate the modality gap, never to score.
+    name_text: dict[int, Vectors] = field(default_factory=dict)
 
     @property
     def dim(self) -> int:
@@ -70,6 +79,16 @@ def _fitted(value: _T | None) -> _T:
     if value is None:
         raise RuntimeError("Classifier is not fitted; call fit() first")
     return value
+
+
+def _modality_gap(data: ClassData) -> Vectors:
+    """Estimated (text - image) offset; ``data`` has images and at least one text embedding."""
+    with_images = sorted(set(data.y.tolist()))
+    sides = [(i, t) for i in with_images if (t := data.text.get(i, data.name_text.get(i))) is not None]
+    if len(sides) == len(with_images):
+        gap: Vectors = np.mean([t - data.X[data.y == i].mean(0) for i, t in sides], axis=0).astype(np.float32)
+        return gap
+    return (np.mean(list(data.text.values()), axis=0) - data.X.mean(0)).astype(np.float32)
 
 
 class Classifier:
@@ -109,14 +128,13 @@ class Classifier:
         self.Pt = None
 
         if data.text and (self.zero_shot or self.text_weight > 0):
-            mean_t = np.mean(list(data.text.values()), axis=0)
-            mean_x = data.X.mean(0) if len(data.X) else mean_t  # mean_x is only used when there are images
+            gap = None if self.zero_shot else _modality_gap(data)
             Pt = np.zeros((C, data.dim), np.float32)
             for i in range(C):
                 if i in data.text:
                     Pt[i] = data.text[i]
                 else:  # image-only class: centroid moved into text space
-                    Pt[i] = _unit(data.X[data.y == i].mean(0) - mean_x + mean_t)
+                    Pt[i] = _unit(data.X[data.y == i].mean(0) + _fitted(gap))
             self.Pt = _unit(Pt)
         if self.zero_shot:
             return self
@@ -124,8 +142,8 @@ class Classifier:
         X, y, w = data.X, data.y, np.ones(len(data.X), np.float32)
         text_only = [i for i in data.text if i not in with_images]
         if text_only:
-            mean_x, mean_t = data.X.mean(0), np.mean(list(data.text.values()), axis=0)
-            T = _unit(np.stack([data.text[i] - mean_t + mean_x for i in text_only]))
+            gap = _modality_gap(data)
+            T = _unit(np.stack([data.text[i] - gap for i in text_only]))
             X = np.concatenate([X, T])
             y = np.concatenate([y, text_only])
             w = np.concatenate([w, np.ones(len(T), np.float32)])

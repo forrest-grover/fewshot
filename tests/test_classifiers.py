@@ -243,3 +243,25 @@ def test_make_classifier_rejects_bad_params(name, params, message):
         make_classifier(name, **params)
     make_classifier("prototype", scale=0, text_weight=0)  # zero is allowed for these
     make_classifier("knn", k=np.int64(3), scale=np.float32(20))  # NumPy numbers are fine
+
+
+def test_single_described_class_uses_names_for_the_gap():
+    """One image-only and one text-only class: the gap comes from the image class's name.
+
+    Without names the text mean is the one description, the shift lands the text-only class's
+    anchor exactly on the other class's centroid, and every prediction is 50/50.
+    """
+    gap = np.array([0, 0, 0, 1.0])
+    cat_img, dog_img = unit([1, 0.2, 0, 0]), unit([0.2, 1, 0, 0])
+    cat_txt, dog_txt = unit(cat_img + gap), unit(dog_img + gap)
+    X = np.stack([cat_img, cat_img]).astype(np.float32)
+    q = np.stack([cat_img, dog_img]).astype(np.float32)
+    without = ClassData(["cat", "dog"], X, np.array([0, 0]), {1: dog_txt.astype(np.float32)})
+    probs, _ = make_classifier("prototype").fit(without).predict(q)
+    np.testing.assert_allclose(probs, 0.5, atol=1e-6)  # the degenerate fallback
+
+    named = ClassData(["cat", "dog"], X, np.array([0, 0]), {1: dog_txt.astype(np.float32)},
+                      {0: cat_txt.astype(np.float32)})
+    for name in ("prototype", "knn", "logreg"):
+        probs, _ = make_classifier(name).fit(named).predict(q)
+        assert probs.argmax(1).tolist() == [0, 1], name

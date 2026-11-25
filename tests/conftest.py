@@ -15,6 +15,7 @@ class ColorEmbedder(Embedder):  # pylint: disable=abstract-method
     """Embeds an image as its normalised mean RGB colour: deterministic and model-free."""
 
     spec = "fake:color"
+    cache_version: str | None = "test"  # skip the fingerprint, which would embed an extra probe image
 
     @property
     def dim(self):

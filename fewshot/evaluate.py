@@ -26,6 +26,7 @@ def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
         X,
         np.array([remap[c] for c in y], int),
         {remap[c]: v for c, v in data.text.items()},
+        {remap[c]: v for c, v in data.name_text.items() if c in remap},
     )
     return sub, np.array(present)
 

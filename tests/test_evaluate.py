@@ -7,7 +7,7 @@ import pytest
 
 from fewshot import Pipeline, benchmark, evaluate_task
 from fewshot.classifiers import ClassData
-from fewshot.embedders import register_embedder, unregister_embedder
+from fewshot.embedders import cache_namespace, register_embedder, unregister_embedder
 from fewshot.evaluate import _folds, _subset, load_folder_dataset  # pylint: disable=protected-access  # unit tests
 from tests.conftest import ColorEmbedder, png
 
@@ -238,7 +238,7 @@ def test_benchmark_zero_shot_with_text_template(ws, tmp_path, text_embedder):
     assert r["shot"] == 0
     assert r["text_template"] == "a photo of something {}"
     assert r["accuracy"] == 1.0
-    cached = Pipeline(ws).cache.get_many(text_embedder, ["text:a photo of something dark red"])
+    cached = Pipeline(ws).cache.get_many(cache_namespace(text_embedder), ["text:a photo of something dark red"])
     assert len(cached) == 1
 
 

@@ -11,6 +11,7 @@ string of the form ``<backend>:<model>[@<pretrained>]``:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -101,6 +102,9 @@ class Embedder(ABC):
     # Text hook: embedders that set ``supports_text`` provide this; ``embed_texts`` checks the flag first.
     _embed_text_batch: Callable[[list[str]], Vectors]
     batch_size: int = 64
+    # For a registered embedder: a name for its weights in the embedding cache, changed whenever the
+    # model changes. None (the default) uses a fingerprint of the model's output instead.
+    cache_version: str | None = None
 
     def __init__(self) -> None:
         # Models are shared across API request threads; serialise GPU use.
@@ -202,6 +206,40 @@ class TimmEmbedder(Embedder):
 
 _loaded: dict[str, Embedder] = {}
 _load_lock = threading.Lock()
+_registered: set[str] = set()  # specs whose embedder came from register_embedder
+_namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once computed
+
+
+def _probe_image() -> Image.Image:
+    """A fixed, deterministic image used to fingerprint a model."""
+    a = np.indices((32, 32)).sum(0) * 4
+    return Image.fromarray(np.stack([a, a[::-1], a.T], -1).astype(np.uint8))
+
+
+def _fingerprint(emb: Embedder) -> str:
+    v = emb.embed_images([_probe_image()])
+    return hashlib.sha256(np.round(v, 4).astype(np.float32).tobytes()).hexdigest()[:12]
+
+
+def cache_namespace(spec: str) -> str:
+    """The name under which embeddings for ``spec`` are cached.
+
+    A built-in spec names its weights, so it is its own namespace. A registered embedder can be
+    replaced under the same spec, so its namespace adds its ``cache_version`` or, by default, a
+    fingerprint of its output on a fixed image: a new model never gets the old one's vectors, and
+    the same model gets them back in a later process.
+    """
+    with _load_lock:
+        emb = _loaded.get(spec) if spec in _registered else None
+        ns = _namespaces.get(spec)
+    if emb is None:
+        return spec
+    if ns is None:
+        ns = f"{spec}#{emb.cache_version or _fingerprint(emb)}"
+        with _load_lock:
+            if _loaded.get(spec) is emb:
+                _namespaces[spec] = ns
+    return ns
 
 
 def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
@@ -230,12 +268,16 @@ def register_embedder(spec: str, embedder: Embedder) -> None:
     """
     with _load_lock:
         _loaded[spec] = embedder
+        _registered.add(spec)
+        _namespaces.pop(spec, None)
 
 
 def unregister_embedder(spec: str) -> None:
     """Forget the embedder registered or loaded under ``spec``; does nothing if there is none."""
     with _load_lock:
         _loaded.pop(spec, None)
+        _registered.discard(spec)
+        _namespaces.pop(spec, None)
 
 
 def spec_supports_text(spec: str) -> bool:

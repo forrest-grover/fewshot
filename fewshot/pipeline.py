@@ -13,7 +13,7 @@ from PIL import Image
 
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
-from .embedders import Vectors, get_embedder, spec_supports_text
+from .embedders import Vectors, cache_namespace, get_embedder, spec_supports_text
 from .store import Task, TaskConfig, Workspace, image_id, load_image
 
 ImageInput = bytes | str | Path | Image.Image
@@ -51,9 +51,9 @@ class Pipeline:
     def __init__(self, workspace: Workspace) -> None:
         self.ws = workspace
         self.cache = EmbeddingCache(workspace.cache_path)
-        # task name -> (task uid, revision, classifier). The uid stops a deleted-and-recreated
-        # task that reaches the same revision from reusing a stale fit.
-        self._fitted: dict[str, tuple[str, int, Classifier]] = {}
+        # task name -> ((task uid, revision, cache namespace), classifier). The uid stops a
+        # deleted-and-recreated task that reaches the same revision from reusing a stale fit.
+        self._fitted: dict[str, tuple[tuple[str, int, str], Classifier]] = {}
         self._lock = threading.Lock()
 
     # ---- embeddings --------------------------------------------------
@@ -64,8 +64,8 @@ class Pipeline:
         An undecodable image raises ``ValueError``, unless ``errors`` is given: then the message is
         stored there under the item's index and that row is all zeros.
         """
-        keys = [k for k, _ in items if k]
-        hit = self.cache.get_many(spec, keys) if keys else {}
+        ns = cache_namespace(spec)
+        hit = self.cache.get_many(ns, [k for k, _ in items if k])
         todo = [(i, k, im) for i, (k, im) in enumerate(items) if not (k and k in hit)]
         out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
         if todo:
@@ -78,20 +78,21 @@ class Pipeline:
                 out[i] = v
                 if k:
                     new[k] = v
-            self.cache.put_many(spec, new)
+            self.cache.put_many(ns, new)
         if not items:
             return np.zeros((0, 0), np.float32)
         return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
 
     def embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
         """Embed strings (rows in input order), using and filling the cache."""
+        ns = cache_namespace(spec)
         keys = ["text:" + t for t in texts]
-        hit = self.cache.get_many(spec, keys)
+        hit = self.cache.get_many(ns, keys)
         missing = [t for t in dict.fromkeys(texts) if "text:" + t not in hit]
         if missing:
             vecs = get_embedder(spec).embed_texts(missing)
             new = {"text:" + t: v for t, v in zip(missing, vecs, strict=True)}
-            self.cache.put_many(spec, new)
+            self.cache.put_many(ns, new)
             hit.update(new)
         return np.stack([hit[k] for k in keys]) if texts else np.zeros((0, 0), np.float32)
 
@@ -114,19 +115,27 @@ class Pipeline:
             X, y = X[keep], y[keep]
         text: dict[int, Vectors] = {}
         if spec_supports_text(cfg.embedder):
-            described = [(i, c.description) for i, c in enumerate(cfg.classes) if c.description.strip()]
-            if described:
-                T = self.embed_texts(cfg.embedder, [d for _, d in described])
-                text = {i: T[j] for j, (i, _) in enumerate(described)}
+            text = self._indexed_texts(cfg.embedder, {i: c.description for i, c in enumerate(cfg.classes)
+                                                      if c.description.strip()})
         # A class with neither examples nor text (e.g. just created) has nothing to fit; leave it out.
         labelled = set(y.tolist())
         used = [i for i in range(len(classes)) if i in text or i in labelled]
+        # With some descriptions, the other classes' names help estimate the modality gap.
+        names = self._indexed_texts(cfg.embedder, {i: classes[i].replace("_", " ") for i in used
+                                                   if i not in text}) if text else {}
         if len(used) < len(classes):
             remap = {old: new for new, old in enumerate(used)}
             classes = [classes[i] for i in used]
             y = np.array([remap[i] for i in y], int)
             text = {remap[i]: v for i, v in text.items()}
-        return ClassData(classes, X, y, text)
+            names = {remap[i]: v for i, v in names.items()}
+        return ClassData(classes, X, y, text, names)
+
+    def _indexed_texts(self, spec: str, texts: dict[int, str]) -> dict[int, Vectors]:
+        """Embed ``{class index: text}``, keeping the indices."""
+        if not texts:
+            return {}
+        return dict(zip(texts, self.embed_texts(spec, list(texts.values())), strict=True))
 
     @staticmethod
     def _new_classifier(cfg: TaskConfig) -> Classifier:
@@ -136,13 +145,15 @@ class Pipeline:
         """The task's classifier (as of ``cfg``, default its current config), re-fitted only when
         the task has changed."""
         cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
+        # The model's namespace is part of the key, so re-registering a spec's embedder refits.
+        stamp = (cfg.uid, cfg.revision, cache_namespace(cfg.embedder))
         with self._lock:
             hit = self._fitted.get(cfg.name)
-            if hit and hit[:2] == (cfg.uid, cfg.revision):
-                return hit[2]
+            if hit and hit[0] == stamp:
+                return hit[1]
         clf = self._new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
         with self._lock:
-            self._fitted[cfg.name] = (cfg.uid, cfg.revision, clf)
+            self._fitted[cfg.name] = (stamp, clf)
         return clf
 
     # ---- prediction --------------------------------------------------

@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 from fewshot.classifiers import KNNClassifier
-from fewshot.embedders import Embedder, register_embedder, unregister_embedder
+from fewshot.embedders import Embedder, cache_namespace, register_embedder, unregister_embedder
 from fewshot.pipeline import Pipeline, Prediction
 from fewshot.store import image_id
 from tests.conftest import ColorEmbedder, png
@@ -40,6 +40,8 @@ class CountingEmbedder(ColorEmbedder):
 
 class ImageOnly(Embedder):
     """Image-only view of another embedder, so both specs share its counters."""
+
+    cache_version = "test"
 
     def __init__(self, inner):
         super().__init__()
@@ -92,7 +94,7 @@ def test_embed_images_uses_and_fills_cache(ws, emb):
     assert out.shape == (2, 3)
     assert out.dtype == np.float32
     assert emb.images == 2
-    assert set(pipe.cache.get_many("fake:color", ["r", "g"])) == {"r"}
+    assert set(pipe.cache.get_many(cache_namespace("fake:color"), ["r", "g"])) == {"r"}
     out2 = pipe.embed_images("fake:color", [("g", green), ("r", red), (None, blue_im)])
     assert emb.images == 4  # only "g" and the PIL image
     np.testing.assert_allclose(out2[1], out[0], atol=1e-6)
@@ -120,7 +122,8 @@ def test_embed_texts_caches_and_dedupes(ws, emb):
     out2 = pipe.embed_texts(TEXT_SPEC, ["blue", "green"])
     assert emb.texts == ["a red thing", "blue", "green"]
     np.testing.assert_allclose(out2[0], out[1])
-    assert set(pipe.cache.get_many(TEXT_SPEC, ["text:blue", "text:green"])) == {"text:blue", "text:green"}
+    cached = pipe.cache.get_many(cache_namespace(TEXT_SPEC), ["text:blue", "text:green"])
+    assert set(cached) == {"text:blue", "text:green"}
     assert pipe.embed_texts(TEXT_SPEC, []).shape == (0, 0)
 
 
@@ -152,7 +155,9 @@ def test_class_data_text_for_described_classes(ws, emb):
     t.upsert_class("purple", "a green-ish purple")
     d = pipe.class_data(t)
     assert sorted(d.text) == [2, 3]
-    assert emb.texts == ["something blue", "a green-ish purple"]
+    # descriptions first, then the undescribed classes' names (for the modality gap only)
+    assert emb.texts == ["something blue", "a green-ish purple", "red", "green"]
+    assert sorted(d.name_text) == [0, 1]
     assert d.text[2].argmax() == 2
     assert d.text[3].argmax() == 1
 
@@ -165,7 +170,14 @@ def test_text_only_class_is_predicted(ws, emb):
     t.upsert_class("blue", "pure blue")
     preds = Pipeline(ws).predict(t, [png(BLUE, seed=3), png(RED, seed=3)])
     assert [p.label for p in preds] == ["blue", "red"]
-    assert emb.texts == ["pure blue"]
+    assert emb.texts == ["pure blue", "red", "green"]
+
+
+def test_names_are_not_embedded_without_descriptions(ws, emb):
+    """Class names are only embedded when some class has a description."""
+    t = make_task(ws, embedder=TEXT_SPEC)
+    assert not Pipeline(ws).class_data(t).name_text
+    assert emb.texts == []
 
 
 # ---- classifier caching ------------------------------------------------
@@ -219,7 +231,7 @@ def test_predict_accepts_bytes_paths_and_pil(ws, emb, tmp_path):
     assert all(not p.rejected and abs(sum(p.scores.values()) - 1) < 1e-6 for p in preds)
     assert preds[0].confidence == max(preds[0].scores.values())
     assert 0 < preds[0].similarity <= 1
-    cached = pipe.cache.get_many("fake:color", [image_id(b) for b in (red, green, blue)])
+    cached = pipe.cache.get_many(cache_namespace("fake:color"), [image_id(b) for b in (red, green, blue)])
     assert len(cached) == 3
     n = emb.images
     pipe.predict(t, [red, pil])
@@ -284,3 +296,55 @@ def test_registered_embedder_decides_text_support(ws, emb):
         assert sorted(Pipeline(ws).class_data(t).text) == [0]
     finally:
         unregister_embedder("mine:v1")
+
+
+def test_reregistered_embedder_gets_fresh_vectors_and_fit(ws):
+    """Replacing the model under a spec never reuses the old model's cached vectors or classifier."""
+
+    class Inverted(ColorEmbedder):  # pylint: disable=abstract-method
+        """A different model: every vector negated."""
+
+        cache_version = None  # fingerprinted
+
+        def _embed_image_batch(self, images):
+            return -super()._embed_image_batch(images)
+
+    register_embedder("mine:v1", ColorEmbedder())
+    try:
+        t = make_task(ws, embedder="mine:v1")
+        pipe = Pipeline(ws)
+        first = pipe.example_embeddings(t)
+        clf = pipe.fitted(t)
+        register_embedder("mine:v1", Inverted())
+        np.testing.assert_allclose(pipe.example_embeddings(t), -first)
+        assert pipe.fitted(t) is not clf
+        ns = cache_namespace("mine:v1")
+        assert ns.startswith("mine:v1#")
+        assert ns != "mine:v1#test"
+        assert cache_namespace("mine:v1") == ns  # computed once
+        register_embedder("mine:v1", Inverted())  # same weights, same fingerprint: cache reused
+        assert cache_namespace("mine:v1") == ns
+    finally:
+        unregister_embedder("mine:v1")
+    assert cache_namespace("mine:v1") == "mine:v1"
+    assert cache_namespace("openclip:ViT-B-32@laion2b_s34b_b79k") == "openclip:ViT-B-32@laion2b_s34b_b79k"
+
+
+def test_namespace_of_a_replaced_embedder_is_not_kept():
+    """If the embedder is replaced while its fingerprint is computed, that result isn't stored."""
+
+    class Replaced(ColorEmbedder):  # pylint: disable=abstract-method
+        """Re-registers the spec with another model during its own fingerprint."""
+
+        cache_version = None
+
+        def _embed_image_batch(self, images):
+            register_embedder("mine:v2", ColorEmbedder())
+            return super()._embed_image_batch(images)
+
+    register_embedder("mine:v2", Replaced())
+    try:
+        assert cache_namespace("mine:v2").startswith("mine:v2#")
+        assert cache_namespace("mine:v2") == "mine:v2#test"  # the replacement's own namespace
+    finally:
+        unregister_embedder("mine:v2")
