@@ -10,10 +10,11 @@ string of the form ``<backend>:<model>[@<pretrained>]``:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 from PIL import Image
@@ -24,6 +25,8 @@ from PIL import Image
 
 @dataclass(frozen=True)
 class EmbedderInfo:
+    """Description of an embedder preset for display in the UI and CLI."""
+
     spec: str
     label: str
     supports_text: bool
@@ -62,9 +65,18 @@ DEFAULT_SPEC = PRESETS[0].spec
 
 
 def _device() -> str:
-    import torch
+    import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _autocast(device: str):
+    """Half-precision autocast on CUDA; a no-op context on CPU."""
+    if device != "cuda":
+        return contextlib.nullcontext()
+    import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
+
+    return torch.autocast("cuda", dtype=torch.float16)
 
 
 def _l2(x) -> np.ndarray:
@@ -74,8 +86,12 @@ def _l2(x) -> np.ndarray:
 
 
 class Embedder(ABC):
+    """Base class: batches images/texts and returns L2-normalised float32 rows."""
+
     spec: str
     supports_text: bool = False
+    # Text hook: embedders that set ``supports_text`` provide this; ``embed_texts`` checks the flag first.
+    _embed_text_batch: Callable[[list[str]], np.ndarray]
     batch_size: int = 64
 
     def __init__(self) -> None:
@@ -85,17 +101,16 @@ class Embedder(ABC):
     @abstractmethod
     def _embed_image_batch(self, images: Sequence[Image.Image]) -> np.ndarray: ...
 
-    def _embed_text_batch(self, texts: Sequence[str]) -> np.ndarray:
-        raise NotImplementedError(f"{self.spec} does not support text embeddings")
-
     @property
     @abstractmethod
-    def dim(self) -> int: ...
+    def dim(self) -> int:
+        """Length of each embedding vector."""
 
     def embed_images(self, images: Sequence[Image.Image]) -> np.ndarray:
+        """Embed images (converted to RGB) in batches of ``batch_size``; returns an ``(n, dim)`` array."""
         if not images:
             return np.zeros((0, self.dim), dtype=np.float32)
-        import torch
+        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         out = []
         with self._lock, torch.inference_mode():
@@ -105,20 +120,25 @@ class Embedder(ABC):
         return np.concatenate(out)
 
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
+        """Embed texts into the image embedding space; raises NotImplementedError if unsupported."""
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
-        import torch
+        if not self.supports_text:
+            raise NotImplementedError(f"{self.spec} does not support text embeddings")
+        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         with self._lock, torch.inference_mode():
             return self._embed_text_batch(list(texts))
 
 
 class OpenCLIPEmbedder(Embedder):
+    """OpenCLIP image/text model; image and text vectors share one space."""
+
     supports_text = True
 
     def __init__(self, spec: str, model_name: str, pretrained: str | None) -> None:
         super().__init__()
-        import open_clip
+        import open_clip  # pylint: disable=import-outside-toplevel  # lazy: heavy import, keeps CLI startup fast
 
         self.spec = spec
         self.device = _device()
@@ -133,28 +153,25 @@ class OpenCLIPEmbedder(Embedder):
     def dim(self) -> int:
         return self._dim
 
-    def _autocast(self):
-        import torch
-
-        return torch.autocast("cuda", dtype=torch.float16) if self.device == "cuda" else torch.autocast("cpu", enabled=False)
-
     def _embed_image_batch(self, images):
-        import torch
+        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
-        with self._autocast():
+        with _autocast(self.device):
             return _l2(self.model.encode_image(x))
 
     def _embed_text_batch(self, texts):
         tok = self.tokenizer(texts).to(self.device)
-        with self._autocast():
+        with _autocast(self.device):
             return _l2(self.model.encode_text(tok))
 
 
 class TimmEmbedder(Embedder):
+    """Image-only timm backbone (e.g. DINOv2) with its classifier head removed."""
+
     def __init__(self, spec: str, model_name: str) -> None:
         super().__init__()
-        import timm
+        import timm  # pylint: disable=import-outside-toplevel  # lazy: heavy import, keeps CLI startup fast
 
         self.spec = spec
         self.device = _device()
@@ -168,13 +185,11 @@ class TimmEmbedder(Embedder):
         return self._dim
 
     def _embed_image_batch(self, images):
-        import torch
+        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
-        if self.device == "cuda":
-            with torch.autocast("cuda", dtype=torch.float16):
-                return _l2(self.model(x))
-        return _l2(self.model(x))
+        with _autocast(self.device):
+            return _l2(self.model(x))
 
 
 _loaded: dict[str, Embedder] = {}
@@ -201,4 +216,5 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
 
 
 def spec_supports_text(spec: str) -> bool:
+    """Whether embedders for ``spec`` can embed text (only the OpenCLIP backend can)."""
     return spec.startswith("openclip:")

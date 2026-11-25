@@ -15,6 +15,8 @@ import numpy as np
 
 
 class EmbeddingCache:
+    """Thread-safe embedding store; vectors are float32 blobs."""
+
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -26,6 +28,7 @@ class EmbeddingCache:
             self._conn.commit()
 
     def get_many(self, spec: str, keys: list[str]) -> dict[str, np.ndarray]:
+        """Return the cached vectors among ``keys`` (missing keys are simply absent)."""
         found: dict[str, np.ndarray] = {}
         with self._lock:
             for i in range(0, len(keys), 500):
@@ -36,6 +39,7 @@ class EmbeddingCache:
         return found
 
     def put_many(self, spec: str, items: dict[str, np.ndarray]) -> None:
+        """Insert or replace vectors for ``spec``."""
         if not items:
             return
         with self._lock:

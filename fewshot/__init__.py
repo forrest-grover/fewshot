@@ -11,6 +11,14 @@
 """
 
 import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # Static view of the lazy exports below, for type checkers and linters.
+    from .classifiers import CLASSIFIERS, ClassData, make_classifier
+    from .embedders import DEFAULT_SPEC, PRESETS, get_embedder
+    from .evaluate import benchmark, evaluate_task
+    from .pipeline import Pipeline, Prediction
+    from .store import Task, Workspace
 
 # Lazy exports so `import fewshot.cli` doesn't pay for importing torch.
 _EXPORTS = {
@@ -23,7 +31,8 @@ _EXPORTS = {
 __all__ = list(_EXPORTS)
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> Any:
+    """Import the submodule that defines ``name`` on first access."""
     if name in _EXPORTS:
         return getattr(importlib.import_module(f".{_EXPORTS[name]}", __name__), name)
-    raise AttributeError(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

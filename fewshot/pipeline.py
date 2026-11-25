@@ -20,6 +20,8 @@ ImageInput = Union[bytes, str, Path, Image.Image]
 
 @dataclass
 class Prediction:
+    """Classification result for one image."""
+
     label: str | None  # None when rejected as unknown
     top_label: str
     confidence: float
@@ -28,6 +30,7 @@ class Prediction:
     scores: dict[str, float]
 
     def to_dict(self) -> dict:
+        """JSON-ready dict of the fields."""
         return asdict(self)
 
 
@@ -41,7 +44,9 @@ class Pipeline:
     def __init__(self, workspace: Workspace) -> None:
         self.ws = workspace
         self.cache = EmbeddingCache(workspace.cache_path)
-        self._fitted: dict[str, tuple[int, Classifier]] = {}
+        # task name -> (task object, revision, classifier). The object identity check stops a
+        # deleted-and-recreated task that reaches the same revision from reusing a stale fit.
+        self._fitted: dict[str, tuple[Task, int, Classifier]] = {}
         self._lock = threading.Lock()
 
     # ---- embeddings --------------------------------------------------
@@ -66,6 +71,7 @@ class Pipeline:
         return np.stack(out).astype(np.float32)
 
     def embed_texts(self, spec: str, texts: Sequence[str]) -> np.ndarray:
+        """Embed strings (rows in input order), using and filling the cache."""
         keys = ["text:" + t for t in texts]
         hit = self.cache.get_many(spec, keys)
         missing = [t for t in dict.fromkeys(texts) if "text:" + t not in hit]
@@ -77,11 +83,13 @@ class Pipeline:
         return np.stack([hit[k] for k in keys]) if texts else np.zeros((0, 0), np.float32)
 
     def example_embeddings(self, task: Task) -> np.ndarray:
+        """Embeddings of the task's examples, in ``task.config.examples`` order."""
         exs = task.config.examples
         return self.embed_images(task.config.embedder, [(e.id, task.path / e.file) for e in exs])
 
     # ---- training data -----------------------------------------------
     def class_data(self, task: Task, exclude: set[int] | None = None) -> ClassData:
+        """Training data for ``task``, leaving out example indices in ``exclude``."""
         cfg = task.config
         classes = task.class_names()
         idx = {c: i for i, c in enumerate(classes)}
@@ -103,20 +111,24 @@ class Pipeline:
         return make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params)
 
     def fitted(self, task: Task) -> Classifier:
+        """The task's classifier, re-fitted only when the task has changed."""
         rev = task.config.revision
         with self._lock:
             hit = self._fitted.get(task.name)
-            if hit and hit[0] == rev:
-                return hit[1]
+            if hit and hit[0] is task and hit[1] == rev:
+                return hit[2]
         clf = self._new_classifier(task).fit(self.class_data(task))
         with self._lock:
-            self._fitted[task.name] = (rev, clf)
+            self._fitted[task.name] = (task, rev, clf)
         return clf
 
     # ---- prediction --------------------------------------------------
     def predict(self, task: Task | str, images: Sequence[ImageInput]) -> list[Prediction]:
+        """Classify images given as bytes, file paths or PIL images."""
         task = self.ws.get(task) if isinstance(task, str) else task
         clf = self.fitted(task)
+        if not images:
+            return []
         items = [(_key(im), im) for im in images]
         Q = self.embed_images(task.config.embedder, items)
         probs, sims = clf.predict(Q)

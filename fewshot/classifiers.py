@@ -28,6 +28,8 @@ CLIP_LOGIT_SCALE = 100.0
 
 @dataclass
 class ClassData:
+    """Training data for a classifier: labelled image embeddings plus optional text embeddings."""
+
     classes: list[str]
     X: np.ndarray  # (n, d) image embeddings
     y: np.ndarray  # (n,) int class indices into ``classes``
@@ -35,6 +37,7 @@ class ClassData:
 
     @property
     def dim(self) -> int:
+        """Embedding dimension, taken from the images or, for zero-shot data, the text."""
         if len(self.X):
             return self.X.shape[1]
         return next(iter(self.text.values())).shape[0]
@@ -51,11 +54,16 @@ def _softmax(z: np.ndarray) -> np.ndarray:
 
 
 class Classifier:
+    """Base class: handles text fusion and modality-gap anchors; subclasses score images."""
+
     name = "base"
 
     def __init__(self, text_weight: float = 1.0) -> None:
         self.text_weight = text_weight
         self.classes: list[str] = []
+        self.zero_shot = False
+        self.Pt: np.ndarray | None = None  # (C, d) text-side vector per class, if any text is used
+        self._X: np.ndarray | None = None  # image-space support points (examples + text anchors)
 
     # Subclasses implement these on image-space data where every class has >= 1 point.
     def _fit_image(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> None:
@@ -69,6 +77,7 @@ class Classifier:
         return (Q @ self._X.T).max(axis=1)
 
     def fit(self, data: ClassData) -> "Classifier":
+        """Fit on ``data``; every class needs at least one image or a text embedding."""
         C = len(data.classes)
         if C < 2:
             raise ValueError("Need at least 2 classes")
@@ -129,6 +138,7 @@ class PrototypeClassifier(Classifier):
     def __init__(self, text_weight: float = 1.0, scale: float = 30.0) -> None:
         super().__init__(text_weight)
         self.scale = scale
+        self.P: np.ndarray | None = None
 
     def _fit_image(self, X, y, w):
         P = np.zeros((len(self.classes), X.shape[1]), np.float32)
@@ -137,7 +147,8 @@ class PrototypeClassifier(Classifier):
 
     def _image_logprobs(self, Q):
         z = self.scale * (Q @ self.P.T)
-        return z - np.log(np.exp(z - z.max(1, keepdims=True)).sum(1, keepdims=True)) - z.max(1, keepdims=True)
+        z = z - z.max(1, keepdims=True)
+        return z - np.log(np.exp(z).sum(1, keepdims=True))
 
     def _image_similarity(self, Q):
         return (Q @ self.P.T).max(axis=1)
@@ -151,6 +162,8 @@ class KNNClassifier(Classifier):
     def __init__(self, text_weight: float = 1.0, k: int = 5, scale: float = 30.0) -> None:
         super().__init__(text_weight)
         self.k, self.scale = k, scale
+        self.y: np.ndarray | None = None
+        self.w: np.ndarray | None = None
 
     def _fit_image(self, X, y, w):
         self.y, self.w = y, w
@@ -162,7 +175,8 @@ class KNNClassifier(Classifier):
         scores = np.full((len(Q), len(self.classes)), 1e-6)
         rows = np.repeat(np.arange(len(Q)), k)
         cols = top.ravel()
-        np.add.at(scores, (rows, self.y[cols]), self.w[cols] * np.exp(self.scale * (S[rows, cols] - 1.0)))
+        votes = self.w[cols] * np.exp(self.scale * (S[rows, cols] - 1.0))
+        np.add.at(scores, (rows, self.y[cols]), votes)
         return np.log(scores / scores.sum(axis=1, keepdims=True))
 
 
@@ -174,9 +188,11 @@ class LogRegClassifier(Classifier):
     def __init__(self, text_weight: float = 1.0, C: float = 10.0) -> None:
         super().__init__(text_weight)
         self.C = C
+        self.model = None
 
     def _fit_image(self, X, y, w):
-        from sklearn.linear_model import LogisticRegression
+        # Lazy import: sklearn is slow to import and only this classifier needs it.
+        from sklearn.linear_model import LogisticRegression  # pylint: disable=import-outside-toplevel
 
         self.model = LogisticRegression(C=self.C, max_iter=2000).fit(X, y, sample_weight=w)
 
@@ -192,6 +208,7 @@ CLASSIFIERS: dict[str, type[Classifier]] = {
 
 
 def make_classifier(name: str, **params) -> Classifier:
+    """Instantiate the classifier registered as ``name`` with keyword ``params``."""
     if name not in CLASSIFIERS:
         raise ValueError(f"Unknown classifier {name!r}; choose from {sorted(CLASSIFIERS)}")
     return CLASSIFIERS[name](**params)

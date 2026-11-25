@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import re
 import shutil
@@ -35,14 +34,17 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def default_root() -> Path:
+    """Workspace root from ``$FEWSHOT_HOME``, defaulting to ``./fewshot_data``."""
     return Path(os.environ.get("FEWSHOT_HOME", "./fewshot_data")).resolve()
 
 
 def image_id(data: bytes) -> str:
+    """Content id of an image: the first 16 hex chars of its SHA-256."""
     return hashlib.sha256(data).hexdigest()[:16]
 
 
 def load_image(data: bytes) -> Image.Image:
+    """Decode image bytes to an upright RGB image; raises ``ValueError`` if unreadable."""
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
@@ -56,11 +58,15 @@ def _now() -> str:
 
 
 class ClassDef(BaseModel):
+    """A class label with an optional text description."""
+
     name: str
     description: str = ""  # used as a CLIP text prompt when non-empty
 
 
 class Example(BaseModel):
+    """A labeled example image stored in the task folder."""
+
     id: str
     label: str
     file: str
@@ -69,6 +75,8 @@ class Example(BaseModel):
 
 
 class TaskConfig(BaseModel):
+    """Everything persisted in ``task.json``."""
+
     name: str
     embedder: str = DEFAULT_SPEC
     classifier: str = "prototype"
@@ -82,6 +90,8 @@ class TaskConfig(BaseModel):
 
 
 class Task:
+    """A task folder: its config plus example images. Every mutation is saved immediately."""
+
     def __init__(self, path: Path, config: TaskConfig) -> None:
         self.path = path
         self.config = config
@@ -90,9 +100,11 @@ class Task:
     # ---- persistence -------------------------------------------------
     @property
     def name(self) -> str:
+        """The task name."""
         return self.config.name
 
     def save(self) -> None:
+        """Bump the revision and atomically write ``task.json``."""
         with self._lock:
             self.config.revision += 1
             tmp = self.path / "task.json.tmp"
@@ -101,6 +113,7 @@ class Task:
 
     # ---- settings ----------------------------------------------------
     def update_settings(self, **kw: Any) -> None:
+        """Change embedder/classifier settings; unknown keys raise ``ValueError``."""
         allowed = {"embedder", "classifier", "classifier_params", "text_weight", "reject_below"}
         bad = set(kw) - allowed
         if bad:
@@ -114,9 +127,11 @@ class Task:
 
     # ---- classes -----------------------------------------------------
     def class_names(self) -> list[str]:
+        """Class names in definition order."""
         return [c.name for c in self.config.classes]
 
     def upsert_class(self, name: str, description: str | None = None) -> ClassDef:
+        """Create a class, or update its description if it exists (``None`` keeps it)."""
         name = name.strip()
         if not name:
             raise ValueError("Class name is empty")
@@ -146,7 +161,10 @@ class Task:
         return n
 
     def rename_class(self, old: str, new: str) -> None:
+        """Rename a class and relabel its examples."""
         new = new.strip()
+        if not new:
+            raise ValueError("Class name is empty")
         with self._lock:
             if new in self.class_names():
                 raise ValueError(f"Class {new!r} already exists")
@@ -177,8 +195,10 @@ class Task:
 
     # ---- examples ----------------------------------------------------
     def add_example(self, data: bytes, label: str, source: str = "") -> Example:
+        """Store an image under ``label`` (creating the class); re-adding an image relabels it."""
         load_image(data)  # validates before anything is written
         eid = image_id(data)
+        label = label.strip()
         with self._lock:
             if label not in self.class_names():
                 self.upsert_class(label)
@@ -208,14 +228,17 @@ class Task:
         return n
 
     def example(self, eid: str) -> Example:
+        """Look up an example by id; raises ``KeyError`` if missing."""
         for e in self.config.examples:
             if e.id == eid:
                 return e
         raise KeyError(f"No example {eid!r}")
 
     def relabel(self, eid: str, label: str) -> Example:
+        """Move an example to ``label``, creating the class if needed."""
         with self._lock:
             e = self.example(eid)
+            label = label.strip()
             if label not in self.class_names():
                 self.upsert_class(label)
             e.label = label
@@ -223,6 +246,7 @@ class Task:
             return e
 
     def delete_example(self, eid: str) -> None:
+        """Remove an example and its image file."""
         with self._lock:
             e = self.example(eid)
             (self.path / e.file).unlink(missing_ok=True)
@@ -230,9 +254,11 @@ class Task:
             self.save()
 
     def image_path(self, eid: str) -> Path:
+        """Path of an example's image file."""
         return self.path / self.example(eid).file
 
     def summary(self) -> dict[str, Any]:
+        """Overview of the task: settings and per-class example counts."""
         counts = {c.name: 0 for c in self.config.classes}
         for e in self.config.examples:
             counts[e.label] = counts.get(e.label, 0) + 1
@@ -248,6 +274,8 @@ class Task:
 
 
 class Workspace:
+    """A folder of tasks plus the shared embedding cache."""
+
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root).resolve() if root else default_root()
         (self.root / "tasks").mkdir(parents=True, exist_ok=True)
@@ -255,9 +283,12 @@ class Workspace:
         self._lock = threading.Lock()
 
     def list_tasks(self) -> list[Task]:
-        return [self.get(p.name) for p in sorted((self.root / "tasks").iterdir()) if (p / "task.json").exists()]
+        """All tasks, sorted by name."""
+        folders = sorted((self.root / "tasks").iterdir())
+        return [self.get(p.name) for p in folders if (p / "task.json").exists()]
 
     def get(self, name: str) -> Task:
+        """Load a task (cached per workspace); raises ``KeyError`` if missing."""
         with self._lock:
             if name in self._tasks:
                 return self._tasks[name]
@@ -269,6 +300,7 @@ class Workspace:
             return t
 
     def create(self, name: str, **settings: Any) -> Task:
+        """Create a new task folder; raises ``ValueError`` for bad or taken names."""
         if not NAME_RE.match(name):
             raise ValueError("Task names use letters, digits, '_', '-', '.' (max 64 chars)")
         p = self.root / "tasks" / name
@@ -285,6 +317,7 @@ class Workspace:
         return t
 
     def delete(self, name: str) -> None:
+        """Delete a task folder and everything in it."""
         t = self.get(name)
         with self._lock:
             shutil.rmtree(t.path)
@@ -292,4 +325,5 @@ class Workspace:
 
     @property
     def cache_path(self) -> Path:
+        """Location of the shared embedding cache."""
         return self.root / "cache.sqlite"

@@ -8,3 +8,7 @@ fewshot_data/
 scratch_ws/
 datasets/
 web/*.tsbuildinfo
+.coverage
+coverage.xml
+.mypy_cache/
+.ruff_cache/
