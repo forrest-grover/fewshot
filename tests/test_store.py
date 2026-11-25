@@ -347,3 +347,70 @@ def test_load_image_reports_truncated_files():
     """Truncated data that Pillow recognises is reported with Pillow's message."""
     with pytest.raises(ValueError, match="Not a readable image: image file is truncated"):
         load_image(png(RED, size=64, noise=50)[:-40])
+
+
+# ---- validation of names and task.json -------------------------------
+@pytest.mark.parametrize("name", [".", "..", "a/b", "a\\b", "tab\there", "x" * 201])
+def test_bad_class_names_are_refused(ws, name):
+    """Names that can't be a URL path segment are refused when creating, renaming or relabelling."""
+    t = ws.create("t")
+    t.add_example(png(RED), "ok")
+    with pytest.raises(ValueError, match="Class name"):
+        t.upsert_class(name)
+    with pytest.raises(ValueError, match="Class name"):
+        t.rename_class("ok", name)
+    with pytest.raises(ValueError, match="Class name"):
+        t.relabel(t.config.examples[0].id, name)
+    with pytest.raises(ValueError, match="Class name"):
+        t.add_example(png(RED, noise=15), name)
+    assert t.class_names() == ["ok"]
+    assert store.check_class_name("  a.b c ") == "a.b c"
+
+
+def test_text_weight_is_not_a_classifier_param(ws):
+    """text_weight inside classifier_params would collide with the task setting at fit time."""
+    t = ws.create("t")
+    with pytest.raises(ValueError, match="text_weight is a task setting"):
+        t.update_settings(classifier_params={"text_weight": 2.0})
+    assert t.config.classifier_params == {}
+
+
+def _write_task_json(ws, name, edit):
+    path = ws.root / "tasks" / name / "task.json"
+    data = json.loads(path.read_text())
+    edit(data)
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("file", ["../../victim.txt", "/etc/passwd", "images/../../x.png", "images/abc.png"])
+def test_example_files_outside_images_are_refused(ws, file):
+    """A task.json pointing an example outside images/ can't be loaded, so nothing follows it."""
+    t = ws.create("t")
+    t.add_example(png(RED), "red")
+
+    def tamper(data):
+        data["examples"][0]["file"] = file
+
+    _write_task_json(ws, "t", tamper)
+    with pytest.raises(KeyError, match=r"Task 't' can't be loaded: .*examples\.0\.file"):
+        Workspace(ws.root).get("t")
+    for _ in range(2):  # the cached copy is dropped on refresh, then re-reading fails the same way
+        with pytest.raises(KeyError, match="can't be loaded"):
+            ws.get("t")
+    assert ws.list_tasks() == []
+
+
+def test_corrupt_or_misnamed_tasks_are_skipped(ws, caplog):
+    """One broken task.json doesn't break listing the others."""
+    ws.create("good")
+    ws.create("bad")
+    ws.create("moved")
+    (ws.root / "tasks" / "bad" / "task.json").write_text("{not json")
+    _write_task_json(ws, "moved", lambda d: d.update(name="other"))
+    fresh = Workspace(ws.root)
+    assert [t.name for t in fresh.list_tasks()] == ["good"]
+    assert "Skipping task folder" in caplog.text
+    with pytest.raises(KeyError, match=r"Task 'bad' can't be loaded: .*task\.json is invalid"):
+        fresh.get("bad")
+    with pytest.raises(KeyError, match="name 'other' does not match its folder"):
+        fresh.get("moved")

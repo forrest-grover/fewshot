@@ -20,6 +20,7 @@ CLIP zero-shot.
 from __future__ import annotations
 
 import inspect
+import numbers
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -230,10 +231,16 @@ CLASSIFIERS: dict[str, type[Classifier]] = {
 }
 
 
+# Upper bounds keep the scores finite: logits are at most about scale + text_weight * 100.
+PARAM_MAX = {"k": 100_000, "scale": 1000.0, "C": 1e6, "text_weight": 100.0}
+POSITIVE_PARAMS = {"k", "C"}
+
+
 def check_params(name: str, params: dict[str, Any]) -> None:
     """Raise ``ValueError`` unless ``params`` are valid keyword arguments for classifier ``name``.
 
-    Every parameter is a non-negative number; ``k`` must be a positive integer and ``C`` positive.
+    Every parameter is a number between 0 and ``PARAM_MAX``; ``k`` must be a positive integer and
+    ``C`` positive. Python and NumPy numbers are accepted; bools are not.
     """
     if name not in CLASSIFIERS:
         raise ValueError(f"Unknown classifier {name!r}; choose from {sorted(CLASSIFIERS)}")
@@ -245,12 +252,20 @@ def check_params(name: str, params: dict[str, Any]) -> None:
         if key not in defaults:
             raise ValueError(f"Unknown parameter {key!r} for {name}; choose from {sorted(defaults)}")
         want_int = isinstance(defaults[key], int)
-        if isinstance(value, bool) or not isinstance(value, int if want_int else (int, float)):
+        kind = numbers.Integral if want_int else numbers.Real
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, kind):
             raise ValueError(f"{name} parameter {key!r} must be {'an integer' if want_int else 'a number'}, "
                              f"got {value!r}")
-        positive = key in {"k", "C"}
-        if not np.isfinite(value) or value < 0 or (positive and value == 0):
-            raise ValueError(f"{name} parameter {key!r} must be {'> 0' if positive else '>= 0'}, got {value!r}")
+        low = 1 if want_int else 0.0
+        high = PARAM_MAX.get(key, 1e6)
+        try:
+            v = float(value)
+            ok = low <= v <= high and (key not in POSITIVE_PARAMS or v > 0)
+        except OverflowError:  # an int too large for a float
+            ok = False
+        if not ok:  # also catches NaN, which fails every comparison
+            bound = "> 0" if key in POSITIVE_PARAMS else f">= {low}"
+            raise ValueError(f"{name} parameter {key!r} must be {bound} and <= {high:g}, got {value!r}")
 
 
 def make_classifier(name: str, **params: Any) -> Classifier:

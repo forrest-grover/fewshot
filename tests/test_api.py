@@ -348,3 +348,25 @@ def test_evaluate(client, task):
     r = client.post("/api/tasks/empty/evaluate")
     assert r.status_code == 400
     assert r.json()["detail"] == "Task has no examples to evaluate"
+
+
+@pytest.mark.parametrize("label", ["..", ".", "a/b"])
+def test_path_like_class_names_are_refused(client, task, label):
+    """A class named '..' would make DELETE .../classes/.. resolve to the task itself."""
+    r = client.post(f"/api/tasks/{task}/examples", data={"label": label}, files=_query(RED))
+    assert r.status_code == 400
+    assert "can't be '.' or '..'" in r.json()["detail"]
+    r = client.post(f"/api/tasks/{task}/classes", json={"name": label})
+    assert r.status_code == 400
+    r = client.patch(f"/api/tasks/{task}/classes/red", json={"name": label})
+    assert r.status_code == 400
+    assert client.get(f"/api/tasks/{task}").status_code == 200
+
+
+def test_corrupt_task_is_skipped_and_reported(client, task, tmp_path):
+    """A broken task.json is left out of the list and is a 404 with the reason."""
+    (tmp_path / "ws" / "tasks" / task / "task.json").write_text("{not json")
+    assert client.get("/api/tasks").json() == []
+    r = client.get(f"/api/tasks/{task}")
+    assert r.status_code == 404
+    assert "can't be loaded" in r.json()["detail"]

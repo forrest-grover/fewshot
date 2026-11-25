@@ -1,5 +1,8 @@
 """Pipeline: embedding cache use, training data, classifier caching and prediction inputs."""
 
+import io
+from pathlib import Path
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -238,7 +241,7 @@ def test_predict_threshold_keeps_confident_labels(ws, emb):
 
 
 def test_predict_rejects_unreadable_input(ws, emb):
-    """An undecodable image gets an error result while the rest are classified; a missing path raises."""
+    """Unreadable inputs get an error result each while the rest are classified."""
     t = make_task(ws)
     pipe = Pipeline(ws)
     bad, good = pipe.predict(t, [b"junk", png(RED, seed=9)])
@@ -247,8 +250,15 @@ def test_predict_rejects_unreadable_input(ws, emb):
     assert (good.error, good.label) == (None, "red")
     with pytest.raises(ValueError, match="Not a readable image"):
         pipe.embed_images("fake:color", [(None, b"junk")])
-    with pytest.raises(FileNotFoundError):
-        pipe.predict(t, ["/nonexistent/x.png"])
+    truncated = Image.open(io.BytesIO(png(RED, size=64, noise=50)[:-40]))  # fails only when loaded
+    missing, folder, cut, later = pipe.predict(t, ["/nonexistent/x.png", ws.root, truncated, Path(ws.root / "r.png")])
+    assert missing.error == "Could not read /nonexistent/x.png: No such file or directory"
+    assert folder.error == f"Could not read {ws.root}: Is a directory"
+    assert cut.error is not None
+    assert cut.error.startswith("Not a readable image: image file is truncated")
+    assert later.error == f"Could not read {ws.root / 'r.png'}: No such file or directory"
+    (ws.root / "r.png").write_bytes(png(RED, seed=9))
+    assert pipe.predict(t, [ws.root / "r.png"])[0].label == "red"
     with pytest.raises(KeyError, match="No task 'nope'"):
         pipe.predict("nope", [png(RED)])
     assert emb.texts == []

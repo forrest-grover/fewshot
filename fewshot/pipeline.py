@@ -149,16 +149,28 @@ class Pipeline:
     def predict(self, task: Task | str, images: Sequence[ImageInput]) -> list[Prediction]:
         """Classify images given as bytes, file paths or PIL images.
 
-        An image that cannot be decoded gets a ``Prediction`` with ``error`` set; the others are
-        still classified. Classes with neither examples nor a description are left out.
+        An image that cannot be read or decoded (including a missing file) gets a ``Prediction``
+        with ``error`` set; the others are still classified. Classes with neither examples nor a
+        description are left out.
         """
         task = self.ws.get(task) if isinstance(task, str) else task
         cfg = task.config
         clf = self.fitted(task, cfg)
         if not images:
             return []
-        items = [(_key(im), im) for im in images]
         errors: dict[int, str] = {}
+        items: list[tuple[str | None, ImageInput]] = []
+        for i, im in enumerate(images):
+            if isinstance(im, (str, Path)):  # read once here: for the cache key and for decoding
+                try:
+                    data = Path(im).read_bytes()
+                except OSError as e:
+                    errors[i] = f"Could not read {im}: {e.strerror or e}"
+                    items.append((None, b""))
+                    continue
+                items.append((image_id(data), data))
+            else:  # PIL images are not cached
+                items.append((image_id(im) if isinstance(im, bytes) else None, im))
         Q = self.embed_images(cfg.embedder, items, errors)
         probs, sims = clf.predict(Q)
         return [Prediction.failed(errors[i]) if i in errors else self._to_pred(cfg, clf, p, s)
@@ -179,25 +191,22 @@ class Pipeline:
         )
 
 
-def _key(im: ImageInput) -> str | None:
-    if isinstance(im, bytes):
-        return image_id(im)
-    if isinstance(im, (str, Path)):
-        return image_id(Path(im).read_bytes())
-    return None  # PIL images are not cached
-
-
 def _decode(todo: list[tuple[int, str | None, ImageInput]], errors: dict[int, str] | None
             ) -> list[tuple[int, str | None, Image.Image]]:
-    """Decode each ``(index, key, image)``; failures raise, or go to ``errors`` when it is given."""
+    """Decode each ``(index, key, image)``; failures raise, or go to ``errors`` when it is given.
+
+    Items already in ``errors`` are skipped.
+    """
     decoded = []
     for i, k, im in todo:
+        if errors is not None and i in errors:
+            continue
         try:
             decoded.append((i, k, _to_pil(im)))
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             if errors is None:
                 raise
-            errors[i] = str(e)
+            errors[i] = str(e) if isinstance(e, ValueError) else f"Not a readable image: {e}"
     return decoded
 
 

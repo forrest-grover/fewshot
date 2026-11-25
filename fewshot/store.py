@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+import logging
 import os
 import re
 import shutil
@@ -35,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .classifiers import CLASSIFIERS, check_params
 from .embedders import DEFAULT_SPEC
@@ -45,8 +46,30 @@ try:
 except ImportError:  # pragma: no cover  # Windows: no cross-process lock
     fcntl = None  # type: ignore[assignment]
 
+log = logging.getLogger(__name__)
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# Example files are always written as images/<id>.<ext>; anything else in task.json was not
+# written by us, and following it could read or delete files outside the task.
+EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}\.[a-z0-9]{1,10}$")
+MAX_CLASS_NAME = 200
+
+
+def check_class_name(name: str) -> str:
+    """Return ``name`` stripped; raise ``ValueError`` if it can't be a class name.
+
+    Class names appear as URL path segments, so ``/``, ``\\``, ``.`` and ``..`` are refused (a
+    client would resolve ``.../classes/..`` to the task itself), as are control characters.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("Class name is empty")
+    if name in {".", ".."} or any(ch in "/\\" or ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError(f"Class name {name!r} can't be '.' or '..' or contain '/', '\\' or control characters")
+    if len(name) > MAX_CLASS_NAME:
+        raise ValueError(f"Class name is longer than {MAX_CLASS_NAME} characters")
+    return name
 
 
 def default_root() -> Path:
@@ -121,10 +144,22 @@ def _file_lock(path: Path) -> Iterator[None]:
 
 
 def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
-    """Parse ``path/task.json`` and stamp the exact file that was read."""
+    """Parse ``path/task.json`` and stamp the exact file that was read.
+
+    Raises ``ValueError`` if the file is not a valid config for the task folder ``path``.
+    """
     with open(path / "task.json", "rb") as f:
         stamp = _stamp(os.fstat(f.fileno()))
-        return TaskConfig.model_validate_json(f.read()), stamp
+        data = f.read()
+    try:
+        cfg = TaskConfig.model_validate_json(data)
+    except ValidationError as e:
+        err = e.errors()[0]
+        where = ".".join(map(str, err["loc"]))
+        raise ValueError(f"{path / 'task.json'} is invalid: {where + ': ' if where else ''}{err['msg']}") from None
+    if cfg.name != path.name:
+        raise ValueError(f"{path / 'task.json'} is invalid: name {cfg.name!r} does not match its folder")
+    return cfg, stamp
 
 
 class ClassDef(BaseModel):
@@ -139,9 +174,16 @@ class Example(BaseModel):
 
     id: str
     label: str
-    file: str
+    file: str  # images/<id>.<ext>, relative to the task folder
     source: str = ""
     added: str = Field(default_factory=_now)
+
+    @field_validator("file")
+    @classmethod
+    def _inside_images(cls, v: str) -> str:
+        if not EXAMPLE_FILE_RE.fullmatch(v):
+            raise ValueError(f"must be images/<id>.<ext>, got {v!r}")
+        return v
 
 
 class TaskConfig(BaseModel):
@@ -274,6 +316,8 @@ class Task:
                 raise ValueError(f"{'.'.join(map(str, err['loc']))}: {err['msg']}") from None
             if new.reject_below is not None and not -1.0 <= new.reject_below <= 1.0:
                 raise ValueError(f"reject_below must be between -1 and 1, got {new.reject_below}")
+            if "text_weight" in new.classifier_params:
+                raise ValueError("text_weight is a task setting, not a classifier parameter")
             check_params(new.classifier, {"text_weight": new.text_weight, **new.classifier_params})
             for k in kw:
                 setattr(self.config, k, getattr(new, k))
@@ -285,10 +329,11 @@ class Task:
         return [c.name for c in self.config.classes]
 
     def upsert_class(self, name: str, description: str | None = None) -> ClassDef:
-        """Create a class, or update its description if it exists (``None`` keeps it)."""
+        """Create a class, or update its description if it exists (``None`` keeps it).
+
+        Raises ``ValueError`` for a name ``check_class_name`` refuses.
+        """
         name = name.strip()
-        if not name:
-            raise ValueError("Class name is empty")
         with self._writing():
             for c in self.config.classes:
                 if c.name == name:
@@ -296,7 +341,7 @@ class Task:
                         c.description = description
                     self._save()
                     return c
-            c = ClassDef(name=name, description=description or "")
+            c = ClassDef(name=check_class_name(name), description=description or "")
             self.config.classes.append(c)
             self._save()
             return c
@@ -316,9 +361,7 @@ class Task:
 
     def rename_class(self, old: str, new: str) -> None:
         """Rename a class and relabel its examples."""
-        new = new.strip()
-        if not new:
-            raise ValueError("Class name is empty")
+        new = check_class_name(new)
         with self._writing():
             if new in self.class_names():
                 raise ValueError(f"Class {new!r} already exists")
@@ -437,14 +480,21 @@ class Workspace:
         self._lock = threading.Lock()
 
     def list_tasks(self) -> list[Task]:
-        """All tasks, sorted by name."""
-        folders = sorted((self.root / "tasks").iterdir())
-        return [self.get(p.name) for p in folders if (p / "task.json").exists()]
+        """All readable tasks, sorted by name; a task whose task.json is invalid is logged and skipped."""
+        tasks = []
+        for p in sorted((self.root / "tasks").iterdir()):
+            if (p / "task.json").exists():
+                try:
+                    tasks.append(self.get(p.name))
+                except KeyError as e:
+                    log.warning("Skipping task folder %s: %s", p, e.args[0])
+        return tasks
 
     def get(self, name: str) -> Task:
         """Load a task, or refresh the cached one if another process changed it.
 
-        Raises ``KeyError`` if the task does not exist (or was deleted by another process).
+        Raises ``KeyError`` if the task does not exist (or was deleted by another process), or if
+        its task.json is invalid; the message says which.
         """
         with self._lock:
             t = self._tasks.get(name)
@@ -456,13 +506,17 @@ class Workspace:
                     t = Task(p, *_read_config(p))
                 except (FileNotFoundError, NotADirectoryError):
                     raise KeyError(f"No task {name!r}") from None
+                except ValueError as e:
+                    raise KeyError(f"Task {name!r} can't be loaded: {e}") from None
                 self._tasks[name] = t
                 return t
         try:
             t.refresh()
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError) as e:
             with self._lock:
                 self._tasks.pop(name, None)
+            if isinstance(e, ValueError):
+                raise KeyError(f"Task {name!r} can't be loaded: {e}") from None
             raise KeyError(f"No task {name!r}") from None
         return t
 

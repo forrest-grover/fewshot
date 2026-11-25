@@ -230,9 +230,16 @@ def test_knn_low_similarities_still_decide():
     ("prototype", {"scale": -1}, "'scale' must be >= 0"),
     ("prototype", {"scale": float("nan")}, "'scale' must be >= 0"),
     ("prototype", {"text_weight": "x"}, "'text_weight' must be a number"),
+    ("prototype", {"scale": 1e308}, "'scale' must be >= 0.0 and <= 1000"),
+    ("prototype", {"text_weight": 101}, "'text_weight' must be >= 0.0 and <= 100"),
+    ("knn", {"k": 10**400}, "'k' must be > 0 and <= 100000"),
+    ("knn", {"k": np.float64(3)}, "'k' must be an integer"),
+    ("knn", {"k": np.bool_(True)}, "'k' must be an integer"),
+    ("logreg", {"C": float("inf")}, "'C' must be > 0"),
 ])
 def test_make_classifier_rejects_bad_params(name, params, message):
     """Bad classifier names and parameters raise ValueError up front, not at predict time."""
     with pytest.raises(ValueError, match=message):
         make_classifier(name, **params)
     make_classifier("prototype", scale=0, text_weight=0)  # zero is allowed for these
+    make_classifier("knn", k=np.int64(3), scale=np.float32(20))  # NumPy numbers are fine
