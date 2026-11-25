@@ -1112,3 +1112,32 @@ label.inline {
   text-decoration: line-through;
   opacity: 0.6;
 }
+
+/* predict: evidence */
+.evidence {
+  display: flex;
+  gap: 6px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.evidence figure {
+  margin: 0;
+  width: 56px;
+}
+
+.evidence-img {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 4px;
+  display: block;
+}
+
+.evidence-caption {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -37,6 +37,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
   const [reject, setReject] = useState(optional(task.reject_below));
   const [rejectZero, setRejectZero] = useState(optional(task.reject_below_zero_shot));
   const [flip, setFlip] = useState(task.flip);
+  const [temperature, setTemperature] = useState(optional(task.temperature));
   const [newName, setNewName] = useState(task.name);
   const [saving, setSaving] = useState(false);
 
@@ -49,6 +50,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
     setEmbedder(task.embedder); setClassifier(task.classifier); setParams(paramTexts(task.classifier_params));
     setTextWeight(task.text_weight); setReject(optional(task.reject_below));
     setRejectZero(optional(task.reject_below_zero_shot)); setFlip(task.flip); setNewName(task.name);
+    setTemperature(optional(task.temperature));
   }
 
   const presets = models?.embedders ?? [];
@@ -69,6 +71,10 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
   }
   const rejectValue = parseNumber(reject);
   if (rejectValue !== null && !Number.isFinite(rejectValue)) problems.push("Reject below must be a number, or blank for off");
+  const temperatureValue = parseNumber(temperature);
+  if (temperatureValue !== null && !(temperatureValue >= 0.01 && temperatureValue <= 100)) {
+    problems.push("Temperature must be between 0.01 and 100, or blank for none");
+  }
   const rejectZeroValue = parseNumber(rejectZero);
   if (rejectZeroValue !== null && !Number.isFinite(rejectZeroValue)) {
     problems.push("Zero-shot reject below must be a number, or blank for off");
@@ -82,6 +88,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
       ...(rejectValue === null ? { clear_reject: true } : { reject_below: rejectValue }),
       ...(rejectZeroValue === null ? { clear_reject_zero_shot: true } : { reject_below_zero_shot: rejectZeroValue }),
       flip,
+      ...(temperatureValue === null ? { clear_temperature: true } : { temperature: temperatureValue }),
     }));
     setSaving(false);
     if (t) setTask(t);
@@ -145,6 +152,12 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
           The same, for a task with descriptions but no example images. Image-to-text similarities are much lower (about 0.2–0.35
           for CLIP), so this needs its own value, e.g. 0.22.
         </small>
+      </label>
+
+      <label>
+        <span>Confidence temperature</span>
+        <input type="text" inputMode="decimal" value={temperature} placeholder="none (1)" onChange={(e) => { setTemperature(e.target.value); }} />
+        <small className="muted">Calibrates confidence so that 0.9 means right about 90% of the time; the Evaluate tab suggests a value. Predictions don't change.</small>
       </label>
 
       <label className="check">

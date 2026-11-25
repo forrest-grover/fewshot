@@ -69,7 +69,7 @@ MAX_NOTE = 2000
 # A task folder without task.json (or a .tmp-/.trash- folder) this old is left over from a crash.
 STALE_SECONDS = 600
 SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "reject_below",
-            "reject_below_zero_shot", "flip"}
+            "reject_below_zero_shot", "flip", "temperature"}
 
 
 def default_root() -> Path:
@@ -196,6 +196,7 @@ class TaskConfig(BaseModel):
     # far lower (about 0.2-0.35 for CLIP) than image-to-image ones; None never rejects them.
     reject_below_zero_shot: float | None = None
     flip: bool = False  # average each image's embedding with its mirror image's (test-time augmentation)
+    temperature: float | None = None  # confidence calibration fitted by evaluation (None: 1, uncalibrated)
     classes: list[ClassDef] = Field(default_factory=list)
     examples: list[Example] = Field(default_factory=list)
     created: str = Field(default_factory=_now)
@@ -209,6 +210,8 @@ def check_settings(cfg: TaskConfig) -> None:
         v = getattr(cfg, key)
         if v is not None and not -1.0 <= v <= 1.0:
             raise ValueError(f"{key} must be between -1 and 1, got {v}")
+    if cfg.temperature is not None and not 0.01 <= cfg.temperature <= 100:
+        raise ValueError(f"temperature must be between 0.01 and 100, got {cfg.temperature}")
     if "text_weight" in cfg.classifier_params:
         raise ValueError("text_weight is a task setting, not a classifier parameter")
     check_params(cfg.classifier, {"text_weight": cfg.text_weight, **cfg.classifier_params})

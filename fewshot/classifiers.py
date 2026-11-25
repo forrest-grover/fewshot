@@ -71,6 +71,20 @@ def _unit(v: npt.NDArray[np.floating[Any]]) -> Vectors:
     return out
 
 
+def temper(probs: Scores, temperature: float) -> Scores:
+    """Probabilities softened (``temperature`` > 1) or sharpened (< 1): ``p ** (1/T)``, renormalised.
+    For softmax outputs this is the same as dividing the logits by T, so the most probable class
+    never changes; it is how a fitted temperature calibrates confidence."""
+    if temperature == 1.0:
+        return probs
+    with np.errstate(divide="ignore"):
+        z = np.log(probs) / temperature
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    out: Scores = e / e.sum(axis=1, keepdims=True)
+    return out
+
+
 def _softmax(z: Scores) -> Scores:
     z = z - z.max(axis=1, keepdims=True)
     e = np.exp(z)
@@ -94,13 +108,15 @@ def _modality_gap(data: ClassData) -> Vectors:
     return (np.mean(list(data.text.values()), axis=0) - data.X.mean(0)).astype(np.float32)
 
 
-class Classifier:
+class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted state plus settings
     """Base class: handles text fusion and modality-gap anchors; subclasses score images."""
 
     name = "base"
 
     def __init__(self, text_weight: float = 1.0) -> None:
         self.text_weight = text_weight
+        self.temperature = 1.0  # applied to the probabilities (see ``temper``); a task setting
+        self.n_images = 0  # support points that are example images (the rest are text anchors)
         self.classes: list[str] = []
         self.zero_shot = False
         self.Pt: Vectors | None = None  # (C, d) text-side vector per class, if any text is used
@@ -163,8 +179,22 @@ class Classifier:
             y = np.concatenate([y, text_only])
             w = np.concatenate([w, np.ones(len(T), np.float32)])
         self._X, self._y = X, y
+        self.n_images = len(data.X)
         self._fit_image(X, y, w)
         return self
+
+    def nearest(self, Q: Vectors, k: int) -> tuple[npt.NDArray[np.int_], Scores]:
+        """The ``k`` example images most similar to each query, as (row indices into the fitted
+        ``ClassData.X``, cosine similarities), most similar first. Evidence to show beside a
+        prediction; for the prototype classifier the decision itself uses class means."""
+        if self.zero_shot or self.n_images == 0:
+            return np.zeros((len(Q), 0), int), np.zeros((len(Q), 0))
+        S = Q @ _fitted(self._X)[: self.n_images].T
+        k = min(k, self.n_images)
+        top = np.argpartition(-S, k - 1, axis=1)[:, :k]
+        order = np.argsort(-np.take_along_axis(S, top, axis=1), axis=1, kind="stable")
+        idx = np.take_along_axis(top, order, axis=1)
+        return idx, np.take_along_axis(S, idx, axis=1)
 
     def predict(self, Q: Vectors) -> tuple[Scores, Scores]:
         """``predict_full`` without the per-class similarities."""
@@ -192,6 +222,7 @@ class Classifier:
             if self.Pt is not None and self.text_weight > 0:
                 logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
             probs = _softmax(logits)
+        probs = temper(probs, self.temperature)
         return probs, per_class[np.arange(len(Q)), probs.argmax(axis=1)], per_class
 
 

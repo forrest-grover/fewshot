@@ -296,6 +296,7 @@ def _detail(t: Task) -> dict[str, Any]:
         "reject_below": c.reject_below,
         "reject_below_zero_shot": c.reject_below_zero_shot,
         "flip": c.flip,
+        "temperature": c.temperature,
         "revision": c.revision,
         "can_undo": t.can_undo(),
         "can_redo": t.can_redo(),
@@ -387,6 +388,8 @@ class TaskSettings(_Body):
     reject_below_zero_shot: float | None = None
     clear_reject_zero_shot: bool = False
     flip: bool | None = None
+    temperature: float | None = None
+    clear_temperature: bool = False
 
 
 class Rename(_Body):
@@ -424,7 +427,11 @@ def get_task(name: str) -> dict[str, Any]:
 def update_task(name: str, body: TaskSettings) -> dict[str, Any]:
     """Change task settings; switching classifier resets its params unless new ones are given."""
     t = _task(name)
-    kw = body.model_dump(exclude_none=True, exclude={"clear_reject", "clear_reject_zero_shot"})
+    kw = body.model_dump(exclude_none=True, exclude={"clear_reject", "clear_reject_zero_shot", "clear_temperature"})
+    if body.clear_temperature:
+        if body.temperature is not None:
+            raise HTTPException(400, "Give either temperature or clear_temperature, not both")
+        kw["temperature"] = None
     for key in ("reject_below", "reject_below_zero_shot"):
         if getattr(body, key.replace("reject_below", "clear_reject")):
             if getattr(body, key) is not None:
@@ -816,11 +823,13 @@ def example_image(name: str, eid: str,
 
 # ---- inference ----------------------------------------------------------
 TOP_K = Query(None, ge=1, description="Return only this many of the highest scores per image")
+EVIDENCE = Query(0, ge=0, le=20, description="Also return this many of the most similar labelled examples")
 
 
-def _predict(t: Task, blobs: list[Blob], top_k: int | None) -> list[dict[str, Any]]:
+def _predict(t: Task, blobs: list[Blob], top_k: int | None, evidence: int = 0) -> list[dict[str, Any]]:
     try:
-        preds = pipe.predict(t, [data if data is not None else b"" for _, data, _ in blobs], top_k=top_k)
+        preds = pipe.predict(t, [data if data is not None else b"" for _, data, _ in blobs], top_k=top_k,
+                             evidence=evidence)
     except ValueError as e:
         raise _bad(e) from e
     return [{"file": f, **(p if data is not None else Prediction.failed(err or "")).to_dict()}
@@ -828,17 +837,18 @@ def _predict(t: Task, blobs: list[Blob], top_k: int | None) -> list[dict[str, An
 
 
 @app.post("/api/tasks/{name}/predict", response_model=list[PredictionOut])
-def predict(name: str, files: list[UploadFile] = File(...), top_k: int | None = TOP_K) -> list[dict[str, Any]]:
+def predict(name: str, files: list[UploadFile] = File(...), top_k: int | None = TOP_K,
+            evidence: int = EVIDENCE) -> list[dict[str, Any]]:
     """Classify uploaded images; an unreadable file gets ``error`` set instead of a label."""
     t = _task(name)
-    return _predict(t, _uploads(files), top_k)
+    return _predict(t, _uploads(files), top_k, evidence)
 
 
 @app.post("/api/tasks/{name}/predict/urls", response_model=list[PredictionOut])
-def predict_urls(name: str, body: Urls, top_k: int | None = TOP_K) -> list[dict[str, Any]]:
+def predict_urls(name: str, body: Urls, top_k: int | None = TOP_K, evidence: int = EVIDENCE) -> list[dict[str, Any]]:
     """Download images (server started with --allow-urls) and classify them; ``file`` is the URL."""
     t = _task(name)
-    return _predict(t, _downloads(body.urls), top_k)
+    return _predict(t, _downloads(body.urls), top_k, evidence)
 
 
 @app.get("/api/tasks/{name}/duplicates", response_model=list[DuplicatePair])

@@ -37,6 +37,8 @@ class Prediction:  # pylint: disable=too-many-instance-attributes  # one field p
     # Every class the image matches (multi-label): with a reject threshold, each class whose own
     # similarity reaches it, ``label`` first; without one, just ``label``.
     labels: list[str] = field(default_factory=list)
+    # The labelled examples most like the image ({id, label, similarity}), when asked for.
+    evidence: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None  # set (with every other field empty) when the image could not be read
 
     @classmethod
@@ -215,9 +217,6 @@ class Pipeline:
             return {}
         return dict(zip(texts, self.embed_descriptions(spec, list(texts.values())), strict=True))
 
-    @staticmethod
-    def _new_classifier(cfg: TaskConfig) -> Classifier:
-        return make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params)
 
     def fitted(self, task: Task, cfg: TaskConfig | None = None) -> Classifier:
         """The task's classifier (as of ``cfg``, default its current config), re-fitted only when
@@ -229,7 +228,7 @@ class Pipeline:
             hit = self._fitted.get(cfg.name)
             if hit and hit[0] == stamp:
                 return hit[1]
-        clf = self._new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
+        clf = new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
         with self._lock:
             # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
             cur = self._fitted.get(cfg.name)
@@ -238,14 +237,15 @@ class Pipeline:
         return clf
 
     # ---- prediction --------------------------------------------------
-    def predict(self, task: Task | str, images: Sequence[ImageInput], top_k: int | None = None,
-                progress: Progress | None = None) -> list[Prediction]:
+    def predict(self, task: Task | str, images: Sequence[ImageInput], top_k: int | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                progress: Progress | None = None, evidence: int = 0) -> list[Prediction]:
         """Classify images given as bytes, file paths or PIL images.
 
         An image that cannot be read or decoded (including a missing file) gets a ``Prediction``
         with ``error`` set; the others are still classified. Classes with neither examples nor a
         description are left out. ``top_k`` keeps only that many of the highest ``scores``;
-        ``progress`` counts images embedded (see ``embed_images``).
+        ``progress`` counts images embedded (see ``embed_images``); ``evidence`` adds that many of
+        the most similar labelled examples to each prediction.
         """
         if top_k is not None and top_k < 1:
             raise ValueError(f"top_k must be at least 1, got {top_k}")
@@ -258,8 +258,11 @@ class Pipeline:
         Q = self.embed_images(cfg.embedder, _keyed(images, errors), errors, progress, cfg.flip)
         probs, sims, per_class = clf.predict_full(Q)
         thr = threshold_for(cfg, clf)
-        return [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)
-                for i, row in enumerate(zip(probs, sims, per_class, strict=True))]
+        preds = [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)
+                 for i, row in enumerate(zip(probs, sims, per_class, strict=True))]
+        if evidence > 0:
+            _attach_evidence(clf, cfg, Q, preds, evidence)
+        return preds
 
     # ---- data checks -------------------------------------------------
     def near_duplicates(self, task: Task, threshold: float = 0.95, limit: int = 500) -> list[dict[str, Any]]:
@@ -284,6 +287,23 @@ class Pipeline:
         return [{"a": exs[i].id, "b": exs[j].id, "similarity": round(sim, 4),
                  "labels": [exs[i].label, exs[j].label], "same_label": exs[i].label == exs[j].label}
                 for sim, i, j in pairs[:limit]]
+
+
+def _attach_evidence(clf: Classifier, cfg: TaskConfig, Q: Vectors, preds: list[Prediction], k: int) -> None:
+    """Give each readable prediction the ``k`` labelled examples most like its image. The fit's
+    example rows are ``cfg.examples`` in order (the snapshot it was fitted from)."""
+    idx, near = clf.nearest(Q, k)
+    for i, p in enumerate(preds):
+        if p.error is None:
+            p.evidence = [{"id": cfg.examples[j].id, "label": cfg.examples[j].label, "similarity": round(float(sv), 4)}
+                          for j, sv in zip(idx[i], near[i], strict=True)]
+
+
+def new_classifier(cfg: TaskConfig) -> Classifier:
+    """An unfitted classifier with ``cfg``'s settings, including its calibration temperature."""
+    clf = make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params)
+    clf.temperature = cfg.temperature or 1.0
+    return clf
 
 
 def threshold_for(cfg: TaskConfig, clf: Classifier) -> float | None:

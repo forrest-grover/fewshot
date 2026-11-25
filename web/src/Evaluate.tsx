@@ -121,6 +121,22 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
             <div className="stat"><div className="stat-value small">{report.method}</div><div className="muted">method</div></div>
           </div>
           <div className="row"><button className="ghost small" onClick={exportCsv}>Export predictions as CSV</button></div>
+          {report.calibration && (
+            <p className="row calibration">
+              <span>
+                Confidence calibration error {pct(report.calibration.ece)}
+                {report.calibration.ece_calibrated < report.calibration.ece
+                  ? `; with temperature ${String(report.calibration.temperature)} it would be ${pct(report.calibration.ece_calibrated)}.`
+                  : " (already about as good as it gets)."}
+              </span>
+              {report.calibration.ece_calibrated < report.calibration.ece && report.calibration.temperature !== (task.temperature ?? 1) && (
+                <button className="small" title="Makes a confidence of 0.9 mean right about 90% of the time; predictions don't change"
+                  onClick={() => { void fix(api.updateTask(task.name, { temperature: report.calibration?.temperature })); }}>
+                  Apply temperature
+                </button>
+              )}
+            </p>
+          )}
 
           <h3>Reject threshold <span className="muted">(similarity of each held-out image to its best match)</span></h3>
           <p className="muted">

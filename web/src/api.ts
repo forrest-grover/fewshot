@@ -9,7 +9,7 @@ export interface Example {
 export interface TaskDetail {
   name: string; embedder: string; supports_text: boolean; classifier: string;
   classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
-  reject_below_zero_shot: number | null; flip: boolean;
+  reject_below_zero_shot: number | null; flip: boolean; temperature: number | null;
   can_undo: boolean; can_redo: boolean; undo_label: string; redo_label: string; // labels: e.g. "delete 3 examples"
   revision: number; classes: ClassInfo[]; examples: Example[];
 }
@@ -17,6 +17,7 @@ export interface Prediction {
   file: string; label: string | null; top_label: string; confidence: number;
   similarity: number; rejected: boolean; scores: Record<string, number>; // scores: highest first
   labels: string[]; // every class the image matches (with a reject threshold), label first
+  evidence: { id: string; label: string; similarity: number }[]; // most similar labelled examples, if asked for
   error: string | null; // set when the image could not be read; the other fields are then empty
 }
 /** An example's prediction by a classifier fitted without it. */
@@ -26,6 +27,7 @@ export interface EvalReport {
   top_k_accuracy: Record<string, number>; classes: string[]; confusion: number[][];
   per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
   mistakes: HeldOut[]; predictions: HeldOut[]; suggested_reject_below: number | null;
+  calibration: { temperature: number; ece: number; ece_calibrated: number } | null;
 }
 export interface DuplicatePair { a: string; b: string; similarity: number; labels: string[]; same_label: boolean }
 export interface Health { status: string; auth_required: boolean; models_loaded: string[]; jobs_running: number; url_fetch: boolean }
@@ -101,8 +103,8 @@ export const api = {
   deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", `${t(n)}/examples/${id}`),
   relabelMany: (n: string, ids: string[], label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, label }),
   deleteExamples: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/examples/delete`, { ids }),
-  predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict`, files(fs)),
-  predictUrls: (n: string, urls: string[]) => req<Prediction[]>("POST", `${t(n)}/predict/urls`, { urls }),
+  predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict?evidence=3`, files(fs)),
+  predictUrls: (n: string, urls: string[]) => req<Prediction[]>("POST", `${t(n)}/predict/urls?evidence=3`, { urls }),
   duplicates: (n: string, threshold: number) => req<DuplicatePair[]>("GET", `${t(n)}/duplicates?threshold=${String(threshold)}`),
   undo: (n: string) => req<TaskDetail>("POST", `${t(n)}/undo`),
   redo: (n: string) => req<TaskDetail>("POST", `${t(n)}/redo`),

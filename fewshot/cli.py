@@ -214,7 +214,8 @@ def show(name: str, as_json: bool = JSON_OPT, root: Path | None = ROOT_OPT) -> N
         return
     typer.echo(f"{c.name}\n  embedder:   {c.embedder}\n  classifier: {c.classifier} {c.classifier_params or ''}"
                f"\n  text_weight: {c.text_weight}   reject_below: {c.reject_below}   "
-               f"reject_below_zero_shot: {c.reject_below_zero_shot}   flip: {c.flip}")
+               f"reject_below_zero_shot: {c.reject_below_zero_shot}   flip: {c.flip}   "
+               f"temperature: {c.temperature or 1}")
     for cd in c.classes:
         desc = "  " + " | ".join(f'"{line}"' for line in cd.description.splitlines() if line.strip())
         typer.echo(f"  {cd.name:24} {counts.get(cd.name, 0):5}{desc.rstrip()}")
@@ -247,6 +248,7 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     clear_reject_zero_shot: bool = typer.Option(False, "--clear-reject-zero-shot"),
     flip: bool | None = typer.Option(None, "--flip/--no-flip",
                                      help="Average each image's embedding with its mirror image's"),
+    temperature: float | None = typer.Option(None, help="Confidence calibration (see `fewshot eval`); 1 = none"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Change task settings; switching classifier resets its params unless --param is given."""
@@ -274,6 +276,8 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
         kw["reject_below_zero_shot"] = reject_below_zero_shot
     if flip is not None:
         kw["flip"] = flip
+    if temperature is not None:
+        kw["temperature"] = None if temperature == 1 else temperature
     try:
         t.update_settings(**kw)
     except ValueError as e:
@@ -447,6 +451,7 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     as_json: bool = JSON_OPT,
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: one row per image"),
     top: int = typer.Option(3, min=1, help="Scores to show per image (and to include, with --json)"),
+    evidence: int = typer.Option(0, min=0, max=20, help="Also show this many of the most similar labelled examples"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Classify images (files, directories or http(s) URLs)."""
@@ -455,15 +460,30 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     images, fetch_errors = _download(files)
     try:
         with _progress("Embedding") as update:
-            preds = _pipe(_ws(root)).predict(t, images, top_k=top if as_json else None, progress=update)
+            preds = _pipe(_ws(root)).predict(t, images, top_k=top if as_json else None, progress=update,
+                                             evidence=evidence)
     except ValueError as e:
         _fail(str(e))
-    from .pipeline import Prediction  # pylint: disable=import-outside-toplevel,redefined-outer-name  # torch-backed
-    preds = [Prediction.failed(fetch_errors[i]) if i in fetch_errors else p for i, p in enumerate(preds)]
+    preds = _with_fetch_errors(preds, fetch_errors)
     failed = sum(p.error is not None for p in preds)
-    if as_json:
+    _output_predictions(files, preds, "json" if as_json else "csv" if as_csv else "text", top)
+    if failed:
+        typer.secho(f"{failed} of {len(preds)} images could not be read", fg="red", err=True)
+        raise typer.Exit(1)
+
+
+def _with_fetch_errors(preds: list[Prediction], errors: dict[int, str]) -> list[Prediction]:
+    """``preds`` with the URLs that couldn't be downloaded failed with the real reason."""
+    from .pipeline import Prediction  # pylint: disable=import-outside-toplevel,redefined-outer-name  # torch-backed
+
+    return [Prediction.failed(errors[i]) if i in errors else p for i, p in enumerate(preds)]
+
+
+def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, top: int) -> None:
+    """Print predictions as JSON, CSV or text."""
+    if fmt == "json":
         _echo_json([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds, strict=True)])
-    elif as_csv:
+    elif fmt == "csv":
         _write_csv(["file", "label", "labels", "top_label", "confidence", "similarity", "rejected", "error", "scores"],
                    [[str(f), p.label or "", ";".join(p.labels), p.top_label, f"{p.confidence:.4f}",
                      f"{p.similarity:.4f}", p.rejected, p.error or "",
@@ -471,9 +491,6 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
                     for f, p in zip(files, preds, strict=True)])
     else:
         _print_predictions(files, preds, top)
-    if failed:
-        typer.secho(f"{failed} of {len(preds)} images could not be read", fg="red", err=True)
-        raise typer.Exit(1)
 
 
 def _download(files: list[Source]) -> tuple[list[bytes | Path], dict[int, str]]:
@@ -499,6 +516,8 @@ def _print_predictions(files: list[Source], preds: list[Prediction], top: int) -
         label = ", ".join(p.labels) if p.label is not None else f"unknown (closest: {p.top_label})"
         scores = "  ".join(f"{c}={v:.2f}" for c, v in best)
         typer.echo(f"{f}: {label}  sim={p.similarity:.3f}  {scores}")
+        for e in p.evidence:
+            typer.echo(f"    like {e['id'][:12]} ({e['label']}, sim={e['similarity']:.3f})")
 
 
 def _print_eval(r: dict[str, Any]) -> None:
@@ -513,6 +532,9 @@ def _print_eval(r: dict[str, Any]) -> None:
             typer.echo(f"  {topk}")
     if r["suggested_reject_below"] is not None:
         typer.echo(f"Suggested --reject-below {r['suggested_reject_below']} (keeps 95% of correct predictions)")
+    if cal := r["calibration"]:
+        typer.echo(f"Calibration error {cal['ece']:.3f}; --temperature {cal['temperature']} would make it "
+                   f"{cal['ece_calibrated']:.3f}")
     for c, m in r["per_class"].items():
         rec = "-" if m["recall"] is None else f"{m['recall']:.2f}"
         prec = "-" if m["precision"] is None else f"{m['precision']:.2f}"

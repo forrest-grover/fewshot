@@ -78,6 +78,7 @@ class TaskDetail(BaseModel):
     reject_below: float | None
     reject_below_zero_shot: float | None
     flip: bool
+    temperature: float | None
     revision: int
     can_undo: bool
     can_redo: bool
@@ -110,6 +111,14 @@ class AddResult(BaseModel):
     task: TaskDetail
 
 
+class Evidence(BaseModel):
+    """A labelled example similar to a predicted image."""
+
+    id: str
+    label: str
+    similarity: float
+
+
 class PredictionOut(BaseModel):
     """The result for one image."""
 
@@ -121,6 +130,7 @@ class PredictionOut(BaseModel):
     confidence: float
     similarity: float
     rejected: bool
+    evidence: list[Evidence]  # the most similar labelled examples, when asked for (?evidence=N)
     error: str | None
 
 
@@ -153,6 +163,24 @@ class HeldOutPrediction(BaseModel):
     correct: bool
 
 
+class ReliabilityBin(BaseModel):
+    """Predictions with about this confidence, and how often they were right."""
+
+    confidence: float
+    accuracy: float
+    count: int
+
+
+class Calibration(BaseModel):
+    """How well confidence matches accuracy, and the temperature that would make it match."""
+
+    temperature: float  # the setting to use (absolute)
+    ece: float  # expected calibration error now
+    ece_calibrated: float  # ... with ``temperature``
+    reliability: list[ReliabilityBin]
+    reliability_calibrated: list[ReliabilityBin]
+
+
 class EvalReport(BaseModel):
     """Cross-validation report."""
 
@@ -168,6 +196,7 @@ class EvalReport(BaseModel):
     mistakes: list[HeldOutPrediction]  # most confident first
     predictions: list[HeldOutPrediction]  # every scored example, in task order
     suggested_reject_below: float | None  # keeps 95% of correct predictions
+    calibration: Calibration | None  # None with fewer than 50 scored examples
 
 
 class JobOut(BaseModel):

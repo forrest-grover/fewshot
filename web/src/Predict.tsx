@@ -191,6 +191,17 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
                   </div>
                 )}
                 {top.map(([c, v], i) => <Bar key={c} label={c} value={v} strong={i === 0} />)}
+                {it.pred.evidence.length > 0 && (
+                  <div className="evidence" title="The labelled examples most like this image">
+                    <span className="muted">Most like</span>
+                    {it.pred.evidence.map((e) => (
+                      <figure key={e.id}>
+                        <img className="evidence-img" src={api.imageUrl(task.name, e.id, 96)} alt={`${e.label} example`} loading="lazy" />
+                        <figcaption className="evidence-caption">{e.label} · {e.similarity.toFixed(2)}</figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                )}
                 <div className="row add-as">
                   {addedAs(it) ? (
                     <span className="ok">Added as {addedAs(it)}</span>

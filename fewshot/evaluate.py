@@ -9,9 +9,9 @@ from typing import Any
 
 import numpy as np
 
-from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier
+from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier, temper
 from .images import IMAGE_EXTS
-from .pipeline import Pipeline
+from .pipeline import Pipeline, new_classifier
 from .store import Task, TaskConfig
 from .text import fill_template
 
@@ -30,11 +30,12 @@ class HeldOut:
     conf: np.ndarray
     sim: np.ndarray
     rank: np.ndarray
+    probs: np.ndarray  # (n, C) probabilities over all classes (0 for classes a fold left out)
 
     @classmethod
     def empty(cls, n: int, n_classes: int) -> HeldOut:
         """Results with nothing scored yet."""
-        return cls(np.full(n, -1), np.zeros(n), np.zeros(n), np.full(n, n_classes))
+        return cls(np.full(n, -1), np.zeros(n), np.zeros(n), np.full(n, n_classes), np.zeros((n, n_classes)))
 
     def record(self, rows: np.ndarray, probs: np.ndarray, sim: np.ndarray, truth: np.ndarray,
                known: np.ndarray) -> None:
@@ -42,6 +43,7 @@ class HeldOut:
         says whether each one's true class was among those trained on."""
         self.pred[rows] = probs.argmax(1)
         self.conf[rows] = probs.max(1)
+        self.probs[rows] = probs
         self.sim[rows] = sim
         self.rank[rows] = _ranks(probs, truth, known)
 
@@ -102,8 +104,7 @@ def _fold(data: ClassData, cfg: TaskConfig, test: np.ndarray, out: HeldOut) -> N
     sub, back = _subset(data, np.setdiff1d(np.arange(len(data.y)), test))
     if len(sub.classes) < min(2, C):
         return
-    p, s = make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params).fit(sub).predict(
-        data.X[test])
+    p, s = new_classifier(cfg).fit(sub).predict(data.X[test])
     full = np.zeros((len(test), C))  # probabilities over all classes, 0 for those left out
     full[:, back] = p
     out.record(test, full, s, data.y[test], np.isin(data.y[test], back))
@@ -133,7 +134,7 @@ def _fast_leave_one_out(data: ClassData, cfg: TaskConfig,
     """Leave-one-out for the prototype and kNN classifiers without refitting per example: each
     example's own contribution is taken out of the fitted model. Gives the same results as
     refitting, for tasks without text descriptions."""
-    clf = make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params)
+    clf = new_classifier(cfg)
     X, y = data.X.astype(np.float64), data.y
     n, C = len(y), len(data.classes)
     present = np.ones((n, C), bool)  # classes left with examples once example i is held out
@@ -148,6 +149,7 @@ def _fast_leave_one_out(data: ClassData, cfg: TaskConfig,
         else:
             assert isinstance(clf, KNNClassifier)
             probs, sim = _loo_knn(clf, X, y, rows, present[rows])
+        probs = temper(probs, clf.temperature)
         ok = present[rows].sum(1) >= min(2, C)  # as many classes as refitting would need
         out.record(rows[ok], probs[ok], sim[ok], y[rows[ok]], present[rows[ok], y[rows[ok]]])
     if progress:
@@ -220,6 +222,45 @@ def _predictions(cfg: TaskConfig, data: ClassData, h: HeldOut) -> list[dict[str,
             for i in np.flatnonzero(h.pred >= 0)]
 
 
+def _ece(conf: np.ndarray, correct: np.ndarray, bins: int = 10) -> tuple[float, list[dict[str, float]]]:
+    """Expected calibration error (how far confidence is from accuracy, weighted by how many
+    predictions have that confidence) and the per-bin reliability it is computed from."""
+    edges = np.linspace(0, 1, bins + 1)
+    which = np.clip(np.digitize(conf, edges[1:-1]), 0, bins - 1)
+    ece, table = 0.0, []
+    for b in range(bins):
+        sel = which == b
+        if sel.any():
+            ece += abs(float(conf[sel].mean()) - float(correct[sel].mean())) * float(sel.mean())
+            table.append({"confidence": round(float(conf[sel].mean()), 4),
+                          "accuracy": round(float(correct[sel].mean()), 4), "count": int(sel.sum())})
+    return round(ece, 4), table
+
+
+MIN_CALIBRATION = 50  # scored examples needed before a temperature is suggested (fewer: too noisy)
+
+
+def _nll(P: np.ndarray, t: np.ndarray, T: float) -> float:
+    return float(-np.log(np.clip(temper(P, T)[np.arange(len(t)), t], 1e-12, 1)).sum())
+
+
+def _calibration(h: HeldOut, truth: np.ndarray, current: float) -> dict[str, Any] | None:
+    """A temperature that makes held-out confidence match held-out accuracy (fitted by maximum
+    likelihood over a grid), with the calibration error before and after. ``None`` with too few
+    scored examples or classes. The temperature is absolute: ``current`` times the one fitted
+    on top of the task's present setting."""
+    rows = np.flatnonzero((h.pred >= 0) & (h.probs[np.arange(len(truth)), truth] > 0))
+    if len(rows) < MIN_CALIBRATION or h.probs.shape[1] < 2:
+        return None
+    P, t = h.probs[rows], truth[rows]
+    best = float(min(np.geomspace(0.01, 100, 81), key=lambda T: _nll(P, t, float(T))))
+    correct = (P.argmax(1) == t).astype(float)
+    ece, table = _ece(P.max(1), correct)
+    ece_after, table_after = _ece(temper(P, best).max(1), correct)
+    return {"temperature": round(current * best, 4), "ece": ece, "ece_calibrated": ece_after,
+            "reliability": table, "reliability_calibrated": table_after}
+
+
 def _macro_f1(cm: np.ndarray) -> float | None:
     """Mean F1 over the classes with examples (None if none were scored)."""
     support, predicted, tp = cm.sum(1), cm.sum(0), np.diag(cm)
@@ -287,6 +328,7 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
         "mistakes": sorted((p for p in predictions if not p["correct"]), key=lambda m: -m["confidence"]),
         "predictions": predictions,
         "suggested_reject_below": _suggest_threshold(h, data.y),
+        "calibration": _calibration(h, data.y, cfg.temperature or 1.0),
     }
 
 
