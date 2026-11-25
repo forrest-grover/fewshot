@@ -16,7 +16,7 @@ cd web && npm install && npm run build && cd ..
 ./.env/bin/fewshot serve            # UI at http://127.0.0.1:8000, API docs at /docs
 ```
 
-Data lives in `$FEWSHOT_HOME` (default `./fewshot_data`): one folder per task with its images and `task.json`, plus a shared SQLite embedding cache. For UI development, run `fewshot serve` and `npm run dev` in `web/`; Vite proxies `/api` to port 8000.
+Data lives in `$FEWSHOT_HOME` (default `./fewshot_data`): one folder per task with its images and `task.json`, plus a shared SQLite embedding cache. The server and CLI can use the same workspace at once: each change to a task locks it, starts from the latest saved `task.json`, and replaces the file atomically (the lock needs Linux or macOS). For UI development, run `fewshot serve` and `npm run dev` in `web/`; Vite proxies `/api` to port 8000.
 
 ## How classification works
 

@@ -9,16 +9,27 @@ Layout::
 Example ids are the first 16 hex chars of the SHA-256 of the image bytes, so
 adding the same image twice is a no-op (or a relabel), and cached embeddings
 are reused across tasks.
+
+Several processes (say ``fewshot serve`` and the CLI) can share a workspace.
+Each change to a task holds an exclusive lock on ``<task>/.lock``, re-reads
+``task.json`` if another process changed it, and replaces the file atomically,
+so no process overwrites another's changes. Reads pick up other processes'
+changes on the next ``Workspace.get``. The file lock needs ``fcntl`` (Linux,
+macOS); elsewhere only threads within one process are serialised.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import os
 import re
 import shutil
+import tempfile
 import threading
+import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +39,11 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .classifiers import CLASSIFIERS, check_params
 from .embedders import DEFAULT_SPEC
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover  # Windows: no cross-process lock
+    fcntl = None  # type: ignore[assignment]
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -69,6 +85,48 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+FileStamp = tuple[int, int, int]  # (inode, mtime_ns, size): changes whenever task.json is replaced
+
+
+def _stamp(st: os.stat_result) -> FileStamp:
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on ``path`` (created if missing) across processes.
+
+    Raises ``FileNotFoundError`` if the folder holding ``path`` is gone.
+    """
+    if fcntl is None:  # pragma: no cover
+        yield
+        return
+    while True:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # If the task was deleted (and maybe recreated) while we waited, we hold a lock on a
+            # file that is no longer at ``path``; start again on the current one.
+            with contextlib.suppress(FileNotFoundError):
+                if os.fstat(fd).st_ino == os.stat(path).st_ino:
+                    break
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+    try:
+        yield
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
+    """Parse ``path/task.json`` and stamp the exact file that was read."""
+    with open(path / "task.json", "rb") as f:
+        stamp = _stamp(os.fstat(f.fileno()))
+        return TaskConfig.model_validate_json(f.read()), stamp
+
+
 class ClassDef(BaseModel):
     """A class label with an optional text description."""
 
@@ -99,15 +157,22 @@ class TaskConfig(BaseModel):
     examples: list[Example] = Field(default_factory=list)
     created: str = Field(default_factory=_now)
     revision: int = 0
+    uid: str = Field(default_factory=lambda: uuid.uuid4().hex)  # tells a re-created task from the old one
 
 
 class Task:
-    """A task folder: its config plus example images. Every mutation is saved immediately."""
+    """A task folder: its config plus example images. Every mutation is saved immediately.
 
-    def __init__(self, path: Path, config: TaskConfig) -> None:
+    Mutations are serialised across threads and processes, and start from the latest
+    ``task.json`` on disk. A mutation on a task deleted by another process raises ``KeyError``.
+    """
+
+    def __init__(self, path: Path, config: TaskConfig, stamp: FileStamp | None = None) -> None:
         self.path = path
         self.config = config
         self._lock = threading.RLock()
+        self._stamp = stamp  # of the task.json that ``config`` matches
+        self._depth = 0  # nesting of ``_writing`` in the thread holding ``_lock``
 
     # ---- persistence -------------------------------------------------
     @property
@@ -115,13 +180,84 @@ class Task:
         """The task name."""
         return self.config.name
 
-    def save(self) -> None:
-        """Bump the revision and atomically write ``task.json``."""
+    def refresh(self) -> bool:
+        """Reload ``task.json`` if it changed on disk; returns whether it did.
+
+        Raises ``FileNotFoundError`` if the task was deleted.
+        """
         with self._lock:
-            self.config.revision += 1
-            tmp = self.path / "task.json.tmp"
-            tmp.write_text(self.config.model_dump_json(indent=2))
-            tmp.replace(self.path / "task.json")
+            if self._stamp == _stamp(os.stat(self.path / "task.json")):
+                return False
+            self.config, self._stamp = _read_config(self.path)
+            return True
+
+    @contextlib.contextmanager
+    def _writing(self) -> Iterator[None]:
+        """Context for a mutation: exclusive across threads and processes, starting from the
+        latest saved config.
+
+        The mutation edits a fresh copy of ``config``, so a reader holding the previous config
+        object never sees it change mid-read. If the mutation fails, the copy is dropped.
+        """
+        with self._lock:
+            if self._depth:  # nested in a mutation that already holds the locks
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
+            with contextlib.ExitStack() as stack:
+                try:
+                    stack.enter_context(_file_lock(self.path / ".lock"))
+                    self.refresh()
+                except FileNotFoundError as e:  # deleted by another process
+                    raise KeyError(f"No task {self.name!r}") from e
+                before = self.config
+                self.config = before.model_copy(deep=True)
+                self._depth = 1
+                try:
+                    yield
+                except BaseException:
+                    self.config = before
+                    self._stamp = None  # re-read on next refresh, in case the save got partway
+                    raise
+                finally:
+                    self._depth = 0
+
+    def _save(self) -> None:
+        """Bump the revision and write ``task.json`` atomically and durably. Call inside ``_writing``."""
+        self.config.revision += 1
+        fd, tmp = tempfile.mkstemp(dir=self.path, prefix=".task.json.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(self.config.model_dump_json(indent=2).encode())
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path / "task.json")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        self._stamp = _stamp(os.stat(self.path / "task.json"))
+        if hasattr(os, "O_DIRECTORY"):  # pragma: no branch  # make the rename itself durable (POSIX)
+            dfd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+
+    @classmethod
+    def new(cls, path: Path, config: TaskConfig) -> Task:
+        """Write a new task's first ``task.json`` into ``path``, a folder only this caller uses yet."""
+        t = cls(path, config)
+        t._save()
+        return t
+
+    def destroy(self) -> None:
+        """Delete the task folder, waiting for any mutation in progress (in any process)."""
+        with self._writing():
+            shutil.rmtree(self.path)
 
     # ---- settings ----------------------------------------------------
     def update_settings(self, **kw: Any) -> None:
@@ -130,7 +266,7 @@ class Task:
         bad = set(kw) - allowed
         if bad:
             raise ValueError(f"Unknown settings: {sorted(bad)}")
-        with self._lock:
+        with self._writing():
             try:
                 new = TaskConfig.model_validate({**self.config.model_dump(), **kw})
             except ValidationError as e:
@@ -141,7 +277,7 @@ class Task:
             check_params(new.classifier, {"text_weight": new.text_weight, **new.classifier_params})
             for k in kw:
                 setattr(self.config, k, getattr(new, k))
-            self.save()
+            self._save()
 
     # ---- classes -----------------------------------------------------
     def class_names(self) -> list[str]:
@@ -153,16 +289,16 @@ class Task:
         name = name.strip()
         if not name:
             raise ValueError("Class name is empty")
-        with self._lock:
+        with self._writing():
             for c in self.config.classes:
                 if c.name == name:
                     if description is not None:
                         c.description = description
-                    self.save()
+                    self._save()
                     return c
             c = ClassDef(name=name, description=description or "")
             self.config.classes.append(c)
-            self.save()
+            self._save()
             return c
 
     def describe_classes(self, template: str, overwrite: bool = False) -> int:
@@ -170,12 +306,12 @@ class Task:
         if "{}" not in template:
             raise ValueError("Template must contain '{}'")
         n = 0
-        with self._lock:
+        with self._writing():
             for c in self.config.classes:
                 if overwrite or not c.description.strip():
                     c.description = fill_template(template, c.name)
                     n += 1
-            self.save()
+            self._save()
         return n
 
     def rename_class(self, old: str, new: str) -> None:
@@ -183,7 +319,7 @@ class Task:
         new = new.strip()
         if not new:
             raise ValueError("Class name is empty")
-        with self._lock:
+        with self._writing():
             if new in self.class_names():
                 raise ValueError(f"Class {new!r} already exists")
             c = self._class(old)
@@ -191,18 +327,18 @@ class Task:
             for e in self.config.examples:
                 if e.label == old:
                     e.label = new
-            self.save()
+            self._save()
 
     def delete_class(self, name: str) -> int:
         """Delete a class and its examples; returns the number of examples removed."""
-        with self._lock:
+        with self._writing():
             self._class(name)
             gone = [e for e in self.config.examples if e.label == name]
-            for e in gone:
-                (self.path / e.file).unlink(missing_ok=True)
             self.config.examples = [e for e in self.config.examples if e.label != name]
             self.config.classes = [c for c in self.config.classes if c.name != name]
-            self.save()
+            self._save()  # before deleting files, so task.json never names a missing image
+            for e in gone:
+                (self.path / e.file).unlink(missing_ok=True)
             return len(gone)
 
     def _class(self, name: str) -> ClassDef:
@@ -217,13 +353,13 @@ class Task:
         load_image(data)  # validates before anything is written
         eid = image_id(data)
         label = label.strip()
-        with self._lock:
+        with self._writing():
             if label not in self.class_names():
                 self.upsert_class(label)
             for e in self.config.examples:
                 if e.id == eid:
                     e.label = label
-                    self.save()
+                    self._save()
                     return e
             fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
             ext = {"jpeg": "jpg"}.get(fmt, fmt)
@@ -232,7 +368,7 @@ class Task:
             (self.path / rel).write_bytes(data)
             ex = Example(id=eid, label=label, file=rel, source=source)
             self.config.examples.append(ex)
-            self.save()
+            self._save()
             return ex
 
     def add_examples_from_dir(self, folder: Path) -> int:
@@ -254,22 +390,22 @@ class Task:
 
     def relabel(self, eid: str, label: str) -> Example:
         """Move an example to ``label``, creating the class if needed."""
-        with self._lock:
+        with self._writing():
             e = self.example(eid)
             label = label.strip()
             if label not in self.class_names():
                 self.upsert_class(label)
             e.label = label
-            self.save()
+            self._save()
             return e
 
     def delete_example(self, eid: str) -> None:
         """Remove an example and its image file."""
-        with self._lock:
+        with self._writing():
             e = self.example(eid)
-            (self.path / e.file).unlink(missing_ok=True)
             self.config.examples = [x for x in self.config.examples if x.id != eid]
-            self.save()
+            self._save()
+            (self.path / e.file).unlink(missing_ok=True)
 
     def image_path(self, eid: str) -> Path:
         """Path of an example's image file."""
@@ -306,16 +442,29 @@ class Workspace:
         return [self.get(p.name) for p in folders if (p / "task.json").exists()]
 
     def get(self, name: str) -> Task:
-        """Load a task (cached per workspace); raises ``KeyError`` if missing."""
+        """Load a task, or refresh the cached one if another process changed it.
+
+        Raises ``KeyError`` if the task does not exist (or was deleted by another process).
+        """
         with self._lock:
-            if name in self._tasks:
-                return self._tasks[name]
-            p = self.root / "tasks" / name
-            if not NAME_RE.fullmatch(name) or not (p / "task.json").exists():
-                raise KeyError(f"No task {name!r}")
-            t = Task(p, TaskConfig.model_validate_json((p / "task.json").read_text()))
-            self._tasks[name] = t
-            return t
+            t = self._tasks.get(name)
+            if t is None:
+                if not NAME_RE.fullmatch(name):
+                    raise KeyError(f"No task {name!r}")
+                p = self.root / "tasks" / name
+                try:
+                    t = Task(p, *_read_config(p))
+                except (FileNotFoundError, NotADirectoryError):
+                    raise KeyError(f"No task {name!r}") from None
+                self._tasks[name] = t
+                return t
+        try:
+            t.refresh()
+        except FileNotFoundError:
+            with self._lock:
+                self._tasks.pop(name, None)
+            raise KeyError(f"No task {name!r}") from None
+        return t
 
     def create(self, name: str, **settings: Any) -> Task:
         """Create a new task folder; raises ``ValueError`` for bad or taken names."""
@@ -330,18 +479,19 @@ class Workspace:
         except FileExistsError:
             raise ValueError(f"Task {name!r} already exists") from None
         (p / "images").mkdir()
-        t = Task(p, cfg)
-        t.save()
+        t = Task.new(p, cfg)
         with self._lock:
             self._tasks[name] = t
         return t
 
     def delete(self, name: str) -> None:
-        """Delete a task folder and everything in it."""
+        """Delete a task folder and everything in it; raises ``KeyError`` if it is already gone."""
         t = self.get(name)
-        with self._lock:
-            shutil.rmtree(t.path)
-            self._tasks.pop(name, None)
+        try:
+            t.destroy()
+        finally:
+            with self._lock:
+                self._tasks.pop(name, None)
 
     @property
     def cache_path(self) -> Path:

@@ -14,7 +14,7 @@ from PIL import Image
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
 from .embedders import Vectors, get_embedder, spec_supports_text
-from .store import Task, Workspace, image_id, load_image
+from .store import Task, TaskConfig, Workspace, image_id, load_image
 
 ImageInput = bytes | str | Path | Image.Image
 
@@ -51,9 +51,9 @@ class Pipeline:
     def __init__(self, workspace: Workspace) -> None:
         self.ws = workspace
         self.cache = EmbeddingCache(workspace.cache_path)
-        # task name -> (task object, revision, classifier). The object identity check stops a
-        # deleted-and-recreated task that reaches the same revision from reusing a stale fit.
-        self._fitted: dict[str, tuple[Task, int, Classifier]] = {}
+        # task name -> (task uid, revision, classifier). The uid stops a deleted-and-recreated
+        # task that reaches the same revision from reusing a stale fit.
+        self._fitted: dict[str, tuple[str, int, Classifier]] = {}
         self._lock = threading.Lock()
 
     # ---- embeddings --------------------------------------------------
@@ -95,18 +95,19 @@ class Pipeline:
             hit.update(new)
         return np.stack([hit[k] for k in keys]) if texts else np.zeros((0, 0), np.float32)
 
-    def example_embeddings(self, task: Task) -> Vectors:
-        """Embeddings of the task's examples, in ``task.config.examples`` order."""
-        exs = task.config.examples
-        return self.embed_images(task.config.embedder, [(e.id, task.path / e.file) for e in exs])
+    def example_embeddings(self, task: Task, cfg: TaskConfig | None = None) -> Vectors:
+        """Embeddings of the task's examples, in ``task.config.examples`` order (or ``cfg``'s)."""
+        cfg = cfg or task.config
+        return self.embed_images(cfg.embedder, [(e.id, task.path / e.file) for e in cfg.examples])
 
     # ---- training data -----------------------------------------------
-    def class_data(self, task: Task, exclude: set[int] | None = None) -> ClassData:
-        """Training data for ``task``, leaving out example indices in ``exclude``."""
-        cfg = task.config
-        classes = task.class_names()
+    def class_data(self, task: Task, exclude: set[int] | None = None, cfg: TaskConfig | None = None) -> ClassData:
+        """Training data for ``task`` (as of ``cfg``, default its current config), leaving out
+        example indices in ``exclude``."""
+        cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
+        classes = [c.name for c in cfg.classes]
         idx = {c: i for i, c in enumerate(classes)}
-        X = self.example_embeddings(task)
+        X = self.example_embeddings(task, cfg)
         y = np.array([idx[e.label] for e in cfg.examples], int)
         if exclude:
             keep = np.array([i not in exclude for i in range(len(y))], bool)
@@ -127,20 +128,21 @@ class Pipeline:
             text = {remap[i]: v for i, v in text.items()}
         return ClassData(classes, X, y, text)
 
-    def _new_classifier(self, task: Task) -> Classifier:
-        cfg = task.config
+    @staticmethod
+    def _new_classifier(cfg: TaskConfig) -> Classifier:
         return make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params)
 
-    def fitted(self, task: Task) -> Classifier:
-        """The task's classifier, re-fitted only when the task has changed."""
-        rev = task.config.revision
+    def fitted(self, task: Task, cfg: TaskConfig | None = None) -> Classifier:
+        """The task's classifier (as of ``cfg``, default its current config), re-fitted only when
+        the task has changed."""
+        cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
         with self._lock:
-            hit = self._fitted.get(task.name)
-            if hit and hit[0] is task and hit[1] == rev:
+            hit = self._fitted.get(cfg.name)
+            if hit and hit[:2] == (cfg.uid, cfg.revision):
                 return hit[2]
-        clf = self._new_classifier(task).fit(self.class_data(task))
+        clf = self._new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
         with self._lock:
-            self._fitted[task.name] = (task, rev, clf)
+            self._fitted[cfg.name] = (cfg.uid, cfg.revision, clf)
         return clf
 
     # ---- prediction --------------------------------------------------
@@ -151,19 +153,21 @@ class Pipeline:
         still classified. Classes with neither examples nor a description are left out.
         """
         task = self.ws.get(task) if isinstance(task, str) else task
-        clf = self.fitted(task)
+        cfg = task.config
+        clf = self.fitted(task, cfg)
         if not images:
             return []
         items = [(_key(im), im) for im in images]
         errors: dict[int, str] = {}
-        Q = self.embed_images(task.config.embedder, items, errors)
+        Q = self.embed_images(cfg.embedder, items, errors)
         probs, sims = clf.predict(Q)
-        return [Prediction.failed(errors[i]) if i in errors else self._to_pred(task, clf, p, s)
+        return [Prediction.failed(errors[i]) if i in errors else self._to_pred(cfg, clf, p, s)
                 for i, (p, s) in enumerate(zip(probs, sims, strict=True))]
 
-    def _to_pred(self, task: Task, clf: Classifier, p: np.ndarray, s: float) -> Prediction:
+    @staticmethod
+    def _to_pred(cfg: TaskConfig, clf: Classifier, p: np.ndarray, s: float) -> Prediction:
         j = int(p.argmax())
-        thr = task.config.reject_below
+        thr = cfg.reject_below
         rejected = thr is not None and float(s) < thr
         return Prediction(
             label=None if rejected else clf.classes[j],

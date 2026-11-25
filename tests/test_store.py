@@ -165,10 +165,9 @@ def test_upsert_class(ws):
     c = t.upsert_class("  cat ", "a cat")
     assert c.name == "cat"
     assert c.description == "a cat"
-    assert t.upsert_class("cat") is c
-    assert c.description == "a cat"
-    t.upsert_class("cat", "")
-    assert c.description == ""
+    assert t.upsert_class("cat") == c
+    assert t.upsert_class("cat", "").description == ""
+    assert t.config.classes[0].description == ""
     assert t.class_names() == ["cat"]
     t.upsert_class("dog")
     assert [x["name"] for x in saved(t)["classes"]] == ["cat", "dog"]
@@ -242,9 +241,10 @@ def test_add_example_stores_file_and_creates_class(ws):
     assert t.class_names() == ["red", "new"]
     assert [e["id"] for e in saved(t)["examples"]] == [p.id, j.id]
     again = t.add_example(png(RED), "new", "copy.png")
-    assert again is p
-    assert p.label == "new"
-    assert p.source == "r.png"
+    assert again.id == p.id
+    assert again.label == "new"
+    assert again.source == "r.png"
+    assert t.example(p.id) == again
     assert len(t.config.examples) == 2
 
 
