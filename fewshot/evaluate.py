@@ -10,8 +10,10 @@ from typing import Any
 import numpy as np
 
 from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier
+from .images import IMAGE_EXTS
 from .pipeline import Pipeline
-from .store import IMAGE_EXTS, Task, TaskConfig, fill_template
+from .store import Task, TaskConfig
+from .text import fill_template
 
 EvalProgress = Callable[[str, int, int], None]  # (stage, done, total); may raise to cancel
 TOP_K = (2, 3, 5)  # top-k accuracies reported, for k below the number of classes

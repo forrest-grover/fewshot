@@ -15,7 +15,9 @@ import typer
 
 from .embedders import DEFAULT_SPEC, PRESETS, check_embedder, spec_supports_text
 from .fetch import fetch_url, is_url
-from .store import IMAGE_EXTS, Task, Workspace, check_class_name
+from .images import IMAGE_EXTS
+from .store import Task, Workspace
+from .text import check_class_name
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline, Prediction
@@ -646,7 +648,7 @@ def cache_prune(
 
     ws = _ws(root)
     tasks = ws.list_tasks()
-    folders = [p for p in (ws.root / "tasks").iterdir() if (p / "task.json").exists()]
+    folders = [p for p in ws.task_folders() if (p / "task.json").exists()]
     if len(tasks) < len(folders):
         unreadable = sorted({p.name for p in folders} - {t.config.name for t in tasks})
         _fail(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
@@ -659,6 +661,15 @@ def cache_prune(
                f"{_mb(ws.cache_path.stat().st_size)} on disk")
     if not dry_run:
         typer.echo(f"Deleted {ws.gc_blobs()} stored images no task uses")
+
+
+@app.command()
+def gc(root: Path | None = ROOT_OPT) -> None:
+    """Remove what crashes and undo history leave behind: half-made or half-deleted task folders
+    (older than 10 minutes), image files no version of their task uses, and stored images no task uses."""
+    n = _ws(root).gc()
+    typer.echo(f"Removed {n['folders']} leftover folders, {n['images']} unused image files and "
+               f"{n['blobs']} unused stored images")
 
 
 def _mb(n: int) -> str:

@@ -32,8 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import hashlib
-import io
 import json
 import logging
 import os
@@ -47,110 +45,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .classifiers import CLASSIFIERS, check_params
 from .embedders import DEFAULT_SPEC
 from .fsutil import FileStamp
+from .fsutil import create_exclusive as _create_exclusive
 from .fsutil import file_lock as _file_lock
 from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
+from .images import IMAGE_EXTS, image_ext, image_id
+from .text import check_class_name, check_tag, check_template, fill_template, prompts
 
 log = logging.getLogger(__name__)
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # Example files are always written as images/<id>.<ext>; anything else in task.json was not
 # written by us, and following it could read or delete files outside the task.
 EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}(?:[0-9a-f]{16})?\.[a-z0-9]{1,10}$")
 # Images saved per task.json write by Task.add_examples.
 ADD_CHUNK = 256
-MAX_CLASS_NAME = 200
-MAX_TAG = 50
 MAX_NOTE = 2000
 HISTORY_KEPT = 20  # earlier task.json versions kept for undo
+# A task folder without task.json (or a .tmp-/.trash- folder) this old is left over from a crash.
+STALE_SECONDS = 600
 SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "reject_below",
             "reject_below_zero_shot", "flip"}
-
-
-def check_class_name(name: str) -> str:
-    """Return ``name`` stripped; raise ``ValueError`` if it can't be a class name.
-
-    Class names appear as URL path segments, so ``/``, ``\\``, ``.`` and ``..`` are refused (a
-    client would resolve ``.../classes/..`` to the task itself), as are control characters.
-    """
-    name = name.strip()
-    if not name:
-        raise ValueError("Class name is empty")
-    if name in {".", ".."} or any(ch in "/\\" or ord(ch) < 32 or ord(ch) == 127 for ch in name):
-        raise ValueError(f"Class name {name!r} can't be '.' or '..' or contain '/', '\\' or control characters")
-    if len(name) > MAX_CLASS_NAME:
-        raise ValueError(f"Class name is longer than {MAX_CLASS_NAME} characters")
-    return name
-
-
-def check_tag(tag: str) -> str:
-    """Return ``tag`` stripped; raise ``ValueError`` if it is empty, too long, or holds a comma or
-    control character."""
-    tag = tag.strip()
-    if not tag:
-        raise ValueError("Tag is empty")
-    if len(tag) > MAX_TAG:
-        raise ValueError(f"Tag is longer than {MAX_TAG} characters")
-    if any(ch == "," or ord(ch) < 32 or ord(ch) == 127 for ch in tag):
-        raise ValueError(f"Tag {tag!r} can't contain ',' or control characters")
-    return tag
-
-
-def prompts(description: str) -> list[str]:
-    """The text prompts in a class description: one per non-blank line. Several prompts are
-    averaged into one text embedding (prompt ensembling)."""
-    return [line.strip() for line in description.splitlines() if line.strip()]
 
 
 def default_root() -> Path:
     """Workspace root from ``$FEWSHOT_HOME``, defaulting to ``./fewshot_data``."""
     return Path(os.environ.get("FEWSHOT_HOME", "./fewshot_data")).resolve()
-
-
-def image_id(data: bytes) -> str:
-    """Content id of an image: the first 32 hex chars (128 bits) of its SHA-256.
-
-    128 bits make a deliberate collision (one image passing for another) infeasible; older tasks
-    hold 16-char ids, which ``Task.add_example`` still recognises.
-    """
-    return hashlib.sha256(data).hexdigest()[:32]
-
-
-def load_image(data: bytes, draft: int | None = None) -> Image.Image:
-    """Decode image bytes to an upright RGB image; raises ``ValueError`` if unreadable.
-
-    With ``draft``, a JPEG may be decoded at a reduced scale that is still at least ``draft``
-    pixels on each side (much faster for large photos); other formats decode in full.
-    """
-    try:
-        im = Image.open(io.BytesIO(data))
-        if draft:
-            im.draft("RGB", (draft, draft))
-        im.load()
-    except UnidentifiedImageError as e:
-        raise ValueError("Not a readable image: unrecognised file format") from e
-    except Image.DecompressionBombError as e:  # not an OSError subclass
-        raise ValueError(f"Not a readable image: {e}") from e
-    except OSError as e:
-        raise ValueError(f"Not a readable image: {e}") from e
-    return ImageOps.exif_transpose(im).convert("RGB")
-
-
-def thumbnail(data: bytes, size: int) -> bytes:
-    """JPEG of the image scaled down to fit in ``size`` x ``size`` pixels (never enlarged);
-    raises ``ValueError`` if unreadable."""
-    im = load_image(data, draft=size)
-    im.thumbnail((size, size), Image.Resampling.LANCZOS)
-    out = io.BytesIO()
-    im.save(out, "JPEG", quality=85)
-    return out.getvalue()
 
 
 class _NewImage(NamedTuple):
@@ -161,14 +86,6 @@ class _NewImage(NamedTuple):
     ext: str  # file extension from the image's actual format
     label: str
     source: str
-
-
-def image_ext(data: bytes) -> str:
-    """File extension for image bytes from their actual format (e.g. "jpg", "png"), after decoding
-    them in full; raises ``ValueError`` if they aren't a readable image."""
-    load_image(data)
-    fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
-    return {"jpeg": "jpg"}.get(fmt, fmt)
 
 
 def _check_item(data: bytes, label: str, source: str) -> _NewImage | ValueError:
@@ -192,22 +109,6 @@ def _copy_config(cfg: TaskConfig) -> TaskConfig:
     })
 
 
-def fill_template(template: str, name: str) -> str:
-    """Text for class ``name`` from a template such as 'a photo of a {}' (underscores become spaces).
-
-    Only the literal ``{}`` is substituted; any other braces are kept as written. A template of
-    several lines gives several prompts (see ``prompts``).
-    """
-    return template.replace("{}", name.replace("_", " "))
-
-
-def check_template(template: str) -> None:
-    """Raise ``ValueError`` unless every non-blank line of ``template`` contains ``{}``."""
-    lines = prompts(template)
-    if not lines or any("{}" not in line for line in lines):
-        raise ValueError("Template must contain '{}' (on every line, for several prompts)")
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -215,7 +116,9 @@ def _now() -> str:
 def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
     """Parse ``path/task.json`` and stamp the exact file that was read.
 
-    Raises ``ValueError`` if the file is not a valid config for the task folder ``path``.
+    The folder's name is the task's name: a task.json naming another (a folder renamed by hand, or
+    a rename interrupted after moving the folder) is taken under the folder's name, and the next
+    save writes that. Raises ``ValueError`` if the file is not a valid config.
     """
     with open(path / "task.json", "rb") as f:
         stamp = _stamp(os.fstat(f.fileno()))
@@ -227,7 +130,8 @@ def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
         where = ".".join(map(str, err["loc"]))
         raise ValueError(f"{path / 'task.json'} is invalid: {where + ': ' if where else ''}{err['msg']}") from None
     if cfg.name != path.name:
-        raise ValueError(f"{path / 'task.json'} is invalid: name {cfg.name!r} does not match its folder")
+        log.warning("%s names task %r; using its folder name %r", path / "task.json", cfg.name, path.name)
+        cfg = cfg.model_copy(update={"name": path.name})
     return cfg, stamp
 
 
@@ -426,7 +330,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             shutil.copyfile(self.path / "task.json", snap)
         if not gone:
             return [snap]
-        snap.with_suffix(".gone").write_text(json.dumps(gone))
+        _write_atomic(snap.with_suffix(".gone"), json.dumps(gone).encode())
         return [snap, snap.with_suffix(".gone")]
 
     def _history(self) -> list[tuple[int, Path]]:
@@ -438,11 +342,16 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
 
     @staticmethod
     def _gone(snap: Path) -> set[str]:
-        """Image files dropped by the change after version ``snap``."""
+        """Image files dropped by the change after version ``snap``. An unreadable list names
+        none, so those files are kept (``Workspace.gc`` finds them later) rather than lost."""
         try:
-            return set(json.loads(snap.with_suffix(".gone").read_text()))
+            files = json.loads(snap.with_suffix(".gone").read_text())
         except FileNotFoundError:
             return set()
+        except (OSError, ValueError):
+            log.warning("Ignoring unreadable %s", snap.with_suffix(".gone"))
+            return set()
+        return {f for f in files if isinstance(f, str)} if isinstance(files, list) else set()
 
     def _prune_history(self) -> None:
         """Forget versions beyond ``HISTORY_KEPT`` and delete images that only they used."""
@@ -460,6 +369,18 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
         gone -= set().union(*(self._gone(p) for _, p in kept))
         for f in gone:
             self._drop_file(f)
+
+    def _drop_unused_images(self) -> int:
+        """Delete image files that neither the task nor any kept version names; returns how many."""
+        with self._writing():
+            used = {e.file for e in self.config.examples}
+            used |= set().union(*(self._files_in(p) for _, p in self._history()))
+            images = self.path / "images"
+            unused = [f"images/{f.name}" for f in images.iterdir() if f.is_file()] if images.is_dir() else []
+            unused = [f for f in unused if f not in used]
+            for f in unused:
+                self._drop_file(f)
+            return len(unused)
 
     def can_undo(self) -> bool:
         """Whether there is an earlier version to go back to."""
@@ -479,7 +400,11 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             try:
                 old = TaskConfig.model_validate_json(snap.read_bytes())
             except ValidationError as e:
-                raise ValueError(f"Can't undo: {snap} is invalid") from e
+                # Drop it, so the next undo can go further back instead of failing here forever.
+                snap.unlink()
+                snap.with_suffix(".gone").unlink(missing_ok=True)
+                raise ValueError(f"Can't undo: {snap.name} is invalid and was removed; undo again to go "
+                                 "further back") from e
             missing = [e.file for e in old.examples if not (self.path / e.file).exists()]
             if missing:
                 raise ValueError(f"Can't undo: {len(missing)} image files are gone, e.g. {missing[0]}")
@@ -513,26 +438,29 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
         name = file.rsplit("/", 1)[-1]
         return self.blobs / name[:2] / name
 
-    def _store_image(self, file: str, data: bytes) -> None:
+    def _store_image(self, file: str, data: bytes) -> bool:
         """Write ``data`` (whose id the name of ``file`` carries) as the task's ``file``: a hard link
-        to the workspace's copy, made if needed, or a plain copy where links aren't possible."""
+        to the workspace's copy, made if needed, or a plain copy where links aren't possible.
+        Returns whether this call created the file (False if it was there already)."""
         dest = self.path / file
         dest.parent.mkdir(exist_ok=True)
         if dest.exists():  # kept for undo, or re-added: same content, since the name is its hash
-            return
+            return False
         blob = self._blob(file)
         if blob is not None:
+            made = False
             try:
-                if not blob.exists():
-                    blob.parent.mkdir(parents=True, exist_ok=True)
-                    _write_atomic(blob, data)
+                blob.parent.mkdir(parents=True, exist_ok=True)
+                made = _create_exclusive(blob, data)
                 os.link(blob, dest)
-                return
-            except FileExistsError:  # another writer got there first: same content
-                return
+                return True
+            except FileExistsError:  # another writer stored this file in this task first
+                return False
             except OSError:  # no hard links here, or the blob vanished under us: copy instead
-                pass
-        dest.write_bytes(data)
+                if made:  # a blob nothing can link to would only waste space
+                    blob.unlink(missing_ok=True)
+        _write_atomic(dest, data)
+        return True
 
     def _drop_file(self, file: str) -> None:
         """Delete a task image file, and the shared copy once no task links to it."""
@@ -551,13 +479,22 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
         return t
 
     def destroy(self) -> None:
-        """Delete the task folder, waiting for any mutation in progress (in any process)."""
+        """Delete the task folder, waiting for any mutation in progress (in any process).
+
+        The folder is first moved aside in one step, so a crash part-way leaves either the whole
+        task or a ``.trash-`` folder that ``Workspace.gc`` removes, never a half-deleted task.
+        """
         with self._writing():
             files = {e.file for e in self.config.examples}
             files |= set().union(*(self._gone(p) for _, p in self._history()))
-            shutil.rmtree(self.path)
+            trash = self.path.parent / f".trash-{uuid.uuid4().hex}"
+            os.rename(self.path, trash)
+            shutil.rmtree(trash)
             for f in files:  # the shared copies no other task links to
-                self._drop_file(f)
+                blob = self._blob(f)
+                with contextlib.suppress(FileNotFoundError):
+                    if blob is not None and blob.stat().st_nlink == 1:
+                        blob.unlink()
 
     # ---- settings ----------------------------------------------------
     def update_settings(self, **kw: Any) -> None:
@@ -670,15 +607,18 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
         for item in items:
             batch.append(item)
             if len(batch) >= chunk:
-                results += self._add_batch(batch)
+                results += self._add_batch(batch, record=not results)
                 batch = []
         if batch:
-            results += self._add_batch(batch)
+            results += self._add_batch(batch, record=not results)
         return results
 
-    def _add_batch(self, batch: list[tuple[bytes, str, str]]) -> list[Example | ValueError]:
+    def _add_batch(self, batch: list[tuple[bytes, str, str]], record: bool = True) -> list[Example | ValueError]:
+        """Add one chunk. Only the first chunk of an ``add_examples`` call keeps the version before
+        it for undo (``record``), so one undo takes back the whole call."""
         checked = [_check_item(*item) for item in batch]  # decoding happens here, before locking
         out: list[Example | ValueError] = []
+        created: list[str] = []
         with self._writing():
             examples = self.config.examples
             at = {e.id: i for i, e in enumerate(examples)}  # id -> position
@@ -693,12 +633,18 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                     ex = examples[i] = examples[i].model_copy(update={"label": c.label})
                 else:
                     ex = Example(id=c.id, label=c.label, file=f"images/{c.id}.{c.ext}", source=c.source)
-                    self._store_image(ex.file, c.data)
+                    if self._store_image(ex.file, c.data):
+                        created.append(ex.file)
                     at[c.id] = len(examples)
                     examples.append(ex)
                 out.append(ex)
-            if any(not isinstance(r, ValueError) for r in out):
-                self._save()
+            try:
+                if any(not isinstance(r, ValueError) for r in out):
+                    self._save(record=record)
+            except BaseException:
+                for f in created:  # not named by any saved version
+                    self._drop_file(f)
+                raise
         return out
 
     def _ensure_class(self, label: str) -> None:
@@ -851,13 +797,17 @@ class Workspace:
     def list_tasks(self) -> list[Task]:
         """All readable tasks, sorted by name; a task whose task.json is invalid is logged and skipped."""
         tasks = []
-        for p in sorted((self.root / "tasks").iterdir()):
+        for p in self.task_folders():
             if (p / "task.json").exists():
                 try:
                     tasks.append(self.get(p.name))
                 except KeyError as e:
                     log.warning("Skipping task folder %s: %s", p, e.args[0])
         return tasks
+
+    def task_folders(self) -> list[Path]:
+        """Task folders, sorted by name (leaving out the hidden ones used while creating and deleting)."""
+        return sorted(p for p in (self.root / "tasks").iterdir() if p.is_dir() and not p.name.startswith("."))
 
     def get(self, name: str) -> Task:
         """Load a task, or refresh the cached one if another process changed it.
@@ -909,8 +859,34 @@ class Workspace:
         try:
             p.mkdir()  # atomic: of two concurrent creates, exactly one succeeds
         except FileExistsError:
+            if not _abandoned(p):
+                raise ValueError(f"Task {name!r} already exists") from None
+            shutil.rmtree(p, ignore_errors=True)  # left by a crash: take the name back
+            return self._reserve_again(name)
+        return p
+
+    def _reserve_again(self, name: str) -> Path:
+        p = self.root / "tasks" / name
+        try:
+            p.mkdir()
+        except FileExistsError:  # pragma: no cover  # another process took it in between
             raise ValueError(f"Task {name!r} already exists") from None
         return p
+
+    def gc(self) -> dict[str, int]:
+        """Clean up what crashes and undo history leave behind: hidden ``.tmp-``/``.trash-``
+        folders and task folders without task.json older than ``STALE_SECONDS``, image files no
+        version of their task names, and shared copies no task links to. Returns counts."""
+        out = {"folders": 0, "images": 0, "blobs": 0}
+        for p in (self.root / "tasks").iterdir():
+            hidden = p.name.startswith((".tmp-", ".trash-"))
+            if p.is_dir() and (hidden or not (p / "task.json").exists()) and _abandoned(p):
+                shutil.rmtree(p, ignore_errors=True)
+                out["folders"] += 1
+        for t in self.list_tasks():
+            out["images"] += t._drop_unused_images()  # pylint: disable=protected-access
+        out["blobs"] = self.gc_blobs()
+        return out
 
     def rename(self, old: str, new: str) -> Task:
         """Rename task ``old`` to ``new``; raises ``KeyError`` if ``old`` is missing and
@@ -962,3 +938,13 @@ class Workspace:
     def cache_path(self) -> Path:
         """Location of the shared embedding cache."""
         return self.root / "cache.sqlite"
+
+
+def _abandoned(folder: Path) -> bool:
+    """Whether ``folder`` is a leftover of a crash: no task.json (or hidden) and untouched for
+    ``STALE_SECONDS``, so no create or import in progress can own it."""
+    try:
+        age = datetime.now(timezone.utc).timestamp() - folder.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())

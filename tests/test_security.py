@@ -12,7 +12,7 @@ import fewshot.api
 from fewshot import archive, store
 from fewshot.archive import import_task
 from fewshot.embedders import DEFAULT_SPEC
-from fewshot.store import image_id
+from fewshot.images import image_id
 from tests.conftest import png
 
 RED = (220, 30, 30)

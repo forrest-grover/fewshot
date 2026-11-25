@@ -9,8 +9,8 @@ from PIL import Image
 
 from fewshot.classifiers import KNNClassifier
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
+from fewshot.images import image_id
 from fewshot.pipeline import Pipeline, Prediction
-from fewshot.store import image_id
 from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)

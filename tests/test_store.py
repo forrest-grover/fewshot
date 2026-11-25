@@ -8,7 +8,9 @@ import pytest
 from PIL import Image
 
 from fewshot import embedders, store
-from fewshot.store import TaskConfig, Workspace, image_id, load_image
+from fewshot.images import image_id, load_image
+from fewshot.store import TaskConfig, Workspace
+from fewshot.text import check_class_name
 from tests.conftest import png
 
 RED, GREEN = (220, 30, 30), (30, 220, 30)
@@ -367,7 +369,7 @@ def test_bad_class_names_are_refused(ws, name):
     with pytest.raises(ValueError, match="Class name"):
         t.add_example(png(RED, noise=15), name)
     assert t.class_names() == ["ok"]
-    assert store.check_class_name("  a.b c ") == "a.b c"
+    assert check_class_name("  a.b c ") == "a.b c"
 
 
 def test_text_weight_is_not_a_classifier_param(ws):
@@ -404,19 +406,23 @@ def test_example_files_outside_images_are_refused(ws, file):
 
 
 def test_corrupt_or_misnamed_tasks_are_skipped(ws, caplog):
-    """One broken task.json doesn't break listing the others."""
+    """One broken task.json doesn't break listing the others; a task.json naming another task
+    (a folder renamed by hand, or an interrupted rename) is taken under its folder's name."""
     ws.create("good")
     ws.create("bad")
     ws.create("moved")
     (ws.root / "tasks" / "bad" / "task.json").write_text("{not json")
     _write_task_json(ws, "moved", lambda d: d.update(name="other"))
     fresh = Workspace(ws.root)
-    assert [t.name for t in fresh.list_tasks()] == ["good"]
+    assert [t.name for t in fresh.list_tasks()] == ["good", "moved"]
     assert "Skipping task folder" in caplog.text
     with pytest.raises(KeyError, match=r"Task 'bad' can't be loaded: .*task\.json is invalid"):
         fresh.get("bad")
-    with pytest.raises(KeyError, match="name 'other' does not match its folder"):
-        fresh.get("moved")
+    moved = fresh.get("moved")
+    assert moved.name == "moved"
+    assert "names task 'other'; using its folder name 'moved'" in caplog.text
+    moved.upsert_class("x")  # the next save writes the folder's name
+    assert json.loads((moved.path / "task.json").read_text())["name"] == "moved"
 
 
 def test_legacy_16_char_ids_still_match(ws):
@@ -445,9 +451,9 @@ def test_add_examples_in_chunks(ws, monkeypatch):
     t = ws.create("t")
     saves = []
     real = type(t)._save  # pylint: disable=protected-access
-    def counted(self):
-        saves.append(1)
-        real(self)
+    def counted(self, **kw):
+        saves.append(kw.get("record", True))
+        real(self, **kw)
 
     monkeypatch.setattr(type(t), "_save", counted)
     a, b = png(RED, noise=5, seed=1), png(GREEN, noise=5, seed=2)
@@ -457,7 +463,7 @@ def test_add_examples_in_chunks(ws, monkeypatch):
     assert out[2].id == out[0].id  # the same image again was relabelled, not duplicated
     assert [(e.label, e.source) for e in t.config.examples] == [("pink", "a"), ("green", "b")]
     assert t.class_names() == ["red", "pink", "green"]
-    assert len(saves) == 3  # one per chunk with something added
+    assert saves == [True, False, False]  # one per chunk added to; only the first is an undo step
     assert isinstance(t.add_examples([(b"junk", "x", "")])[0], ValueError)
     assert len(saves) == 3  # nothing added: no save
 

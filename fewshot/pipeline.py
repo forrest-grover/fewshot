@@ -14,7 +14,9 @@ from PIL import Image, ImageOps
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
-from .store import Task, TaskConfig, Workspace, image_id, load_image, prompts
+from .images import image_id, load_image
+from .store import Task, TaskConfig, Workspace
+from .text import prompts
 
 ImageInput = bytes | str | Path | Image.Image
 Progress = Callable[[int, int], None]  # (done, total); may raise to cancel the work

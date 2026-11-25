@@ -61,6 +61,7 @@ from .embedders import (
 )
 from .evaluate import evaluate_task
 from .fetch import fetch_url
+from .images import thumbnail
 from .pipeline import Pipeline, Prediction
 from .schemas import (
     AddResult,
@@ -74,7 +75,7 @@ from .schemas import (
     TaskDetail,
     TaskSummary,
 )
-from .store import MAX_NOTE, Task, Workspace, thumbnail
+from .store import MAX_NOTE, Task, Workspace
 
 log = logging.getLogger(__name__)
 

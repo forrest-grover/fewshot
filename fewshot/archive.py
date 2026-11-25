@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import uuid
 import zipfile
@@ -11,7 +12,9 @@ from typing import IO
 
 from pydantic import ValidationError
 
-from .store import ClassDef, Task, TaskConfig, Workspace, check_class_name, check_settings, image_ext, image_id
+from .images import image_ext, image_id
+from .store import ClassDef, Task, TaskConfig, Workspace, check_settings
+from .text import check_class_name
 
 # Limits on what an export zip may unpack to (guards against zip bombs): per image, for task.json,
 # and for all images together.
@@ -22,15 +25,19 @@ MAX_IMPORT_TOTAL = 10 * 1024 * 1024 * 1024
 
 def export_task(ws: Workspace, name: str, out: IO[bytes]) -> int:
     """Write task ``name`` (task.json and images, not its history) as a zip to ``out``;
-    returns the number of examples. Raises ``KeyError`` if there is no such task."""
+    returns the number of examples. Raises ``KeyError`` if there is no such task.
+
+    The task is locked meanwhile, so another process can't rename or change it half-way; an image
+    file missing from the task (only if it was damaged) is left out with its example.
+    """
     t = ws.get(name)
-    cfg = t.config  # one snapshot
     examples = []
-    with zipfile.ZipFile(out, "w") as z:
+    with t._writing(), zipfile.ZipFile(out, "w") as z:  # pylint: disable=protected-access
+        cfg = t.config
         for e in cfg.examples:
             try:
                 data = (t.path / e.file).read_bytes()
-            except FileNotFoundError:  # deleted since the snapshot
+            except FileNotFoundError:
                 continue
             z.writestr(e.file, data, zipfile.ZIP_STORED)  # images are compressed already
             examples.append(e)
@@ -55,12 +62,18 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,
                 embedder_ok(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
             p = ws._reserve(cfg.name)  # pylint: disable=protected-access
+            # Built in a hidden folder and moved into place at the end, so a crash part-way leaves
+            # no half-imported task (Workspace.gc removes the leftover).
+            build = ws.root / "tasks" / f".tmp-{uuid.uuid4().hex}"
+            build.mkdir()
             try:
-                t = Task(p, cfg, blobs=ws.blobs)
+                t = Task(build, cfg, blobs=ws.blobs)
                 for e in cfg.examples:
                     t._store_image(e.file, _read_member(z, images[e.file]))  # pylint: disable=protected-access
                 t._save(record=False)  # pylint: disable=protected-access
+                os.replace(build, p)  # replaces the empty reserved folder (POSIX)
             except BaseException:
+                shutil.rmtree(build, ignore_errors=True)
                 shutil.rmtree(p, ignore_errors=True)
                 raise
     except zipfile.BadZipFile as e:
@@ -93,13 +106,13 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
         err = err_.errors()[0]
         raise ValueError(f"task.json is invalid: {'.'.join(map(str, err['loc']))}: {err['msg']}") from None
     check_settings(cfg)
-    classes = [c.model_copy(update={"name": check_class_name(c.name)}) for c in cfg.classes]
-    names = {c.name for c in classes}
-    examples = list({x.id: x for x in cfg.examples}.values())  # one per id
+    classes: dict[str, ClassDef] = {}  # by cleaned-up name; the first of any duplicates wins
+    for c in cfg.classes:
+        classes.setdefault(check_class_name(c.name), c.model_copy(update={"name": check_class_name(c.name)}))
+    examples = [x.model_copy(update={"label": check_class_name(x.label)})
+                for x in {x.id: x for x in cfg.examples}.values()]  # one per id
     for ex in examples:
-        if ex.label not in names:
-            classes.append(ClassDef(name=check_class_name(ex.label)))
-            names.add(ex.label)
+        classes.setdefault(ex.label, ClassDef(name=ex.label))
     members = {m.filename: m for m in z.infolist()}
     missing = next((ex.file for ex in examples if ex.file not in members), None)
     if missing:
@@ -116,4 +129,4 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
             raise ValueError(f"Not a valid task export: {ex.file}: {e}") from None
         if not ex.file.endswith("." + ext):
             raise ValueError(f"Not a valid task export: {ex.file} is really a .{ext} image")
-    return cfg.model_copy(update={"classes": classes, "examples": examples}), members
+    return cfg.model_copy(update={"classes": list(classes.values()), "examples": examples}), members

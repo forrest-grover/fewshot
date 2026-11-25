@@ -9,7 +9,9 @@ import pytest
 
 from fewshot import store
 from fewshot.archive import export_task, import_task
-from fewshot.store import Example, TaskConfig, Workspace, check_tag, check_template, prompts
+from fewshot.images import image_id
+from fewshot.store import Example, TaskConfig, Workspace
+from fewshot.text import check_tag, check_template, prompts
 from tests.conftest import png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
@@ -283,7 +285,7 @@ def _zip(files):
 def test_import_rejects_bad_zips(ws):
     """Bad archives are refused with a ValueError and leave no task folder behind."""
     img = png(RED)
-    eid = store.image_id(img)
+    eid = image_id(img)
     good = {"name": "t", "classes": [{"name": "red"}],
             "examples": [{"id": eid, "label": "red", "file": f"images/{eid}.png"}]}
     cases = {
@@ -303,7 +305,7 @@ def test_import_rejects_bad_zips(ws):
 def test_import_fixes_up_labels_and_duplicates(ws):
     """Examples whose class is missing get it added; repeated ids are kept once."""
     img = png(RED)
-    eid = store.image_id(img)
+    eid = image_id(img)
     ex = {"id": eid, "label": "red", "file": f"images/{eid}.png"}
     t = import_task(ws, _zip({"task.json": json.dumps({"name": "t", "examples": [ex, ex]}),
                               f"images/{eid}.png": img}))
@@ -316,7 +318,7 @@ def test_import_refuses_oversized_members(ws, monkeypatch):
     import fewshot.archive  # pylint: disable=import-outside-toplevel
 
     img = png(RED)
-    eid = store.image_id(img)
+    eid = image_id(img)
     zip_ = _zip({"task.json": json.dumps({"name": "t", "examples": [
         {"id": eid, "label": "red", "file": f"images/{eid}.png"}]}), f"images/{eid}.png": img})
     monkeypatch.setattr(fewshot.archive, "MAX_IMPORT_IMAGE", 10)

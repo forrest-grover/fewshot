@@ -61,3 +61,20 @@ def write_atomic(path: Path, data: bytes) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def create_exclusive(path: Path, data: bytes) -> bool:
+    """Create ``path`` with all of ``data`` unless it already exists; returns whether it was
+    created. Readers never see it partly written. Raises ``OSError`` where hard links aren't
+    supported (the file is written aside and linked into place)."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
