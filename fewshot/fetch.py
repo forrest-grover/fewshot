@@ -28,10 +28,22 @@ def public_addresses(host: str, port: int) -> list[str]:
     addrs = []
     for info in infos:
         addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
-        if not addr.is_global:
+        if not addr.is_global or not _embedded_ipv4_public(addr):
             raise ValueError(f"{host} is not a public address ({addr})")
         addrs.append(str(addr))
     return addrs
+
+
+NAT64 = ipaddress.ip_network("64:ff9b::/96")  # IPv6 addresses that a NAT64 gateway maps to IPv4
+
+
+def _embedded_ipv4_public(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """For an IPv6 address carrying an IPv4 one (NAT64, IPv4-mapped), whether that IPv4 address
+    is public too: 64:ff9b::7f00:1 reaches 127.0.0.1 through a NAT64 gateway."""
+    if isinstance(addr, ipaddress.IPv4Address):
+        return True
+    inner = addr.ipv4_mapped or (ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF) if addr in NAT64 else None)
+    return inner is None or inner.is_global
 
 
 def check_public(url: str) -> None:

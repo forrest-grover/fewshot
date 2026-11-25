@@ -321,9 +321,11 @@ class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole
     # ---- image files -------------------------------------------------
     def _blob(self, file: str) -> Path | None:
         """The shared-store file for ``images/<name>``, or None without a store."""
-        if self.blobs is None:
-            return None
         name = file.rsplit("/", 1)[-1]
+        # Ids from before 128-bit ids are too short to rule out a crafted collision, which in a
+        # shared store would let one task's image stand in for another's: those stay task-local.
+        if self.blobs is None or len(name.split(".", 1)[0]) != 32:
+            return None
         return self.blobs / name[:2] / name
 
     def _store_image(self, file: str, data: bytes) -> bool:

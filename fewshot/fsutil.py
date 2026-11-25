@@ -19,12 +19,14 @@ if fcntl is None:  # pragma: no cover  # Windows only
     msvcrt = importlib.import_module("msvcrt")
 
 
-FileStamp = tuple[int, int, int]  # (inode, mtime_ns, size): changes whenever task.json is replaced
+# (inode, mtime_ns, ctime_ns, size): changes whenever task.json is replaced. The ctime (set when the
+# new file is renamed into place) guards against a freed inode being reused within one mtime tick.
+FileStamp = tuple[int, int, int, int]
 
 
 def stamp(st: os.stat_result) -> FileStamp:
     """The stamp of a file from its ``os.stat``."""
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
+    return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
 
 
 @contextlib.contextmanager

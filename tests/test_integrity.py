@@ -277,3 +277,10 @@ def test_abandoned_folder_vanishing(tmp_path):
     """A folder that disappears while being checked is not abandoned."""
     assert not store._abandoned(tmp_path / "gone")  # pylint: disable=protected-access
     assert archive.MAX_IMPORT_TOTAL > 0
+
+
+def test_short_legacy_ids_stay_out_of_the_shared_store(ws):
+    """An image with a 16-character id (older tasks) is copied, not shared through the store."""
+    t = ws.create("t", embedder="fake:color")
+    assert t._blob("images/" + "ab" * 8 + ".png") is None  # pylint: disable=protected-access
+    assert t._blob("images/" + "ab" * 16 + ".png") is not None  # pylint: disable=protected-access

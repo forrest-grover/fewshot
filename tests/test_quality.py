@@ -571,3 +571,15 @@ def test_texts_are_embedded_in_batches_with_oom_halving(monkeypatch):
     assert v.shape == (5, 3)
     assert sizes == [2, 2, 1]
     assert emb.batch_size == 2
+
+
+def test_nat64_and_mapped_private_addresses_are_refused(monkeypatch):
+    """An IPv6 address that reaches a private IPv4 one through NAT64 is not public."""
+    def answer(ip):
+        return lambda host, port, *a, **k: [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, port, 0, 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", answer("64:ff9b::7f00:1"))
+    with pytest.raises(ValueError, match="not a public address"):
+        fetch.public_addresses("nat64.test", 80)
+    monkeypatch.setattr(socket, "getaddrinfo", answer("64:ff9b::808:808"))  # 8.8.8.8
+    assert fetch.public_addresses("nat64.test", 80) == ["64:ff9b::808:808"]
