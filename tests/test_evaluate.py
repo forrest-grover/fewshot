@@ -180,6 +180,7 @@ def test_benchmark_separable_colours(ws, tmp_path):
     folder = make_folder(tmp_path / "data")
     messages: list[str] = []
     r = benchmark(Pipeline(ws), folder, "fake:color", way=3, shot=2, query=3, episodes=5, progress=messages.append)
+    assert r.pop("flip") is False
     assert r == {
         "embedder": "fake:color", "classifier": "prototype", "way": 3, "shot": 2, "query": 3,
         "episodes": 5, "text_template": None, "accuracy": 1.0, "ci95": 0.0,

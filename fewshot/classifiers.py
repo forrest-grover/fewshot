@@ -16,6 +16,9 @@ image-only class (in a task where others have text) gets its image centroid plus
 the gap as its text-side vector. A task with no images at all is pure CLIP
 zero-shot.
 
+A single class is allowed: every image gets that class, and its similarity score is what tells
+members from outsiders (one-class or anomaly tasks, with a reject threshold).
+
 The gap is the mean of (text - image centroid) over the classes with images,
 taking each class's description, or else the embedding of its name
 (``ClassData.name_text``). Without names it falls back to the difference of the
@@ -102,6 +105,7 @@ class Classifier:
         self.zero_shot = False
         self.Pt: Vectors | None = None  # (C, d) text-side vector per class, if any text is used
         self._X: Vectors | None = None  # image-space support points (examples + text anchors)
+        self._y: Labels | None = None  # class of each support point
 
     # Subclasses implement these on image-space data where every class has >= 1 point.
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
@@ -110,15 +114,26 @@ class Classifier:
     def _image_logprobs(self, Q: Vectors) -> Scores:
         raise NotImplementedError
 
-    def _image_similarity(self, Q: Vectors) -> Scores:
-        """Cosine similarity of each query to its nearest support point/prototype."""
-        return (Q @ _fitted(self._X).T).max(axis=1)
+    def _class_similarity_image(self, Q: Vectors) -> Scores:
+        """(m, C) cosine similarity of each query to each class's nearest support point."""
+        S = Q @ _fitted(self._X).T
+        y = _fitted(self._y)
+        return np.stack([S[:, y == c].max(axis=1) for c in range(len(self.classes))], axis=1)
+
+    def class_similarity(self, Q: Vectors) -> Scores:
+        """(m, C) similarity of each query to each class: to its nearest example (its prototype, for
+        the prototype classifier), or to its text for zero-shot tasks. Unlike the probabilities,
+        each class's score doesn't depend on the others, so several classes can pass a threshold
+        (multi-label prediction)."""
+        if self.zero_shot:
+            return Q @ _fitted(self.Pt).T
+        return self._class_similarity_image(Q)
 
     def fit(self, data: ClassData) -> Classifier:
         """Fit on ``data``; every class needs at least one image or a text embedding."""
         C = len(data.classes)
-        if C < 2:
-            raise ValueError("Need at least 2 classes with examples or descriptions")
+        if C < 1:
+            raise ValueError("Need at least 1 class with examples or a description")
         with_images = set(data.y.tolist())
         missing = [c for i, c in enumerate(data.classes) if i not in with_images and i not in data.text]
         if missing:
@@ -147,7 +162,7 @@ class Classifier:
             X = np.concatenate([X, T])
             y = np.concatenate([y, text_only])
             w = np.concatenate([w, np.ones(len(T), np.float32)])
-        self._X = X
+        self._X, self._y = X, y
         self._fit_image(X, y, w)
         return self
 
@@ -159,13 +174,15 @@ class Classifier:
         thresholds are not interchangeable between the two. Raises RuntimeError
         if called before ``fit``.
         """
+        sims = self.class_similarity(Q).max(axis=1)
         if self.zero_shot:
-            S = Q @ _fitted(self.Pt).T
-            return _softmax(CLIP_LOGIT_SCALE * S), S.max(axis=1)
+            return _softmax(CLIP_LOGIT_SCALE * (Q @ _fitted(self.Pt).T)), sims
+        if len(self.classes) == 1:
+            return np.ones((len(Q), 1)), sims
         logits = self._image_logprobs(Q)
         if self.Pt is not None and self.text_weight > 0:
             logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
-        return _softmax(logits), self._image_similarity(Q)
+        return _softmax(logits), sims
 
 
 class PrototypeClassifier(Classifier):
@@ -188,8 +205,8 @@ class PrototypeClassifier(Classifier):
         z = z - z.max(1, keepdims=True)
         return z - np.log(np.exp(z).sum(1, keepdims=True))
 
-    def _image_similarity(self, Q: Vectors) -> Scores:
-        return (Q @ _fitted(self.P).T).max(axis=1)
+    def _class_similarity_image(self, Q: Vectors) -> Scores:
+        return Q @ _fitted(self.P).T
 
 
 class KNNClassifier(Classifier):
@@ -235,6 +252,8 @@ class LogRegClassifier(Classifier):
         # Lazy import: sklearn is slow to import and only this classifier needs it.
         from sklearn.linear_model import LogisticRegression  # pylint: disable=import-outside-toplevel
 
+        if len(self.classes) == 1:  # nothing to separate; predict() doesn't use the model
+            return
         self.model = LogisticRegression(C=self.C, max_iter=2000).fit(X, y, sample_weight=w)
 
     def _image_logprobs(self, Q: Vectors) -> Scores:

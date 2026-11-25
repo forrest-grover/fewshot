@@ -365,10 +365,9 @@ def test_predict_errors(run, task, tmp_path):
     assert '"error": "Not a readable image: unrecognised file format"' in r.output
 
     run("create", "lonely", "--embedder", "fake:color")
-    run("add", "lonely", "red", good)
     r = run("predict", "lonely", good)
     assert r.exit_code == 1
-    assert "Need at least 2 classes" in r.output
+    assert "Need at least 1 class" in r.output
 
     r = run("predict", task, tmp_path / "nope.png")
     assert r.exit_code == 1

@@ -4,24 +4,25 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
-from .store import Task, TaskConfig, Workspace, image_id, load_image
+from .store import Task, TaskConfig, Workspace, image_id, load_image, prompts
 
 ImageInput = bytes | str | Path | Image.Image
 Progress = Callable[[int, int], None]  # (done, total); may raise to cancel the work
+FLIP_KEY = ":flip"  # cache key suffix for flip-averaged embeddings
 
 
 @dataclass
-class Prediction:
+class Prediction:  # pylint: disable=too-many-instance-attributes  # one field per result value
     """Classification result for one image."""
 
     label: str | None  # None when rejected as unknown
@@ -29,7 +30,10 @@ class Prediction:
     confidence: float
     similarity: float
     rejected: bool
-    scores: dict[str, float]
+    scores: dict[str, float]  # probability per class, highest first
+    # Every class the image matches (multi-label): with a reject threshold, each class whose own
+    # similarity reaches it, ``label`` first; without one, just ``label``.
+    labels: list[str] = field(default_factory=list)
     error: str | None = None  # set (with every other field empty) when the image could not be read
 
     @classmethod
@@ -59,8 +63,12 @@ class Pipeline:
 
     # ---- embeddings --------------------------------------------------
     def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],
-                     errors: dict[int, str] | None = None, progress: Progress | None = None) -> Vectors:
+                     errors: dict[int, str] | None = None, progress: Progress | None = None,
+                     flip: bool = False) -> Vectors:
         """Embed ``(cache_key or None, image)`` pairs, using and filling the cache.
+
+        With ``flip``, each vector is the normalised mean of the image's and its mirror image's
+        embeddings (test-time augmentation), cached under the key plus ``FLIP_KEY``.
 
         Uncached images are decoded, embedded and cached one batch at a time, so memory stays
         bounded however many there are, and an interrupted run keeps what it finished. An
@@ -68,50 +76,55 @@ class Pipeline:
         stored there under the item's index and that row is all zeros. ``progress(done, total)`` is
         called after each batch with counts of images needing the model; it may raise to cancel.
         """
+        if not items:
+            return np.zeros((0, 0), np.float32)
         ns = cache_namespace(spec)
-        hit = self.cache.get_many(ns, [k for k, _ in items if k])
+        if flip:
+            items = [(k + FLIP_KEY if k else None, im) for k, im in items]
+        emb, hit = self._cached(spec, ns, [k for k, _ in items])
+        out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
+        if emb is not None:
+            todo = [(i, k, im) for i, (k, im) in enumerate(items) if i not in out]
+            out.update(self._embed_uncached(emb, ns, todo, errors, progress, flip))
+        return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
+
+    def _cached(self, spec: str, ns: str, keys: list[str | None]) -> tuple[Embedder | None, dict[str, Vectors]]:
+        """Cached vectors for ``keys``, plus the loaded embedder if any key misses the cache."""
+        hit = self.cache.get_many(ns, [k for k in keys if k])
         emb = None
-        if any(not (k and k in hit) for k, _ in items) or len({len(v) for v in hit.values()}) > 1:
+        if any(not (k and k in hit) for k in keys) or len({len(v) for v in hit.values()}) > 1:
             # Some images need the model, or the cache holds vectors of different lengths (written
             # by another model under this name): load it and re-embed any that don't fit.
             emb = get_embedder(spec)
             hit = {k: v for k, v in hit.items() if len(v) == emb.dim}
-        todo = [(i, k, im) for i, (k, im) in enumerate(items) if not (k and k in hit)]
-        out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
-        if emb is not None and todo:
-            out.update(self._embed_uncached(emb, ns, todo, errors, progress))
-        if not items:
-            return np.zeros((0, 0), np.float32)
-        return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
+        return emb, hit
 
-    def _embed_uncached(self, emb: Embedder, ns: str, todo: list[tuple[int, str | None, ImageInput]],
-                        errors: dict[int, str] | None, progress: Progress | None) -> dict[int, Vectors]:
+    def _embed_uncached(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # internal helper
+            self, emb: Embedder, ns: str, todo: list[tuple[int, str | None, ImageInput]],
+            errors: dict[int, str] | None, progress: Progress | None, flip: bool = False) -> dict[int, Vectors]:
         """Decode, embed and cache ``todo`` one batch at a time; returns row index -> vector."""
         out: dict[int, Vectors] = {}
         step = emb.batch_size
         for start in range(0, len(todo), step):
             chunk = todo[start : start + step]
             decoded = _decode(chunk, errors)
-            if errors:
+            if errors:  # unreadable rows are zeros
                 out.update({i: np.zeros(emb.dim, np.float32) for i, _, _ in chunk if i in errors})
-            new: dict[str, Vectors] = {}
-            for (i, k, _), v in zip(decoded, emb.embed_images([im for _, _, im in decoded]), strict=True):
-                out[i] = v
-                if k:
-                    new[k] = v
-            self.cache.put_many(ns, new)
+            vecs = _embed_decoded(emb, [im for _, _, im in decoded], flip)
+            out.update({i: v for (i, _, _), v in zip(decoded, vecs, strict=True)})
+            self.cache.put_many(ns, {k: v for (_, k, _), v in zip(decoded, vecs, strict=True) if k})
             if progress:
                 progress(min(start + step, len(todo)), len(todo))
         return out
 
     def embed_files(self, spec: str, paths: Sequence[Path], progress: Progress | None = None,
-                    chunk: int = 256) -> Vectors:
+                    chunk: int = 256, flip: bool = False) -> Vectors:
         """Embed image files, reading each once (for both its cache key and decoding) and holding
         only ``chunk`` files' bytes at a time. ``progress(done, total)`` counts files."""
         parts = []
         for start in range(0, len(paths), chunk):
             blobs = [p.read_bytes() for p in paths[start : start + chunk]]
-            parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs]))
+            parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs], flip=flip))
             if progress:
                 progress(min(start + chunk, len(paths)), len(paths))
         return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
@@ -132,12 +145,23 @@ class Pipeline:
             hit.update(new)
         return np.stack([hit[k] for k in keys]) if texts else np.zeros((0, 0), np.float32)
 
+    def embed_descriptions(self, spec: str, descriptions: Sequence[str]) -> Vectors:
+        """One text vector per description: the normalised mean of its prompts (one per line)."""
+        groups = [prompts(d) or [d] for d in descriptions]
+        flat = self.embed_texts(spec, [t for g in groups for t in g])
+        out, at = [], 0
+        for g in groups:
+            v = flat[at : at + len(g)].mean(0)
+            out.append(v / max(float(np.linalg.norm(v)), 1e-12))
+            at += len(g)
+        return np.stack(out).astype(np.float32) if out else np.zeros((0, 0), np.float32)
+
     def example_embeddings(self, task: Task, cfg: TaskConfig | None = None,
                            progress: Progress | None = None) -> Vectors:
         """Embeddings of the task's examples, in ``task.config.examples`` order (or ``cfg``'s)."""
         cfg = cfg or task.config
         return self.embed_images(cfg.embedder, [(e.id, task.path / e.file) for e in cfg.examples],
-                                 progress=progress)
+                                 progress=progress, flip=cfg.flip)
 
     # ---- training data -----------------------------------------------
     def class_data(self, task: Task, exclude: set[int] | None = None, cfg: TaskConfig | None = None,
@@ -155,7 +179,7 @@ class Pipeline:
         text: dict[int, Vectors] = {}
         if spec_supports_text(cfg.embedder):
             text = self._indexed_texts(cfg.embedder, {i: c.description for i, c in enumerate(cfg.classes)
-                                                      if c.description.strip()})
+                                                      if prompts(c.description)})
         # A class with neither examples nor text (e.g. just created) has nothing to fit; leave it out.
         labelled = set(y.tolist())
         used = [i for i in range(len(classes)) if i in text or i in labelled]
@@ -174,7 +198,7 @@ class Pipeline:
         """Embed ``{class index: text}``, keeping the indices."""
         if not texts:
             return {}
-        return dict(zip(texts, self.embed_texts(spec, list(texts.values())), strict=True))
+        return dict(zip(texts, self.embed_descriptions(spec, list(texts.values())), strict=True))
 
     @staticmethod
     def _new_classifier(cfg: TaskConfig) -> Classifier:
@@ -196,12 +220,14 @@ class Pipeline:
         return clf
 
     # ---- prediction --------------------------------------------------
-    def predict(self, task: Task | str, images: Sequence[ImageInput]) -> list[Prediction]:
+    def predict(self, task: Task | str, images: Sequence[ImageInput], top_k: int | None = None,
+                progress: Progress | None = None) -> list[Prediction]:
         """Classify images given as bytes, file paths or PIL images.
 
         An image that cannot be read or decoded (including a missing file) gets a ``Prediction``
         with ``error`` set; the others are still classified. Classes with neither examples nor a
-        description are left out.
+        description are left out. ``top_k`` keeps only that many of the highest ``scores``;
+        ``progress`` counts images embedded (see ``embed_images``).
         """
         task = self.ws.get(task) if isinstance(task, str) else task
         cfg = task.config
@@ -209,36 +235,89 @@ class Pipeline:
         if not images:
             return []
         errors: dict[int, str] = {}
-        items: list[tuple[str | None, ImageInput]] = []
-        for i, im in enumerate(images):
-            if isinstance(im, (str, Path)):  # read once here: for the cache key and for decoding
-                try:
-                    data = Path(im).read_bytes()
-                except OSError as e:
-                    errors[i] = f"Could not read {im}: {e.strerror or e}"
-                    items.append((None, b""))
-                    continue
-                items.append((image_id(data), data))
-            else:  # PIL images are not cached
-                items.append((image_id(im) if isinstance(im, bytes) else None, im))
-        Q = self.embed_images(cfg.embedder, items, errors)
+        Q = self.embed_images(cfg.embedder, _keyed(images, errors), errors, progress, cfg.flip)
         probs, sims = clf.predict(Q)
-        return [Prediction.failed(errors[i]) if i in errors else self._to_pred(cfg, clf, p, s)
-                for i, (p, s) in enumerate(zip(probs, sims, strict=True))]
+        thr = threshold_for(cfg, clf)
+        return [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)
+                for i, row in enumerate(zip(probs, sims, clf.class_similarity(Q), strict=True))]
 
-    @staticmethod
-    def _to_pred(cfg: TaskConfig, clf: Classifier, p: np.ndarray, s: float) -> Prediction:
-        j = int(p.argmax())
-        thr = cfg.reject_below
-        rejected = thr is not None and float(s) < thr
-        return Prediction(
-            label=None if rejected else clf.classes[j],
-            top_label=clf.classes[j],
-            confidence=float(p[j]),
-            similarity=float(s),
-            rejected=rejected,
-            scores={c: float(v) for c, v in zip(clf.classes, p, strict=True)},
-        )
+    # ---- data checks -------------------------------------------------
+    def near_duplicates(self, task: Task, threshold: float = 0.95, limit: int = 500) -> list[dict[str, Any]]:
+        """Pairs of the task's examples whose embeddings have cosine similarity >= ``threshold``,
+        most similar first (at most ``limit``). Pairs with different labels are often labelling
+        mistakes; identical files are already stored once, so these are re-encodes, crops and the like.
+        """
+        cfg = task.config
+        X = self.example_embeddings(task, cfg)
+        exs = cfg.examples
+        pairs: list[tuple[float, int, int]] = []
+        for start in range(0, len(X), 1024):
+            S = X[start : start + 1024] @ X.T
+            rows, cols = np.nonzero(np.greater_equal(S, threshold))
+            for r, c in zip(rows.tolist(), cols.tolist(), strict=True):
+                if c > start + r:
+                    pairs.append((float(S[r, c]), start + r, c))
+        pairs.sort(key=lambda t: -t[0])
+        return [{"a": exs[i].id, "b": exs[j].id, "similarity": round(sim, 4),
+                 "labels": [exs[i].label, exs[j].label], "same_label": exs[i].label == exs[j].label}
+                for sim, i, j in pairs[:limit]]
+
+
+def threshold_for(cfg: TaskConfig, clf: Classifier) -> float | None:
+    """The reject threshold that applies to ``clf``'s predictions: the zero-shot one for a task
+    without images, otherwise ``reject_below``."""
+    return cfg.reject_below_zero_shot if clf.zero_shot else cfg.reject_below
+
+
+def _keyed(images: Sequence[ImageInput], errors: dict[int, str]) -> list[tuple[str | None, ImageInput]]:
+    """``(cache key, image)`` per image. Files are read here, once, for both the key and decoding;
+    one that can't be read gets a message in ``errors``. PIL images aren't cached."""
+    items: list[tuple[str | None, ImageInput]] = []
+    for i, im in enumerate(images):
+        if isinstance(im, (str, Path)):
+            try:
+                data = Path(im).read_bytes()
+            except OSError as e:
+                errors[i] = f"Could not read {im}: {e.strerror or e}"
+                items.append((None, b""))
+                continue
+            items.append((image_id(data), data))
+        else:
+            items.append((image_id(im) if isinstance(im, bytes) else None, im))
+    return items
+
+
+def _to_pred(clf: Classifier, thr: float | None, row: tuple[np.ndarray, float, np.ndarray],
+             top_k: int | None) -> Prediction:
+    """The prediction from one image's (probabilities, best similarity, similarity per class)."""
+    p, s, per_class = row
+    j = int(p.argmax())
+    rejected = thr is not None and float(s) < thr
+    label = None if rejected else clf.classes[j]
+    labels = [] if label is None else [label]
+    if thr is not None and label is not None:
+        order = np.argsort(-per_class, kind="stable")
+        labels += [clf.classes[i] for i in order if i != j and per_class[i] >= thr]
+    ranked = sorted(zip(clf.classes, p.tolist(), strict=True), key=lambda cv: -cv[1])
+    return Prediction(
+        label=label,
+        top_label=clf.classes[j],
+        confidence=float(p[j]),
+        similarity=float(s),
+        rejected=rejected,
+        scores=dict(ranked[:top_k] if top_k else ranked),
+        labels=labels,
+    )
+
+
+def _embed_decoded(emb: Embedder, images: list[Image.Image], flip: bool) -> Vectors:
+    """Embed decoded images; with ``flip``, average each with its mirror image."""
+    if not flip:
+        return emb.embed_images(images)
+    v = emb.embed_images(images + [ImageOps.mirror(im) for im in images])
+    v = v[: len(images)] + v[len(images) :]
+    out: Vectors = (v / np.linalg.norm(v, axis=1, keepdims=True).clip(1e-12)).astype(np.float32)
+    return out
 
 
 def _decode(todo: list[tuple[int, str | None, ImageInput]], errors: dict[int, str] | None

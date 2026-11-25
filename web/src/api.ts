@@ -3,23 +3,32 @@ export interface TaskSummary {
   n_classes: number; n_examples: number; counts: Record<string, number>; created: string;
 }
 export interface ClassInfo { name: string; description: string; count: number }
-export interface Example { id: string; label: string; file: string; source: string; added: string }
+export interface Example {
+  id: string; label: string; file: string; source: string; added: string; tags: string[]; note: string;
+}
 export interface TaskDetail {
   name: string; embedder: string; supports_text: boolean; classifier: string;
   classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
+  reject_below_zero_shot: number | null; flip: boolean; can_undo: boolean;
   revision: number; classes: ClassInfo[]; examples: Example[];
 }
 export interface Prediction {
   file: string; label: string | null; top_label: string; confidence: number;
-  similarity: number; rejected: boolean; scores: Record<string, number>;
+  similarity: number; rejected: boolean; scores: Record<string, number>; // scores: highest first
+  labels: string[]; // every class the image matches (with a reject threshold), label first
   error: string | null; // set when the image could not be read; the other fields are then empty
 }
+/** An example's prediction by a classifier fitted without it. */
+export interface HeldOut { id: string; true: string; pred: string; confidence: number; similarity: number; correct: boolean }
 export interface EvalReport {
-  method: string; n_scored: number; n_examples: number; accuracy: number | null; classes: string[];
-  confusion: number[][];
+  method: string; n_scored: number; n_examples: number; accuracy: number | null; macro_f1: number | null;
+  top_k_accuracy: Record<string, number>; classes: string[]; confusion: number[][];
   per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
-  mistakes: { id: string; true: string; pred: string; confidence: number }[];
+  mistakes: HeldOut[]; predictions: HeldOut[]; suggested_reject_below: number | null;
 }
+export interface DuplicatePair { a: string; b: string; similarity: number; labels: string[]; same_label: boolean }
+export interface Health { status: string; auth_required: boolean; models_loaded: string[]; jobs_running: number; url_fetch: boolean }
+export interface AddResult { added: Example[]; errors: { file: string; error: string }[]; task: TaskDetail }
 export interface Job<T> {
   id: string; task: string; kind: string; status: "running" | "done" | "failed" | "cancelled";
   stage: string; done: number; total: number; result: T | null; error: string | null;
@@ -82,14 +91,28 @@ export const api = {
   describe: (n: string, template: string, overwrite: boolean) =>
     req<TaskDetail>("POST", `${t(n)}/describe`, { template, overwrite }),
   deleteClass: (n: string, c: string) => req<TaskDetail>("DELETE", `${t(n)}/classes/${encodeURIComponent(c)}`),
-  addExamples: (n: string, label: string, fs: File[]) =>
-    req<{ added: Example[]; errors: { file: string; error: string }[]; task: TaskDetail }>(
-      "POST", `${t(n)}/examples`, files(fs, { label })),
+  addExamples: (n: string, label: string, fs: File[]) => req<AddResult>("POST", `${t(n)}/examples`, files(fs, { label })),
+  addExampleUrls: (n: string, label: string, urls: string[]) => req<AddResult>("POST", `${t(n)}/examples/urls`, { label, urls }),
   relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, { label }),
+  annotate: (n: string, id: string, p: { tags?: string[]; note?: string }) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, p),
+  tagMany: (n: string, ids: string[], add_tags: string[], remove_tags: string[] = []) =>
+    req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, add_tags, remove_tags }),
   deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", `${t(n)}/examples/${id}`),
   relabelMany: (n: string, ids: string[], label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, label }),
   deleteExamples: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/examples/delete`, { ids }),
   predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict`, files(fs)),
+  predictUrls: (n: string, urls: string[]) => req<Prediction[]>("POST", `${t(n)}/predict/urls`, { urls }),
+  duplicates: (n: string, threshold: number) => req<DuplicatePair[]>("GET", `${t(n)}/duplicates?threshold=${String(threshold)}`),
+  undo: (n: string) => req<TaskDetail>("POST", `${t(n)}/undo`),
+  rename: (n: string, name: string) => req<TaskDetail>("POST", `${t(n)}/rename`, { name }),
+  exportUrl: (n: string) => `${t(n)}/export`,
+  importTask: (file: File, name?: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (name) fd.append("name", name);
+    return req<TaskDetail>("POST", "/api/tasks/import", fd);
+  },
+  health: () => req<Health>("GET", "/api/health"),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
   startEvaluation: (n: string) => req<Job<EvalReport>>("POST", `${t(n)}/evaluate/jobs`),
   job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${id}`),

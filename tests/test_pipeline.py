@@ -76,12 +76,12 @@ def make_task(ws, name="t", embedder="fake:color", **settings):
 
 def test_prediction_to_dict():
     """to_dict exposes every field."""
-    p = Prediction("a", "a", 0.9, 0.8, False, {"a": 0.9, "b": 0.1})
+    p = Prediction("a", "a", 0.9, 0.8, False, {"a": 0.9, "b": 0.1}, ["a"])
     assert p.to_dict() == {"label": "a", "top_label": "a", "confidence": 0.9, "similarity": 0.8,
-                           "rejected": False, "scores": {"a": 0.9, "b": 0.1}, "error": None}
+                           "rejected": False, "scores": {"a": 0.9, "b": 0.1}, "labels": ["a"], "error": None}
     assert Prediction.failed("bad").to_dict() == {"label": None, "top_label": "", "confidence": 0.0,
                                                   "similarity": 0.0, "rejected": False, "scores": {},
-                                                  "error": "bad"}
+                                                  "labels": [], "error": "bad"}
 
 
 # ---- embeddings --------------------------------------------------------

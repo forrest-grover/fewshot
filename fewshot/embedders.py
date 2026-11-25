@@ -68,24 +68,57 @@ PRESETS: list[EmbedderInfo] = [
         False,
         "Image-only. Larger DINOv2.",
     ),
+    EmbedderInfo(
+        "timm:vit_large_patch14_dinov2.lvd142m",
+        "DINOv2 ViT-L/14",
+        False,
+        "Image-only. Largest DINOv2 preset: most accurate on fine-grained classes, about 3x slower than ViT-B.",
+    ),
+    EmbedderInfo(
+        "openclip:ViT-B-16-SigLIP2@webli",
+        "SigLIP 2 ViT-B/16 (WebLI)",
+        True,
+        "Usually more accurate than CLIP, with multilingual descriptions. Needs `pip install transformers` "
+        "for its tokenizer.",
+    ),
 ]
 
 DEFAULT_SPEC = PRESETS[0].spec
 
 
 def _device() -> str:
+    """``$FEWSHOT_DEVICE`` if set (e.g. ``cpu``, ``cuda:1``, ``mps``), else CUDA, then Apple's GPU
+    (MPS), then the CPU, whichever is available first."""
     import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if forced := os.environ.get("FEWSHOT_DEVICE", "").strip():
+        try:
+            torch.device(forced)
+        except RuntimeError as e:
+            raise ValueError(f"FEWSHOT_DEVICE={forced!r} is not a torch device: {e}") from None
+        return forced
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def _autocast(device: str) -> AbstractContextManager[Any]:
-    """Half-precision autocast on CUDA; a no-op context on CPU."""
-    if device != "cuda":
+    """Half-precision autocast on CUDA; a no-op context on other devices."""
+    if not device.startswith("cuda"):
         return contextlib.nullcontext()
     import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
     return torch.autocast("cuda", dtype=torch.float16)
+
+
+def _is_oom(e: BaseException) -> bool:
+    """Whether ``e`` is the GPU running out of memory (CUDA's own error, or MPS's RuntimeError)."""
+    import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
+
+    return isinstance(e, torch.cuda.OutOfMemoryError) or (
+        isinstance(e, RuntimeError) and "out of memory" in str(e).lower())
 
 
 def _l2(x: torch.Tensor) -> Vectors:
@@ -139,16 +172,33 @@ class Embedder(ABC):
         """
         if not images:
             return np.zeros((0, self.dim), dtype=np.float32)
-        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         out: list[Vectors] = []
-        for i in range(0, len(images), self.batch_size):
+        i = 0
+        while i < len(images):
             batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
-            prepared = self._prepare_images(batch)
+            out.append(self._embed_halving(self._prepare_images(batch), len(batch)))
+            i += len(batch)
+        return np.concatenate(out)
+
+    def _embed_halving(self, prepared: Any, n: int) -> Vectors:
+        """Embed a prepared batch of ``n`` images. If the GPU runs out of memory, free what it can,
+        halve ``batch_size`` for the rest of this embedder's life, and embed the batch in halves."""
+        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
+
+        try:
             with self._lock, torch.inference_mode():
                 vecs = self._embed_prepared(prepared)
-            out.append(self._checked(vecs, len(batch)))
-        return np.concatenate(out)
+        except Exception as e:  # pylint: disable=broad-exception-caught  # only OOM is handled; re-raised
+            if n == 1 or not _is_oom(e):
+                raise
+            del e  # the traceback holds the failed batch's GPU tensors
+            _free_gpu_memory()
+            half = n // 2
+            self.batch_size = max(1, min(self.batch_size, half))
+            return np.concatenate([self._embed_halving(prepared[:half], half),
+                                   self._embed_halving(prepared[half:], n - half)])
+        return self._checked(vecs, n)
 
     def embed_texts(self, texts: Sequence[str]) -> Vectors:
         """Embed texts into the image embedding space; raises NotImplementedError if unsupported."""
@@ -191,7 +241,13 @@ class OpenCLIPEmbedder(Embedder):
         )
         self.model.eval()
         self.tokenizer = open_clip.get_tokenizer(model_name)
-        self._dim = int(self.model.visual.output_dim)
+        dim = getattr(self.model.visual, "output_dim", None)
+        if dim is None:  # e.g. SigLIP's timm vision tower: measure it on a blank image
+            import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
+
+            with torch.inference_mode():
+                dim = self._embed_image_batch([Image.new("RGB", (32, 32))]).shape[1]
+        self._dim = int(dim)
 
     @property
     def dim(self) -> int:
@@ -249,14 +305,14 @@ class TimmEmbedder(Embedder):
 _loaded: dict[str, Embedder] = {}  # in least- to most-recently used order
 _load_lock = threading.Lock()  # guards the dicts here; never held while a model loads
 _spec_locks: dict[str, threading.Lock] = {}  # one per spec: two loads of one model wait for each other
+_registered: set[str] = set()  # specs whose embedder came from register_embedder
+_namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once computed
 
 
 def max_models() -> int:
     """Most built-in models kept loaded at once (``$FEWSHOT_MAX_MODELS``, default 2); loading
     another unloads the least recently used. Registered embedders don't count and stay loaded."""
     return max(1, int(os.environ.get("FEWSHOT_MAX_MODELS", "2")))
-_registered: set[str] = set()  # specs whose embedder came from register_embedder
-_namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once computed
 
 
 def _probe_image() -> Image.Image:

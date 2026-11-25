@@ -54,9 +54,10 @@ export function usePasteImages(onFiles: (files: File[]) => void) {
 }
 
 /** One result. ``file`` is what was classified (scaled down), and is also what "Add as" uploads,
- * so adding it reuses the embedding computed for the prediction. */
+ * so adding it reuses the embedding computed for the prediction. A result for an image URL has no
+ * ``file``: its ``url`` is the remote image, which "Add as" has the server fetch again. */
 export interface Item {
-  key: number; name: string; file: File; url: string; pred: Prediction; adding?: boolean; addedAs?: string;
+  key: number; name: string; file?: File; url: string; pred: Prediction; adding?: boolean; addedAs?: string;
 }
 
 /** Prediction results for one task, kept by the App so they survive switching tabs. */

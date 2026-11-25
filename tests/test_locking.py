@@ -14,7 +14,7 @@ import threading
 
 import pytest
 
-from fewshot import store
+from fewshot import fsutil
 from fewshot.store import Workspace
 from tests.conftest import png
 
@@ -130,7 +130,8 @@ def test_failed_save_rolls_back_and_cleans_up(pair, monkeypatch):
         t.upsert_class("two")
     assert t.class_names() == ["one"]
     assert t.config.revision == 2
-    assert sorted(os.listdir(t.path)) == [".lock", "images", "task.json"]
+    assert sorted(os.listdir(t.path)) == [".lock", "history", "images", "task.json"]
+    assert len(os.listdir(t.path / "history")) == 1  # just the version before "one"
 
 
 def test_delete_files_after_saving(pair, monkeypatch):
@@ -165,7 +166,7 @@ def test_waiting_writer_follows_a_recreated_task(pair):
         tb.upsert_class("late")
         done.set()
 
-    with store._file_lock(lock):  # pylint: disable=protected-access
+    with fsutil.file_lock(lock):  # pylint: disable=protected-access
         th = threading.Thread(target=write)
         th.start()
         started.wait()
@@ -223,6 +224,6 @@ def test_lock_file_is_closed_when_locking_fails(tmp_path, monkeypatch):
         raise OSError("no locks here")
 
     monkeypatch.setattr(fcntl, "flock", broken_flock)
-    with pytest.raises(OSError, match="no locks here"), store._file_lock(tmp_path / ".lock"):  # pylint: disable=protected-access
+    with pytest.raises(OSError, match="no locks here"), fsutil.file_lock(tmp_path / ".lock"):  # pylint: disable=protected-access
         pass  # pragma: no cover
     assert len(closed) == 1

@@ -9,11 +9,39 @@ from typing import Any
 
 import numpy as np
 
-from .classifiers import ClassData, make_classifier
+from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier
 from .pipeline import Pipeline
 from .store import IMAGE_EXTS, Task, TaskConfig, fill_template
 
 EvalProgress = Callable[[str, int, int], None]  # (stage, done, total); may raise to cancel
+TOP_K = (2, 3, 5)  # top-k accuracies reported, for k below the number of classes
+KEEP_CORRECT = 0.95  # the suggested reject threshold keeps this share of correct predictions
+
+
+@dataclass
+class HeldOut:
+    """Cross-validated results per example: predicted class index (-1 if a fold had too few
+    classes to train on), its probability, the similarity to the best match, and the rank of the
+    true class among the predictions (0 = top; the number of classes if it couldn't be predicted)."""
+
+    pred: np.ndarray
+    conf: np.ndarray
+    sim: np.ndarray
+    rank: np.ndarray
+
+    @classmethod
+    def empty(cls, n: int, n_classes: int) -> HeldOut:
+        """Results with nothing scored yet."""
+        return cls(np.full(n, -1), np.zeros(n), np.zeros(n), np.full(n, n_classes))
+
+    def record(self, rows: np.ndarray, probs: np.ndarray, sim: np.ndarray, truth: np.ndarray,
+               known: np.ndarray) -> None:
+        """Store results for examples ``rows`` from their probabilities over all classes; ``known``
+        says whether each one's true class was among those trained on."""
+        self.pred[rows] = probs.argmax(1)
+        self.conf[rows] = probs.max(1)
+        self.sim[rows] = sim
+        self.rank[rows] = _ranks(probs, truth, known)
 
 
 def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
@@ -49,26 +77,109 @@ def _folds(y: np.ndarray, k: int, seed: int) -> list[np.ndarray]:
 
 
 def _cross_val_predict(data: ClassData, cfg: TaskConfig, k: int, seed: int,
-                       progress: Callable[[int, int], None] | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Held-out predicted class index and confidence per example; -1 where a fold
-    left fewer than 2 classes to train on."""
-    n = len(data.y)
-    pred = np.full(n, -1)
-    conf = np.zeros(n)
+                       progress: Callable[[int, int], None] | None = None) -> HeldOut:
+    """Held-out predictions per example. A fold whose training part has fewer than 2 classes (or,
+    for a one-class task, none) leaves its examples unscored."""
+    n, C = len(data.y), len(data.classes)
+    if k >= n and not data.text and cfg.classifier in {"prototype", "knn"}:
+        return _fast_leave_one_out(data, cfg, progress)
+    out = HeldOut.empty(n, C)
     folds = _folds(data.y, k, seed)
     for done, test in enumerate(folds):
         if progress:
             progress(done, len(folds))
-        sub, back = _subset(data, np.setdiff1d(np.arange(n), test))
-        if len(sub.classes) < 2:
-            continue
-        clf = make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params).fit(sub)
-        p, _ = clf.predict(data.X[test])
-        pred[test] = back[p.argmax(1)]
-        conf[test] = p.max(1)
+        _fold(data, cfg, test, out)
     if progress:
         progress(len(folds), len(folds))
-    return pred, conf
+    return out
+
+
+def _fold(data: ClassData, cfg: TaskConfig, test: np.ndarray, out: HeldOut) -> None:
+    """Fit on every example but ``test`` and record the predictions for ``test`` in ``out``."""
+    C = len(data.classes)
+    sub, back = _subset(data, np.setdiff1d(np.arange(len(data.y)), test))
+    if len(sub.classes) < min(2, C):
+        return
+    p, s = make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params).fit(sub).predict(
+        data.X[test])
+    full = np.zeros((len(test), C))  # probabilities over all classes, 0 for those left out
+    full[:, back] = p
+    out.record(test, full, s, data.y[test], np.isin(data.y[test], back))
+
+
+def _ranks(probs: np.ndarray, truth: np.ndarray, known: np.ndarray) -> np.ndarray:
+    """Rank of each row's true class (0 = most probable); the number of classes where the true
+    class wasn't among those trained on (``known`` False)."""
+    true_p = probs[np.arange(len(truth)), truth]
+    ranks: np.ndarray = np.where(known, (probs > true_p[:, None]).sum(1), probs.shape[1])
+    return ranks
+
+
+def _fast_leave_one_out(data: ClassData, cfg: TaskConfig,
+                        progress: Callable[[int, int], None] | None) -> HeldOut:
+    """Leave-one-out for the prototype and kNN classifiers without refitting per example: each
+    example's own contribution is taken out of the fitted model. Gives the same results as
+    refitting, for tasks without text descriptions."""
+    clf = make_classifier(cfg.classifier, text_weight=cfg.text_weight, **cfg.classifier_params)
+    X, y = data.X.astype(np.float64), data.y
+    n, C = len(y), len(data.classes)
+    present = np.ones((n, C), bool)  # classes left with examples once example i is held out
+    present[np.arange(n), y] = np.bincount(y, minlength=C)[y] > 1
+    out = HeldOut.empty(n, C)
+    for start in range(0, n, 1024):
+        if progress:
+            progress(start, n)
+        rows = np.arange(start, min(start + 1024, n))
+        if isinstance(clf, PrototypeClassifier):
+            probs, sim = _loo_prototype(clf, X, y, rows, present[rows])
+        else:
+            assert isinstance(clf, KNNClassifier)
+            probs, sim = _loo_knn(clf, X, y, rows, present[rows])
+        ok = present[rows].sum(1) >= min(2, C)  # as many classes as refitting would need
+        out.record(rows[ok], probs[ok], sim[ok], y[rows[ok]], present[rows[ok], y[rows[ok]]])
+    if progress:
+        progress(n, n)
+    return out
+
+
+def _masked_softmax(z: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    z = np.where(mask, z, -np.inf)
+    z = z - np.max(z, axis=1, keepdims=True)
+    e = np.where(mask, np.exp(z), 0.0)
+    return e / e.sum(1, keepdims=True)
+
+
+def _loo_prototype(clf: PrototypeClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
+                   present: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Probabilities and best similarity for ``rows``, each against prototypes built without it."""
+    C = present.shape[1]
+    sums = np.zeros((C, X.shape[1]))
+    np.add.at(sums, y, X)
+    norms = np.linalg.norm(sums, axis=1).clip(1e-12)
+    xs = X[rows]
+    cos = (xs @ sums.T) / norms
+    own = sums[y[rows]] - xs  # the example's class sum without it
+    cos[np.arange(len(rows)), y[rows]] = (xs * own).sum(1) / np.linalg.norm(own, axis=1).clip(1e-12)
+    with np.errstate(invalid="ignore"):  # rows with no class present are dropped by the caller
+        probs = _masked_softmax(clf.scale * cos, present)
+    return probs, np.where(present, cos, -np.inf).max(1)
+
+
+def _loo_knn(clf: KNNClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
+             present: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Probabilities and best similarity for ``rows``, each voted on by the other examples."""
+    C = present.shape[1]
+    S = X[rows] @ X.T
+    S[np.arange(len(rows)), rows] = -np.inf  # not its own neighbour
+    k = min(clf.k, len(X) - 1)
+    if k < 1:  # a single example: nothing left to vote
+        return np.zeros((len(rows), C)), np.full(len(rows), -np.inf)
+    top = np.argpartition(-S, k - 1, axis=1)[:, :k]
+    top_s = np.take_along_axis(S, top, axis=1)
+    votes = np.exp(clf.scale * (top_s - top_s.max(axis=1, keepdims=True)))
+    scores = np.where(present, 1e-6, 0.0)  # the same floor as KNNClassifier, for classes still present
+    np.add.at(scores, (np.repeat(np.arange(len(rows)), k), y[top.ravel()]), votes.ravel())
+    return scores / scores.sum(1, keepdims=True), S.max(1)
 
 
 def _per_class(classes: list[str], cm: np.ndarray) -> dict[str, dict[str, Any]]:
@@ -84,17 +195,31 @@ def _per_class(classes: list[str], cm: np.ndarray) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _mistakes(cfg: TaskConfig, data: ClassData, pred: np.ndarray, conf: np.ndarray) -> list[dict[str, Any]]:
-    """Scored, misclassified examples, most confident first."""
+def _predictions(cfg: TaskConfig, data: ClassData, h: HeldOut) -> list[dict[str, Any]]:
+    """The held-out prediction for every scored example, in task order."""
     exs = cfg.examples
-    wrong = np.flatnonzero((pred >= 0) & (pred != data.y))
-    mistakes = [
-        {"id": exs[i].id, "true": data.classes[data.y[i]], "pred": data.classes[pred[i]],
-         "confidence": float(conf[i])}
-        for i in wrong
-    ]
-    mistakes.sort(key=lambda m: -m["confidence"])
-    return mistakes
+    return [{"id": exs[i].id, "true": data.classes[data.y[i]], "pred": data.classes[h.pred[i]],
+             "confidence": round(float(h.conf[i]), 4), "similarity": round(float(h.sim[i]), 4),
+             "correct": bool(h.pred[i] == data.y[i])}
+            for i in np.flatnonzero(h.pred >= 0)]
+
+
+def _macro_f1(cm: np.ndarray) -> float | None:
+    """Mean F1 over the classes with examples (None if none were scored)."""
+    support, predicted, tp = cm.sum(1), cm.sum(0), np.diag(cm)
+    has = support > 0
+    if not has.any():
+        return None
+    return float(np.mean(2 * tp[has] / (support[has] + predicted[has])))
+
+
+def _suggest_threshold(h: HeldOut, truth: np.ndarray) -> float | None:
+    """A reject threshold that keeps ``KEEP_CORRECT`` of the correct held-out predictions:
+    images less similar to the task's examples than nearly all real members are likely outsiders."""
+    ok = (h.pred >= 0) & (h.pred == truth)
+    if not ok.any():
+        return None
+    return round(float(np.quantile(h.sim[ok], 1 - KEEP_CORRECT)), 3)
 
 
 def _confusion(truth: np.ndarray, pred: np.ndarray, n_classes: int) -> np.ndarray:
@@ -128,19 +253,24 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     if n == 0:
         raise ValueError("Task has no examples to evaluate")
     k = folds or (n if n <= 300 else 5)
-    pred, conf = _cross_val_predict(data, cfg, k, seed, _stage(progress, "evaluating"))
+    h = _cross_val_predict(data, cfg, k, seed, _stage(progress, "evaluating"))
 
-    scored = pred >= 0
-    cm = _confusion(data.y[scored], pred[scored], C)
+    scored = h.pred >= 0
+    cm = _confusion(data.y[scored], h.pred[scored], C)
+    predictions = _predictions(cfg, data, h)
     return {
         "method": "leave-one-out" if k >= n else f"{k}-fold",
         "n_scored": int(scored.sum()),
         "n_examples": n,
-        "accuracy": float((pred[scored] == data.y[scored]).mean()) if scored.any() else None,
+        "accuracy": float((h.pred[scored] == data.y[scored]).mean()) if scored.any() else None,
+        "macro_f1": _macro_f1(cm),
+        "top_k_accuracy": {str(t): float((h.rank[scored] < t).mean()) for t in TOP_K if t < C and scored.any()},
         "classes": data.classes,
         "confusion": cm.tolist(),
         "per_class": _per_class(data.classes, cm),
-        "mistakes": _mistakes(cfg, data, pred, conf),
+        "mistakes": sorted((p for p in predictions if not p["correct"]), key=lambda m: -m["confidence"]),
+        "predictions": predictions,
+        "suggested_reject_below": _suggest_threshold(h, data.y),
     }
 
 
@@ -164,17 +294,19 @@ class _EpisodeSampler:
     T: np.ndarray | None  # one text embedding per class, or None
 
     @classmethod
-    def embed(cls, pipe: Pipeline, ds: dict[str, list[Path]], embedder: str, text_template: str | None,
-              progress: Callable[[str], None] | None) -> _EpisodeSampler:
-        """Embed every image in ``ds`` (and each class's ``text_template`` text, if given)."""
+    def embed(cls, pipe: Pipeline, ds: dict[str, list[Path]], embedder: str,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+              text_template: str | None, progress: Callable[[str], None] | None, flip: bool = False
+              ) -> _EpisodeSampler:
+        """Embed every image in ``ds`` (and each class's ``text_template`` text, if given; a
+        template of several lines gives several prompts, which are averaged)."""
         names = sorted(ds)
         files = [f for c in names for f in ds[c]]
         if progress:
             progress(f"Embedding {len(files)} images with {embedder} (cached after first run)")
-        E = pipe.embed_files(embedder, files)
+        E = pipe.embed_files(embedder, files, flip=flip)
         T = None
         if text_template:
-            T = pipe.embed_texts(embedder, [fill_template(text_template, c) for c in names])
+            T = pipe.embed_descriptions(embedder, [fill_template(text_template, c) for c in names])
         return cls(names, [len(ds[c]) for c in names], E, T)
 
     def sample(self, rng: np.random.Generator, way: int, shot: int, query: int
@@ -207,12 +339,13 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     text_weight: float = 1.0,
     seed: int = 0,
     progress: Callable[[str], None] | None = None,
+    flip: bool = False,
     **classifier_params: Any,
 ) -> dict[str, Any]:
     """Mean accuracy over random N-way K-shot episodes from ``folder/<class>/*``.
 
     ``shot=0`` with a ``text_template`` such as ``"a photo of a {}"`` measures
-    CLIP zero-shot accuracy.
+    CLIP zero-shot accuracy. ``flip`` averages each image with its mirror image.
     """
     for arg, value, low in (("way", way, 2), ("shot", shot, 0), ("query", query, 1), ("episodes", episodes, 1)):
         if value < low:
@@ -220,7 +353,7 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     ds = {c: fs for c, fs in load_folder_dataset(folder).items() if len(fs) >= shot + query}
     if len(ds) < way:
         raise ValueError(f"Only {len(ds)} classes have >= {shot + query} images; need {way}")
-    sampler = _EpisodeSampler.embed(pipe, ds, embedder, text_template, progress)
+    sampler = _EpisodeSampler.embed(pipe, ds, embedder, text_template, progress, flip)
 
     rng = np.random.default_rng(seed)
     accs = []
@@ -231,7 +364,7 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     a = np.array(accs)
     return {
         "embedder": embedder, "classifier": classifier, "way": way, "shot": shot, "query": query,
-        "episodes": episodes, "text_template": text_template,
+        "episodes": episodes, "text_template": text_template, "flip": flip,
         "accuracy": float(a.mean()),
         "ci95": float(1.96 * a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0,
     }

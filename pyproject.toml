@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint", "ruff", "mypy"]
+siglip = ["transformers"]  # tokenizer of the SigLIP 2 preset
 
 [project.scripts]
 fewshot = "fewshot.cli:app"

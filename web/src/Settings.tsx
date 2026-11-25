@@ -3,7 +3,7 @@ import { api, type ModelInfo, type TaskDetail } from "./api";
 
 interface Props {
   task: TaskDetail; models: ModelInfo | null; setTask: (t: TaskDetail) => void;
-  run: <T>(p: Promise<T>) => Promise<T | undefined>; onDeleted: () => void;
+  run: <T>(p: Promise<T>) => Promise<T | undefined>; onDeleted: () => void; onRenamed: (t: TaskDetail) => void;
 }
 
 const PARAMS: Record<string, { key: string; label: string; help: string; def: number }[]> = {
@@ -26,13 +26,18 @@ function parseNumber(s: string): number | null {
   return t === "" ? null : Number(t);
 }
 
-export default function Settings({ task, models, setTask, run, onDeleted }: Props) {
+const optional = (v: number | null) => (v == null ? "" : String(v));
+
+export default function Settings({ task, models, setTask, run, onDeleted, onRenamed }: Props) {
   const [embedder, setEmbedder] = useState(task.embedder);
   const [classifier, setClassifier] = useState(task.classifier);
   // Inputs keep exactly what was typed; it is parsed and checked on save.
   const [params, setParams] = useState<Record<string, string>>(paramTexts(task.classifier_params));
   const [textWeight, setTextWeight] = useState(task.text_weight);
-  const [reject, setReject] = useState(task.reject_below == null ? "" : String(task.reject_below));
+  const [reject, setReject] = useState(optional(task.reject_below));
+  const [rejectZero, setRejectZero] = useState(optional(task.reject_below_zero_shot));
+  const [flip, setFlip] = useState(task.flip);
+  const [newName, setNewName] = useState(task.name);
   const [saving, setSaving] = useState(false);
 
   // Reset the form whenever the saved task changes (another task, or a new revision after a save).
@@ -42,7 +47,8 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
   if (formKey !== taskKey) {
     setFormKey(taskKey);
     setEmbedder(task.embedder); setClassifier(task.classifier); setParams(paramTexts(task.classifier_params));
-    setTextWeight(task.text_weight); setReject(task.reject_below == null ? "" : String(task.reject_below));
+    setTextWeight(task.text_weight); setReject(optional(task.reject_below));
+    setRejectZero(optional(task.reject_below_zero_shot)); setFlip(task.flip); setNewName(task.name);
   }
 
   const presets = models?.embedders ?? [];
@@ -63,6 +69,10 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
   }
   const rejectValue = parseNumber(reject);
   if (rejectValue !== null && !Number.isFinite(rejectValue)) problems.push("Reject below must be a number, or blank for off");
+  const rejectZeroValue = parseNumber(rejectZero);
+  if (rejectZeroValue !== null && !Number.isFinite(rejectZeroValue)) {
+    problems.push("Zero-shot reject below must be a number, or blank for off");
+  }
 
   const save = async () => {
     setSaving(true);
@@ -70,6 +80,8 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
       embedder, classifier, classifier_params: parsedParams,
       text_weight: textWeight,
       ...(rejectValue === null ? { clear_reject: true } : { reject_below: rejectValue }),
+      ...(rejectZeroValue === null ? { clear_reject_zero_shot: true } : { reject_below_zero_shot: rejectZeroValue }),
+      flip,
     }));
     setSaving(false);
     if (t) setTask(t);
@@ -120,8 +132,25 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
         <input type="text" inputMode="decimal" value={reject} placeholder="off" onChange={(e) => { setReject(e.target.value); }} />
         <small className="muted">
           Images whose best similarity falls below this value are returned as "unknown". Start near 0.7 for image examples, and tune it
-          with the similarity values shown on the Predict tab. Tasks that only have text descriptions score lower (about 0.2–0.35).
+          with the similarity values shown on the Predict tab, or use the value the Evaluate tab suggests. Several classes above it are
+          all listed (multi-label). With a single class, this is what separates members from everything else.
         </small>
+      </label>
+
+      <label className={supportsText ? "" : "disabled"}>
+        <span>Reject below similarity, zero-shot</span>
+        <input type="text" inputMode="decimal" value={rejectZero} placeholder="off" disabled={!supportsText}
+          onChange={(e) => { setRejectZero(e.target.value); }} />
+        <small className="muted">
+          The same, for a task with descriptions but no example images. Image-to-text similarities are much lower (about 0.2–0.35
+          for CLIP), so this needs its own value, e.g. 0.22.
+        </small>
+      </label>
+
+      <label className="check">
+        <input type="checkbox" checked={flip} onChange={(e) => { setFlip(e.target.checked); }} />
+        <span>Average each image with its mirror image</span>
+        <small className="muted check-help">Often a little more accurate when left and right don't matter (most photos). Embedding takes twice as long.</small>
       </label>
 
       {problems.length > 0 && <div className="error" role="alert"><span>{problems.join(". ")}.</span></div>}
@@ -130,9 +159,24 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
       </div>
 
       <hr />
+      <form className="row" onSubmit={(e) => {
+        e.preventDefault();
+        void run(api.rename(task.name, newName.trim())).then((t) => { if (t) onRenamed(t); });
+      }}>
+        <label className="grow">
+          <span>Task name</span>
+          <input value={newName} onChange={(e) => { setNewName(e.target.value); }} pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" required />
+        </label>
+        <button type="submit" className="secondary" disabled={!newName.trim() || newName.trim() === task.name}>Rename</button>
+      </form>
+      <div className="row">
+        <a className="button secondary" href={api.exportUrl(task.name)} download={`${task.name}.zip`}>Export as zip</a>
+        <span className="muted">Settings, classes, labels and images, for backup or to import into another workspace.</span>
+      </div>
+      <hr />
       <div className="row">
         <button className="danger" onClick={() => {
-          if (confirm(`Delete task "${task.name}" and all ${String(task.examples.length)} images? This cannot be undone.`)) {
+          if (confirm(`Delete task "${task.name}" and all ${String(task.examples.length)} images? This cannot be undone (export it first to keep a copy).`)) {
             void run(api.deleteTask(task.name).then(() => true)).then((ok) => { if (ok) onDeleted(); });
           }
         }}>Delete task</button>

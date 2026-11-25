@@ -18,6 +18,7 @@ export default function Examples({ task, setTask, run }: Props) {
   const [shown, setShown] = useState<Partial<Record<string, number>>>({}); // class -> thumbnails shown
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set()); // selected example ids
   const [dropOn, setDropOn] = useState<string | null>(null); // class card under a drag
+  const [tagFilter, setTagFilter] = useState(""); // show only examples with this tag
   const pointed = useRef<string | null>(null); // class card last hovered or focused: where a paste goes
   const anchor = useRef<string | null>(null); // last ticked example, for Shift+click ranges
 
@@ -44,14 +45,34 @@ export default function Examples({ task, setTask, run }: Props) {
   };
   const fail = (message: string) => { void run(Promise.reject(new Error(message))); };
 
+  const allTags = [...new Set(task.examples.flatMap((e) => e.tags))].sort();
+  const filter = allTags.includes(tagFilter) ? tagFilter : "";
   const byClass = new Map<string, Example[]>(task.classes.map((c) => [c.name, []]));
-  for (const e of task.examples) byClass.get(e.label)?.push(e);
+  for (const e of task.examples) if (!filter || e.tags.includes(filter)) byClass.get(e.label)?.push(e);
   const labelOf = new Map(task.examples.map((e) => [e.id, e.label]));
   const selection = [...picked].filter((id) => labelOf.has(id)); // ids still in the task
 
   const move = async (ids: string[], label: string) => {
     const moving = ids.filter((id) => labelOf.get(id) !== label);
     if (moving.length && (await save(api.relabelMany(task.name, moving, label)))) setPicked(new Set());
+  };
+  const tagSelection = async (ids: string[]) => {
+    const text = prompt(`Tags to add to ${String(ids.length)} example${ids.length === 1 ? "" : "s"} (comma-separated; prefix with - to remove)`);
+    if (!text) return;
+    const words = text.split(",").map((w) => w.trim()).filter(Boolean);
+    const add = words.filter((w) => !w.startsWith("-"));
+    const drop = words.filter((w) => w.startsWith("-")).map((w) => w.slice(1).trim()).filter(Boolean);
+    if (add.length || drop.length) await save(api.tagMany(task.name, ids, add, drop));
+  };
+  /** Edit one example's tags and note in two prompts (Cancel keeps a value as it was). */
+  const annotate = async (ex: Example) => {
+    const tags = prompt("Tags (comma-separated)", ex.tags.join(", "));
+    const note = prompt("Note", ex.note);
+    if (tags === null && note === null) return;
+    await save(api.annotate(task.name, ex.id, {
+      ...(tags === null ? {} : { tags: tags.split(",").map((w) => w.trim()).filter(Boolean) }),
+      ...(note === null ? {} : { note }),
+    }));
   };
   const remove = async (ids: string[]) => {
     if (!confirm(`Delete ${String(ids.length)} example${ids.length === 1 ? "" : "s"}?`)) return;
@@ -136,7 +157,9 @@ export default function Examples({ task, setTask, run }: Props) {
             className="secondary"
             title="Fill empty descriptions from the class names. CLIP uses them as text prompts."
             onClick={() => {
-              const tpl = prompt("Description template ({} = class name)", "a photo of a {}");
+              // Several templates, separated by "|", become several prompts per class.
+              const tpl = prompt("Description template ({} = class name; separate several with |)", "a photo of a {} | a close-up photo of a {}")
+                ?.split("|").map((x) => x.trim()).filter(Boolean).join("\n");
               if (tpl) void save(api.describe(task.name, tpl, false));
             }}
           >
@@ -151,6 +174,17 @@ export default function Examples({ task, setTask, run }: Props) {
           {task.supports_text && " With CLIP, a class can also work from its text description alone."}
         </p>
       )}
+      {allTags.length > 0 && (
+        <div className="row tag-filter">
+          <label className="inline">
+            <span>Show</span>
+            <select value={filter} onChange={(e) => { setTagFilter(e.target.value); }}>
+              <option value="">all examples</option>
+              {allTags.map((t) => <option key={t} value={t}>tagged “{t}”</option>)}
+            </select>
+          </label>
+        </div>
+      )}
       {task.examples.length > 0 && selection.length === 0 && (
         <p className="muted keys">
           Drag a thumbnail onto another class to move it. Tick several (Shift+click for a range) to move or delete them
@@ -164,6 +198,7 @@ export default function Examples({ task, setTask, run }: Props) {
             <option value="">Move to…</option>
             {task.classes.map((c, i) => <option key={c.name} value={c.name}>{i < 9 ? `${String(i + 1)} · ` : ""}{c.name}</option>)}
           </select>
+          <button className="small secondary" onClick={() => { void tagSelection(selection); }}>Tag…</button>
           <button className="small danger" onClick={() => { void remove(selection); }}>Delete</button>
           <button className="ghost small" onClick={() => { setPicked(new Set()); }}>Clear selection <kbd>Esc</kbd></button>
         </div>
@@ -185,7 +220,7 @@ export default function Examples({ task, setTask, run }: Props) {
             <header>
               {ci < 9 && <kbd title={`Press ${String(ci + 1)} to move ticked examples here`}>{ci + 1}</kbd>}
               <h3>{c.name}</h3>
-              <span className="muted">{c.count} example{c.count === 1 ? "" : "s"}</span>
+              <span className="muted">{c.count} example{c.count === 1 ? "" : "s"}{filter ? ` (${String(list.length)} tagged)` : ""}</span>
               <span className="spacer" />
               {list.length > 0 && (
                 <button className="ghost small" onClick={() => {
@@ -205,15 +240,16 @@ export default function Examples({ task, setTask, run }: Props) {
               }}>Delete</button>
             </header>
             {task.supports_text && (
-              <input
+              <textarea
                 className="desc"
                 key={c.description}
                 defaultValue={c.description}
-                placeholder="Text description used as a CLIP prompt, e.g. 'a photo of a cracked weld' (optional)"
+                rows={Math.max(1, c.description.split("\n").length)}
+                placeholder="Text description used as a CLIP prompt, e.g. 'a photo of a cracked weld' (optional; one prompt per line, Shift+Enter for a new line)"
                 onBlur={(e) => {
                   if (e.target.value !== c.description) void save(api.patchClass(task.name, c.name, { description: e.target.value }));
                 }}
-                onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); } }}
               />
             )}
             <div className="thumbs">
@@ -238,8 +274,14 @@ export default function Examples({ task, setTask, run }: Props) {
                       onChange={() => { /* handled on click, which knows about Shift */ }}
                     />
                   </label>
+                  {(ex.tags.length > 0 || ex.note) && (
+                    <span className="tags" title={[ex.tags.join(", "), ex.note].filter(Boolean).join("\n")}>
+                      {ex.tags.length > 0 ? ex.tags.join(", ") : "note"}
+                    </span>
+                  )}
                   <img
                     src={api.imageUrl(task.name, ex.id, THUMB_SIZE)}
+                    title={[ex.source, ex.note].filter(Boolean).join(" · ") || undefined}
                     alt={ex.source || ex.id}
                     loading="lazy"
                     draggable={false}
@@ -253,16 +295,17 @@ export default function Examples({ task, setTask, run }: Props) {
                     >
                       {task.classes.map((k) => <option key={k.name}>{k.name}</option>)}
                     </select>
+                    <button className="ghost small" aria-label="Tags and note" title="Tags and note" onClick={() => { void annotate(ex); }}>✎</button>
                     <button className="ghost small danger" aria-label="Delete example" onClick={() => { void save(api.deleteExample(task.name, ex.id)); }}>×</button>
                   </figcaption>
                 </figure>
               ))}
-              {c.count > limit && (
+              {list.length > limit && (
                 <button
                   className="secondary more"
                   onClick={() => { setShown((s) => ({ ...s, [c.name]: limit + PAGE * 4 })); }}
                 >
-                  Show more ({c.count - limit} hidden)
+                  Show more ({list.length - limit} hidden)
                 </button>
               )}
               <DropZone compact onFiles={(fs) => { void upload(c.name, fs); }}>

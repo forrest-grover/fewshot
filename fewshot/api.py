@@ -12,6 +12,9 @@ variables, read when this module is imported (``fewshot serve`` sets them from i
     arbitrary models.
 ``FEWSHOT_WARM=1``
     At startup, load the models existing tasks use (in the background).
+``FEWSHOT_ALLOW_URLS=1``
+    Accept image URLs (``.../predict/urls``, ``.../examples/urls``): the server downloads them,
+    from public addresses only.
 ``FEWSHOT_MAX_UPLOAD_MB`` / ``FEWSHOT_MAX_REQUEST_MB``
     Largest image per upload (default 50) and largest request body (default 1024).
 """
@@ -21,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -32,11 +36,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .archive import export_task as write_export
+from .archive import import_task as read_export
 from .classifiers import CLASSIFIERS
 from .embedders import (
     DEFAULT_SPEC,
@@ -49,14 +55,29 @@ from .embedders import (
     spec_supports_text,
 )
 from .evaluate import evaluate_task
+from .fetch import fetch_url
 from .pipeline import Pipeline, Prediction
-from .store import Task, Workspace, thumbnail
+from .schemas import (
+    AddResult,
+    DuplicatePair,
+    EvalReport,
+    ExamplePage,
+    Health,
+    JobOut,
+    ModelsOut,
+    PredictionOut,
+    TaskDetail,
+    TaskSummary,
+)
+from .store import MAX_NOTE, Task, Workspace, thumbnail
 
 log = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("FEWSHOT_TOKEN") or None
 ALLOW_ANY_MODEL = os.environ.get("FEWSHOT_ALLOW_ANY_MODEL") == "1"
 WARM = os.environ.get("FEWSHOT_WARM") == "1"
+ALLOW_URLS = os.environ.get("FEWSHOT_ALLOW_URLS") == "1"
+MAX_URLS = 100  # per request
 MAX_REQUEST_BYTES = int(float(os.environ.get("FEWSHOT_MAX_REQUEST_MB", "1024")) * 1024 * 1024)
 
 ws = Workspace()
@@ -223,21 +244,24 @@ def _detail(t: Task) -> dict[str, Any]:
         "classifier_params": c.classifier_params,
         "text_weight": c.text_weight,
         "reject_below": c.reject_below,
+        "reject_below_zero_shot": c.reject_below_zero_shot,
+        "flip": c.flip,
         "revision": c.revision,
+        "can_undo": t.can_undo(),
         "classes": [{"name": k.name, "description": k.description, "count": counts.get(k.name, 0)} for k in c.classes],
         "examples": [e.model_dump() for e in c.examples],
     }
 
 
 # ---- metadata -----------------------------------------------------------
-@app.get("/api/health")
+@app.get("/api/health", response_model=Health)
 @app.get("/healthz", include_in_schema=False)
 def health() -> dict[str, Any]:
     """Liveness check; also lists loaded models and running jobs. Needs no token."""
     with _jobs_lock:
         running = sum(j.status == "running" for j in _jobs.values())
     return {"status": "ok", "auth_required": TOKEN is not None, "models_loaded": loaded_embedders(),
-            "jobs_running": running}
+            "jobs_running": running, "url_fetch": ALLOW_URLS}
 
 
 class Login(_Body):
@@ -261,7 +285,7 @@ def logout(response: Response) -> None:
     response.delete_cookie(AUTH_COOKIE)
 
 
-@app.get("/api/models")
+@app.get("/api/models", response_model=ModelsOut)
 def models() -> dict[str, Any]:
     """List embedder presets and classifier names."""
     return {
@@ -288,15 +312,24 @@ class TaskSettings(_Body):
     text_weight: float | None = None
     reject_below: float | None = None
     clear_reject: bool = False
+    reject_below_zero_shot: float | None = None
+    clear_reject_zero_shot: bool = False
+    flip: bool | None = None
 
 
-@app.get("/api/tasks")
+class Rename(_Body):
+    """Body of POST .../rename."""
+
+    name: str
+
+
+@app.get("/api/tasks", response_model=list[TaskSummary])
 def list_tasks() -> list[dict[str, Any]]:
     """Summaries of all tasks."""
     return [t.summary() for t in ws.list_tasks()]
 
 
-@app.post("/api/tasks", status_code=201)
+@app.post("/api/tasks", status_code=201, response_model=TaskDetail)
 def create_task(body: TaskCreate) -> dict[str, Any]:
     """Create a task, validating the embedder spec first."""
     kw = {"classifier": body.classifier}
@@ -309,21 +342,23 @@ def create_task(body: TaskCreate) -> dict[str, Any]:
         raise _bad(e) from e
 
 
-@app.get("/api/tasks/{name}")
+@app.get("/api/tasks/{name}", response_model=TaskDetail)
 def get_task(name: str) -> dict[str, Any]:
     """Full detail of one task."""
     return _detail(_task(name))
 
 
-@app.patch("/api/tasks/{name}")
+@app.patch("/api/tasks/{name}", response_model=TaskDetail)
 def update_task(name: str, body: TaskSettings) -> dict[str, Any]:
     """Change task settings; switching classifier resets its params unless new ones are given."""
     t = _task(name)
-    kw = body.model_dump(exclude_none=True, exclude={"clear_reject"})
-    if body.clear_reject:
-        if body.reject_below is not None:
-            raise HTTPException(400, "Give either reject_below or clear_reject, not both")
-        kw["reject_below"] = None
+    kw = body.model_dump(exclude_none=True, exclude={"clear_reject", "clear_reject_zero_shot"})
+    for key in ("reject_below", "reject_below_zero_shot"):
+        if getattr(body, key.replace("reject_below", "clear_reject")):
+            if getattr(body, key) is not None:
+                raise HTTPException(400, f"Give either {key} or {key.replace('reject_below', 'clear_reject')}, "
+                                         "not both")
+            kw[key] = None
     if "classifier" in kw and "classifier_params" not in kw and kw["classifier"] != t.config.classifier:
         kw["classifier_params"] = {}
     if "embedder" in kw and kw["embedder"] != t.config.embedder:
@@ -342,6 +377,62 @@ def delete_task(name: str) -> None:
     ws.delete(name)
 
 
+@app.post("/api/tasks/{name}/rename", response_model=TaskDetail)
+def rename_task(name: str, body: Rename) -> dict[str, Any]:
+    """Rename a task (400 if the new name is bad or taken)."""
+    _task(name)
+    try:
+        return _detail(ws.rename(name, body.name))
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
+
+
+@app.post("/api/tasks/{name}/undo", response_model=TaskDetail)
+def undo(name: str) -> dict[str, Any]:
+    """Undo the task's last change (400 if there is nothing to undo)."""
+    t = _task(name)
+    try:
+        t.undo()
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
+    return _detail(t)
+
+
+@app.get("/api/tasks/{name}/export", response_class=StreamingResponse,
+         responses={200: {"content": {"application/zip": {}}}})
+def export_task(name: str) -> StreamingResponse:
+    """Download the task (settings, classes, labels and images) as a zip, for backup or to move it."""
+    _task(name)
+    buf = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)  # noqa: SIM115  # pylint: disable=consider-using-with  # closed by the response
+    try:
+        write_export(ws, name, buf)
+    except KeyError as e:
+        buf.close()
+        raise _missing(e) from e
+    buf.seek(0)
+
+    def chunks() -> Iterator[bytes]:
+        with buf:
+            while chunk := buf.read(1024 * 1024):
+                yield chunk
+
+    return StreamingResponse(chunks(), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
+
+
+@app.post("/api/tasks/import", status_code=201, response_model=TaskDetail)
+def import_task(file: UploadFile = File(...), name: str | None = Form(None)) -> dict[str, Any]:
+    """Create a task from a zip made by .../export, named ``name`` or as exported."""
+    try:
+        return _detail(read_export(ws, file.file, name or None))
+    except ValueError as e:
+        raise _bad(e) from e
+
+
 # ---- classes ------------------------------------------------------------
 class ClassBody(_Body):
     """Body of POST .../classes."""
@@ -357,7 +448,7 @@ class ClassPatch(_Body):
     description: str | None = None
 
 
-@app.post("/api/tasks/{name}/classes", status_code=201)
+@app.post("/api/tasks/{name}/classes", status_code=201, response_model=TaskDetail)
 def add_class(name: str, body: ClassBody) -> dict[str, Any]:
     """Add a class, or update the description of an existing one."""
     t = _task(name)
@@ -368,7 +459,7 @@ def add_class(name: str, body: ClassBody) -> dict[str, Any]:
     return _detail(t)
 
 
-@app.patch("/api/tasks/{name}/classes/{label}")
+@app.patch("/api/tasks/{name}/classes/{label}", response_model=TaskDetail)
 def patch_class(name: str, label: str, body: ClassPatch) -> dict[str, Any]:
     """Rename a class (relabelling its examples) and/or set its description."""
     t = _task(name)
@@ -393,7 +484,7 @@ class Describe(_Body):
     overwrite: bool = False
 
 
-@app.post("/api/tasks/{name}/describe")
+@app.post("/api/tasks/{name}/describe", response_model=TaskDetail)
 def describe_classes(name: str, body: Describe) -> dict[str, Any]:
     """Fill class descriptions from a template such as 'a photo of a {}'."""
     t = _task(name)
@@ -404,7 +495,7 @@ def describe_classes(name: str, body: Describe) -> dict[str, Any]:
     return _detail(t)
 
 
-@app.delete("/api/tasks/{name}/classes/{label}")
+@app.delete("/api/tasks/{name}/classes/{label}", response_model=TaskDetail)
 def delete_class(name: str, label: str) -> dict[str, Any]:
     """Delete a class and all of its examples."""
     t = _task(name)
@@ -416,32 +507,28 @@ def delete_class(name: str, label: str) -> dict[str, Any]:
 
 
 # ---- examples -----------------------------------------------------------
-@app.post("/api/tasks/{name}/examples", status_code=201)
-def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    """Upload images as examples of ``label``; unreadable files are reported in ``errors``.
+@app.get("/api/tasks/{name}/examples", response_model=ExamplePage)
+def list_examples(name: str, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000),
+                  label: str | None = None, tag: str | None = None) -> dict[str, Any]:
+    """One page of the task's examples, optionally only those with ``label`` and/or ``tag``."""
+    found = _task(name).find_examples(label, tag)
+    return {"total": len(found), "offset": offset,
+            "examples": [e.model_dump() for e in found[offset : offset + limit]]}
 
-    Returns 400 when the label is blank or no file could be added.
-    """
-    t = _task(name)
+
+Blob = tuple[str | None, bytes | None, str | None]  # (file name, bytes or None, error if None)
+
+
+def _add_blobs(t: Task, label: str, blobs: list[Blob]) -> dict[str, Any]:
+    """Add the readable ``blobs`` as examples of ``label``; 400 if none could be added."""
     if not label.strip():
         raise HTTPException(400, "Class name is empty")
+    errors: list[dict[str, str | None]] = [{"file": f, "error": err} for f, data, err in blobs if data is None]
+    ok = [(f, data) for f, data, _ in blobs if data is not None]
     added: list[dict[str, Any]] = []
-    errors: list[dict[str, str | None]] = []
-    readable: list[UploadFile] = []  # in step with add_examples' results
-
-    def items() -> Iterator[tuple[bytes, str, str]]:
-        for f in files:
-            data = _read_upload(f)
-            if data is None:
-                errors.append({"file": f.filename, "error": _too_large()})
-                continue
-            readable.append(f)
-            yield data, label, f.filename or ""
-
-    results = t.add_examples(items())
-    for f, r in zip(readable, results, strict=True):
+    for (f, _), r in zip(ok, t.add_examples((data, label, f or "") for f, data in ok), strict=True):
         if isinstance(r, ValueError):
-            errors.append({"file": f.filename, "error": str(r)})
+            errors.append({"file": f, "error": str(r)})
         else:
             added.append(r.model_dump())
     if not added:
@@ -449,18 +536,74 @@ def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = Fi
     return {"added": added, "errors": errors, "task": _detail(t)}
 
 
-class Relabel(_Body):
-    """Body of PATCH .../examples/{eid}."""
+def _uploads(files: list[UploadFile]) -> list[Blob]:
+    out: list[Blob] = []
+    for f in files:
+        data = _read_upload(f)
+        out.append((f.filename, data, None if data is not None else _too_large()))
+    return out
+
+
+def _downloads(urls: list[str]) -> list[Blob]:
+    """Fetch image URLs for the server (public addresses only); 403 unless ALLOW_URLS."""
+    if not ALLOW_URLS:
+        raise HTTPException(403, "This server doesn't fetch URLs; start it with --allow-urls "
+                                 "(FEWSHOT_ALLOW_URLS=1)")
+    out: list[Blob] = []
+    for url in urls:
+        try:
+            out.append((url, fetch_url(url, MAX_UPLOAD_BYTES, public_only=True), None))
+        except ValueError as e:
+            out.append((url, None, str(e)))
+    return out
+
+
+@app.post("/api/tasks/{name}/examples", status_code=201, response_model=AddResult)
+def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """Upload images as examples of ``label``; unreadable files are reported in ``errors``.
+
+    Returns 400 when the label is blank or no file could be added.
+    """
+    t = _task(name)
+    return _add_blobs(t, label, _uploads(files))
+
+
+class Urls(_Body):
+    """Body of POST .../predict/urls."""
+
+    urls: list[str] = Field(min_length=1, max_length=MAX_URLS)
+
+
+class LabelledUrls(Urls):
+    """Body of POST .../examples/urls."""
 
     label: str
 
 
-@app.patch("/api/tasks/{name}/examples/{eid}")
-def relabel(name: str, eid: str, body: Relabel) -> dict[str, Any]:
-    """Move an example to another (possibly new) class."""
+@app.post("/api/tasks/{name}/examples/urls", status_code=201, response_model=AddResult)
+def add_examples_by_url(name: str, body: LabelledUrls) -> dict[str, Any]:
+    """Download images (server started with --allow-urls) and add them as examples of ``label``."""
+    t = _task(name)
+    return _add_blobs(t, body.label, _downloads(body.urls))
+
+
+class ExampleEdit(_Body):
+    """Body of PATCH .../examples/{eid}: any of a new label, tags (replacing them) and a note."""
+
+    label: str | None = None
+    tags: list[str] | None = None
+    note: str | None = Field(None, max_length=MAX_NOTE)
+
+
+@app.patch("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail)
+def edit_example(name: str, eid: str, body: ExampleEdit) -> dict[str, Any]:
+    """Move an example to another (possibly new) class, and/or set its tags or note."""
     t = _task(name)
     try:
-        t.relabel(eid, body.label)
+        if body.label is not None:
+            t.relabel(eid, body.label)
+        if body.tags is not None or body.note is not None:
+            t.annotate([eid], tags=body.tags, note=body.note)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -468,7 +611,7 @@ def relabel(name: str, eid: str, body: Relabel) -> dict[str, Any]:
     return _detail(t)
 
 
-@app.delete("/api/tasks/{name}/examples/{eid}")
+@app.delete("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail)
 def delete_example(name: str, eid: str) -> dict[str, Any]:
     """Delete one example."""
     t = _task(name)
@@ -485,18 +628,24 @@ class ExampleIds(_Body):
     ids: list[str] = Field(min_length=1)
 
 
-class BulkRelabel(ExampleIds):
-    """Body of PATCH .../examples."""
+class BulkEdit(ExampleIds):
+    """Body of PATCH .../examples: a new label and/or tags to add or remove."""
 
-    label: str
+    label: str | None = None
+    add_tags: list[str] = Field(default_factory=list)
+    remove_tags: list[str] = Field(default_factory=list)
 
 
-@app.patch("/api/tasks/{name}/examples")
-def relabel_many(name: str, body: BulkRelabel) -> dict[str, Any]:
-    """Move several examples to another (possibly new) class; an unknown id changes nothing (404)."""
+@app.patch("/api/tasks/{name}/examples", response_model=TaskDetail)
+def edit_examples(name: str, body: BulkEdit) -> dict[str, Any]:
+    """Move several examples to another (possibly new) class and/or tag them; an unknown id
+    changes nothing (404)."""
     t = _task(name)
     try:
-        t.relabel_many(body.ids, body.label)
+        if body.label is not None:
+            t.relabel_many(body.ids, body.label)
+        if body.add_tags or body.remove_tags:
+            t.annotate(body.ids, add_tags=body.add_tags, remove_tags=body.remove_tags)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -504,7 +653,7 @@ def relabel_many(name: str, body: BulkRelabel) -> dict[str, Any]:
     return _detail(t)
 
 
-@app.post("/api/tasks/{name}/examples/delete")
+@app.post("/api/tasks/{name}/examples/delete", response_model=TaskDetail)
 def delete_examples(name: str, body: ExampleIds) -> dict[str, Any]:
     """Delete several examples; an unknown id deletes nothing (404)."""
     t = _task(name)
@@ -539,20 +688,43 @@ def example_image(name: str, eid: str,
 
 
 # ---- inference ----------------------------------------------------------
-@app.post("/api/tasks/{name}/predict")
-def predict(name: str, files: list[UploadFile] = File(...)) -> list[dict[str, Any]]:
-    """Classify uploaded images; an unreadable file gets ``error`` set instead of a label."""
-    t = _task(name)
-    blobs = [_read_upload(f) for f in files]
+TOP_K = Query(None, ge=1, description="Return only this many of the highest scores per image")
+
+
+def _predict(t: Task, blobs: list[Blob], top_k: int | None) -> list[dict[str, Any]]:
     try:
-        preds = pipe.predict(t, [b if b is not None else b"" for b in blobs])
+        preds = pipe.predict(t, [data if data is not None else b"" for _, data, _ in blobs], top_k=top_k)
     except ValueError as e:
         raise _bad(e) from e
-    preds = [p if b is not None else Prediction.failed(_too_large()) for b, p in zip(blobs, preds, strict=True)]
-    return [{"file": f.filename, **p.to_dict()} for f, p in zip(files, preds, strict=True)]
+    return [{"file": f, **(p if data is not None else Prediction.failed(err or "")).to_dict()}
+            for (f, data, err), p in zip(blobs, preds, strict=True)]
 
 
-@app.post("/api/tasks/{name}/evaluate")
+@app.post("/api/tasks/{name}/predict", response_model=list[PredictionOut])
+def predict(name: str, files: list[UploadFile] = File(...), top_k: int | None = TOP_K) -> list[dict[str, Any]]:
+    """Classify uploaded images; an unreadable file gets ``error`` set instead of a label."""
+    t = _task(name)
+    return _predict(t, _uploads(files), top_k)
+
+
+@app.post("/api/tasks/{name}/predict/urls", response_model=list[PredictionOut])
+def predict_urls(name: str, body: Urls, top_k: int | None = TOP_K) -> list[dict[str, Any]]:
+    """Download images (server started with --allow-urls) and classify them; ``file`` is the URL."""
+    t = _task(name)
+    return _predict(t, _downloads(body.urls), top_k)
+
+
+@app.get("/api/tasks/{name}/duplicates", response_model=list[DuplicatePair])
+def duplicates(name: str, threshold: float = Query(0.95, ge=0.5, le=1.0),
+               limit: int = Query(200, ge=1, le=5000)) -> list[dict[str, Any]]:
+    """Pairs of near-identical examples (cosine similarity >= ``threshold``), most similar first."""
+    try:
+        return pipe.near_duplicates(_task(name), threshold, limit)
+    except ValueError as e:
+        raise _bad(e) from e
+
+
+@app.post("/api/tasks/{name}/evaluate", response_model=EvalReport)
 def evaluate(name: str, folds: int | None = None) -> dict[str, Any]:
     """Cross-validate the task (leave-one-out unless ``folds`` is given). For a large task, prefer
     POST .../evaluate/jobs, which reports progress and can be cancelled."""
@@ -631,7 +803,7 @@ def _job(jid: str) -> Job:
     return job
 
 
-@app.post("/api/tasks/{name}/evaluate/jobs", status_code=202)
+@app.post("/api/tasks/{name}/evaluate/jobs", status_code=202, response_model=JobOut)
 def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
     """Start cross-validating the task in the background; poll GET /api/jobs/{id} for progress
     (stage "embedding" counts images, "evaluating" counts folds) and the report."""
@@ -642,13 +814,13 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
                       lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
 
 
-@app.get("/api/jobs/{jid}")
+@app.get("/api/jobs/{jid}", response_model=JobOut)
 def get_job(jid: str) -> dict[str, Any]:
     """A job's status, progress and (once done) result."""
     return _job(jid).to_dict()
 
 
-@app.delete("/api/jobs/{jid}")
+@app.delete("/api/jobs/{jid}", response_model=JobOut)
 def cancel_job(jid: str) -> dict[str, Any]:
     """Ask a running job to stop; it does so at its next progress step (status becomes "cancelled")."""
     job = _job(jid)

@@ -266,6 +266,22 @@ def test_openclip_construction_on_cpu(calls):
 
 
 @pytest.mark.usefixtures("fake_backends", "cpu")
+def test_openclip_dim_measured_when_not_declared(calls, monkeypatch):
+    """A vision tower without ``output_dim`` (SigLIP's timm tower) has its size measured once."""
+    real = open_clip.create_model_and_transforms
+
+    def no_output_dim(*args, **kw):
+        model, a, b = real(*args, **kw)
+        model.visual = SimpleNamespace()
+        return model, a, b
+
+    monkeypatch.setattr(open_clip, "create_model_and_transforms", no_output_dim)
+    emb = OpenCLIPEmbedder("openclip:Tiny@weights", "Tiny", "weights")
+    assert emb.dim == CLIP_DIM
+    assert calls["clip_model"].image_batches == [1]  # the probe
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
 def test_openclip_embed_images_batches_in_order(calls):
     """Images are converted to RGB, split by batch_size and concatenated in input order."""
     emb = OpenCLIPEmbedder("openclip:Tiny", "Tiny", None)

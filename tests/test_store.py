@@ -209,8 +209,10 @@ def test_rename_class(ws):
     assert [e["label"] for e in saved(t)["examples"]] == ["rouge", "green"]
 
 
-def test_delete_class_removes_examples_and_files(ws):
-    """Deleting a class deletes its examples and image files, and returns how many."""
+def test_delete_class_removes_examples_and_files(ws, monkeypatch):
+    """Deleting a class deletes its examples and (with no undo history kept) image files, and
+    returns how many."""
+    monkeypatch.setattr(store, "HISTORY_KEPT", 0)
     t = ws.create("t")
     r1 = t.add_example(png(RED), "red")
     t.add_example(png(RED, noise=5), "red")
@@ -281,8 +283,9 @@ def test_add_examples_from_dir(ws, tmp_path):
     assert [(e.label, e.source) for e in t.config.examples] == [("green", "c.png"), ("red", "a.PNG")]
 
 
-def test_example_lookup_relabel_and_delete(ws):
+def test_example_lookup_relabel_and_delete(ws, monkeypatch):
     """Examples can be found, moved between classes and deleted with their file."""
+    monkeypatch.setattr(store, "HISTORY_KEPT", 0)
     t = ws.create("t")
     e = t.add_example(png(RED), "red")
     t.upsert_class("blue")

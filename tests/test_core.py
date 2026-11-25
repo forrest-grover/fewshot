@@ -64,8 +64,9 @@ def test_reject_threshold_marks_unknown(ws):
     assert p.top_label in {"red", "green", "blue"}
 
 
-def test_refit_after_change_and_persistence(ws):
+def test_refit_after_change_and_persistence(ws, monkeypatch):
     """Renames and deletions take effect on the next prediction and persist to disk."""
+    monkeypatch.setattr(store, "HISTORY_KEPT", 0)  # no undo: deleted images go at once
     t = make_task(ws)
     pipe = Pipeline(ws)
     assert pipe.predict(t, [png(GREEN, seed=5)])[0].label == "green"

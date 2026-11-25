@@ -18,6 +18,10 @@ cd web && npm install && npm run build && cd ..
 
 Data lives in `$FEWSHOT_HOME` (default `./fewshot_data`): one folder per task with its images and `task.json`, plus a shared SQLite embedding cache. The server and CLI can use the same workspace at once: each change to a task locks it, starts from the latest saved `task.json`, and replaces the file atomically (the lock needs Linux or macOS), and the cache runs in WAL mode so one process's writes don't fail the other's. `fewshot cache info` shows the cache's size per model; `fewshot cache prune` deletes vectors no task's examples use, such as those of deleted examples and `bench` datasets. At most two built-in models stay loaded at once (`FEWSHOT_MAX_MODELS`); loading another unloads the least recently used. The web UI scales images down to at most 1024 px on the longest side (as JPEG) before uploading them as examples or for prediction; the CLI and API store whatever they are given. In the UI you can drag thumbnails between classes, tick several (Shift+click for a range) to move or delete them together, and paste images: on the Examples tab into the class under the pointer, on the Predict tab to classify them. Number keys 1–9 move ticked examples to that class, or add the highlighted prediction as that class (Enter accepts the prediction). Prediction and evaluation results stay while you switch tabs. For UI development, run `fewshot serve` and `npm run dev` in `web/`; Vite proxies `/api` to port 8000.
 
+Every change to a task can be undone (`fewshot undo`, the Undo button or Ctrl+Z in the UI, `POST .../undo`): the last 20 versions of `task.json` are kept in the task's `history/` folder, and a deleted example's image stays until no kept version names it. Images are stored once per workspace, in `blobs/`, and hard-linked into each task that uses them; `fewshot cache prune` also removes stored images no task uses. Examples can carry tags and a note (`fewshot example tag/note`, the ✎ button on a thumbnail, or select several and "Tag…"), and the Examples tab can show only one tag. A task can be renamed, and exported as a zip of its settings, labels and images and imported into another workspace (`fewshot export` / `fewshot import-task`, or Settings → Export and New task → Import).
+
+Models run on CUDA if available, then Apple's GPU (MPS), then the CPU; `FEWSHOT_DEVICE` (e.g. `cpu`, `cuda:1`) picks one. If the GPU runs out of memory, the batch is split in halves and later batches stay smaller. The SigLIP 2 preset needs `transformers` for its tokenizer (`pip install -e ".[siglip]"`).
+
 ## How classification works
 
 Each task has an embedder, a classifier, and classes. A class has example images, an optional text description, or both.
@@ -30,7 +34,9 @@ Each task has an embedder, a classifier, and classes. A class has example images
 
 With a CLIP embedder, class descriptions add `text_weight × 100 × cos(image, description)` to the image log-probabilities. A class can then work from its description alone, and a task with no images at all is plain CLIP zero-shot. Combining text and images at the logit level, rather than averaging their vectors, is what makes adding images improve accuracy instead of diluting the text signal. Text-only classes still get an image-side anchor by shifting their text vector across CLIP's modality gap.
 
-`reject_below` returns "unknown" when an image's best similarity falls below a threshold. Use similarity for this, not confidence: softmax confidence can be 1.00 for an image of a class the task doesn't contain.
+`reject_below` returns "unknown" when an image's best similarity falls below a threshold. Use similarity for this, not confidence: softmax confidence can be 1.00 for an image of a class the task doesn't contain. The Evaluate tab (and `fewshot eval`) suggests a value that keeps 95% of correct held-out predictions, and shows a histogram of held-out similarities where you can pick another. Zero-shot tasks compare images with text, which scores far lower (about 0.2–0.35 for CLIP), so they use a separate `reject_below_zero_shot`. With a threshold set, a prediction's `labels` lists every class whose own similarity reaches it, best first (multi-label). A task with a single class predicts that class for everything, so with a threshold it tells members from outsiders (one-class or anomaly detection).
+
+A class description can hold several prompts, one per line (`fewshot class describe` and the UI's template accept several); their embeddings are averaged. The `flip` setting averages each image's embedding with its mirror image's, which usually helps a little when left and right don't matter. Evaluation reports accuracy, macro-F1, top-2/3/5 accuracy, per-class recall and precision, a confusion matrix (click a cell in the UI to list those mistakes) and every held-out prediction (`fewshot eval --csv`, or Export in the UI). Leave-one-out for the prototype and kNN classifiers is computed in closed form instead of refitting per example, for tasks without descriptions. "Find near-duplicate examples" on the Evaluate tab (`fewshot dupes`) lists pairs of examples that look almost the same; pairs with different labels are usually labelling mistakes.
 
 ## Measured accuracy
 
@@ -51,15 +57,21 @@ fewshot create pets --embedder openclip:ViT-B-32@laion2b_s34b_b79k
 fewshot import pets ./photos --shots 5        # ./photos/<class>/<image>
 fewshot add pets Beagle a.jpg b.jpg
 fewshot class describe pets "a photo of a {}, a type of pet"
-fewshot eval pets                             # leave-one-out cross-validation
-fewshot predict pets new/ --json
-fewshot config pets --classifier knn --param k=3 --reject-below 0.7
+fewshot eval pets                             # leave-one-out cross-validation; --csv for every prediction
+fewshot predict pets new/ https://example.com/cat.jpg --json   # also --csv
+fewshot config pets --classifier knn --param k=3 --reject-below 0.7 --flip
+fewshot example ls pets --label Beagle        # also: rm, relabel, tag --add/--remove, note
+fewshot dupes pets                            # near-duplicate examples
+fewshot undo pets
+fewshot rename pets dogs-and-cats
+fewshot export pets pets.zip && fewshot import-task pets.zip --name pets-copy
+fewshot list --json                           # also show --json, models --json
 fewshot bench ./photos --embedder timm:vit_small_patch14_dinov2.lvd142m --shot 1 --shot 5
 fewshot cache prune --dry-run
 fewshot serve --host 0.0.0.0 --token "$(openssl rand -hex 16)"
 ```
 
-`serve` loads the models existing tasks use at startup (`--no-warm` skips this). With `--token`, the API and UI require that token; the UI asks for it once and keeps it in a cookie. Serving on anything but localhost without a token prints a warning, since anyone who can reach the port can read and change every task. By default API callers can only choose preset embedders, registered ones, and ones a task already uses, so they can't make the server download arbitrary models; `--allow-any-model` lifts that.
+`serve` loads the models existing tasks use at startup (`--no-warm` skips this). With `--token`, the API and UI require that token; the UI asks for it once and keeps it in a cookie. Serving on anything but localhost without a token prints a warning, since anyone who can reach the port can read and change every task. By default API callers can only choose preset embedders, registered ones, and ones a task already uses, so they can't make the server download arbitrary models; `--allow-any-model` lifts that. With `--allow-urls`, API callers can send image URLs for the server to download (public addresses only; the UI then shows a URL field on the Predict tab). The CLI accepts URLs in `add` and `predict` either way.
 
 ## Python
 
@@ -72,7 +84,7 @@ task.add_example(open("crack.jpg", "rb").read(), "crack")
 pred = Pipeline(ws).predict(task, ["new.jpg"])[0]   # .label, .confidence, .similarity, .scores
 ```
 
-To add many images, `task.add_examples(items)` takes `(bytes, label, source)` tuples (a generator is fine) and saves `task.json` once per 256 images instead of once per image.
+`task.undo()`, `task.annotate(ids, add_tags=[...], note=...)`, `ws.rename(old, new)` and `fewshot.archive.export_task` / `import_task` do what the matching commands do. To add many images, `task.add_examples(items)` takes `(bytes, label, source)` tuples (a generator is fine) and saves `task.json` once per 256 images instead of once per image.
 
 To use your own model, subclass `fewshot.embedders.Embedder` (implement `dim` and `_embed_image_batch`, returning L2-normalised float32 rows) and register it under any spec string; `unregister_embedder` removes it again. Output with the wrong shape or non-finite values raises `ValueError`; rows that aren't unit length are normalised. To keep CPU preprocessing outside the per-model lock, also override `_prepare_images` (runs unlocked) and `_embed_prepared` (runs locked).
 
@@ -84,7 +96,7 @@ task = ws.create("parts", embedder="mine:v1")
 
 ## REST API
 
-`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `PATCH .../examples` (`{"ids": [...], "label": ...}` moves several) and `POST .../examples/delete` (`{"ids": [...]}`), both changing nothing if any id is unknown, `GET .../examples/{id}/image` (`?size=N` returns a JPEG scaled down to fit N×N pixels, 16–2048), `POST .../predict` (multipart `files`; an unreadable file gets an `error` field instead of a label), `POST .../evaluate`, `GET /api/health` (also `/healthz`). OpenAPI docs are served at `/docs`. Request bodies reject unknown fields (422). Each uploaded image is limited to 50 MB (`FEWSHOT_MAX_UPLOAD_MB`), a whole request to 1024 MB (`FEWSHOT_MAX_REQUEST_MB`, refused with 413 before the body is stored), and a request to 1000 files.
+`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `PATCH .../examples` (`{"ids": [...], "label": ...}` moves several) and `POST .../examples/delete` (`{"ids": [...]}`), both changing nothing if any id is unknown, `GET .../examples/{id}/image` (`?size=N` returns a JPEG scaled down to fit N×N pixels, 16–2048), `POST .../predict` (multipart `files`, optional `?top_k=N`; an unreadable file gets an `error` field instead of a label), `POST .../evaluate`, `GET /api/health` (also `/healthz`). Also: `GET .../examples?offset=&limit=&label=&tag=` (one page of examples), `PATCH .../examples/{id}` with `tags` and `note`, `PATCH .../examples` with `add_tags`/`remove_tags`, `POST .../undo`, `POST .../rename` (`{"name": ...}`), `GET .../export` (zip) and `POST /api/tasks/import` (multipart `file`, optional `name`), `GET .../duplicates?threshold=0.95`, and, on a server started with `--allow-urls`, `POST .../predict/urls` and `POST .../examples/urls` (`{"urls": [...]}`, plus `label` to add). OpenAPI docs are served at `/docs`. Request bodies reject unknown fields (422). Each uploaded image is limited to 50 MB (`FEWSHOT_MAX_UPLOAD_MB`), a whole request to 1024 MB (`FEWSHOT_MAX_REQUEST_MB`, refused with 413 before the body is stored), and a request to 1000 files.
 
 Evaluation of a large task can take a while, so it can also run as a background job: `POST .../evaluate/jobs` returns a job; `GET /api/jobs/{id}` reports `status` (`running`, `done`, `failed`, `cancelled`), `stage` (`embedding` counts images, `evaluating` counts folds), `done`/`total`, and the report as `result` once done; `DELETE /api/jobs/{id}` cancels it. The web UI uses this to show progress and a Cancel button.
 

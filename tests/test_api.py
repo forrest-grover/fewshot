@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import fewshot.api
+import fewshot.store
 from tests.conftest import png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
@@ -234,8 +235,9 @@ def test_describe_classes(client, task):
     assert client.post("/api/tasks/missing/describe", json={}).status_code == 404
 
 
-def test_delete_class(client, task, tmp_path):
-    """Deleting a class removes its examples and image files."""
+def test_delete_class(client, task, tmp_path, monkeypatch):
+    """Deleting a class removes its examples and (with no undo history kept) image files."""
+    monkeypatch.setattr(fewshot.store, "HISTORY_KEPT", 0)
     t = client.delete(f"/api/tasks/{task}/classes/red").json()
     assert [c["name"] for c in t["classes"]] == ["blue"]
     assert {e["label"] for e in t["examples"]} == {"blue"}
@@ -263,7 +265,7 @@ def test_examples_errors(client, task):
     assert client.get("/api/tasks/missing/examples/nope/image").status_code == 404
 
 
-def test_bulk_relabel_and_delete(client, task, tmp_path):
+def test_bulk_relabel_and_delete(client, task, tmp_path, monkeypatch):
     """Several examples move or go in one request; an unknown id or bad label changes nothing."""
     ex = client.get(f"/api/tasks/{task}").json()["examples"]
     red = [e["id"] for e in ex if e["label"] == "red"]
@@ -280,6 +282,7 @@ def test_bulk_relabel_and_delete(client, task, tmp_path):
     assert client.patch("/api/tasks/missing/examples", json={"ids": ["a"], "label": "x"}).status_code == 404
 
     images = tmp_path / "ws" / "tasks" / task / "images"
+    monkeypatch.setattr(fewshot.store, "HISTORY_KEPT", 0)  # delete image files at once
     assert client.post(f"/api/tasks/{task}/examples/delete", json={"ids": [red[0], "nope"]}).status_code == 404
     assert len(list(images.iterdir())) == 6
     t = client.post(f"/api/tasks/{task}/examples/delete", json={"ids": red[:2]}).json()
@@ -345,13 +348,14 @@ def test_predict(client, task):
 
 
 def test_predict_errors(client):
-    """Predict is 404 for unknown tasks and 400 for one class; unreadable images get a per-file error."""
+    """Predict is 404 for unknown tasks and 400 with no classes; unreadable images get a per-file error."""
     assert client.post("/api/tasks/missing/predict", files=_query(RED)).status_code == 404
     client.post("/api/tasks", json={"name": "one", "embedder": "fake:color"})
-    _upload(client, "one", "red", RED)
     r = client.post("/api/tasks/one/predict", files=_query(RED))
     assert r.status_code == 400
-    assert r.json()["detail"] == "Need at least 2 classes with examples or descriptions"
+    assert r.json()["detail"] == "Need at least 1 class with examples or a description"
+    _upload(client, "one", "red", RED)
+    assert client.post("/api/tasks/one/predict", files=_query(BLUE)).json()[0]["label"] == "red"  # one class
     _upload(client, "one", "blue", BLUE, seeds=range(10, 13))
     r = client.post("/api/tasks/one/predict", files=[("files", ("x.png", b"junk", "image/png")), *_query(BLUE)])
     assert r.status_code == 200

@@ -57,11 +57,17 @@ def test_dim_from_images_or_text():
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_needs_two_classes(name):
-    """A single-class problem is rejected."""
-    data = ClassData(["only"], unit([[1, 0, 0]]), np.array([0]))
-    with pytest.raises(ValueError, match="at least 2 classes"):
-        make_classifier(name).fit(data)
+def test_one_class(name):
+    """A single class is allowed: every query gets it, with its similarity to the class, which is
+    what tells members from outsiders. No class at all is an error."""
+    data = ClassData(["only"], unit([[1, 0, 0], [0.9, 0.1, 0]]), np.array([0, 0]))
+    clf = make_classifier(name).fit(data)
+    probs, sims = clf.predict(unit([[1, 0, 0], [0, 0, 1]]))
+    assert probs.tolist() == [[1.0], [1.0]]
+    assert sims[0] > 0.9 > 0.1 > sims[1]
+    assert clf.class_similarity(unit([[0, 0, 1]])).shape == (1, 1)
+    with pytest.raises(ValueError, match="at least 1 class"):
+        make_classifier(name).fit(ClassData([], np.zeros((0, 3), np.float32), np.zeros(0, int)))
 
 
 @pytest.mark.parametrize("name", ALL)

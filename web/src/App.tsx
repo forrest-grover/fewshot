@@ -36,6 +36,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [signIn, setSignIn] = useState(false); // the server wants its token
+  const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
   // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
   const predictState = usePredictResults(route.task);
@@ -66,6 +67,7 @@ export default function App() {
     window.addEventListener("hashchange", on);
     void refreshTasks();
     void run(api.models()).then((m) => { if (m) setModels(m); });
+    void api.health().then((h) => { setUrlFetch(h.url_fetch); }, () => { /* an old server: no URL fetching */ });
     return () => { window.removeEventListener("hashchange", on); };
   }, [refreshTasks, run]);
 
@@ -95,6 +97,25 @@ export default function App() {
     }
     void refreshTasks();
   };
+
+  const undo = async () => {
+    if (!task?.can_undo) return;
+    const t = await run(api.undo(task.name));
+    if (t) updateTask(t);
+  };
+  // Ctrl/Cmd+Z undoes the task's last change, unless typing in a field (where it undoes the typing).
+  const undoRef = useRef(undo);
+  undoRef.current = undo;
+  useEffect(() => {
+    const on = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== "z") return;
+      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      e.preventDefault();
+      void undoRef.current();
+    };
+    window.addEventListener("keydown", on);
+    return () => { window.removeEventListener("keydown", on); };
+  }, []);
 
   if (signIn) return <SignIn />;
 
@@ -126,6 +147,9 @@ export default function App() {
               <span className="muted">
                 {models?.embedders.find((e) => e.spec === task.embedder)?.label ?? task.embedder} · {task.classifier}
               </span>
+              <span className="spacer" />
+              <button className="ghost small" disabled={!task.can_undo} onClick={() => { void undo(); }}
+                title="Undo the last change to this task: examples, classes or settings (Ctrl+Z)">↶ Undo</button>
             </header>
             <div className="tabs" role="tablist" aria-label="Task views" onKeyDown={(e) => {
               // Arrow keys, Home and End move between tabs (the WAI-ARIA tabs pattern).
@@ -155,10 +179,11 @@ export default function App() {
             </div>
             <div id="tab-panel" role="tabpanel" aria-labelledby={`tab-${route.tab}`}>
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
-              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} />}
+              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
               {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun} />}
               {route.tab === "settings" && (
-                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }} />
+                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }}
+                  onRenamed={(t) => { void refreshTasks(); go(t.name, "settings"); }} />
               )}
             </div>
           </>
@@ -206,7 +231,9 @@ function NewTask({ models, run, onCreated }: {
   const [embedder, setEmbedder] = useState("");
   const [busy, setBusy] = useState(false);
   const spec = embedder || (models?.embedders[0]?.spec ?? "");
+  const importZip = useRef<HTMLInputElement>(null);
   return (
+    <>
     <form
       className="new-task"
       onSubmit={(e) => {
@@ -236,5 +263,23 @@ function NewTask({ models, run, onCreated }: {
       </label>
       <button type="submit" disabled={busy || !name.trim()}>{busy ? "Creating… (loads the model on first use)" : "Create task"}</button>
     </form>
+    <div className="new-task import">
+      <h3>Or import a task</h3>
+      <p className="muted">From a zip made with “Export” on a task's Settings tab, or <code>fewshot export</code>.</p>
+      <input ref={importZip} type="file" accept=".zip,application/zip" hidden onChange={(e) => {
+        const f = e.target.files?.[0];
+        e.target.value = "";
+        if (!f) return;
+        setBusy(true);
+        void run(api.importTask(f, name.trim() || undefined)).then((t) => {
+          setBusy(false);
+          if (t) onCreated(t);
+        });
+      }} />
+      <button className="secondary" disabled={busy} onClick={() => { importZip.current?.click(); }}>
+        Import zip{name.trim() ? ` as “${name.trim()}”` : ""}…
+      </button>
+    </div>
+    </>
   );
 }
