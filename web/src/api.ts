@@ -77,5 +77,7 @@ export const api = {
   deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", `${t(n)}/examples/${id}`),
   predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict`, files(fs)),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
-  imageUrl: (n: string, id: string) => `${t(n)}/examples/${id}/image`,
+  /** An example's image; with ``size``, a JPEG scaled down to fit in that many pixels. */
+  imageUrl: (n: string, id: string, size?: number) =>
+    `${t(n)}/examples/${id}/image` + (size ? `?size=${String(size)}` : ""),
 };

@@ -50,7 +50,12 @@ export function DropZone(props: {
       onClick={() => { if (!props.disabled) input.current?.click(); }}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") input.current?.click(); }}
+      aria-disabled={props.disabled ?? false}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault(); // Space would otherwise scroll the page
+        if (!props.disabled) input.current?.click();
+      }}
     >
       <input
         ref={input}

@@ -9,8 +9,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
@@ -18,7 +18,7 @@ from .classifiers import CLASSIFIERS
 from .embedders import PRESETS, check_embedder, spec_supports_text
 from .evaluate import evaluate_task
 from .pipeline import Pipeline, Prediction
-from .store import Task, Workspace
+from .store import Task, Workspace, thumbnail
 
 ws = Workspace()
 pipe = Pipeline(ws)
@@ -296,14 +296,27 @@ def delete_example(name: str, eid: str) -> dict[str, Any]:
     return _detail(t)
 
 
-@app.get("/api/tasks/{name}/examples/{eid}/image")
-def example_image(name: str, eid: str) -> FileResponse:
-    """Serve an example's image file (content-addressed, so cached forever)."""
+CACHE_FOREVER = {"Cache-Control": "max-age=31536000, immutable"}  # image ids are content hashes
+
+
+@app.get("/api/tasks/{name}/examples/{eid}/image", response_model=None)
+def example_image(name: str, eid: str,
+                  size: int | None = Query(None, ge=16, le=2048)) -> FileResponse | Response:
+    """Serve an example's image file, or with ``size`` a JPEG scaled down to fit in that many pixels."""
     t = _task(name)
     try:
-        return FileResponse(t.image_path(eid), headers={"Cache-Control": "max-age=31536000, immutable"})
+        path = t.image_path(eid)
     except KeyError as e:
         raise _missing(e) from e
+    if size is None:
+        return FileResponse(path, headers=CACHE_FOREVER)
+    try:
+        data = thumbnail(path.read_bytes(), size)
+    except FileNotFoundError as e:  # deleted between the lookup and the read
+        raise HTTPException(404, f"No example {eid!r}") from e
+    except ValueError as e:
+        raise _bad(e) from e
+    return Response(data, media_type="image/jpeg", headers=CACHE_FOREVER)
 
 
 # ---- inference ----------------------------------------------------------

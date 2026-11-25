@@ -1,41 +1,51 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Prediction, type TaskDetail } from "./api";
+import { shrinkImages } from "./images";
 import { Bar, DropZone } from "./ui";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
-interface Item { file: File; url: string; pred: Prediction; addedAs?: string }
+/** One result. ``file`` is what was classified (scaled down), and is also what "Add as" uploads,
+ * so adding it reuses the embedding computed for the prediction. */
+interface Item { key: number; name: string; file: File; url: string; pred: Prediction; adding?: boolean; addedAs?: string }
 
 export default function Predict({ task, setTask, run }: Props) {
   const [items, setItems] = useState<Item[]>([]);
   const [busy, setBusy] = useState(false);
+  const nextKey = useRef(0);
 
-  // Every preview object URL created by this tab, revoked when the tab unmounts.
+  // Preview object URLs still in use, revoked on Clear and when the tab unmounts.
   const objectUrls = useRef(new Set<string>());
   useEffect(() => {
     const urls = objectUrls.current;
-    return () => {
-      urls.forEach((u) => { URL.revokeObjectURL(u); });
-      urls.clear();
-    };
+    return () => { revoke(urls); };
   }, []);
 
-  const classify = async (files: File[]) => {
+  const classify = async (originals: File[]) => {
     setBusy(true);
-    const preds = await run(api.predict(task.name, files));
-    setBusy(false);
-    if (preds) {
-      const added = files.map((f, i) => ({ file: f, url: URL.createObjectURL(f), pred: preds[i] }));
-      added.forEach((it) => objectUrls.current.add(it.url));
-      setItems((old) => [...added, ...old]);
+    try {
+      const files = await shrinkImages(originals);
+      const preds = await run(api.predict(task.name, files));
+      if (preds) {
+        const added = files.map((f, i) => ({
+          key: nextKey.current++, name: originals[i].name, file: f, url: URL.createObjectURL(f), pred: preds[i],
+        }));
+        added.forEach((it) => objectUrls.current.add(it.url));
+        setItems((old) => [...added, ...old]);
+      }
+    } finally {
+      setBusy(false);
     }
   };
 
-  const addAs = async (idx: number, label: string) => {
-    const r = await run(api.addExamples(task.name, label, [items[idx].file]));
-    if (r) {
-      setTask(r.task);
-      setItems((old) => old.map((it, i) => (i === idx ? { ...it, addedAs: label } : it)));
-    }
+  const patch = (key: number, p: Partial<Item>) => {
+    setItems((old) => old.map((it) => (it.key === key ? { ...it, ...p } : it)));
+  };
+  const addAs = async (it: Item, label: string) => {
+    if (it.adding || it.addedAs) return;
+    patch(it.key, { adding: true });
+    const r = await run(api.addExamples(task.name, label, [it.file]));
+    patch(it.key, r ? { adding: false, addedAs: label } : { adding: false }); // a failure shows in the error box
+    if (r) setTask(r.task);
   };
 
   const ready = task.classes.length >= 2;
@@ -48,18 +58,18 @@ export default function Predict({ task, setTask, run }: Props) {
       {items.length > 0 && (
         <div className="row" style={{ justifyContent: "space-between", margin: "12px 0" }}>
           <span className="muted">{items.length} result{items.length === 1 ? "" : "s"}. Add correct or corrected images as examples to improve the task.</span>
-          <button className="ghost small" onClick={() => { setItems([]); }}>Clear</button>
+          <button className="ghost small" onClick={() => { revoke(objectUrls.current); setItems([]); }}>Clear</button>
         </div>
       )}
       <div className="results">
-        {items.map((it, idx) => {
+        {items.map((it) => {
           if (it.pred.error) {
             return (
-              <article key={it.url} className="result">
-                <img src={it.url} alt={it.file.name} />
+              <article key={it.key} className="result">
+                <img src={it.url} alt={it.name} />
                 <div className="result-body">
                   <strong className="unknown">Could not read image</strong>
-                  <div className="muted file">{it.file.name}</div>
+                  <div className="muted file">{it.name}</div>
                   <div className="muted">{it.pred.error}</div>
                 </div>
               </article>
@@ -67,8 +77,8 @@ export default function Predict({ task, setTask, run }: Props) {
           }
           const top = Object.entries(it.pred.scores).sort((a, b) => b[1] - a[1]).slice(0, 3);
           return (
-            <article key={it.url} className="result">
-              <img src={it.url} alt={it.file.name} />
+            <article key={it.key} className="result">
+              <img src={it.url} alt={it.name} />
               <div className="result-body">
                 <div className="result-head">
                   <strong className={it.pred.rejected ? "unknown" : ""}>
@@ -78,15 +88,15 @@ export default function Predict({ task, setTask, run }: Props) {
                     sim {it.pred.similarity.toFixed(3)}
                   </span>
                 </div>
-                <div className="muted file">{it.file.name}</div>
+                <div className="muted file">{it.name}</div>
                 {top.map(([c, v], i) => <Bar key={c} label={c} value={v} strong={i === 0} />)}
                 <div className="row add-as">
                   {it.addedAs ? (
                     <span className="ok">Added as {it.addedAs}</span>
                   ) : (
                     <>
-                      <button className="small" onClick={() => { void addAs(idx, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
-                      <select className="small" value="" onChange={(e) => { if (e.target.value) void addAs(idx, e.target.value); }} aria-label="Add as another class">
+                      <button className="small" disabled={it.adding} onClick={() => { void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
+                      <select className="small" value="" disabled={it.adding} onChange={(e) => { if (e.target.value) void addAs(it, e.target.value); }} aria-label="Add as another class">
                         <option value="">Add as other…</option>
                         {task.classes.filter((c) => c.name !== it.pred.top_label).map((c) => <option key={c.name}>{c.name}</option>)}
                       </select>
@@ -100,4 +110,9 @@ export default function Predict({ task, setTask, run }: Props) {
       </div>
     </div>
   );
+}
+
+function revoke(urls: Set<string>) {
+  urls.forEach((u) => { URL.revokeObjectURL(u); });
+  urls.clear();
 }

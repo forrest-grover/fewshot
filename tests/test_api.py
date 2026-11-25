@@ -1,9 +1,11 @@
 """Tests for the REST API (fewshot.api) using the fake colour embedder."""
 
 import importlib
+import io
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import fewshot.api
 from tests.conftest import png
@@ -256,6 +258,35 @@ def test_examples_errors(client, task):
     assert client.patch("/api/tasks/missing/examples/nope", json={"label": "red"}).status_code == 404
     assert client.get(f"/api/tasks/{task}/examples/nope/image").status_code == 404
     assert client.get("/api/tasks/missing/examples/nope/image").status_code == 404
+
+
+def test_image_thumbnails(client, task, tmp_path):
+    """``?size=`` serves a JPEG scaled down to fit; bad sizes, missing and corrupt files are errors."""
+    big = io.BytesIO()
+    Image.new("RGB", (900, 300), RED).save(big, "JPEG")
+    r = client.post(f"/api/tasks/{task}/examples", data={"label": "red"},
+                    files=[("files", ("big.jpg", big.getvalue(), "image/jpeg"))])
+    eid = r.json()["added"][0]["id"]
+    url = f"/api/tasks/{task}/examples/{eid}/image"
+    thumb = client.get(url, params={"size": 120})
+    assert thumb.status_code == 200
+    assert thumb.headers["content-type"] == "image/jpeg"
+    assert "immutable" in thumb.headers["cache-control"]
+    assert Image.open(io.BytesIO(thumb.content)).size == (120, 40)
+    small = client.get(f"/api/tasks/{task}/examples/{r.json()['task']['examples'][0]['id']}/image",
+                       params={"size": 120})
+    assert Image.open(io.BytesIO(small.content)).size == (8, 8)  # never enlarged
+    assert client.get(url, params={"size": 8}).status_code == 422
+    assert client.get(url, params={"size": 5000}).status_code == 422
+    assert client.get(f"/api/tasks/{task}/examples/nope/image", params={"size": 120}).status_code == 404
+
+    path = tmp_path / "ws" / "tasks" / task / r.json()["added"][0]["file"]
+    path.write_bytes(b"junk")
+    bad = client.get(url, params={"size": 120})
+    assert bad.status_code == 400
+    assert bad.json()["detail"].startswith("Not a readable image")
+    path.unlink()
+    assert client.get(url, params={"size": 120}).status_code == 404
 
 
 def test_relabel_to_new_class(client, task):

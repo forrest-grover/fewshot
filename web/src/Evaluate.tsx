@@ -72,7 +72,8 @@ export default function Evaluate({ task, setTask, run }: Props) {
                   const exists = task.examples.find((e) => e.id === m.id);
                   return (
                     <figure key={m.id} className="thumb wide">
-                      <img src={api.imageUrl(task.name, m.id)} alt="" loading="lazy" />
+                      {/* 400 px: 2x the 200 px tile */}
+                      <img src={api.imageUrl(task.name, m.id, 400)} alt="" loading="lazy" />
                       <figcaption className="col">
                         <span><b>{m.true}</b> → {m.pred} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (

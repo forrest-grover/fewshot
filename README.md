@@ -16,7 +16,7 @@ cd web && npm install && npm run build && cd ..
 ./.env/bin/fewshot serve            # UI at http://127.0.0.1:8000, API docs at /docs
 ```
 
-Data lives in `$FEWSHOT_HOME` (default `./fewshot_data`): one folder per task with its images and `task.json`, plus a shared SQLite embedding cache. The server and CLI can use the same workspace at once: each change to a task locks it, starts from the latest saved `task.json`, and replaces the file atomically (the lock needs Linux or macOS). For UI development, run `fewshot serve` and `npm run dev` in `web/`; Vite proxies `/api` to port 8000.
+Data lives in `$FEWSHOT_HOME` (default `./fewshot_data`): one folder per task with its images and `task.json`, plus a shared SQLite embedding cache. The server and CLI can use the same workspace at once: each change to a task locks it, starts from the latest saved `task.json`, and replaces the file atomically (the lock needs Linux or macOS). The web UI scales images down to at most 1024 px on the longest side (as JPEG) before uploading them as examples or for prediction; the CLI and API store whatever they are given. For UI development, run `fewshot serve` and `npm run dev` in `web/`; Vite proxies `/api` to port 8000.
 
 ## How classification works
 
@@ -78,7 +78,7 @@ task = ws.create("parts", embedder="mine:v1")
 
 ## REST API
 
-`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `GET .../examples/{id}/image`, `POST .../predict` (multipart `files`; an unreadable file gets an `error` field instead of a label), `POST .../evaluate`. OpenAPI docs are served at `/docs`. Request bodies reject unknown fields (422), and each uploaded image is limited to 50 MB (`FEWSHOT_MAX_UPLOAD_MB` changes it).
+`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `GET .../examples/{id}/image` (`?size=N` returns a JPEG scaled down to fit N×N pixels, 16–2048), `POST .../predict` (multipart `files`; an unreadable file gets an `error` field instead of a label), `POST .../evaluate`. OpenAPI docs are served at `/docs`. Request bodies reject unknown fields (422), and each uploaded image is limited to 50 MB (`FEWSHOT_MAX_UPLOAD_MB` changes it).
 
 ## Tests and checks
 

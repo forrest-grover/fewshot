@@ -87,10 +87,16 @@ def image_id(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:32]
 
 
-def load_image(data: bytes) -> Image.Image:
-    """Decode image bytes to an upright RGB image; raises ``ValueError`` if unreadable."""
+def load_image(data: bytes, draft: int | None = None) -> Image.Image:
+    """Decode image bytes to an upright RGB image; raises ``ValueError`` if unreadable.
+
+    With ``draft``, a JPEG may be decoded at a reduced scale that is still at least ``draft``
+    pixels on each side (much faster for large photos); other formats decode in full.
+    """
     try:
         im = Image.open(io.BytesIO(data))
+        if draft:
+            im.draft("RGB", (draft, draft))
         im.load()
     except UnidentifiedImageError as e:
         raise ValueError("Not a readable image: unrecognised file format") from e
@@ -99,6 +105,16 @@ def load_image(data: bytes) -> Image.Image:
     except OSError as e:
         raise ValueError(f"Not a readable image: {e}") from e
     return ImageOps.exif_transpose(im).convert("RGB")
+
+
+def thumbnail(data: bytes, size: int) -> bytes:
+    """JPEG of the image scaled down to fit in ``size`` x ``size`` pixels (never enlarged);
+    raises ``ValueError`` if unreadable."""
+    im = load_image(data, draft=size)
+    im.thumbnail((size, size), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=85)
+    return out.getvalue()
 
 
 def fill_template(template: str, name: str) -> str:

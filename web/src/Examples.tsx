@@ -1,20 +1,34 @@
 import { useState } from "react";
-import { api, type TaskDetail } from "./api";
+import { api, type Example, type TaskDetail } from "./api";
+import { shrinkImages, THUMB_SIZE } from "./images";
 import { DropZone } from "./ui";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
+interface Skipped { file: string; error: string }
+
+/** Thumbnails shown per class at first, and added by each "Show more", so a class with thousands of
+ * examples doesn't render thousands of images and class menus at once. */
+const PAGE = 60;
 
 export default function Examples({ task, setTask, run }: Props) {
   const [newClass, setNewClass] = useState("");
-  const [uploading, setUploading] = useState<string | null>(null);
+  const [uploading, setUploading] = useState<Partial<Record<string, number>>>({}); // class -> uploads in flight
+  const [skipped, setSkipped] = useState<Partial<Record<string, Skipped[]>>>({}); // class -> files the last upload skipped
+  const [shown, setShown] = useState<Partial<Record<string, number>>>({}); // class -> thumbnails shown
 
+  const busy = (label: string, delta: number) => {
+    setUploading((u) => ({ ...u, [label]: (u[label] ?? 0) + delta }));
+  };
   const upload = async (label: string, files: File[]) => {
-    setUploading(label);
-    const r = await run(api.addExamples(task.name, label, files));
-    setUploading(null);
-    if (r) {
-      setTask(r.task);
-      if (r.errors.length) alert(`Skipped ${String(r.errors.length)} file(s):\n` + r.errors.map((e) => `${e.file}: ${e.error}`).join("\n"));
+    busy(label, 1);
+    try {
+      const r = await run(shrinkImages(files).then((fs) => api.addExamples(task.name, label, fs)));
+      if (r) {
+        setTask(r.task);
+        setSkipped((s) => ({ ...s, [label]: r.errors }));
+      }
+    } finally {
+      busy(label, -1);
     }
   };
   /** Run a mutation and show its result; resolves to whether it succeeded. */
@@ -24,7 +38,8 @@ export default function Examples({ task, setTask, run }: Props) {
     return t !== undefined;
   };
 
-  const byClass = new Map(task.classes.map((c) => [c.name, task.examples.filter((e) => e.label === c.name)]));
+  const byClass = new Map<string, Example[]>(task.classes.map((c) => [c.name, []]));
+  for (const e of task.examples) byClass.get(e.label)?.push(e);
 
   return (
     <div className="examples">
@@ -59,54 +74,75 @@ export default function Examples({ task, setTask, run }: Props) {
         </p>
       )}
 
-      {task.classes.map((c) => (
-        <section key={c.name} className="class-card">
-          <header>
-            <h3>{c.name}</h3>
-            <span className="muted">{c.count} example{c.count === 1 ? "" : "s"}</span>
-            <span className="spacer" />
-            <button className="ghost small" onClick={() => {
-              const n = prompt("Rename class", c.name);
-              if (n && n !== c.name) void save(api.patchClass(task.name, c.name, { name: n }));
-            }}>Rename</button>
-            <button className="ghost small danger" onClick={() => {
-              if (confirm(`Delete class "${c.name}" and its ${String(c.count)} example(s)?`)) void save(api.deleteClass(task.name, c.name));
-            }}>Delete</button>
-          </header>
-          {task.supports_text && (
-            <input
-              className="desc"
-              key={c.description}
-              defaultValue={c.description}
-              placeholder="Text description used as a CLIP prompt, e.g. 'a photo of a cracked weld' (optional)"
-              onBlur={(e) => {
-                if (e.target.value !== c.description) void save(api.patchClass(task.name, c.name, { description: e.target.value }));
-              }}
-              onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
-            />
-          )}
-          <div className="thumbs">
-            {(byClass.get(c.name) ?? []).map((ex) => (
-              <figure key={ex.id} className="thumb">
-                <img src={api.imageUrl(task.name, ex.id)} alt={ex.source || ex.id} loading="lazy" />
-                <figcaption>
-                  <select
-                    value={ex.label}
-                    aria-label="Move to class"
-                    onChange={(e) => { void save(api.relabel(task.name, ex.id, e.target.value)); }}
-                  >
-                    {task.classes.map((k) => <option key={k.name}>{k.name}</option>)}
-                  </select>
-                  <button className="ghost small danger" aria-label="Delete example" onClick={() => { void save(api.deleteExample(task.name, ex.id)); }}>×</button>
-                </figcaption>
-              </figure>
-            ))}
-            <DropZone compact disabled={uploading === c.name} onFiles={(fs) => { void upload(c.name, fs); }}>
-              {uploading === c.name ? "Uploading…" : "+ Add images"}
-            </DropZone>
-          </div>
-        </section>
-      ))}
+      {task.classes.map((c) => {
+        const limit = shown[c.name] ?? PAGE;
+        const skip = skipped[c.name] ?? [];
+        return (
+          <section key={c.name} className="class-card">
+            <header>
+              <h3>{c.name}</h3>
+              <span className="muted">{c.count} example{c.count === 1 ? "" : "s"}</span>
+              <span className="spacer" />
+              <button className="ghost small" onClick={() => {
+                const n = prompt("Rename class", c.name);
+                if (n && n !== c.name) void save(api.patchClass(task.name, c.name, { name: n }));
+              }}>Rename</button>
+              <button className="ghost small danger" onClick={() => {
+                if (confirm(`Delete class "${c.name}" and its ${String(c.count)} example(s)?`)) void save(api.deleteClass(task.name, c.name));
+              }}>Delete</button>
+            </header>
+            {task.supports_text && (
+              <input
+                className="desc"
+                key={c.description}
+                defaultValue={c.description}
+                placeholder="Text description used as a CLIP prompt, e.g. 'a photo of a cracked weld' (optional)"
+                onBlur={(e) => {
+                  if (e.target.value !== c.description) void save(api.patchClass(task.name, c.name, { description: e.target.value }));
+                }}
+                onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+              />
+            )}
+            <div className="thumbs">
+              {(byClass.get(c.name) ?? []).slice(0, limit).map((ex) => (
+                <figure key={ex.id} className="thumb">
+                  <img src={api.imageUrl(task.name, ex.id, THUMB_SIZE)} alt={ex.source || ex.id} loading="lazy" />
+                  <figcaption>
+                    <select
+                      value={ex.label}
+                      aria-label="Move to class"
+                      onChange={(e) => { void save(api.relabel(task.name, ex.id, e.target.value)); }}
+                    >
+                      {task.classes.map((k) => <option key={k.name}>{k.name}</option>)}
+                    </select>
+                    <button className="ghost small danger" aria-label="Delete example" onClick={() => { void save(api.deleteExample(task.name, ex.id)); }}>×</button>
+                  </figcaption>
+                </figure>
+              ))}
+              {c.count > limit && (
+                <button
+                  className="secondary more"
+                  onClick={() => { setShown((s) => ({ ...s, [c.name]: limit + PAGE * 4 })); }}
+                >
+                  Show more ({c.count - limit} hidden)
+                </button>
+              )}
+              <DropZone compact onFiles={(fs) => { void upload(c.name, fs); }}>
+                {uploading[c.name] ? "Uploading…" : "+ Add images"}
+              </DropZone>
+            </div>
+            {skip.length > 0 && (
+              <div className="error skipped" role="alert">
+                <div>
+                  Skipped {skip.length} file{skip.length === 1 ? "" : "s"}:
+                  <ul>{skip.map((e, i) => <li key={i}><b>{e.file}</b>: {e.error}</li>)}</ul>
+                </div>
+                <button className="ghost" aria-label="Dismiss" onClick={() => { setSkipped((s) => ({ ...s, [c.name]: [] })); }}>×</button>
+              </div>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }

@@ -113,19 +113,40 @@ export default function App() {
                 {models?.embedders.find((e) => e.spec === task.embedder)?.label ?? task.embedder} · {task.classifier}
               </span>
             </header>
-            <div className="tabs" role="tablist">
+            <div className="tabs" role="tablist" aria-label="Task views" onKeyDown={(e) => {
+              // Arrow keys, Home and End move between tabs (the WAI-ARIA tabs pattern).
+              const i = TABS.indexOf(route.tab);
+              const moves: Record<string, number> = { ArrowLeft: i - 1, ArrowRight: i + 1, Home: 0, End: TABS.length - 1 };
+              if (!(e.key in moves)) return;
+              const j = moves[e.key];
+              e.preventDefault();
+              const next = TABS[(j + TABS.length) % TABS.length];
+              go(task.name, next);
+              document.getElementById(`tab-${next}`)?.focus();
+            }}>
               {TABS.map((t) => (
-                <button key={t} role="tab" aria-selected={route.tab === t} className={route.tab === t ? "tab active" : "tab"} onClick={() => { go(task.name, t); }}>
+                <button
+                  key={t}
+                  id={`tab-${t}`}
+                  role="tab"
+                  aria-selected={route.tab === t}
+                  aria-controls="tab-panel"
+                  tabIndex={route.tab === t ? 0 : -1}
+                  className={route.tab === t ? "tab active" : "tab"}
+                  onClick={() => { go(task.name, t); }}
+                >
                   {t[0].toUpperCase() + t.slice(1)}
                 </button>
               ))}
             </div>
-            {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
-            {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} />}
-            {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} />}
-            {route.tab === "settings" && (
-              <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }} />
-            )}
+            <div id="tab-panel" role="tabpanel" aria-labelledby={`tab-${route.tab}`}>
+              {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
+              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} />}
+              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} />}
+              {route.tab === "settings" && (
+                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }} />
+              )}
+            </div>
           </>
         )}
       </main>
