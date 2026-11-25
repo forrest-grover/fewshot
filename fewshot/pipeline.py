@@ -264,6 +264,34 @@ class Pipeline:
             _attach_evidence(clf, cfg, Q, preds, evidence)
         return preds
 
+    # ---- inbox ---------------------------------------------------------
+    def inbox_suggestions(self, task: Task, sort: str = "uncertain") -> list[dict[str, Any]]:
+        """The task's inbox images with the model's suggestion for each, sorted for labelling:
+
+        ``uncertain`` (default): smallest margin between the two most probable classes first; the
+        images whose labels teach the model most (active learning). ``confident``: most confident
+        first, for accepting suggestions in bulk. ``novel``: least like any labelled example first,
+        which finds new kinds of image. ``added``: oldest first.
+
+        Each entry is the inbox item plus ``prediction`` (as from ``predict``, top 3 scores) and
+        ``margin``; with no classes yet there is no prediction.
+        """
+        orders = {"uncertain", "confident", "novel", "added"}
+        if sort not in orders:
+            raise ValueError(f"sort must be one of {sorted(orders)}, got {sort!r}")
+        cfg = task.config
+        items = [x.model_dump() for x in cfg.inbox]
+        if not items or not cfg.classes:
+            return items
+        preds = self.predict(task, [task.path / x.file for x in cfg.inbox], top_k=3)
+        for item, p in zip(items, preds, strict=True):
+            top = list(p.scores.values())
+            item["prediction"] = p.to_dict()
+            item["margin"] = round(top[0] - (top[1] if len(top) > 1 else 0.0), 4) if top else 0.0
+        keys = {"uncertain": lambda i: (i["margin"],), "confident": lambda i: (-i["prediction"]["confidence"],),
+                "novel": lambda i: (i["prediction"]["similarity"],), "added": lambda i: ()}
+        return sorted(items, key=keys[sort])
+
     # ---- data checks -------------------------------------------------
     def near_duplicates(self, task: Task, threshold: float = 0.95, limit: int = 500) -> list[dict[str, Any]]:
         """Pairs of the task's examples whose embeddings have cosine similarity >= ``threshold``,

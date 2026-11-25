@@ -2,12 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, AUTH_EVENT, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
 import Evaluate, { type EvalRun } from "./Evaluate";
 import Examples from "./Examples";
+import Inbox from "./Inbox";
 import { usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import { ErrorBox } from "./ui";
 
-const TABS = ["examples", "predict", "evaluate", "settings"] as const;
+const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
 
 /** decodeURIComponent, but malformed input (e.g. a stray "%") is kept as typed instead of throwing. */
@@ -203,12 +204,13 @@ export default function App() {
                   className={route.tab === t ? "tab active" : "tab"}
                   onClick={() => { go(task.name, t); }}
                 >
-                  {t[0].toUpperCase() + t.slice(1)}
+                  {t[0].toUpperCase() + t.slice(1)}{t === "inbox" && task.inbox_count ? ` (${String(task.inbox_count)})` : ""}
                 </button>
               ))}
             </div>
             <div id="tab-panel" role="tabpanel" aria-labelledby={`tab-${route.tab}`}>
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
+              {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} />}
               {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
               {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun} />}
               {route.tab === "settings" && (

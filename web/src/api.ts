@@ -9,7 +9,7 @@ export interface Example {
 export interface TaskDetail {
   name: string; embedder: string; supports_text: boolean; classifier: string;
   classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
-  reject_below_zero_shot: number | null; flip: boolean; temperature: number | null;
+  reject_below_zero_shot: number | null; flip: boolean; temperature: number | null; inbox_count: number;
   can_undo: boolean; can_redo: boolean; undo_label: string; redo_label: string; // labels: e.g. "delete 3 examples"
   revision: number; classes: ClassInfo[]; examples: Example[];
 }
@@ -29,6 +29,11 @@ export interface EvalReport {
   mistakes: HeldOut[]; predictions: HeldOut[]; suggested_reject_below: number | null;
   calibration: { temperature: number; ece: number; ece_calibrated: number } | null;
 }
+export interface InboxEntry {
+  id: string; file: string; source: string; added: string;
+  prediction?: Prediction | null; margin?: number | null; // absent while the task has no classes
+}
+export type InboxSort = "uncertain" | "confident" | "novel" | "added";
 export interface DuplicatePair { a: string; b: string; similarity: number; labels: string[]; same_label: boolean }
 export interface Health { status: string; auth_required: boolean; models_loaded: string[]; jobs_running: number; url_fetch: boolean }
 export interface AddResult { added: Example[]; errors: { file: string; error: string }[]; task: TaskDetail }
@@ -117,6 +122,11 @@ export const api = {
     return req<TaskDetail>("POST", "/api/tasks/import", fd);
   },
   health: () => req<Health>("GET", "/api/health"),
+  inbox: (n: string, sort: InboxSort) => req<{ total: number; items: InboxEntry[] }>("GET", `${t(n)}/inbox?sort=${sort}&limit=1000`),
+  addToInbox: (n: string, fs: File[]) =>
+    req<{ added: InboxEntry[]; errors: { file: string; error: string }[]; task: TaskDetail }>("POST", `${t(n)}/inbox`, files(fs)),
+  acceptInbox: (n: string, labels: Record<string, string>) => req<TaskDetail>("POST", `${t(n)}/inbox/accept`, { labels }),
+  dismissInbox: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/inbox/dismiss`, { ids }),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
   startEvaluation: (n: string) => req<Job<EvalReport>>("POST", `${t(n)}/evaluate/jobs`),
   job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${id}`),

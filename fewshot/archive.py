@@ -8,7 +8,7 @@ import uuid
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from pydantic import ValidationError
 
@@ -32,20 +32,20 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
     file missing from the task (only if it was damaged) is left out with its example.
     """
     t = ws.get(name)
-    examples = []
     with t._writing(), zipfile.ZipFile(out, "w") as z:  # pylint: disable=protected-access
         cfg = t.config
-        for e in cfg.examples:
-            try:
-                data = (t.path / e.file).read_bytes()
-            except FileNotFoundError:
-                continue
-            z.writestr(e.file, data, zipfile.ZIP_STORED)  # images are compressed already
-            examples.append(e)
-        z.writestr("task.json", cfg.model_copy(update={"examples": examples}).model_dump_json(indent=2),
-                   zipfile.ZIP_DEFLATED)
-        skipped = len(cfg.examples) - len(examples)
-    return len(examples), skipped
+        kept: dict[str, list[Any]] = {"examples": [], "inbox": []}
+        for field, items in (("examples", cfg.examples), ("inbox", cfg.inbox)):
+            for e in items:
+                try:
+                    data = (t.path / e.file).read_bytes()
+                except FileNotFoundError:
+                    continue
+                z.writestr(e.file, data, zipfile.ZIP_STORED)  # images are compressed already
+                kept[field].append(e)
+        z.writestr("task.json", cfg.model_copy(update=kept).model_dump_json(indent=2), zipfile.ZIP_DEFLATED)
+        skipped = len(cfg.examples) + len(cfg.inbox) - len(kept["examples"]) - len(kept["inbox"])
+    return len(kept["examples"]), skipped
 
 
 def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -73,7 +73,7 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
             build.mkdir()
             try:
                 t = Task(build, cfg, blobs=ws.blobs)
-                for e in cfg.examples:
+                for e in [*cfg.examples, *cfg.inbox]:
                     t._store_image(e.file, _read_member(z, images[e.file]))  # pylint: disable=protected-access
                 t._save(record=False)  # pylint: disable=protected-access
                 os.replace(build, p)  # replaces the empty reserved folder (POSIX)
@@ -93,6 +93,21 @@ def _read_member(z: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int | None = 
     if info.file_size > limit:
         raise ValueError(f"{info.filename} is larger than {limit // 1024 // 1024} MB")
     return z.read(info)  # zipfile stops at the declared size (and checks the CRC), so this is bounded
+
+
+def _check_member(z: zipfile.ZipFile, info: zipfile.ZipInfo) -> None:
+    """``ValueError`` unless the member is an image whose content hashes to the id in its name and
+    whose extension matches its real format."""
+    data = _read_member(z, info)
+    name = info.filename.rsplit("/", 1)[-1]
+    if not image_id(data).startswith(name.split(".", 1)[0]):
+        raise ValueError(f"Not a valid task export: {info.filename} doesn't match its id")
+    try:
+        ext = image_ext(data)
+    except ValueError as e:
+        raise ValueError(f"Not a valid task export: {info.filename}: {e}") from None
+    if not name.endswith("." + ext):
+        raise ValueError(f"Not a valid task export: {info.filename} is really a .{ext} image")
 
 
 def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipInfo]]:
@@ -116,22 +131,17 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
         classes.setdefault(check_class_name(c.name), c.model_copy(update={"name": check_class_name(c.name)}))
     examples = [x.model_copy(update={"label": check_class_name(x.label)})
                 for x in {x.id: x for x in cfg.examples}.values()]  # one per id
+    labelled = {x.id for x in examples}
+    inbox = [x for x in {x.id: x for x in cfg.inbox}.values() if x.id not in labelled]
     for ex in examples:
         classes.setdefault(ex.label, ClassDef(name=ex.label))
     members = {m.filename: m for m in z.infolist()}
-    missing = next((ex.file for ex in examples if ex.file not in members), None)
+    files = [x.file for x in [*examples, *inbox]]
+    missing = next((f for f in files if f not in members), None)
     if missing:
         raise ValueError(f"Not a valid task export: {missing} is missing")
-    if sum(members[ex.file].file_size for ex in examples) > MAX_IMPORT_TOTAL:
+    if sum(members[f].file_size for f in files) > MAX_IMPORT_TOTAL:
         raise ValueError(f"Not imported: the images unpack to more than {MAX_IMPORT_TOTAL // 1024 ** 3} GB")
-    for ex in examples:
-        data = _read_member(z, members[ex.file])
-        if not image_id(data).startswith(ex.id):
-            raise ValueError(f"Not a valid task export: {ex.file} doesn't match its id")
-        try:
-            ext = image_ext(data)
-        except ValueError as e:
-            raise ValueError(f"Not a valid task export: {ex.file}: {e}") from None
-        if not ex.file.endswith("." + ext):
-            raise ValueError(f"Not a valid task export: {ex.file} is really a .{ext} image")
-    return cfg.model_copy(update={"classes": list(classes.values()), "examples": examples}), members
+    for f in files:
+        _check_member(z, members[f])
+    return cfg.model_copy(update={"classes": list(classes.values()), "examples": examples, "inbox": inbox}), members

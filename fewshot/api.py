@@ -32,12 +32,10 @@ import secrets
 import tempfile
 import threading
 import time
-import uuid
 from collections import Counter, deque
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +43,6 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFi
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .archive import export_task as write_export
 from .archive import import_task as read_export
@@ -62,7 +59,9 @@ from .embedders import (
 )
 from .evaluate import evaluate_task
 from .fetch import fetch_url
+from .guard import LimitBody, cross_site, host_name
 from .images import thumbnail
+from .jobs import Job, Jobs
 from .pipeline import Pipeline, Prediction
 from .schemas import (
     AddResult,
@@ -70,6 +69,8 @@ from .schemas import (
     EvalReport,
     ExamplePage,
     Health,
+    InboxAdded,
+    InboxPage,
     JobOut,
     ModelsOut,
     PredictionOut,
@@ -97,6 +98,7 @@ MAX_REQUEST_BYTES = int(float(os.environ.get("FEWSHOT_MAX_REQUEST_MB", "1024")) 
 
 ws = Workspace()
 pipe = Pipeline(ws)
+jobs = Jobs()
 
 
 @asynccontextmanager
@@ -137,31 +139,14 @@ def _token_ok(given: str | None) -> bool:
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
-def _host_name(host: str) -> str:
-    """The name part of a Host header or URL authority, lower-cased, without port or brackets."""
-    host = host.strip().lower()
-    if host.startswith("["):  # [::1]:8000
-        return host[1 : host.find("]")] if "]" in host else host
-    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-
-
-def _cross_site(request: Request) -> bool:
-    """Whether a request comes from a page on another site: its Origin isn't this server, or the
-    browser says so in Sec-Fetch-Site. Requests without either (curl, the CLI) are not."""
-    origin = request.headers.get("origin")
-    if origin is not None:
-        return origin == "null" or origin.split("://", 1)[-1].lower() != request.headers.get("host", "").lower()
-    return request.headers.get("sec-fetch-site", "same-origin") not in {"same-origin", "none"}
-
-
 @app.middleware("http")
 async def _guard(request: Request, call_next: Any) -> Response:
     """Refuse requests for another host name (DNS rebinding) and writes from other sites (CSRF),
     then check the token."""
-    if "*" not in ALLOWED_HOSTS and _host_name(request.headers.get("host", "")) not in ALLOWED_HOSTS:
+    if "*" not in ALLOWED_HOSTS and host_name(request.headers.get("host", "")) not in ALLOWED_HOSTS:
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path
-    if request.method not in SAFE_METHODS and path.startswith("/api/") and _cross_site(request):
+    if request.method not in SAFE_METHODS and path.startswith("/api/") and cross_site(request):
         return JSONResponse({"detail": "Cross-site requests are not allowed"}, 403)
     if TOKEN is not None and path.startswith("/api/") and path not in OPEN_PATHS:
         auth = request.headers.get("authorization", "")
@@ -170,61 +155,6 @@ async def _guard(request: Request, call_next: Any) -> Response:
             return JSONResponse({"detail": "Not signed in"}, 401, headers={"WWW-Authenticate": "Bearer"})
     response: Response = await call_next(request)
     return response
-
-
-class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware is just __call__
-    """Refuse (413) request bodies over ``limit`` bytes, by Content-Length or while streaming, so an
-    oversized upload isn't spooled to disk first.
-
-    A streamed body that passes the limit gets the 413 at once (if no response has started), and
-    the app is told the client went away; whatever it then sends is dropped. Raising from the
-    body stream instead would reach FastAPI as a body-parsing error, which it reports as 400.
-    """
-
-    def __init__(self, inner: ASGIApp, limit: int) -> None:
-        self.inner, self.limit = inner, limit
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.inner(scope, receive, send)
-            return
-        length = dict(scope["headers"]).get(b"content-length")
-        if length is not None and length.isdigit() and int(length) > self.limit:
-            await self._refuse(scope, receive, send)
-            return
-        seen = 0
-        started = refused = False
-
-        async def counted() -> Message:
-            nonlocal seen, started, refused
-            if refused:
-                return {"type": "http.disconnect"}
-            msg = await receive()
-            seen += len(msg.get("body", b""))
-            if seen <= self.limit:
-                return msg
-            refused = True
-            if not started:  # too late for a 413 once a response has begun: just stop
-                started = True
-                await self._refuse(scope, receive, send)
-            return {"type": "http.disconnect"}
-
-        async def tracked(msg: Message) -> None:
-            nonlocal started
-            if refused:
-                return
-            started = started or msg["type"] == "http.response.start"
-            await send(msg)
-
-        try:
-            await self.inner(scope, counted, tracked)
-        except Exception:  # pylint: disable=broad-exception-caught  # the app failing on the cut-off body
-            if not refused:
-                raise
-
-    async def _refuse(self, scope: Scope, receive: Receive, send: Send) -> None:
-        mb = self.limit / 1024 / 1024
-        await JSONResponse({"detail": f"Request is larger than the {mb:.3g} MB limit"}, 413)(scope, receive, send)
 
 
 app.add_middleware(LimitBody, limit=MAX_REQUEST_BYTES)  # added last, so it runs first
@@ -298,6 +228,7 @@ def _detail(t: Task) -> dict[str, Any]:
         "flip": c.flip,
         "temperature": c.temperature,
         "revision": c.revision,
+        "inbox_count": len(c.inbox),
         "can_undo": t.can_undo(),
         "can_redo": t.can_redo(),
         "undo_label": t.undo_label(),
@@ -312,8 +243,7 @@ def _detail(t: Task) -> dict[str, Any]:
 @app.get("/healthz", include_in_schema=False)
 def health() -> dict[str, Any]:
     """Liveness check; also lists loaded models and running jobs. Needs no token."""
-    with _jobs_lock:
-        running = sum(j.status == "running" for j in _jobs.values())
+    running = len(jobs.running())
     return {"status": "ok", "auth_required": TOKEN is not None, "models_loaded": loaded_embedders(),
             "jobs_running": running, "url_fetch": ALLOW_URLS}
 
@@ -821,6 +751,79 @@ def example_image(name: str, eid: str,
     return Response(data, media_type="image/jpeg", headers={**CACHE_FOREVER, **IMAGE_HEADERS})
 
 
+# ---- inbox --------------------------------------------------------------
+def _add_inbox(t: Task, blobs: list[Blob]) -> dict[str, Any]:
+    """Put the readable ``blobs`` in the inbox; 400 if none could be added."""
+    errors: list[dict[str, str | None]] = [{"file": f, "error": err} for f, data, err in blobs if data is None]
+    ok = [(f, data) for f, data, _ in blobs if data is not None]
+    added: list[dict[str, Any]] = []
+    for (f, _), r in zip(ok, t.add_to_inbox((data, f or "") for f, data in ok), strict=True):
+        if isinstance(r, ValueError):
+            errors.append({"file": f, "error": str(r)})
+        else:
+            added.append(r.model_dump())
+    if not added:
+        why = "; ".join(f"{e['file']}: {e['error']}" for e in errors)
+        raise HTTPException(400, f"Nothing added to the inbox: {why}")
+    return {"added": added, "errors": errors, "task": _detail(t)}
+
+
+@app.post("/api/tasks/{name}/inbox", status_code=201, response_model=InboxAdded)
+def add_to_inbox(name: str, files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """Upload unlabelled images to the task's inbox, to label later with the model's suggestions."""
+    return _add_inbox(_task(name), _uploads(files))
+
+
+@app.post("/api/tasks/{name}/inbox/urls", status_code=201, response_model=InboxAdded)
+def add_urls_to_inbox(name: str, body: Urls) -> dict[str, Any]:
+    """Download images (server started with --allow-urls) into the task's inbox."""
+    t = _task(name)
+    return _add_inbox(t, _downloads(body.urls))
+
+
+@app.get("/api/tasks/{name}/inbox", response_model=InboxPage)
+def list_inbox(name: str, sort: str = Query("uncertain", pattern="^(uncertain|confident|novel|added)$"),
+               offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+    """The inbox with suggestions: ``uncertain`` first (the most useful to label), ``confident``
+    first (to accept in bulk), ``novel`` first (unlike any example), or as ``added``."""
+    t = _task(name)
+    try:
+        items = pipe.inbox_suggestions(t, sort)
+    except ValueError as e:
+        raise _bad(e) from e
+    return {"total": len(items), "offset": offset, "items": items[offset : offset + limit]}
+
+
+class InboxLabels(_Body):
+    """Body of POST .../inbox/accept: the class for each inbox image to label."""
+
+    labels: dict[str, str] = Field(min_length=1)
+
+
+@app.post("/api/tasks/{name}/inbox/accept", response_model=TaskDetail)
+def accept_inbox(name: str, body: InboxLabels) -> dict[str, Any]:
+    """Label inbox images, moving them to the examples (one undo step); 404 if an id isn't waiting."""
+    t = _task(name)
+    try:
+        t.accept(body.labels)
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
+    return _detail(t)
+
+
+@app.post("/api/tasks/{name}/inbox/dismiss", response_model=TaskDetail)
+def dismiss_inbox(name: str, body: ExampleIds) -> dict[str, Any]:
+    """Remove images from the inbox without labelling them (undo brings them back)."""
+    t = _task(name)
+    try:
+        t.dismiss(body.ids)
+    except KeyError as e:
+        raise _missing(e) from e
+    return _detail(t)
+
+
 # ---- inference ----------------------------------------------------------
 TOP_K = Query(None, ge=1, description="Return only this many of the highest scores per image")
 EVIDENCE = Query(0, ge=0, le=20, description="Also return this many of the most similar labelled examples")
@@ -872,70 +875,8 @@ def evaluate(name: str, folds: int | None = None) -> dict[str, Any]:
 
 
 # ---- background jobs ----------------------------------------------------
-class _Cancelled(Exception):
-    pass
-
-
-@dataclass
-class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job's state, one field each
-    """A long-running operation in a background thread, polled through /api/jobs/{id}."""
-
-    task: str
-    kind: str
-    revision: int = 0  # of the task when the job started
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    status: str = "running"  # running | done | failed | cancelled
-    stage: str = "starting"
-    done: int = 0
-    total: int = 0
-    result: Any = None
-    error: str | None = None
-    finished: float | None = None
-    cancel: threading.Event = field(default_factory=threading.Event)
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON view of the job."""
-        return {k: getattr(self, k) for k in ("id", "task", "kind", "status", "stage", "done", "total", "result",
-                                              "error")}
-
-    def progress(self, stage: str, done: int, total: int) -> None:
-        """Progress callback for the work; raises ``_Cancelled`` once cancellation was asked for."""
-        if self.cancel.is_set():
-            raise _Cancelled
-        self.stage, self.done, self.total = stage, done, total
-
-
-_jobs: dict[str, Job] = {}
-_jobs_lock = threading.Lock()
-JOBS_KEPT = 100  # finished jobs remembered (oldest are forgotten first)
-
-
-def _start_job(job: Job, work: Any) -> Job:
-    def run() -> None:
-        try:
-            job.result = work(job.progress)
-            job.status = "done"
-        except _Cancelled:
-            job.status = "cancelled"
-        except (ValueError, KeyError) as e:
-            job.status, job.error = "failed", str(e.args[0]) if e.args else str(e)
-        except Exception as e:  # pylint: disable=broad-exception-caught  # reported to the poller
-            log.exception("Job %s failed", job.id)
-            job.status, job.error = "failed", f"Internal error: {e}"
-        job.finished = time.time()
-
-    with _jobs_lock:
-        finished = sorted((j for j in _jobs.values() if j.finished), key=lambda j: j.finished or 0)
-        for old in finished[: max(0, len(finished) - JOBS_KEPT + 1)]:
-            del _jobs[old.id]
-        _jobs[job.id] = job
-    threading.Thread(target=run, name=f"fewshot-job-{job.id[:8]}", daemon=True).start()
-    return job
-
-
 def _job(jid: str) -> Job:
-    with _jobs_lock:
-        job = _jobs.get(jid)
+    job = jobs.get(jid)
     if job is None:
         raise HTTPException(404, f"No job {jid!r}")
     return job
@@ -949,15 +890,14 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
     if folds is not None and folds < 2:
         raise HTTPException(400, f"folds must be at least 2, got {folds}")
     kind = "evaluate" if folds is None else f"evaluate:{folds}"
-    with _jobs_lock:
-        running = [j for j in _jobs.values() if j.status == "running"]
+    running = jobs.running()
     same = next((j for j in running if (j.task, j.kind) == (name, kind) and j.revision == t.config.revision), None)
     if same is not None:  # the same evaluation is already running: share it
         return same.to_dict()
     if len(running) >= MAX_JOBS:
         raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
     job = Job(task=name, kind=kind, revision=t.config.revision)
-    return _start_job(job, lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
+    return jobs.start(job, lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
 
 
 @app.get("/api/jobs/{jid}", response_model=JobOut)

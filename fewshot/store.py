@@ -55,6 +55,7 @@ from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
 from .images import IMAGE_EXTS, image_ext, image_id
+from .inbox import TaskInbox
 from .text import check_class_name, check_tag, check_template, fill_template, prompts
 
 log = logging.getLogger(__name__)
@@ -105,6 +106,7 @@ def _copy_config(cfg: TaskConfig) -> TaskConfig:
         "classifier_params": copy.deepcopy(cfg.classifier_params),
         "classes": list(cfg.classes),
         "examples": list(cfg.examples),
+        "inbox": list(cfg.inbox),
     })
 
 
@@ -143,18 +145,15 @@ class ClassDef(BaseModel):
     description: str = ""  # used as a CLIP text prompt when non-empty
 
 
-class Example(BaseModel):
-    """A labeled example image stored in the task folder. Immutable: edits replace the object."""
+class ImageRef(BaseModel):
+    """An image stored in the task folder, named by its content id. Immutable: edits replace it."""
 
     model_config = ConfigDict(frozen=True)
 
     id: str
-    label: str
     file: str  # images/<id>.<ext>, relative to the task folder
     source: str = ""
     added: str = Field(default_factory=_now)
-    tags: tuple[str, ...] = ()
-    note: str = ""
 
     @field_validator("file")
     @classmethod
@@ -164,11 +163,23 @@ class Example(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _named_by_id(self) -> Example:
+    def _named_by_id(self) -> ImageRef:
         # The file name is how the shared image store finds the content, so it must be the id.
         if self.file.split("/", 1)[1].rsplit(".", 1)[0] != self.id:
             raise ValueError(f"file {self.file!r} is not named by the example id {self.id!r}")
         return self
+
+
+class InboxItem(ImageRef):
+    """An unlabelled image waiting in the task's inbox to be labelled (or dismissed)."""
+
+
+class Example(ImageRef):
+    """A labeled example image stored in the task folder. Immutable: edits replace the object."""
+
+    label: str
+    tags: tuple[str, ...] = ()
+    note: str = ""
 
     @field_validator("tags")
     @classmethod
@@ -199,9 +210,14 @@ class TaskConfig(BaseModel):
     temperature: float | None = None  # confidence calibration fitted by evaluation (None: 1, uncalibrated)
     classes: list[ClassDef] = Field(default_factory=list)
     examples: list[Example] = Field(default_factory=list)
+    inbox: list[InboxItem] = Field(default_factory=list)  # unlabelled images waiting to be labelled
     created: str = Field(default_factory=_now)
     revision: int = 0
     uid: str = Field(default_factory=lambda: uuid.uuid4().hex)  # tells a re-created task from the old one
+
+    def files(self) -> set[str]:
+        """Every image file this version uses: examples' and the inbox's."""
+        return {e.file for e in self.examples} | {i.file for i in self.inbox}
 
 
 def check_settings(cfg: TaskConfig) -> None:
@@ -217,7 +233,7 @@ def check_settings(cfg: TaskConfig) -> None:
     check_params(cfg.classifier, {"text_weight": cfg.text_weight, **cfg.classifier_params})
 
 
-class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole editing API of a task
+class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  # the whole editing API of a task
     """A task folder: its config plus example images. Every mutation is saved immediately.
 
     Mutations are serialised across threads and processes, and start from the latest
@@ -378,7 +394,7 @@ class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole
         task or a ``.trash-`` folder that ``Workspace.gc`` removes, never a half-deleted task.
         """
         with self._writing():
-            files = {e.file for e in self.config.examples} | self._redo_files()
+            files = self.config.files() | self._redo_files()
             files |= set().union(*(self._gone(p) for _, p in self._history()))
             trash = self.path.parent / f".trash-{uuid.uuid4().hex}"
             os.rename(self.path, trash)
@@ -516,11 +532,15 @@ class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole
             examples = self.config.examples
             at = {e.id: i for i, e in enumerate(examples)}  # id -> position
             legacy = {e.id: i for i, e in enumerate(examples) if len(e.id) == 16}  # 16 chars: older tasks
+            waiting = {x.id for x in self.config.inbox}
             for c in checked:
                 if isinstance(c, ValueError):
                     out.append(c)
                     continue
                 self._ensure_class(c.label)
+                if c.id in waiting:  # labelled now: no longer waiting in the inbox
+                    self.config.inbox = [x for x in self.config.inbox if x.id != c.id]
+                    waiting.discard(c.id)
                 i = at.get(c.id, legacy.get(c.id[:16]))
                 if i is not None:  # already stored: just relabel
                     ex = examples[i] = examples[i].model_copy(update={"label": c.label})
@@ -531,14 +551,19 @@ class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole
                     at[c.id] = len(examples)
                     examples.append(ex)
                 out.append(ex)
-            try:
-                if any(not isinstance(r, ValueError) for r in out):
-                    self._save(record=record, label=_add_label(out))
-            except BaseException:
-                for f in created:  # not named by any saved version
-                    self._drop_file(f)
-                raise
+            if any(not isinstance(r, ValueError) for r in out):
+                self._save_new(created, record, _add_label(out))
         return out
+
+    def _save_new(self, created: list[str], record: bool, label: str) -> None:
+        """``_save`` after storing new image files; if the save fails, the files ``created`` (named
+        by no saved version) are removed again."""
+        try:
+            self._save(record=record, label=label)
+        except BaseException:
+            for f in created:
+                self._drop_file(f)
+            raise
 
     def _ensure_class(self, label: str) -> None:
         """Add class ``label`` (already checked) if missing, without saving."""
@@ -659,7 +684,10 @@ class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole
         return [e for e in self.config.examples if e.id in keep]
 
     def image_path(self, eid: str) -> Path:
-        """Path of an example's image file."""
+        """Path of an example's (or inbox image's) file; ``KeyError`` if neither has the id."""
+        for x in self.config.inbox:
+            if x.id == eid:
+                return self.path / x.file
         return self.path / self.example(eid).file
 
     def summary(self) -> dict[str, Any]:
@@ -673,6 +701,7 @@ class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole
             "classifier": self.config.classifier,
             "n_classes": len(self.config.classes),
             "n_examples": len(self.config.examples),
+            "n_inbox": len(self.config.inbox),
             "counts": counts,
             "created": self.config.created,
             "revision": self.config.revision,

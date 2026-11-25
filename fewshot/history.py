@@ -100,7 +100,7 @@ class TaskHistory:
             return
         files = self._redo_files()
         shutil.rmtree(self.path / "history" / "redo", ignore_errors=True)
-        files -= {e.file for e in self.config.examples}
+        files -= self.config.files()
         files -= set().union(*(self._files_in(p) for _, p in self._history()))
         for f in files:
             self._drop_file(f)
@@ -136,7 +136,7 @@ class TaskHistory:
         for _, p in old:
             self._forget(p)
         # A file dropped again later is deleted when that later version goes.
-        gone -= {e.file for e in self.config.examples}
+        gone -= self.config.files()
         gone -= set().union(*(self._gone(p) for _, p in kept))
         gone -= self._redo_files()
         for f in gone:
@@ -145,7 +145,7 @@ class TaskHistory:
     def _drop_unused_images(self) -> int:
         """Delete image files that neither the task nor any kept version names; returns how many."""
         with self._writing():
-            used = {e.file for e in self.config.examples} | self._redo_files()
+            used = self.config.files() | self._redo_files()
             used |= set().union(*(self._files_in(p) for _, p in self._history()))
             images = self.path / "images"
             unused = [f"images/{f.name}" for f in images.iterdir() if f.is_file()] if images.is_dir() else []
@@ -157,7 +157,7 @@ class TaskHistory:
     def kept_files(self) -> set[str]:
         """Image files that undo or redo may bring back (named by a kept version, not the current one)."""
         files = self._redo_files() | set().union(*(self._files_in(p) for _, p in self._history()))
-        return files - {e.file for e in self.config.examples}
+        return files - self.config.files()
 
     def can_undo(self) -> bool:
         """Whether there is an earlier version to go back to."""
@@ -232,8 +232,9 @@ class TaskHistory:
 
     @staticmethod
     def _files_in(snap: Path) -> set[str]:
-        """Image files named by a kept version (read without full validation)."""
+        """Image files named by a kept version, examples' and inbox's (read without full validation)."""
         try:
-            return {e["file"] for e in json.loads(snap.read_bytes()).get("examples", [])}
+            cfg = json.loads(snap.read_bytes())
+            return {e["file"] for e in [*cfg.get("examples", []), *cfg.get("inbox", [])]}
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return set()

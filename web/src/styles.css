@@ -1141,3 +1141,60 @@ label.inline {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* inbox */
+.inbox-bar {
+  margin: 12px 0 4px;
+}
+
+.inbox-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.inbox-grid.stale {
+  opacity: 0.6;
+}
+
+.inbox-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.inbox-card.current {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.inbox-card.picked {
+  background: var(--accent-soft);
+}
+
+.inbox-pick {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+}
+
+.inbox-img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.inbox-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}

@@ -41,6 +41,7 @@ class TaskSummary(BaseModel):
     classifier: str
     n_classes: int
     n_examples: int
+    n_inbox: int
     counts: dict[str, int]  # examples per class
     created: str
     revision: int
@@ -66,6 +67,15 @@ class ExampleOut(BaseModel):
     note: str
 
 
+class InboxItemOut(BaseModel):
+    """An unlabelled image waiting in a task's inbox."""
+
+    id: str
+    file: str
+    source: str
+    added: str
+
+
 class TaskDetail(BaseModel):
     """A task's settings, classes and examples."""
 
@@ -80,6 +90,7 @@ class TaskDetail(BaseModel):
     flip: bool
     temperature: float | None
     revision: int
+    inbox_count: int  # images waiting in the inbox (listed by GET .../inbox)
     can_undo: bool
     can_redo: bool
     undo_label: str  # what undo would take back, e.g. "delete 3 examples" ("" if unknown)
@@ -122,7 +133,7 @@ class Evidence(BaseModel):
 class PredictionOut(BaseModel):
     """The result for one image."""
 
-    file: str | None
+    file: str | None = None  # the uploaded file's name or URL (not given for inbox suggestions)
     label: str | None  # None when rejected as unknown, or on error
     labels: list[str]  # every class the image matches (multi-label), ``label`` first
     top_label: str  # the most probable class, even if rejected
@@ -132,6 +143,29 @@ class PredictionOut(BaseModel):
     rejected: bool
     evidence: list[Evidence]  # the most similar labelled examples, when asked for (?evidence=N)
     error: str | None
+
+
+class InboxEntry(InboxItemOut):
+    """An inbox image with the model's suggestion (absent while the task has no classes)."""
+
+    prediction: PredictionOut | None = None
+    margin: float | None = None  # top probability minus the second: small means unsure
+
+
+class InboxPage(BaseModel):
+    """GET .../inbox: ``items`` is the page starting at ``offset`` of ``total``, in the sort asked for."""
+
+    total: int
+    offset: int
+    items: list[InboxEntry]
+
+
+class InboxAdded(BaseModel):
+    """POST .../inbox."""
+
+    added: list[InboxItemOut]
+    errors: list[FileError]
+    task: TaskDetail
 
 
 class DuplicatePair(BaseModel):

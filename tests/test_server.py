@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import fewshot.api
+import fewshot.guard
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
 from tests.conftest import png
 
@@ -114,7 +115,7 @@ def _asgi(chunks, inner):
         sent.append(msg)
 
     scope = {"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""}
-    asyncio.run(fewshot.api.LimitBody(inner, 10)(scope, receive, send))
+    asyncio.run(fewshot.guard.LimitBody(inner, 10)(scope, receive, send))
     return sent
 
 
@@ -151,7 +152,7 @@ def test_request_size_limit_passes_other_scopes():
     async def unused(*_args):
         raise AssertionError("not called")
 
-    asyncio.run(fewshot.api.LimitBody(inner, 10)({"type": "lifespan"}, unused, unused))
+    asyncio.run(fewshot.guard.LimitBody(inner, 10)({"type": "lifespan"}, unused, unused))
     assert seen == ["lifespan"]
 
 
@@ -261,9 +262,9 @@ def test_job_internal_error_and_cancel(client, monkeypatch):
 
 
 def test_old_jobs_are_forgotten(client, monkeypatch):
-    """Only the most recent JOBS_KEPT finished jobs are kept."""
+    """Only the most recent `kept` finished jobs are remembered."""
     task = _task(client, n=1)
-    monkeypatch.setattr(fewshot.api, "JOBS_KEPT", 2)
+    monkeypatch.setattr(fewshot.api.jobs, "kept", 2)
     ids = []
     for _ in range(3):
         ids.append(client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"])
