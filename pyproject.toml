@@ -23,10 +23,32 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint"]
 
 [project.scripts]
 fewshot = "fewshot.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["fewshot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["fewshot"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+exclude_also = ["if __name__ == .__main__.:"]
+
+[tool.pylint.main]
+init-hook = "import sys; sys.path.insert(0, 'tests')"
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pylint.basic]
+# One- and two-character names are standard notation for embeddings and matrices (X, y, Q, P, k).
+good-names-rgxs = ["^[_a-zA-Z][_a-zA-Z0-9]?$"]
