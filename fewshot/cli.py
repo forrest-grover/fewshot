@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 import typer
 
-from .embedders import DEFAULT_SPEC, PRESETS, spec_supports_text
-from .store import IMAGE_EXTS, Task, Workspace
+from .embedders import DEFAULT_SPEC, PRESETS, check_embedder, spec_supports_text
+from .store import IMAGE_EXTS, Task, Workspace, check_class_name
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline, Prediction
@@ -51,15 +51,21 @@ def _pipe(ws: Workspace) -> Pipeline:
     return Pipeline(ws)
 
 
+def _images_in(folder: Path, recursive: bool = True) -> list[Path]:
+    """Image files under ``folder``, sorted; folders and broken links with image names are left out."""
+    found = folder.rglob("*") if recursive else folder.iterdir()
+    return sorted(f for f in found if f.suffix.lower() in IMAGE_EXTS and f.is_file())
+
+
 def _expand(paths: list[Path]) -> list[Path]:
+    """Files named on the command line plus the images inside named folders; fails if there are none."""
     out: list[Path] = []
     for p in paths:
         if not p.exists():
             _fail(f"No such file or directory: {p}")
-        if p.is_dir():
-            out += sorted(f for f in p.rglob("*") if f.suffix.lower() in IMAGE_EXTS)
-        else:
-            out.append(p)
+        out += _images_in(p) if p.is_dir() else [p]
+    if not out:
+        _fail("No images found in " + ", ".join(map(str, paths)))
     return out
 
 
@@ -71,9 +77,18 @@ def _add_files(task: Task, label: str, files: list[Path]) -> int:
             task.add_example(f.read_bytes(), label, f.name)
         except ValueError as e:
             typer.secho(f"skip {f}: {e}", fg="yellow", err=True)
+        except OSError as e:
+            typer.secho(f"skip {f}: {e.strerror or e}", fg="yellow", err=True)
         else:
             n += 1
     return n
+
+
+def _check_embedder(spec: str) -> None:
+    try:
+        check_embedder(spec)
+    except ValueError as e:
+        _fail(str(e))
 
 
 @app.command()
@@ -92,7 +107,8 @@ def create(
 ) -> None:
     """Create a task."""
     kw = {"classifier": classifier}
-    if embedder:
+    if embedder is not None:
+        _check_embedder(embedder)
         kw["embedder"] = embedder
     try:
         t = _ws(root).create(name, **kw)
@@ -143,15 +159,19 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments 
     classifier: str | None = None,
     param: list[str] = typer.Option([], help="Classifier param KEY=VALUE (e.g. k=3, scale=20). Repeatable."),
     text_weight: float | None = None,
-    reject_below: float | None = typer.Option(None, help="Similarity threshold for 'unknown'; negative clears it"),
+    reject_below: float | None = typer.Option(None, help="Similarity threshold (-1 to 1) for 'unknown'"),
+    clear_reject: bool = typer.Option(False, "--clear-reject", help="Turn off the 'unknown' threshold"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Change task settings."""
+    """Change task settings; switching classifier resets its params unless --param is given."""
     t = _task(root, name)
+    if clear_reject and reject_below is not None:
+        _fail("Give either --reject-below or --clear-reject, not both")
     kw: dict[str, Any] = {}
-    if embedder:
+    if embedder is not None and embedder != t.config.embedder:
+        _check_embedder(embedder)
         kw["embedder"] = embedder
-    if classifier:
+    if classifier and classifier != t.config.classifier:
         kw["classifier"] = classifier
         kw["classifier_params"] = {}
     if param:
@@ -159,7 +179,9 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments 
     if text_weight is not None:
         kw["text_weight"] = text_weight
     if reject_below is not None:
-        kw["reject_below"] = None if reject_below < 0 else reject_below
+        kw["reject_below"] = reject_below
+    if clear_reject:
+        kw["reject_below"] = None
     try:
         t.update_settings(**kw)
     except ValueError as e:
@@ -219,10 +241,16 @@ def class_rm(name: str, label: str, root: Path | None = ROOT_OPT) -> None:
 
 @app.command()
 def add(name: str, label: str, paths: list[Path], root: Path | None = ROOT_OPT) -> None:
-    """Add images (files or directories) as examples of LABEL."""
+    """Add images (files or directories) as examples of LABEL; exits 1 if none could be added."""
     t = _task(root, name)
-    _add_files(t, label, _expand(paths))
+    try:
+        label = check_class_name(label)
+    except ValueError as e:
+        _fail(str(e))
+    n = _add_files(t, label, _expand(paths))
     typer.echo(f"{name}: {len(t.config.examples)} examples")
+    if n == 0:
+        _fail("No images were added")
 
 
 @app.command("import")
@@ -232,15 +260,16 @@ def import_dir(
     shots: int | None = typer.Option(None, min=1, help="Take at most this many images per class"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Import FOLDER/<class>/<image> into a task."""
+    """Import FOLDER/<class>/<image> into a task; exits 1 if no image could be imported."""
     t = _task(root, name)
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
     n = 0
     for d in sorted(p for p in folder.iterdir() if p.is_dir()):
-        files = sorted(f for f in d.iterdir() if f.suffix.lower() in IMAGE_EXTS)[:shots]
-        n += _add_files(t, d.name, files)
+        n += _add_files(t, d.name, _images_in(d, recursive=False)[:shots])
     typer.echo(f"Imported {n} images into {name}")
+    if n == 0:
+        _fail(f"No images were imported; expected {folder}/<class>/<image>")
 
 
 @app.command()
@@ -348,10 +377,10 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     folder: Path,
     embedder: list[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
     classifier: list[str] = typer.Option(["prototype"], help="Classifier(s) to compare"),
-    way: int = 5,
-    shot: list[int] = typer.Option([1, 5], help="Shot count(s)"),
-    query: int = 15,
-    episodes: int = 200,
+    way: int = typer.Option(5, min=2),
+    shot: list[int] = typer.Option([1, 5], min=0, help="Shot count(s)"),
+    query: int = typer.Option(15, min=1),
+    episodes: int = typer.Option(200, min=1),
     text_template: str | None = typer.Option(
         None, help="e.g. 'a photo of a {}' to use class names as text (CLIP only)"),
     root: Path | None = ROOT_OPT,

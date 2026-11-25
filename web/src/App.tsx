@@ -146,7 +146,7 @@ function NewTask({ models, run, onCreated }: {
       onSubmit={(e) => {
         e.preventDefault();
         setBusy(true);
-        void run(api.createTask(name.trim(), spec, "prototype")).then((t) => {
+        void run(api.createTask(name.trim(), spec || undefined, "prototype")).then((t) => {
           setBusy(false);
           if (t) onCreated(t);
         });

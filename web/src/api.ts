@@ -58,7 +58,8 @@ export const api = {
   models: () => req<ModelInfo>("GET", "/api/models"),
   tasks: () => req<TaskSummary[]>("GET", "/api/tasks"),
   task: (n: string) => req<TaskDetail>("GET", t(n)),
-  createTask: (name: string, embedder: string, classifier: string) =>
+  // An undefined embedder is left out of the body, so the server uses its default.
+  createTask: (name: string, embedder: string | undefined, classifier: string) =>
     req<TaskDetail>("POST", "/api/tasks", { name, embedder, classifier }),
   updateTask: (n: string, s: Record<string, unknown>) => req<TaskDetail>("PATCH", t(n), s),
   deleteTask: (n: string) => req<undefined>("DELETE", t(n)),

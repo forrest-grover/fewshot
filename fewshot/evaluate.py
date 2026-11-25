@@ -125,7 +125,7 @@ def load_folder_dataset(folder: Path) -> dict[str, list[Path]]:
     """Map each subfolder name of ``folder`` to its sorted image files; empty classes are skipped."""
     ds = {}
     for d in sorted(p for p in folder.iterdir() if p.is_dir()):
-        files = sorted(f for f in d.iterdir() if f.suffix.lower() in IMAGE_EXTS)
+        files = sorted(f for f in d.iterdir() if f.suffix.lower() in IMAGE_EXTS and f.is_file())
         if files:
             ds[d.name] = files
     return ds
@@ -191,6 +191,9 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     ``shot=0`` with a ``text_template`` such as ``"a photo of a {}"`` measures
     CLIP zero-shot accuracy.
     """
+    for arg, value, low in (("way", way, 2), ("shot", shot, 0), ("query", query, 1), ("episodes", episodes, 1)):
+        if value < low:
+            raise ValueError(f"{arg} must be at least {low}, got {value}")
     ds = {c: fs for c, fs in load_folder_dataset(folder).items() if len(fs) >= shot + query}
     if len(ds) < way:
         raise ValueError(f"Only {len(ds)} classes have >= {shot + query} images; need {way}")

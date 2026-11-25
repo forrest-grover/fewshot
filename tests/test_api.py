@@ -115,7 +115,7 @@ def test_check_embedder_trims_model_list(client, monkeypatch):
     def boom(spec):
         raise RuntimeError(f"Model {spec} not found. Available: " + ", ".join(["m"] * 500))
 
-    monkeypatch.setattr(fewshot.api, "get_embedder", boom)
+    monkeypatch.setattr(fewshot.embedders, "get_embedder", boom)
     r = client.post("/api/tasks", json={"name": "x", "embedder": "openclip:NotAModel"})
     assert r.status_code == 400
     assert r.json()["detail"] == "Could not load embedder 'openclip:NotAModel': Model openclip:NotAModel not found"
@@ -149,7 +149,7 @@ def test_update_task_settings(client, task, monkeypatch, request):
         calls.append(spec)
         return real(spec)
 
-    monkeypatch.setattr(fewshot.api, "get_embedder", recording_get_embedder)
+    monkeypatch.setattr(fewshot.embedders, "get_embedder", recording_get_embedder)
     assert client.patch(f"/api/tasks/{task}", json={"embedder": "fake:color"}).status_code == 200
     assert not calls
     r = client.patch(f"/api/tasks/{task}", json={"embedder": "bogus:x"})
@@ -193,10 +193,11 @@ def test_patch_class(client, task):
     assert classes["crimson"] == {"name": "crimson", "description": "deep red", "count": 3}
     assert sum(e["label"] == "crimson" for e in t["examples"]) == 3
 
-    # same name (after trimming) or empty-string name is a no-op rename
+    # the same name (after trimming) is a no-op rename; an empty one is an error
     before = client.get(f"/api/tasks/{task}").json()["classes"]
     assert client.patch(f"{url}/crimson", json={"name": " crimson "}).json()["classes"] == before
-    assert client.patch(f"{url}/crimson", json={"name": ""}).json()["classes"] == before
+    r = client.patch(f"{url}/crimson", json={"name": ""})
+    assert (r.status_code, r.json()["detail"]) == (400, "Class name is empty")
 
     r = client.patch(f"{url}/crimson", json={"name": "blue", "description": "clobbered?"})
     assert r.status_code == 400
@@ -370,3 +371,34 @@ def test_corrupt_task_is_skipped_and_reported(client, task, tmp_path):
     r = client.get(f"/api/tasks/{task}")
     assert r.status_code == 404
     assert "can't be loaded" in r.json()["detail"]
+
+
+def test_settings_bodies_are_strict(client, task):
+    """Unknown fields, contradictory options and an empty embedder are errors, not silent no-ops."""
+    r = client.patch(f"/api/tasks/{task}", json={"reject_bellow": 0.5})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == ["body", "reject_bellow"]
+    r = client.patch(f"/api/tasks/{task}", json={"clear_reject": True, "reject_below": 0.5})
+    assert (r.status_code, r.json()["detail"]) == (400, "Give either reject_below or clear_reject, not both")
+    for body in ({"embedder": ""}, {"embedder": "  "}):
+        r = client.patch(f"/api/tasks/{task}", json=body)
+        assert (r.status_code, r.json()["detail"]) == (400, "Embedder spec is empty")
+    r = client.post("/api/tasks", json={"name": "d", "embedder": ""})
+    assert (r.status_code, r.json()["detail"]) == (400, "Embedder spec is empty")
+    assert client.post(f"/api/tasks/{task}/classes", json={"name": "x", "colour": "red"}).status_code == 422
+    assert client.get(f"/api/tasks/{task}").json()["embedder"] == "fake:color"
+
+
+def test_uploads_over_the_size_limit_are_refused(client, task, monkeypatch):
+    """Files over the limit are reported per file and never fully read."""
+    monkeypatch.setattr(fewshot.api, "MAX_UPLOAD_BYTES", 100)
+    big = png(RED, size=64, noise=50)
+    assert len(big) > 100
+    files = [("files", ("big.png", big, "image/png")), ("files", ("small.png", png(RED, size=2), "image/png"))]
+    r = client.post(f"/api/tasks/{task}/examples", data={"label": "red"}, files=files)
+    assert r.status_code == 201
+    assert r.json()["errors"] == [{"file": "big.png", "error": "File is larger than the 9.53674e-05 MB upload limit"}]
+    r = client.post(f"/api/tasks/{task}/predict", files=files)
+    big_pred, small_pred = r.json()
+    assert big_pred["error"].startswith("File is larger than")
+    assert small_pred["error"] is None

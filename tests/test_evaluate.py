@@ -247,3 +247,12 @@ def test_benchmark_zero_shot_without_text_fails(ws, tmp_path):
     folder = make_folder(tmp_path / "data", classes=("red", "blue"))
     with pytest.raises(ValueError, match="no images and no text"):
         benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=0, query=2, episodes=1)
+
+
+@pytest.mark.parametrize(("arg", "value"), [("way", 1), ("shot", -1), ("query", 0), ("episodes", 0)])
+def test_benchmark_rejects_meaningless_arguments(ws, tmp_path, arg, value):
+    """Arguments that would give NaN or an empty benchmark are ValueErrors."""
+    folder = make_folder(tmp_path / "data", classes=("red", "blue"))
+    kw = {"way": 2, "shot": 1, "query": 1, "episodes": 1, arg: value}
+    with pytest.raises(ValueError, match=f"{arg} must be at least"):
+        benchmark(Pipeline(ws), folder, "fake:color", **kw)

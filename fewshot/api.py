@@ -5,18 +5,19 @@ The built web UI (web/dist) is served at / when present.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .classifiers import CLASSIFIERS
-from .embedders import PRESETS, get_embedder, spec_supports_text
+from .embedders import PRESETS, check_embedder, spec_supports_text
 from .evaluate import evaluate_task
-from .pipeline import Pipeline
+from .pipeline import Pipeline, Prediction
 from .store import Task, Workspace
 
 ws = Workspace()
@@ -40,13 +41,31 @@ def _bad(e: Exception) -> HTTPException:
 
 
 def _check_embedder(spec: str) -> None:
-    """Load the embedder now so a bad spec fails here, not at predict time."""
+    """Load the embedder now so a bad spec fails here (400), not at predict time."""
     try:
-        get_embedder(spec)
-    # Model loaders (open_clip, timm, hub downloads) raise many unrelated exception types for a bad name.
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        msg = str(e).split(". Available:", maxsplit=1)[0]  # open_clip appends every known model name
-        raise HTTPException(400, f"Could not load embedder {spec!r}: {msg[:300]}") from e
+        check_embedder(spec)
+    except ValueError as e:
+        raise _bad(e) from e
+
+
+# Largest accepted upload per image; FEWSHOT_MAX_UPLOAD_MB overrides it.
+MAX_UPLOAD_BYTES = int(float(os.environ.get("FEWSHOT_MAX_UPLOAD_MB", "50")) * 1024 * 1024)
+
+
+def _read_upload(f: UploadFile) -> bytes | None:
+    """The uploaded file's bytes, or None if it is over ``MAX_UPLOAD_BYTES`` (read no further)."""
+    data = f.file.read(MAX_UPLOAD_BYTES + 1)
+    return None if len(data) > MAX_UPLOAD_BYTES else data
+
+
+def _too_large() -> str:
+    return f"File is larger than the {MAX_UPLOAD_BYTES / 1024 / 1024:g} MB upload limit"
+
+
+class _Body(BaseModel):
+    """Request bodies refuse unknown fields, so a misspelt setting is an error, not a no-op."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 def _detail(t: Task) -> dict[str, Any]:
@@ -77,7 +96,7 @@ def models() -> dict[str, Any]:
 
 
 # ---- tasks --------------------------------------------------------------
-class TaskCreate(BaseModel):
+class TaskCreate(_Body):
     """Body of POST /api/tasks."""
 
     name: str
@@ -85,7 +104,7 @@ class TaskCreate(BaseModel):
     classifier: str = "prototype"
 
 
-class TaskSettings(BaseModel):
+class TaskSettings(_Body):
     """Body of PATCH /api/tasks/{name}; omitted fields are left unchanged."""
 
     embedder: str | None = None
@@ -106,7 +125,7 @@ def list_tasks() -> list[dict[str, Any]]:
 def create_task(body: TaskCreate) -> dict[str, Any]:
     """Create a task, validating the embedder spec first."""
     kw = {"classifier": body.classifier}
-    if body.embedder:
+    if body.embedder is not None:
         _check_embedder(body.embedder)
         kw["embedder"] = body.embedder
     try:
@@ -127,10 +146,12 @@ def update_task(name: str, body: TaskSettings) -> dict[str, Any]:
     t = _task(name)
     kw = body.model_dump(exclude_none=True, exclude={"clear_reject"})
     if body.clear_reject:
+        if body.reject_below is not None:
+            raise HTTPException(400, "Give either reject_below or clear_reject, not both")
         kw["reject_below"] = None
     if "classifier" in kw and "classifier_params" not in kw and kw["classifier"] != t.config.classifier:
         kw["classifier_params"] = {}
-    if kw.get("embedder") and kw["embedder"] != t.config.embedder:
+    if "embedder" in kw and kw["embedder"] != t.config.embedder:
         _check_embedder(kw["embedder"])
     try:
         t.update_settings(**kw)
@@ -147,14 +168,14 @@ def delete_task(name: str) -> None:
 
 
 # ---- classes ------------------------------------------------------------
-class ClassBody(BaseModel):
+class ClassBody(_Body):
     """Body of POST .../classes."""
 
     name: str
     description: str | None = None
 
 
-class ClassPatch(BaseModel):
+class ClassPatch(_Body):
     """Body of PATCH .../classes/{label}: rename and/or set the description."""
 
     name: str | None = None
@@ -178,10 +199,8 @@ def patch_class(name: str, label: str, body: ClassPatch) -> dict[str, Any]:
     t = _task(name)
     if label not in t.class_names():
         raise HTTPException(404, f"No class {label!r}")
-    if body.name and body.name.strip() != label:
+    if body.name is not None and body.name.strip() != label:
         new = body.name.strip()
-        if not new:
-            raise HTTPException(400, "Class name is empty")
         try:
             t.rename_class(label, new)
         except ValueError as e:
@@ -192,7 +211,7 @@ def patch_class(name: str, label: str, body: ClassPatch) -> dict[str, Any]:
     return _detail(t)
 
 
-class Describe(BaseModel):
+class Describe(_Body):
     """Body of POST .../describe."""
 
     template: str = "a photo of a {}"
@@ -234,8 +253,12 @@ def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = Fi
     added: list[dict[str, Any]] = []
     errors: list[dict[str, str | None]] = []
     for f in files:
+        data = _read_upload(f)
+        if data is None:
+            errors.append({"file": f.filename, "error": _too_large()})
+            continue
         try:
-            added.append(t.add_example(f.file.read(), label, f.filename or "").model_dump())
+            added.append(t.add_example(data, label, f.filename or "").model_dump())
         except ValueError as e:
             errors.append({"file": f.filename, "error": str(e)})
     if not added:
@@ -243,7 +266,7 @@ def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = Fi
     return {"added": added, "errors": errors, "task": _detail(t)}
 
 
-class Relabel(BaseModel):
+class Relabel(_Body):
     """Body of PATCH .../examples/{eid}."""
 
     label: str
@@ -288,11 +311,12 @@ def example_image(name: str, eid: str) -> FileResponse:
 def predict(name: str, files: list[UploadFile] = File(...)) -> list[dict[str, Any]]:
     """Classify uploaded images; an unreadable file gets ``error`` set instead of a label."""
     t = _task(name)
-    blobs = [f.file.read() for f in files]
+    blobs = [_read_upload(f) for f in files]
     try:
-        preds = pipe.predict(t, blobs)
+        preds = pipe.predict(t, [b if b is not None else b"" for b in blobs])
     except ValueError as e:
         raise _bad(e) from e
+    preds = [p if b is not None else Prediction.failed(_too_large()) for b, p in zip(blobs, preds, strict=True)]
     return [{"file": f.filename, **p.to_dict()} for f, p in zip(files, preds, strict=True)]
 
 

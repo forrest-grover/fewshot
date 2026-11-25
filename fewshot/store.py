@@ -6,7 +6,8 @@ Layout::
     <root>/tasks/<name>/task.json       config, classes, example labels
     <root>/tasks/<name>/images/<id>.<ext>
 
-Example ids are the first 16 hex chars of the SHA-256 of the image bytes, so
+Example ids are the first 32 hex chars (128 bits) of the SHA-256 of the image
+bytes (16 in tasks created before that; both are accepted), so
 adding the same image twice is a no-op (or a relabel), and cached embeddings
 are reused across tasks.
 
@@ -52,7 +53,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # Example files are always written as images/<id>.<ext>; anything else in task.json was not
 # written by us, and following it could read or delete files outside the task.
-EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}\.[a-z0-9]{1,10}$")
+EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}(?:[0-9a-f]{16})?\.[a-z0-9]{1,10}$")
 MAX_CLASS_NAME = 200
 
 
@@ -78,8 +79,12 @@ def default_root() -> Path:
 
 
 def image_id(data: bytes) -> str:
-    """Content id of an image: the first 16 hex chars of its SHA-256."""
-    return hashlib.sha256(data).hexdigest()[:16]
+    """Content id of an image: the first 32 hex chars (128 bits) of its SHA-256.
+
+    128 bits make a deliberate collision (one image passing for another) infeasible; older tasks
+    hold 16-char ids, which ``Task.add_example`` still recognises.
+    """
+    return hashlib.sha256(data).hexdigest()[:32]
 
 
 def load_image(data: bytes) -> Image.Image:
@@ -400,7 +405,7 @@ class Task:
             if label not in self.class_names():
                 self.upsert_class(label)
             for e in self.config.examples:
-                if e.id == eid:
+                if e.id == eid or (len(e.id) == 16 and eid.startswith(e.id)):  # 16 chars: older tasks
                     e.label = label
                     self._save()
                     return e

@@ -40,10 +40,10 @@ def test_default_root_uses_env_or_local_folder(monkeypatch, tmp_path):
     assert store.default_root() == (tmp_path / "fewshot_data").resolve()
 
 
-def test_image_id_is_short_content_hash():
-    """Same bytes give the same 16-hex id; different bytes differ."""
+def test_image_id_is_content_hash():
+    """Same bytes give the same 32-hex (128-bit) id; different bytes differ."""
     a = image_id(b"abc")
-    assert a == "ba7816bf8f01cfea"
+    assert a == "ba7816bf8f01cfea414140de5dae2223"
     assert image_id(b"abc") == a
     assert image_id(b"abd") != a
 
@@ -414,3 +414,24 @@ def test_corrupt_or_misnamed_tasks_are_skipped(ws, caplog):
         fresh.get("bad")
     with pytest.raises(KeyError, match="name 'other' does not match its folder"):
         fresh.get("moved")
+
+
+def test_legacy_16_char_ids_still_match(ws):
+    """Tasks saved with 16-char ids load, and re-adding the same image relabels it instead of duplicating."""
+    t = ws.create("t")
+    t.add_example(png(RED), "red")
+
+    def shorten(data):
+        e = data["examples"][0]
+        e["id"] = e["id"][:16]
+        e["file"] = f"images/{e['id']}.png"
+
+    old = t.path / t.config.examples[0].file
+    old.rename(t.path / f"images/{t.config.examples[0].id[:16]}.png")
+    _write_task_json(ws, "t", shorten)
+    fresh = Workspace(ws.root).get("t")
+    assert len(fresh.config.examples[0].id) == 16
+    again = fresh.add_example(png(RED), "blue")
+    assert again.id == fresh.config.examples[0].id
+    assert [e.label for e in fresh.config.examples] == ["blue"]
+    assert fresh.image_path(again.id).exists()

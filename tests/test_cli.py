@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from fewshot import cli, embedders
-from fewshot.embedders import PRESETS
+from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
 from fewshot.store import Workspace
 from tests.conftest import ColorEmbedder, png
 
@@ -141,16 +141,38 @@ def test_config(run, root, task):
     assert (c.classifier, c.classifier_params, c.text_weight, c.reject_below) == (
         "knn", {"k": 3, "scale": 20}, 0.5, 0.7)
 
-    # A --param on its own extends the existing params; a negative --reject-below clears the threshold.
-    assert run("config", task, "--param", "k=5", "--reject-below", "-1").exit_code == 0
+    # A --param on its own extends the existing params; a negative --reject-below is a threshold.
+    assert run("config", task, "--param", "k=5", "--reject-below", "-0.5").exit_code == 0
     c = load(root).config
     assert c.classifier_params == {"k": 5, "scale": 20}
-    assert c.reject_below is None
+    assert c.reject_below == -0.5
+    assert run("config", task, "--clear-reject").exit_code == 0
+    assert load(root).config.reject_below is None
 
-    # Changing the classifier resets its params, and --embedder is stored as given.
-    assert run("config", task, "--classifier", "prototype", "--embedder", "fake:other").exit_code == 0
+    # Naming the current classifier keeps its params; changing it resets them.
+    assert run("config", task, "--classifier", "knn").exit_code == 0
+    assert load(root).config.classifier_params == {"k": 5, "scale": 20}
+    register_embedder("fake:other", ColorEmbedder())
+    try:
+        assert run("config", task, "--classifier", "prototype", "--embedder", "fake:other").exit_code == 0
+    finally:
+        unregister_embedder("fake:other")
     c = load(root).config
     assert (c.classifier, c.classifier_params, c.embedder) == ("prototype", {}, "fake:other")
+
+
+def test_config_and_create_validate_embedders(run, root, task):
+    """A spec that can't be loaded is refused before anything is saved."""
+    for args in (["config", task, "--embedder", "bogus:x"], ["create", "new", "--embedder", "bogus:x"],
+                 ["config", task, "--embedder", ""]):
+        r = run(*args)
+        assert r.exit_code == 1
+        assert "embedder" in r.output.lower()
+    assert load(root).config.embedder == "fake:color"
+    assert not (root / "tasks" / "new").exists()
+    r = run("config", task, "--reject-below", "0.5", "--clear-reject")
+    assert r.exit_code == 1
+    assert "not both" in r.output
 
 
 @pytest.mark.parametrize(("args", "message"), [
@@ -460,3 +482,76 @@ def test_serve(monkeypatch, tmp_path):
     assert runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--root", str(tmp_path)]).exit_code == 0
     assert calls[-1] == ("fewshot.api:app", {"host": "0.0.0.0", "port": 8000})
     assert os.environ["FEWSHOT_HOME"] == str(tmp_path)
+
+
+def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):
+    """A directory or dangling symlink called *.png is not treated as an image."""
+    odd = tmp_path / "odd"
+    write_images(odd, COLORS["red"], 1)
+    (odd / "folder.png").mkdir()
+    (odd / "folder.png" / "inner.png").write_bytes(png(COLORS["red"], noise=20, seed=77))
+    (odd / "broken.png").symlink_to(tmp_path / "missing.png")
+    (photos / "blue" / "sub.png").mkdir()
+    (photos / "blue" / "dangling.png").symlink_to(tmp_path / "missing.png")
+
+    r = run("add", task, "red", odd)
+    assert r.exit_code == 0, r.output  # 0.png and folder.png/inner.png; the dangling link is skipped
+    assert "folder.png:" not in r.output
+    r = run("import", task, photos)
+    assert r.exit_code == 0, r.output
+    r = run("predict", task, odd, "--json")
+    assert r.exit_code == 0, r.output
+    assert [os.path.basename(p["file"]) for p in json.loads(r.output)] == ["0.png", "inner.png"]
+
+
+def test_add_and_import_fail_when_nothing_is_added(run, task, tmp_path):
+    """Exit 1 when no image could be added, instead of reporting success."""
+    junk = tmp_path / "junk.png"
+    junk.write_bytes(b"junk")
+    r = run("add", task, "blue", junk)
+    assert r.exit_code == 1
+    assert "No images were added" in r.output
+    r = run("add", task, "   ", junk)
+    assert r.exit_code == 1
+    assert "Class name is empty" in r.output
+    r = run("add", task, "..", junk)
+    assert r.exit_code == 1
+    assert "can't be '.' or '..'" in r.output
+
+    empty = tmp_path / "empty"
+    (empty / "red").mkdir(parents=True)
+    r = run("import", task, empty)
+    assert r.exit_code == 1
+    assert "No images were imported" in r.output
+    r = run("predict", task, empty)
+    assert r.exit_code == 1
+    assert "No images found" in r.output
+
+
+def test_unreadable_file_is_skipped_when_adding(run, task, tmp_path, monkeypatch):
+    """An OSError reading one file skips it with a message rather than a traceback."""
+    good, bad = tmp_path / "good.png", tmp_path / "bad.png"
+    good.write_bytes(png(COLORS["red"], noise=20, seed=55))
+    bad.write_bytes(png(COLORS["red"], noise=20, seed=56))
+    real = type(bad).read_bytes
+
+    def read_bytes(self):
+        if self.name == "bad.png":
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+
+    monkeypatch.setattr(type(bad), "read_bytes", read_bytes)
+    r = run("add", task, "red", good, bad)
+    assert r.exit_code == 0
+    assert f"skip {bad}: Permission denied" in r.output
+
+
+@pytest.mark.parametrize(("args", "option"), [
+    (["--way", "1"], "--way"), (["--query", "0"], "--query"), (["--episodes", "0"], "--episodes"),
+    (["--shot", "-1"], "--shot"),
+])
+def test_bench_rejects_out_of_range_options(run, bench_data, args, option):
+    """Options that would make the benchmark meaningless are usage errors."""
+    r = run("bench", bench_data, "--embedder", "fake:color", *args)
+    assert r.exit_code == 2
+    assert option in r.output

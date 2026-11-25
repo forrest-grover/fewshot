@@ -261,6 +261,22 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
         return emb
 
 
+def check_embedder(spec: str) -> None:
+    """Load the embedder for ``spec`` now, raising ``ValueError`` with a short reason if it can't be.
+
+    Used where a spec is chosen (task create and settings) so a bad one fails there, not at
+    predict time. A preset may be downloaded on first use.
+    """
+    if not spec.strip():
+        raise ValueError("Embedder spec is empty")
+    try:
+        get_embedder(spec)
+    # Model loaders (open_clip, timm, hub downloads) raise many unrelated exception types for a bad name.
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        msg = str(e).split(". Available:", maxsplit=1)[0]  # open_clip appends every known model name
+        raise ValueError(f"Could not load embedder {spec!r}: {msg[:300]}") from e
+
+
 def register_embedder(spec: str, embedder: Embedder) -> None:
     """Make ``get_embedder(spec)`` return ``embedder``, replacing any embedder loaded under ``spec``.
 
