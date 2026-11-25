@@ -15,15 +15,22 @@ const PARAMS: Record<string, { key: string; label: string; help: string; def: nu
   logreg: [{ key: "C", label: "C", help: "Inverse regularisation strength (default 10)", def: 10 }],
 };
 
-/** Display value for a classifier parameter; params are numbers (or numeric strings) from the server. */
-function paramValue(v: unknown, def: number): string {
-  return typeof v === "number" || typeof v === "string" ? String(v) : String(def);
+/** Classifier params from the server as the text shown in their inputs. */
+function paramTexts(p: Record<string, unknown>): Record<string, string> {
+  return Object.fromEntries(Object.entries(p).map(([k, v]) => [k, typeof v === "number" || typeof v === "string" ? String(v) : ""]));
+}
+
+/** A typed number, or null for blank (use the default) or NaN for anything unparseable. */
+function parseNumber(s: string): number | null {
+  const t = s.trim();
+  return t === "" ? null : Number(t);
 }
 
 export default function Settings({ task, models, setTask, run, onDeleted }: Props) {
   const [embedder, setEmbedder] = useState(task.embedder);
   const [classifier, setClassifier] = useState(task.classifier);
-  const [params, setParams] = useState<Record<string, unknown>>(task.classifier_params);
+  // Inputs keep exactly what was typed; it is parsed and checked on save.
+  const [params, setParams] = useState<Record<string, string>>(paramTexts(task.classifier_params));
   const [textWeight, setTextWeight] = useState(task.text_weight);
   const [reject, setReject] = useState(task.reject_below == null ? "" : String(task.reject_below));
   const [saving, setSaving] = useState(false);
@@ -34,7 +41,7 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
   const [formKey, setFormKey] = useState(taskKey);
   if (formKey !== taskKey) {
     setFormKey(taskKey);
-    setEmbedder(task.embedder); setClassifier(task.classifier); setParams(task.classifier_params);
+    setEmbedder(task.embedder); setClassifier(task.classifier); setParams(paramTexts(task.classifier_params));
     setTextWeight(task.text_weight); setReject(task.reject_below == null ? "" : String(task.reject_below));
   }
 
@@ -45,13 +52,24 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
     ? task.supports_text
     : presets.find((p) => p.spec === embedder)?.supports_text ?? embedder.startsWith("openclip:");
 
+  // Switching classifier clears ``params`` (see its select), so they always belong to ``classifier``.
+  const parsedParams: Record<string, number> = {};
+  const problems: string[] = [];
+  for (const [k, text] of Object.entries(params)) {
+    const n = parseNumber(text);
+    if (n === null) continue; // blank: the server uses the default
+    if (Number.isFinite(n)) parsedParams[k] = n;
+    else problems.push(`${k} must be a number`);
+  }
+  const rejectValue = parseNumber(reject);
+  if (rejectValue !== null && !Number.isFinite(rejectValue)) problems.push("Reject below must be a number, or blank for off");
+
   const save = async () => {
     setSaving(true);
-    const r = reject.trim();
     const t = await run(api.updateTask(task.name, {
-      embedder, classifier, classifier_params: classifier === task.classifier ? params : {},
+      embedder, classifier, classifier_params: parsedParams,
       text_weight: textWeight,
-      ...(r === "" ? { clear_reject: true } : { reject_below: Number(r) }),
+      ...(rejectValue === null ? { clear_reject: true } : { reject_below: rejectValue }),
     }));
     setSaving(false);
     if (t) setTask(t);
@@ -82,8 +100,8 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
       {(PARAMS[classifier] ?? []).map((p) => (
         <label key={p.key}>
           <span>{p.label}</span>
-          <input type="number" step="any" value={paramValue(params[p.key], p.def)}
-            onChange={(e) => { setParams({ ...params, [p.key]: e.target.value === "" ? p.def : Number(e.target.value) }); }} />
+          <input type="text" inputMode="decimal" value={params[p.key] ?? ""} placeholder={String(p.def)}
+            onChange={(e) => { setParams({ ...params, [p.key]: e.target.value }); }} />
           <small className="muted">{p.help}</small>
         </label>
       ))}
@@ -99,15 +117,16 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
 
       <label>
         <span>Reject below similarity</span>
-        <input type="number" step="0.01" min={0} max={1} value={reject} placeholder="off" onChange={(e) => { setReject(e.target.value); }} />
+        <input type="text" inputMode="decimal" value={reject} placeholder="off" onChange={(e) => { setReject(e.target.value); }} />
         <small className="muted">
           Images whose best similarity falls below this value are returned as "unknown". Start near 0.7 for image examples, and tune it
           with the similarity values shown on the Predict tab. Tasks that only have text descriptions score lower (about 0.2–0.35).
         </small>
       </label>
 
+      {problems.length > 0 && <div className="error" role="alert"><span>{problems.join(". ")}.</span></div>}
       <div className="row">
-        <button onClick={() => { void save(); }} disabled={saving || !embedder}>{saving ? "Saving…" : "Save settings"}</button>
+        <button onClick={() => { void save(); }} disabled={saving || !embedder || problems.length > 0}>{saving ? "Saving…" : "Save settings"}</button>
       </div>
 
       <hr />

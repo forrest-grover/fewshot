@@ -17,7 +17,12 @@ export default function Examples({ task, setTask, run }: Props) {
       if (r.errors.length) alert(`Skipped ${String(r.errors.length)} file(s):\n` + r.errors.map((e) => `${e.file}: ${e.error}`).join("\n"));
     }
   };
-  const save = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
+  /** Run a mutation and show its result; resolves to whether it succeeded. */
+  const save = async (p: Promise<TaskDetail>) => {
+    const t = await run(p);
+    if (t) setTask(t);
+    return t !== undefined;
+  };
 
   const byClass = new Map(task.classes.map((c) => [c.name, task.examples.filter((e) => e.label === c.name)]));
 
@@ -27,7 +32,7 @@ export default function Examples({ task, setTask, run }: Props) {
         className="row add-class"
         onSubmit={(e) => {
           e.preventDefault();
-          if (newClass.trim()) void save(api.addClass(task.name, newClass.trim())).then(() => { setNewClass(""); });
+          if (newClass.trim()) void save(api.addClass(task.name, newClass.trim())).then((ok) => { if (ok) setNewClass(""); });
         }}
       >
         <input value={newClass} onChange={(e) => { setNewClass(e.target.value); }} placeholder="New class name" />

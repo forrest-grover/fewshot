@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
 import Evaluate from "./Evaluate";
 import Examples from "./Examples";
@@ -9,8 +9,18 @@ import { ErrorBox } from "./ui";
 const TABS = ["examples", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
 
+/** decodeURIComponent, but malformed input (e.g. a stray "%") is kept as typed instead of throwing. */
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 function parseHash(): { task: string | null; tab: Tab } {
-  const [, name, tab] = decodeURIComponent(location.hash.slice(1)).split("/");
+  // Split before decoding, so an encoded "/" stays inside its segment.
+  const [, name = "", tab = ""] = location.hash.slice(1).split("/").map(safeDecode);
   return { task: name || null, tab: (TABS as readonly string[]).includes(tab) ? (tab as Tab) : "examples" };
 }
 const go = (task: string | null, tab: Tab = "examples") => {
@@ -23,6 +33,8 @@ export default function App() {
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [models, setModels] = useState<ModelInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
 
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
     try {
@@ -47,13 +59,28 @@ export default function App() {
   }, [refreshTasks, run]);
 
   useEffect(() => {
+    currentTask.current = route.task;
     setError(null);
     setTask(null);
-    if (route.task) void run(api.task(route.task)).then((t) => { if (t) setTask(t); });
-  }, [route.task, run]);
+    setLoadFailed(false);
+    if (!route.task) return;
+    let current = true; // false once the user opens another task: a late response must not show
+    api.task(route.task).then(
+      (t) => { if (current) setTask(t); },
+      (e: unknown) => {
+        if (!current) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setLoadFailed(true);
+      },
+    );
+    return () => { current = false; };
+  }, [route.task]);
 
+  /** Show a task returned by a mutation, unless it is for another task or older than what is shown. */
   const updateTask = (t: TaskDetail) => {
-    setTask(t);
+    if (t.name === currentTask.current) {
+      setTask((cur) => (cur && cur.name === t.name && cur.revision > t.revision ? cur : t));
+    }
     void refreshTasks();
   };
 
@@ -75,7 +102,9 @@ export default function App() {
       <main>
         <ErrorBox error={error} onClose={() => { setError(null); }} />
         {!route.task && <NewTask models={models} run={run} onCreated={(t) => { void refreshTasks(); go(t.name); }} />}
-        {route.task && !task && <p className="muted">Loading…</p>}
+        {route.task && !task && (loadFailed
+          ? <p className="muted">Task “{route.task}” could not be loaded. <a href="#">Back to tasks</a></p>
+          : <p className="muted">Loading…</p>)}
         {task && (
           <>
             <header className="task-head">
