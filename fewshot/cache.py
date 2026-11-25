@@ -15,15 +15,23 @@ import numpy as np
 
 from .embedders import Vectors
 
+BUSY_TIMEOUT = 30.0  # seconds to wait for another process's write to finish
+
 
 class EmbeddingCache:
     """Thread-safe embedding store; vectors are float32 blobs."""
 
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self.path = path
+        # The server and CLI may share this file: wait up to BUSY_TIMEOUT for the other's write
+        # instead of failing with "database is locked".
+        self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=BUSY_TIMEOUT)
         self._lock = threading.Lock()
         with self._lock:
+            # WAL: readers never block on a writer, and a writer blocks only other writers.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")  # durable enough for a cache, much faster
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS emb (spec TEXT, key TEXT, vec BLOB, PRIMARY KEY (spec, key))"
             )
@@ -50,3 +58,28 @@ class EmbeddingCache:
                 [(spec, k, np.asarray(v, dtype=np.float32).tobytes()) for k, v in items.items()],
             )
             self._conn.commit()
+
+    def stats(self) -> list[tuple[str, int, int]]:
+        """``(namespace, rows, bytes of vectors)`` per namespace, largest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT spec, COUNT(*), SUM(LENGTH(vec)) FROM emb GROUP BY spec ORDER BY 3 DESC").fetchall()
+        return [(ns, n, size or 0) for ns, n, size in rows]
+
+    def prune(self, keep: set[str], dry_run: bool = False) -> int:
+        """Delete image vectors whose key isn't in ``keep`` (text vectors are kept); returns how
+        many rows were (or, with ``dry_run``, would be) deleted. Frees the disk space afterwards."""
+        with self._lock:
+            self._conn.execute("CREATE TEMP TABLE IF NOT EXISTS keep (key TEXT PRIMARY KEY)")
+            self._conn.execute("DELETE FROM keep")
+            self._conn.executemany("INSERT OR IGNORE INTO keep VALUES (?)", [(k,) for k in keep])
+            where = "key NOT LIKE 'text:%' AND key NOT IN (SELECT key FROM keep)"
+            if dry_run:
+                n: int = self._conn.execute(f"SELECT COUNT(*) FROM emb WHERE {where}").fetchone()[0]
+            else:
+                n = self._conn.execute(f"DELETE FROM emb WHERE {where}").rowcount
+            self._conn.execute("DROP TABLE keep")
+            self._conn.commit()
+            if n and not dry_run:
+                self._conn.execute("VACUUM")
+        return n

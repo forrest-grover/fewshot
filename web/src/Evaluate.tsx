@@ -1,31 +1,57 @@
-import { type Dispatch, type SetStateAction } from "react";
-import { api, type EvalReport, type TaskDetail } from "./api";
+import { useEffect, type Dispatch, type SetStateAction } from "react";
+import { api, type EvalReport, type Job, type TaskDetail } from "./api";
 import { pct } from "./format";
 
-/** The last evaluation of a task, kept by the App so it survives switching tabs. */
-export interface EvalRun { task: string; report: EvalReport | null; rev: number | null; busy: boolean }
+/** The last evaluation of a task, kept by the App so it survives switching tabs. While it runs,
+ * ``job`` is the server's background job, polled for progress. */
+export interface EvalRun { task: string; report: EvalReport | null; rev: number | null; job: Job<EvalReport> | null }
 
 interface Props {
   task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
   state: EvalRun | null; setState: Dispatch<SetStateAction<EvalRun | null>>;
 }
 
+const POLL_MS = 500;
+const STAGES: Record<string, string> = { starting: "Starting", embedding: "Embedding images", evaluating: "Cross-validating" };
+
 export default function Evaluate({ task, setTask, run, state, setState }: Props) {
   const mine = state?.task === task.name ? state : null; // never show another task's report
   const report = mine?.report ?? null;
-  const busy = mine?.busy ?? false;
+  const job = mine?.job ?? null;
+  const busy = job !== null;
   const rev = mine?.rev ?? null;
   const update = (p: Partial<EvalRun>) => {
     // A run that finishes after the user opened another task is dropped.
-    setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, busy: false, ...s, ...p }));
+    setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, job: null, ...s, ...p }));
   };
 
   const go = async () => {
-    const revision = task.revision;
-    update({ busy: true });
-    const r = await run(api.evaluate(task.name));
-    update(r ? { busy: false, report: r, rev: revision } : { busy: false });
+    const j = await run(api.startEvaluation(task.name));
+    if (j) update({ job: j, rev: task.revision });
   };
+  // Poll the running job until it ends. Leaving the tab stops polling; coming back resumes it.
+  const jobId = job?.id;
+  useEffect(() => {
+    if (!jobId) return;
+    let live = true;
+    const timer = setInterval(() => {
+      void api.job<EvalReport>(jobId).then((j) => {
+        if (!live) return;
+        setState((s) => {
+          if (!s || s.job?.id !== jobId) return s;
+          if (j.status === "running") return { ...s, job: j };
+          return { ...s, job: null, report: j.status === "done" ? j.result : s.report };
+        });
+        if (j.status === "failed") void run(Promise.reject(new Error(`Evaluation failed: ${j.error ?? "unknown error"}`)));
+      }, (e: unknown) => {
+        if (!live) return;
+        setState((s) => (s && s.job?.id === jobId ? { ...s, job: null } : s)); // e.g. the server restarted
+        void run(Promise.reject(e instanceof Error ? e : new Error(String(e))));
+      });
+    }, POLL_MS);
+    return () => { live = false; clearInterval(timer); };
+  }, [jobId, run, setState]);
+
   const fix = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
   const stale = report && rev !== task.revision;
   const maxCell = report ? Math.max(1, ...report.confusion.flat()) : 1;
@@ -38,6 +64,13 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
           Cross-validates the current settings on this task's examples: each image is predicted by a classifier fitted without it.
         </span>
       </div>
+      {job && (
+        <div className="row job">
+          <span>{STAGES[job.stage] ?? job.stage}{job.total ? ` ${String(job.done)} / ${String(job.total)}` : "…"}</span>
+          <progress max={job.total || 1} value={job.total ? job.done : undefined} />
+          <button className="ghost small" onClick={() => { void run(api.cancelJob(job.id)); }}>Cancel</button>
+        </div>
+      )}
       {stale && <p className="hint">The task changed since this evaluation ran. Re-run it to see the effect.</p>}
       {report && (
         <>

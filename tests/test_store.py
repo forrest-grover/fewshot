@@ -435,3 +435,37 @@ def test_legacy_16_char_ids_still_match(ws):
     assert again.id == fresh.config.examples[0].id
     assert [e.label for e in fresh.config.examples] == ["blue"]
     assert fresh.image_path(again.id).exists()
+
+
+def test_add_examples_in_chunks(ws, monkeypatch):
+    """add_examples saves once per chunk and reports each item's example or error in order."""
+    t = ws.create("t")
+    saves = []
+    real = type(t)._save  # pylint: disable=protected-access
+    def counted(self):
+        saves.append(1)
+        real(self)
+
+    monkeypatch.setattr(type(t), "_save", counted)
+    a, b = png(RED, noise=5, seed=1), png(GREEN, noise=5, seed=2)
+    items = iter([(a, "red", "a"), (b"junk", "red", "j"), (a, "pink", "a again"), (b, " ", "b"), (b, "green", "b")])
+    out = t.add_examples(items, chunk=2)
+    assert [type(r).__name__ for r in out] == ["Example", "ValueError", "Example", "ValueError", "Example"]
+    assert out[2].id == out[0].id  # the same image again was relabelled, not duplicated
+    assert [(e.label, e.source) for e in t.config.examples] == [("pink", "a"), ("green", "b")]
+    assert t.class_names() == ["red", "pink", "green"]
+    assert len(saves) == 3  # one per chunk with something added
+    assert isinstance(t.add_examples([(b"junk", "x", "")])[0], ValueError)
+    assert len(saves) == 3  # nothing added: no save
+
+
+def test_add_examples_from_dir_raises_after_adding_the_rest(ws, tmp_path):
+    """An unreadable image in an imported folder is raised once the readable ones are in."""
+    src = tmp_path / "src"
+    (src / "red").mkdir(parents=True)
+    (src / "red" / "a.png").write_bytes(png(RED))
+    (src / "red" / "b.png").write_bytes(b"junk")
+    t = ws.create("t")
+    with pytest.raises(ValueError, match="Not a readable image"):
+        t.add_examples_from_dir(src)
+    assert [e.source for e in t.config.examples] == ["a.png"]

@@ -503,6 +503,26 @@ def test_serve(monkeypatch, tmp_path):
     assert os.environ["FEWSHOT_HOME"] == str(tmp_path)
 
 
+def test_serve_settings(monkeypatch):
+    """serve passes its options to the API through the environment, and warns when an open
+    address has no token."""
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
+    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM"):
+        monkeypatch.setenv(k, "")  # let monkeypatch restore them after the test
+    monkeypatch.delenv("FEWSHOT_TOKEN")
+    runner = CliRunner()
+    r = runner.invoke(cli.app, ["serve"])
+    settings = ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM")
+    assert [os.environ[k] for k in settings] == ["", "", "1"]
+    assert "Warning" not in r.output
+    r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--no-warm", "--allow-any-model"])
+    assert "Warning: serving on 0.0.0.0 without --token" in ANSI.sub("", r.output)
+    assert (os.environ["FEWSHOT_ALLOW_ANY_MODEL"], os.environ["FEWSHOT_WARM"]) == ("1", "")
+    r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--token", "t0k"])
+    assert "Warning" not in r.output
+    assert os.environ["FEWSHOT_TOKEN"] == "t0k"
+
+
 def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):
     """A directory or dangling symlink called *.png is not treated as an image."""
     odd = tmp_path / "odd"
@@ -574,3 +594,26 @@ def test_bench_rejects_out_of_range_options(run, bench_data, args, option):
     r = run("bench", bench_data, "--embedder", "fake:color", *args)
     assert r.exit_code == 2
     assert option in r.output
+
+
+def test_cache_info_and_prune(run, root, task):
+    """cache info lists namespaces; prune drops vectors of deleted examples, dry run first."""
+    assert run("predict", task, root / "tasks" / task / "images").exit_code == 0  # fills the cache
+    t = load(root)
+    victim = t.config.examples[0].id
+    t.delete_example(victim)
+    info = run("cache", "info")
+    assert info.exit_code == 0
+    assert "fake:color#test: 12 vectors" in info.output
+    dry = run("cache", "prune", "--dry-run")
+    assert "Would delete 1 cached image vectors" in dry.output
+    assert "Deleted 1 cached image vectors" in run("cache", "prune").output
+    assert "fake:color#test: 11 vectors" in run("cache", "info").output
+
+
+def test_cache_prune_refuses_with_unreadable_task(run, root, task):
+    """A task that can't be read would lose its vectors, so prune stops."""
+    (root / "tasks" / task / "task.json").write_text("{broken")
+    r = run("cache", "prune")
+    assert r.exit_code == 1
+    assert f"Can't read task(s) {task}" in r.output

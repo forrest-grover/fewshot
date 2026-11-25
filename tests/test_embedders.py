@@ -1,6 +1,7 @@
 """Tests for fewshot.embedders using tiny fake OpenCLIP/timm models (no downloads, no GPU required)."""
 
 import contextlib
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -466,3 +467,152 @@ def test_register_and_unregister_embedder():
 def test_register_embedder_is_exported_lazily():
     """The top-level package re-exports register_embedder."""
     assert fewshot.register_embedder is register_embedder
+
+
+# --- output checks, locking and the loaded-model limit -----------------------------------------------------------
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
+def test_builtin_embed_image_batch_matches_embed_images():
+    """The built-ins' direct batch hook gives the same rows as the batched path."""
+    images = [solid((255, 0, 0)), solid((0, 0, 255))]
+    for emb in (OpenCLIPEmbedder("openclip:Tiny", "Tiny", None), TimmEmbedder("timm:t", "t")):
+        with torch.inference_mode():
+            direct = emb._embed_image_batch(images)  # pylint: disable=protected-access
+        np.testing.assert_allclose(direct, emb.embed_images(images), rtol=1e-6)
+
+
+class Raw(ColorEmbedder):
+    """Returns whatever ``out`` holds, to test the output checks."""
+
+    supports_text = True
+
+    def __init__(self, out):
+        super().__init__()
+        self.out = out
+
+    def _embed_image_batch(self, images):
+        return self.out
+
+    def _embed_text_batch(self, texts):  # pylint: disable=unused-argument  # returns out whatever the input
+        return self.out
+
+
+def test_embedder_output_is_checked():
+    """Wrong shapes and non-finite values are errors naming the spec; other rows are normalised."""
+    img = [solid((1, 2, 3))]
+    with pytest.raises(ValueError, match=r"'fake:color' returned shape \(1, 2\), expected \(1, 3\)"):
+        Raw(np.ones((1, 2))).embed_images(img)
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        Raw(np.array([[np.nan, 1, 1]])).embed_texts(["x"])
+    out = Raw(np.array([[3.0, 0, 4]], np.float64)).embed_images(img)
+    assert out.dtype == np.float32
+    np.testing.assert_allclose(out, [[0.6, 0, 0.8]], rtol=1e-6)
+    already = np.array([[0.6, 0, 0.8]], np.float32)
+    assert Raw(already).embed_texts(["x"]).tolist() == already.tolist()
+
+
+def test_lock_is_held_only_for_the_forward_pass():
+    """Preprocessing runs without the model lock; the forward pass holds it."""
+    seen = []
+
+    class Watch(ColorEmbedder):
+        """Records whether the model lock is held in each step."""
+
+        def _prepare_images(self, images):
+            seen.append(("prepare", self._lock.locked()))
+            return images
+
+        def _embed_image_batch(self, images):
+            seen.append(("forward", self._lock.locked()))
+            return super()._embed_image_batch(images)
+
+    emb = Watch()
+    emb.batch_size = 1
+    emb.embed_images([solid((1, 2, 3)), solid((3, 2, 1))])
+    assert seen == [("prepare", False), ("forward", True)] * 2
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
+def test_least_recently_used_model_is_unloaded(monkeypatch):
+    """Beyond FEWSHOT_MAX_MODELS built-in models, the least recently used one is dropped and GPU
+    memory released; registered embedders are never dropped."""
+    freed = []
+    monkeypatch.setattr(embedders, "_free_gpu_memory", lambda: freed.append(True))
+    monkeypatch.setenv("FEWSHOT_MAX_MODELS", "2")
+    register_embedder("custom:mine", ColorEmbedder())
+    try:
+        a, b = get_embedder("timm:a"), get_embedder("timm:b")
+        assert get_embedder("timm:a") is a  # a is now the most recently used
+        get_embedder("timm:c")
+        assert embedders.loaded_embedders() == ["custom:mine", "timm:a", "timm:c"]
+        assert freed == [True]
+        assert get_embedder("timm:b") is not b  # reloaded
+    finally:
+        unregister_embedder("custom:mine")
+    monkeypatch.setenv("FEWSHOT_MAX_MODELS", "0")
+    assert embedders.max_models() == 1  # at least one
+
+
+def test_free_gpu_memory_empties_the_cuda_cache(monkeypatch):
+    """With CUDA, freeing memory also empties torch's CUDA cache."""
+    emptied = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
+    embedders._free_gpu_memory()  # pylint: disable=protected-access
+    assert emptied == [True]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    embedders._free_gpu_memory()  # pylint: disable=protected-access
+    assert emptied == [True]
+
+
+def _blocking_build(monkeypatch):
+    """Make model building wait for the returned event; returns (event, started, builds)."""
+    release, started, builds = threading.Event(), threading.Event(), []
+
+    def build(spec):
+        builds.append(spec)
+        started.set()
+        assert release.wait(5)
+        return ColorEmbedder()
+
+    monkeypatch.setattr(embedders, "_build", build)
+    return release, started, builds
+
+
+def test_one_model_loading_does_not_block_others(monkeypatch):
+    """While one spec loads, another loaded spec is still served, and a second request for the
+    loading spec waits for that load instead of starting its own."""
+    only = {"fake:color": get_embedder("fake:color")}
+    monkeypatch.setattr(embedders, "_loaded", only)
+    release, started, builds = _blocking_build(monkeypatch)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(get_embedder("slow:x"))) for _ in range(2)]
+    threads[0].start()
+    assert started.wait(5)
+    threads[1].start()
+    assert isinstance(get_embedder("fake:color"), ColorEmbedder)  # not blocked by the load
+    release.set()
+    for t in threads:
+        t.join(5)
+    assert builds == ["slow:x"]
+    assert results[0] is results[1]
+
+
+def test_registration_during_a_load_wins(monkeypatch):
+    """An embedder registered while the same spec is loading replaces the loaded model."""
+    release, started, _ = _blocking_build(monkeypatch)
+    result = []
+    t = threading.Thread(target=lambda: result.append(get_embedder("slow:y")))
+    t.start()
+    assert started.wait(5)
+    mine = ColorEmbedder()
+    register_embedder("slow:y", mine)
+    try:
+        assert embedders.is_registered("slow:y")
+        release.set()
+        t.join(5)
+        assert result == [mine]
+    finally:
+        unregister_embedder("slow:y")
+    assert not embedders.is_registered("slow:y")

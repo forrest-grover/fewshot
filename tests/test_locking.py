@@ -197,6 +197,16 @@ def test_readers_keep_a_stable_snapshot(pair):
     assert [e.label for e in snapshot.examples] == ["red"]
     assert [e.label for e in t.config.examples] == ["blue", "blue"]
 
+    t.update_settings(classifier="knn", classifier_params={"k": 3})
+    snapshot = t.config
+    t.upsert_class("blue", "a blue thing")
+    with t._writing():  # pylint: disable=protected-access  # an in-place edit, as mutations make
+        t.config.classifier_params["k"] = 5
+        t._save()  # pylint: disable=protected-access
+    assert [c.description for c in snapshot.classes] == ["", ""]
+    assert snapshot.classifier_params == {"k": 3}
+    assert t.config.classifier_params == {"k": 5}
+
 
 def test_lock_file_is_closed_when_locking_fails(tmp_path, monkeypatch):
     """An error while taking the lock doesn't leak the descriptor."""

@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 app = typer.Typer(help="Embedding-based few-shot image classification.", no_args_is_help=True)
 cls_app = typer.Typer(help="Manage a task's classes.", no_args_is_help=True)
 app.add_typer(cls_app, name="class")
+cache_app = typer.Typer(help="Inspect and prune the embedding cache.", no_args_is_help=True)
+app.add_typer(cache_app, name="cache")
 
 ROOT_OPT = typer.Option(None, "--root", envvar="FEWSHOT_HOME", help="Workspace directory [default: ./fewshot_data]")
 
@@ -71,14 +73,23 @@ def _expand(paths: list[Path]) -> list[Path]:
 
 def _add_files(task: Task, label: str, files: list[Path]) -> int:
     """Add ``files`` as examples of ``label``, skipping unreadable images; returns how many were added."""
+
+    def readable() -> Iterator[tuple[bytes, str, str]]:
+        for f in files:
+            try:
+                data = f.read_bytes()
+            except OSError as e:
+                typer.secho(f"skip {f}: {e.strerror or e}", fg="yellow", err=True)
+                continue
+            names.append(f)
+            yield data, label, f.name
+
+    names: list[Path] = []  # the files actually read, in step with add_examples' results
+    results = task.add_examples(readable())
     n = 0
-    for f in files:
-        try:
-            task.add_example(f.read_bytes(), label, f.name)
-        except ValueError as e:
-            typer.secho(f"skip {f}: {e}", fg="yellow", err=True)
-        except OSError as e:
-            typer.secho(f"skip {f}: {e.strerror or e}", fg="yellow", err=True)
+    for f, r in zip(names, results, strict=True):
+        if isinstance(r, ValueError):
+            typer.secho(f"skip {f}: {r}", fg="yellow", err=True)
         else:
             n += 1
     return n
@@ -395,9 +406,14 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 
 
 @app.command()
-def serve(
+def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     host: str = "127.0.0.1",
     port: int = 8000,
+    token: str | None = typer.Option(None, envvar="FEWSHOT_TOKEN", show_envvar=True,
+                                     help="Require this token for the API and UI"),
+    allow_any_model: bool = typer.Option(False, "--allow-any-model",
+                                         help="Let API callers load any embedder spec, not just presets"),
+    warm: bool = typer.Option(True, "--warm/--no-warm", help="Load the models tasks use at startup"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Run the REST API and web UI."""
@@ -406,7 +422,54 @@ def serve(
 
     if root:
         os.environ["FEWSHOT_HOME"] = str(root)
+    # fewshot.api reads its settings from the environment when uvicorn imports it.
+    for name, value in (("FEWSHOT_TOKEN", token or ""), ("FEWSHOT_ALLOW_ANY_MODEL", "1" if allow_any_model else ""),
+                        ("FEWSHOT_WARM", "1" if warm else "")):
+        os.environ[name] = value
+    if not token and host not in {"127.0.0.1", "localhost", "::1"}:
+        typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
+                    "change every task.", fg="yellow", err=True)
     uvicorn.run("fewshot.api:app", host=host, port=port)
+
+
+@cache_app.command("info")
+def cache_info(root: Path | None = ROOT_OPT) -> None:
+    """Show the cache file's size and how many vectors each model has cached."""
+    from .cache import EmbeddingCache  # pylint: disable=import-outside-toplevel  # keeps --help fast
+
+    ws = _ws(root)
+    cache = EmbeddingCache(ws.cache_path)
+    typer.echo(f"{ws.cache_path}: {_mb(ws.cache_path.stat().st_size)}")
+    for ns, n, size in cache.stats():
+        typer.echo(f"  {ns}: {n} vectors, {_mb(size)}")
+
+
+@cache_app.command("prune")
+def cache_prune(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only report how many vectors would go"),
+    root: Path | None = ROOT_OPT,
+) -> None:
+    """Delete cached image vectors that no task's examples use (e.g. deleted examples, bench datasets).
+
+    Text vectors are kept. Refuses to run if a task can't be read, since its examples would be lost.
+    """
+    from .cache import EmbeddingCache  # pylint: disable=import-outside-toplevel  # keeps --help fast
+
+    ws = _ws(root)
+    tasks = ws.list_tasks()
+    folders = [p for p in (ws.root / "tasks").iterdir() if (p / "task.json").exists()]
+    if len(tasks) < len(folders):
+        unreadable = sorted({p.name for p in folders} - {t.config.name for t in tasks})
+        _fail(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
+    keep = {e.id for t in tasks for e in t.config.examples}
+    cache = EmbeddingCache(ws.cache_path)
+    n = cache.prune(keep, dry_run=dry_run)
+    typer.echo(f"{'Would delete' if dry_run else 'Deleted'} {n} cached image vectors; "
+               f"{_mb(ws.cache_path.stat().st_size)} on disk")
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1024 / 1024:.1f} MB"
 
 
 if __name__ == "__main__":

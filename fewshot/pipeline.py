@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -13,10 +13,11 @@ from PIL import Image
 
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
-from .embedders import Vectors, cache_namespace, get_embedder, spec_supports_text
+from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
 from .store import Task, TaskConfig, Workspace, image_id, load_image
 
 ImageInput = bytes | str | Path | Image.Image
+Progress = Callable[[int, int], None]  # (done, total); may raise to cancel the work
 
 
 @dataclass
@@ -58,36 +59,71 @@ class Pipeline:
 
     # ---- embeddings --------------------------------------------------
     def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],
-                     errors: dict[int, str] | None = None) -> Vectors:
+                     errors: dict[int, str] | None = None, progress: Progress | None = None) -> Vectors:
         """Embed ``(cache_key or None, image)`` pairs, using and filling the cache.
 
-        An undecodable image raises ``ValueError``, unless ``errors`` is given: then the message is
-        stored there under the item's index and that row is all zeros.
+        Uncached images are decoded, embedded and cached one batch at a time, so memory stays
+        bounded however many there are, and an interrupted run keeps what it finished. An
+        undecodable image raises ``ValueError``, unless ``errors`` is given: then the message is
+        stored there under the item's index and that row is all zeros. ``progress(done, total)`` is
+        called after each batch with counts of images needing the model; it may raise to cancel.
         """
         ns = cache_namespace(spec)
         hit = self.cache.get_many(ns, [k for k, _ in items if k])
+        emb = None
+        if any(not (k and k in hit) for k, _ in items) or len({len(v) for v in hit.values()}) > 1:
+            # Some images need the model, or the cache holds vectors of different lengths (written
+            # by another model under this name): load it and re-embed any that don't fit.
+            emb = get_embedder(spec)
+            hit = {k: v for k, v in hit.items() if len(v) == emb.dim}
         todo = [(i, k, im) for i, (k, im) in enumerate(items) if not (k and k in hit)]
         out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
-        if todo:
-            emb = get_embedder(spec)
-            decoded = _decode(todo, errors)
-            out.update({i: np.zeros(emb.dim, np.float32) for i in errors or {}})
-            vecs = emb.embed_images([im for _, _, im in decoded])
+        if emb is not None and todo:
+            out.update(self._embed_uncached(emb, ns, todo, errors, progress))
+        if not items:
+            return np.zeros((0, 0), np.float32)
+        return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
+
+    def _embed_uncached(self, emb: Embedder, ns: str, todo: list[tuple[int, str | None, ImageInput]],
+                        errors: dict[int, str] | None, progress: Progress | None) -> dict[int, Vectors]:
+        """Decode, embed and cache ``todo`` one batch at a time; returns row index -> vector."""
+        out: dict[int, Vectors] = {}
+        step = emb.batch_size
+        for start in range(0, len(todo), step):
+            chunk = todo[start : start + step]
+            decoded = _decode(chunk, errors)
+            if errors:
+                out.update({i: np.zeros(emb.dim, np.float32) for i, _, _ in chunk if i in errors})
             new: dict[str, Vectors] = {}
-            for (i, k, _), v in zip(decoded, vecs, strict=True):
+            for (i, k, _), v in zip(decoded, emb.embed_images([im for _, _, im in decoded]), strict=True):
                 out[i] = v
                 if k:
                     new[k] = v
             self.cache.put_many(ns, new)
-        if not items:
-            return np.zeros((0, 0), np.float32)
-        return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
+            if progress:
+                progress(min(start + step, len(todo)), len(todo))
+        return out
+
+    def embed_files(self, spec: str, paths: Sequence[Path], progress: Progress | None = None,
+                    chunk: int = 256) -> Vectors:
+        """Embed image files, reading each once (for both its cache key and decoding) and holding
+        only ``chunk`` files' bytes at a time. ``progress(done, total)`` counts files."""
+        parts = []
+        for start in range(0, len(paths), chunk):
+            blobs = [p.read_bytes() for p in paths[start : start + chunk]]
+            parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs]))
+            if progress:
+                progress(min(start + chunk, len(paths)), len(paths))
+        return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
 
     def embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
         """Embed strings (rows in input order), using and filling the cache."""
         ns = cache_namespace(spec)
         keys = ["text:" + t for t in texts]
         hit = self.cache.get_many(ns, keys)
+        if len({len(v) for v in hit.values()}) > 1:  # mixed lengths: keep only the model's own
+            dim = get_embedder(spec).dim
+            hit = {k: v for k, v in hit.items() if len(v) == dim}
         missing = [t for t in dict.fromkeys(texts) if "text:" + t not in hit]
         if missing:
             vecs = get_embedder(spec).embed_texts(missing)
@@ -96,19 +132,22 @@ class Pipeline:
             hit.update(new)
         return np.stack([hit[k] for k in keys]) if texts else np.zeros((0, 0), np.float32)
 
-    def example_embeddings(self, task: Task, cfg: TaskConfig | None = None) -> Vectors:
+    def example_embeddings(self, task: Task, cfg: TaskConfig | None = None,
+                           progress: Progress | None = None) -> Vectors:
         """Embeddings of the task's examples, in ``task.config.examples`` order (or ``cfg``'s)."""
         cfg = cfg or task.config
-        return self.embed_images(cfg.embedder, [(e.id, task.path / e.file) for e in cfg.examples])
+        return self.embed_images(cfg.embedder, [(e.id, task.path / e.file) for e in cfg.examples],
+                                 progress=progress)
 
     # ---- training data -----------------------------------------------
-    def class_data(self, task: Task, exclude: set[int] | None = None, cfg: TaskConfig | None = None) -> ClassData:
+    def class_data(self, task: Task, exclude: set[int] | None = None, cfg: TaskConfig | None = None,
+                   progress: Progress | None = None) -> ClassData:
         """Training data for ``task`` (as of ``cfg``, default its current config), leaving out
-        example indices in ``exclude``."""
+        example indices in ``exclude``. ``progress`` reports images embedded (see ``embed_images``)."""
         cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
         classes = [c.name for c in cfg.classes]
         idx = {c: i for i, c in enumerate(classes)}
-        X = self.example_embeddings(task, cfg)
+        X = self.example_embeddings(task, cfg, progress)
         y = np.array([idx[e.label] for e in cfg.examples], int)
         if exclude:
             keep = np.array([i not in exclude for i in range(len(y))], bool)

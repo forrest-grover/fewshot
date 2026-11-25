@@ -749,3 +749,17 @@ kbd {
 .result:focus {
   outline: none; /* the highlighted (current) result is the focused one, and is styled above */
 }
+
+.sign-in {
+  margin: 10vh auto 0;
+  max-width: 420px;
+}
+
+.job {
+  margin-top: 12px;
+}
+
+.job progress {
+  flex: 1;
+  max-width: 320px;
+}

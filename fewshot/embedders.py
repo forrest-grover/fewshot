@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -107,7 +108,8 @@ class Embedder(ABC):
     cache_version: str | None = None
 
     def __init__(self) -> None:
-        # Models are shared across API request threads; serialise GPU use.
+        # Models are shared across API request threads; serialise GPU use. The lock is taken per batch
+        # and only around the forward pass, so one long job doesn't hold off other requests.
         self._lock = threading.Lock()
 
     @abstractmethod
@@ -118,17 +120,34 @@ class Embedder(ABC):
     def dim(self) -> int:
         """Length of each embedding vector."""
 
+    def _prepare_images(self, images: list[Image.Image]) -> Any:
+        """CPU-side preprocessing of one batch, run without holding the model lock.
+
+        The default passes the images through to ``_embed_image_batch`` unchanged.
+        """
+        return images
+
+    def _embed_prepared(self, batch: Any) -> Vectors:
+        """Embed one ``_prepare_images`` result; runs under the model lock."""
+        return self._embed_image_batch(batch)
+
     def embed_images(self, images: Sequence[Image.Image]) -> Vectors:
-        """Embed images (converted to RGB) in batches of ``batch_size``; returns an ``(n, dim)`` array."""
+        """Embed images (converted to RGB) in batches of ``batch_size``; returns an ``(n, dim)`` array.
+
+        Raises ``ValueError`` if the model returns the wrong shape or non-finite values; rows that
+        aren't unit length are normalised.
+        """
         if not images:
             return np.zeros((0, self.dim), dtype=np.float32)
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         out: list[Vectors] = []
-        with self._lock, torch.inference_mode():
-            for i in range(0, len(images), self.batch_size):
-                batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
-                out.append(self._embed_image_batch(batch))
+        for i in range(0, len(images), self.batch_size):
+            batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
+            prepared = self._prepare_images(batch)
+            with self._lock, torch.inference_mode():
+                vecs = self._embed_prepared(prepared)
+            out.append(self._checked(vecs, len(batch)))
         return np.concatenate(out)
 
     def embed_texts(self, texts: Sequence[str]) -> Vectors:
@@ -140,7 +159,20 @@ class Embedder(ABC):
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         with self._lock, torch.inference_mode():
-            return self._embed_text_batch(list(texts))
+            vecs = self._embed_text_batch(list(texts))
+        return self._checked(vecs, len(texts))
+
+    def _checked(self, vecs: Any, n: int) -> Vectors:
+        """``vecs`` as ``(n, dim)`` float32 unit rows; ``ValueError`` names the embedder if it can't be."""
+        v = np.asarray(vecs, dtype=np.float32)
+        if v.shape != (n, self.dim):
+            raise ValueError(f"Embedder {self.spec!r} returned shape {v.shape}, expected {(n, self.dim)}")
+        if not np.isfinite(v).all():
+            raise ValueError(f"Embedder {self.spec!r} returned NaN or infinite values")
+        norms = np.linalg.norm(v, axis=1, keepdims=True)
+        if not np.allclose(norms, 1.0, atol=1e-3):
+            v = v / np.maximum(norms, 1e-12)
+        return v
 
 
 class OpenCLIPEmbedder(Embedder):
@@ -165,12 +197,17 @@ class OpenCLIPEmbedder(Embedder):
     def dim(self) -> int:
         return self._dim
 
-    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors:
+    def _prepare_images(self, images: list[Image.Image]) -> torch.Tensor:
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
-        x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
+        return torch.stack([self.preprocess(im) for im in images])
+
+    def _embed_prepared(self, batch: torch.Tensor) -> Vectors:
         with _autocast(self.device):
-            return _l2(self.model.encode_image(x))
+            return _l2(self.model.encode_image(batch.to(self.device)))
+
+    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors:
+        return self._embed_prepared(self._prepare_images(list(images)))
 
     def _embed_text_batch(self, texts: list[str]) -> Vectors:
         tok = self.tokenizer(texts).to(self.device)
@@ -196,16 +233,28 @@ class TimmEmbedder(Embedder):
     def dim(self) -> int:
         return self._dim
 
-    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors:
+    def _prepare_images(self, images: list[Image.Image]) -> torch.Tensor:
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
-        x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
+        return torch.stack([self.preprocess(im) for im in images])
+
+    def _embed_prepared(self, batch: torch.Tensor) -> Vectors:
         with _autocast(self.device):
-            return _l2(self.model(x))
+            return _l2(self.model(batch.to(self.device)))
+
+    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors:
+        return self._embed_prepared(self._prepare_images(list(images)))
 
 
-_loaded: dict[str, Embedder] = {}
-_load_lock = threading.Lock()
+_loaded: dict[str, Embedder] = {}  # in least- to most-recently used order
+_load_lock = threading.Lock()  # guards the dicts here; never held while a model loads
+_spec_locks: dict[str, threading.Lock] = {}  # one per spec: two loads of one model wait for each other
+
+
+def max_models() -> int:
+    """Most built-in models kept loaded at once (``$FEWSHOT_MAX_MODELS``, default 2); loading
+    another unloads the least recently used. Registered embedders don't count and stay loaded."""
+    return max(1, int(os.environ.get("FEWSHOT_MAX_MODELS", "2")))
 _registered: set[str] = set()  # specs whose embedder came from register_embedder
 _namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once computed
 
@@ -243,22 +292,66 @@ def cache_namespace(spec: str) -> str:
 
 
 def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
-    """Load (once per process) and return the embedder for ``spec``."""
+    """Load (once per process) and return the embedder for ``spec``.
+
+    Loading one model (which may mean downloading it) doesn't block requests for other models.
+    """
     with _load_lock:
         if spec in _loaded:
-            return _loaded[spec]
-        backend, _, rest = spec.partition(":")
-        if not rest:
-            raise ValueError(f"Bad embedder spec {spec!r}; expected '<backend>:<model>'")
-        if backend == "openclip":
-            model, _, pretrained = rest.partition("@")
-            emb: Embedder = OpenCLIPEmbedder(spec, model, pretrained or None)
-        elif backend == "timm":
-            emb = TimmEmbedder(spec, rest)
-        else:
-            raise ValueError(f"Unknown embedder backend {backend!r} (use 'openclip' or 'timm')")
-        _loaded[spec] = emb
-        return emb
+            _loaded[spec] = emb = _loaded.pop(spec)  # now most recently used
+            return emb
+        spec_lock = _spec_locks.setdefault(spec, threading.Lock())
+    with spec_lock:
+        with _load_lock:
+            if spec in _loaded:  # another thread loaded it while we waited
+                return _loaded[spec]
+        emb = _build(spec)
+        with _load_lock:
+            if spec in _loaded:  # registered while we were loading: the registration wins
+                return _loaded[spec]
+            _loaded[spec] = emb
+            evicted = _evict_locked()
+    if evicted:
+        _free_gpu_memory()
+    return emb
+
+
+def _build(spec: str) -> Embedder:
+    backend, _, rest = spec.partition(":")
+    if not rest:
+        raise ValueError(f"Bad embedder spec {spec!r}; expected '<backend>:<model>'")
+    if backend == "openclip":
+        model, _, pretrained = rest.partition("@")
+        return OpenCLIPEmbedder(spec, model, pretrained or None)
+    if backend == "timm":
+        return TimmEmbedder(spec, rest)
+    raise ValueError(f"Unknown embedder backend {backend!r} (use 'openclip' or 'timm')")
+
+
+def _evict_locked() -> list[str]:
+    """Drop least recently used built-in models beyond ``max_models()``; returns their specs."""
+    built_in = [s for s in _loaded if s not in _registered]
+    gone = built_in[: max(0, len(built_in) - max_models())]
+    for spec in gone:
+        del _loaded[spec]
+    return gone
+
+
+def _free_gpu_memory() -> None:
+    """Return unloaded models' GPU memory to the driver (a model still in use is freed after its job)."""
+    import gc  # pylint: disable=import-outside-toplevel  # only needed when a model is unloaded
+
+    import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def loaded_embedders() -> list[str]:
+    """Specs of the embedders currently loaded, least recently used first."""
+    with _load_lock:
+        return list(_loaded)
 
 
 def check_embedder(spec: str) -> None:
@@ -294,6 +387,12 @@ def unregister_embedder(spec: str) -> None:
         _loaded.pop(spec, None)
         _registered.discard(spec)
         _namespaces.pop(spec, None)
+
+
+def is_registered(spec: str) -> bool:
+    """Whether ``spec`` names an embedder added with ``register_embedder``."""
+    with _load_lock:
+        return spec in _registered
 
 
 def spec_supports_text(spec: str) -> bool:

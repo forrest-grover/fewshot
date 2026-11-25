@@ -1,28 +1,162 @@
 """REST API (FastAPI). Run with ``fewshot serve``; docs at /docs.
 
-The built web UI (web/dist) is served at / when present.
+The built web UI (web/dist) is served at / when present. Server settings come from environment
+variables, read when this module is imported (``fewshot serve`` sets them from its options):
+
+``FEWSHOT_TOKEN``
+    If set, every /api request except /api/login and /api/health needs this token, as a
+    ``Bearer`` header or the cookie /api/login sets.
+``FEWSHOT_ALLOW_ANY_MODEL=1``
+    Let API callers choose any embedder spec. By default only presets, registered embedders and
+    specs existing tasks already use are accepted, so a caller can't make the server download
+    arbitrary models.
+``FEWSHOT_WARM=1``
+    At startup, load the models existing tasks use (in the background).
+``FEWSHOT_MAX_UPLOAD_MB`` / ``FEWSHOT_MAX_REQUEST_MB``
+    Largest image per upload (default 50) and largest request body (default 1024).
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import secrets
+import threading
+import time
+import uuid
+from collections import Counter
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .classifiers import CLASSIFIERS
-from .embedders import PRESETS, check_embedder, spec_supports_text
+from .embedders import (
+    DEFAULT_SPEC,
+    PRESETS,
+    check_embedder,
+    get_embedder,
+    is_registered,
+    loaded_embedders,
+    max_models,
+    spec_supports_text,
+)
 from .evaluate import evaluate_task
 from .pipeline import Pipeline, Prediction
 from .store import Task, Workspace, thumbnail
 
+log = logging.getLogger(__name__)
+
+TOKEN = os.environ.get("FEWSHOT_TOKEN") or None
+ALLOW_ANY_MODEL = os.environ.get("FEWSHOT_ALLOW_ANY_MODEL") == "1"
+WARM = os.environ.get("FEWSHOT_WARM") == "1"
+MAX_REQUEST_BYTES = int(float(os.environ.get("FEWSHOT_MAX_REQUEST_MB", "1024")) * 1024 * 1024)
+
 ws = Workspace()
 pipe = Pipeline(ws)
-app = FastAPI(title="fewshot", version="0.1.0")
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if WARM:
+        threading.Thread(target=warm_models, name="fewshot-warm", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="fewshot", version="0.1.0", lifespan=_lifespan)
+
+
+def warm_models() -> list[str]:
+    """Load the embedders the most tasks use (up to the loaded-model limit), or the default one if
+    there are no tasks, so the first request doesn't wait for a model; returns the specs loaded."""
+    counts = Counter(t.config.embedder for t in ws.list_tasks())
+    specs = [s for s, _ in counts.most_common(max_models())] or [DEFAULT_SPEC]
+    loaded = []
+    for spec in specs:
+        try:
+            get_embedder(spec)
+        except Exception:  # pylint: disable=broad-exception-caught  # a bad model mustn't stop the server
+            log.exception("Could not preload embedder %r", spec)
+        else:
+            loaded.append(spec)
+    return loaded
+
+
+# ---- access control -----------------------------------------------------
+AUTH_COOKIE = "fewshot_token"
+OPEN_PATHS = {"/api/login", "/api/health"}  # reachable without the token
+
+
+def _token_ok(given: str | None) -> bool:
+    return TOKEN is None or (given is not None and secrets.compare_digest(given.encode(), TOKEN.encode()))
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next: Any) -> Response:
+    path = request.url.path
+    if TOKEN is not None and path.startswith("/api/") and path not in OPEN_PATHS:
+        auth = request.headers.get("authorization", "")
+        given = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get(AUTH_COOKIE)
+        if not _token_ok(given):
+            return JSONResponse({"detail": "Not signed in"}, 401, headers={"WWW-Authenticate": "Bearer"})
+    response: Response = await call_next(request)
+    return response
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware is just __call__
+    """Refuse (413) request bodies over ``limit`` bytes, by Content-Length or while streaming, so an
+    oversized upload isn't spooled to disk first."""
+
+    def __init__(self, inner: ASGIApp, limit: int) -> None:
+        self.inner, self.limit = inner, limit
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.inner(scope, receive, send)
+            return
+        length = dict(scope["headers"]).get(b"content-length")
+        if length is not None and length.isdigit() and int(length) > self.limit:
+            await self._refuse(scope, receive, send)
+            return
+        seen = 0
+        started = False
+
+        async def counted() -> Message:
+            nonlocal seen
+            msg = await receive()
+            seen += len(msg.get("body", b""))
+            if seen > self.limit:
+                raise _BodyTooLarge
+            return msg
+
+        async def tracked(msg: Message) -> None:
+            nonlocal started
+            started = started or msg["type"] == "http.response.start"
+            await send(msg)
+
+        try:
+            await self.inner(scope, counted, tracked)
+        except _BodyTooLarge:
+            if not started:
+                await self._refuse(scope, receive, send)
+
+    async def _refuse(self, scope: Scope, receive: Receive, send: Send) -> None:
+        mb = self.limit / 1024 / 1024
+        await JSONResponse({"detail": f"Request is larger than the {mb:g} MB limit"}, 413)(scope, receive, send)
+
+
+app.add_middleware(LimitBody, limit=MAX_REQUEST_BYTES)  # added last, so it runs first
 
 
 def _task(name: str) -> Task:
@@ -41,7 +175,17 @@ def _bad(e: Exception) -> HTTPException:
 
 
 def _check_embedder(spec: str) -> None:
-    """Load the embedder now so a bad spec fails here (400), not at predict time."""
+    """Load the embedder now so a bad spec fails here (400), not at predict time.
+
+    Unless ``ALLOW_ANY_MODEL``, a spec that isn't a preset, registered, or already used by a task
+    is refused (403) before anything is downloaded.
+    """
+    if not spec.strip():
+        raise HTTPException(400, "Embedder spec is empty")
+    if not (ALLOW_ANY_MODEL or spec in {p.spec for p in PRESETS} or is_registered(spec)
+            or any(t.config.embedder == spec for t in ws.list_tasks())):
+        raise HTTPException(403, f"Embedder {spec!r} is not a preset. To use other models, start the "
+                                 "server with --allow-any-model (FEWSHOT_ALLOW_ANY_MODEL=1).")
     try:
         check_embedder(spec)
     except ValueError as e:
@@ -86,6 +230,37 @@ def _detail(t: Task) -> dict[str, Any]:
 
 
 # ---- metadata -----------------------------------------------------------
+@app.get("/api/health")
+@app.get("/healthz", include_in_schema=False)
+def health() -> dict[str, Any]:
+    """Liveness check; also lists loaded models and running jobs. Needs no token."""
+    with _jobs_lock:
+        running = sum(j.status == "running" for j in _jobs.values())
+    return {"status": "ok", "auth_required": TOKEN is not None, "models_loaded": loaded_embedders(),
+            "jobs_running": running}
+
+
+class Login(_Body):
+    """Body of POST /api/login."""
+
+    token: str
+
+
+@app.post("/api/login", status_code=204)
+def login(body: Login, response: Response) -> None:
+    """Check the server token and remember it in an HttpOnly cookie (30 days)."""
+    if not _token_ok(body.token):
+        raise HTTPException(401, "Wrong token")
+    if TOKEN is not None:
+        response.set_cookie(AUTH_COOKIE, TOKEN, max_age=30 * 86400, httponly=True, samesite="strict")
+
+
+@app.post("/api/logout", status_code=204)
+def logout(response: Response) -> None:
+    """Forget the login cookie."""
+    response.delete_cookie(AUTH_COOKIE)
+
+
 @app.get("/api/models")
 def models() -> dict[str, Any]:
     """List embedder presets and classifier names."""
@@ -252,15 +427,23 @@ def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = Fi
         raise HTTPException(400, "Class name is empty")
     added: list[dict[str, Any]] = []
     errors: list[dict[str, str | None]] = []
-    for f in files:
-        data = _read_upload(f)
-        if data is None:
-            errors.append({"file": f.filename, "error": _too_large()})
-            continue
-        try:
-            added.append(t.add_example(data, label, f.filename or "").model_dump())
-        except ValueError as e:
-            errors.append({"file": f.filename, "error": str(e)})
+    readable: list[UploadFile] = []  # in step with add_examples' results
+
+    def items() -> Iterator[tuple[bytes, str, str]]:
+        for f in files:
+            data = _read_upload(f)
+            if data is None:
+                errors.append({"file": f.filename, "error": _too_large()})
+                continue
+            readable.append(f)
+            yield data, label, f.filename or ""
+
+    results = t.add_examples(items())
+    for f, r in zip(readable, results, strict=True):
+        if isinstance(r, ValueError):
+            errors.append({"file": f.filename, "error": str(r)})
+        else:
+            added.append(r.model_dump())
     if not added:
         raise HTTPException(400, "No images added: " + "; ".join(f"{e['file']}: {e['error']}" for e in errors))
     return {"added": added, "errors": errors, "task": _detail(t)}
@@ -371,11 +554,106 @@ def predict(name: str, files: list[UploadFile] = File(...)) -> list[dict[str, An
 
 @app.post("/api/tasks/{name}/evaluate")
 def evaluate(name: str, folds: int | None = None) -> dict[str, Any]:
-    """Cross-validate the task (leave-one-out unless ``folds`` is given)."""
+    """Cross-validate the task (leave-one-out unless ``folds`` is given). For a large task, prefer
+    POST .../evaluate/jobs, which reports progress and can be cancelled."""
     try:
         return evaluate_task(pipe, _task(name), folds)
     except ValueError as e:
         raise _bad(e) from e
+
+
+# ---- background jobs ----------------------------------------------------
+class _Cancelled(Exception):
+    pass
+
+
+@dataclass
+class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job's state, one field each
+    """A long-running operation in a background thread, polled through /api/jobs/{id}."""
+
+    task: str
+    kind: str
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    status: str = "running"  # running | done | failed | cancelled
+    stage: str = "starting"
+    done: int = 0
+    total: int = 0
+    result: Any = None
+    error: str | None = None
+    finished: float | None = None
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON view of the job."""
+        return {k: getattr(self, k) for k in ("id", "task", "kind", "status", "stage", "done", "total", "result",
+                                              "error")}
+
+    def progress(self, stage: str, done: int, total: int) -> None:
+        """Progress callback for the work; raises ``_Cancelled`` once cancellation was asked for."""
+        if self.cancel.is_set():
+            raise _Cancelled
+        self.stage, self.done, self.total = stage, done, total
+
+
+_jobs: dict[str, Job] = {}
+_jobs_lock = threading.Lock()
+JOBS_KEPT = 100  # finished jobs remembered (oldest are forgotten first)
+
+
+def _start_job(job: Job, work: Any) -> Job:
+    def run() -> None:
+        try:
+            job.result = work(job.progress)
+            job.status = "done"
+        except _Cancelled:
+            job.status = "cancelled"
+        except (ValueError, KeyError) as e:
+            job.status, job.error = "failed", str(e.args[0]) if e.args else str(e)
+        except Exception as e:  # pylint: disable=broad-exception-caught  # reported to the poller
+            log.exception("Job %s failed", job.id)
+            job.status, job.error = "failed", f"Internal error: {e}"
+        job.finished = time.time()
+
+    with _jobs_lock:
+        finished = sorted((j for j in _jobs.values() if j.finished), key=lambda j: j.finished or 0)
+        for old in finished[: max(0, len(finished) - JOBS_KEPT + 1)]:
+            del _jobs[old.id]
+        _jobs[job.id] = job
+    threading.Thread(target=run, name=f"fewshot-job-{job.id[:8]}", daemon=True).start()
+    return job
+
+
+def _job(jid: str) -> Job:
+    with _jobs_lock:
+        job = _jobs.get(jid)
+    if job is None:
+        raise HTTPException(404, f"No job {jid!r}")
+    return job
+
+
+@app.post("/api/tasks/{name}/evaluate/jobs", status_code=202)
+def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
+    """Start cross-validating the task in the background; poll GET /api/jobs/{id} for progress
+    (stage "embedding" counts images, "evaluating" counts folds) and the report."""
+    t = _task(name)
+    if folds is not None and folds < 2:
+        raise HTTPException(400, f"folds must be at least 2, got {folds}")
+    return _start_job(Job(task=name, kind="evaluate"),
+                      lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
+
+
+@app.get("/api/jobs/{jid}")
+def get_job(jid: str) -> dict[str, Any]:
+    """A job's status, progress and (once done) result."""
+    return _job(jid).to_dict()
+
+
+@app.delete("/api/jobs/{jid}")
+def cancel_job(jid: str) -> dict[str, Any]:
+    """Ask a running job to stop; it does so at its next progress step (status becomes "cancelled")."""
+    job = _job(jid)
+    job.cancel.set()
+    return job.to_dict()
 
 
 # ---- web UI -------------------------------------------------------------

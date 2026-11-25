@@ -22,6 +22,7 @@ macOS); elsewhere only threads within one process are serialised.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import io
 import logging
@@ -34,10 +35,10 @@ import uuid
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .classifiers import CLASSIFIERS, check_params
 from .embedders import DEFAULT_SPEC
@@ -54,6 +55,8 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # Example files are always written as images/<id>.<ext>; anything else in task.json was not
 # written by us, and following it could read or delete files outside the task.
 EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}(?:[0-9a-f]{16})?\.[a-z0-9]{1,10}$")
+# Images saved per task.json write by Task.add_examples.
+ADD_CHUNK = 256
 MAX_CLASS_NAME = 200
 
 
@@ -115,6 +118,38 @@ def thumbnail(data: bytes, size: int) -> bytes:
     out = io.BytesIO()
     im.save(out, "JPEG", quality=85)
     return out.getvalue()
+
+
+class _NewImage(NamedTuple):
+    """An image checked and ready to store."""
+
+    data: bytes
+    id: str
+    ext: str  # file extension from the image's actual format
+    label: str
+    source: str
+
+
+def _check_item(data: bytes, label: str, source: str) -> _NewImage | ValueError:
+    """Validate one image to add (decoding it) and its label; the error instead of raising it."""
+    try:
+        label = check_class_name(label)
+        load_image(data)
+    except ValueError as e:
+        return e
+    fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
+    return _NewImage(data, image_id(data), {"jpeg": "jpg"}.get(fmt, fmt), label, source)
+
+
+def _copy_config(cfg: TaskConfig) -> TaskConfig:
+    """A copy of ``cfg`` that edits can't reach back through. Classes and examples are immutable,
+    so new lists of the same objects are enough; only the params dict is copied. This is far
+    cheaper than a deep copy, which matters because every write to a task makes one."""
+    return cfg.model_copy(update={
+        "classifier_params": copy.deepcopy(cfg.classifier_params),
+        "classes": list(cfg.classes),
+        "examples": list(cfg.examples),
+    })
 
 
 def fill_template(template: str, name: str) -> str:
@@ -184,14 +219,18 @@ def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
 
 
 class ClassDef(BaseModel):
-    """A class label with an optional text description."""
+    """A class label with an optional text description. Immutable: edits replace the object."""
+
+    model_config = ConfigDict(frozen=True)
 
     name: str
     description: str = ""  # used as a CLIP text prompt when non-empty
 
 
 class Example(BaseModel):
-    """A labeled example image stored in the task folder."""
+    """A labeled example image stored in the task folder. Immutable: edits replace the object."""
+
+    model_config = ConfigDict(frozen=True)
 
     id: str
     label: str
@@ -277,7 +316,7 @@ class Task:
                 except FileNotFoundError as e:  # deleted by another process
                     raise KeyError(f"No task {self.name!r}") from e
                 before = self.config
-                self.config = before.model_copy(deep=True)
+                self.config = _copy_config(before)
                 self._depth = 1
                 try:
                     yield
@@ -356,10 +395,10 @@ class Task:
         """
         name = name.strip()
         with self._writing():
-            for c in self.config.classes:
+            for i, c in enumerate(self.config.classes):
                 if c.name == name:
                     if description is not None:
-                        c.description = description
+                        c = self.config.classes[i] = c.model_copy(update={"description": description})
                     self._save()
                     return c
             c = ClassDef(name=check_class_name(name), description=description or "")
@@ -373,9 +412,10 @@ class Task:
             raise ValueError("Template must contain '{}'")
         n = 0
         with self._writing():
-            for c in self.config.classes:
+            classes = self.config.classes
+            for i, c in enumerate(classes):
                 if overwrite or not c.description.strip():
-                    c.description = fill_template(template, c.name)
+                    classes[i] = c.model_copy(update={"description": fill_template(template, c.name)})
                     n += 1
             self._save()
         return n
@@ -386,11 +426,10 @@ class Task:
         with self._writing():
             if new in self.class_names():
                 raise ValueError(f"Class {new!r} already exists")
-            c = self._class(old)
-            c.name = new
-            for e in self.config.examples:
-                if e.label == old:
-                    e.label = new
+            self._class(old)
+            cfg = self.config
+            cfg.classes = [c.model_copy(update={"name": new}) if c.name == old else c for c in cfg.classes]
+            cfg.examples = [e.model_copy(update={"label": new}) if e.label == old else e for e in cfg.examples]
             self._save()
 
     def delete_class(self, name: str) -> int:
@@ -413,37 +452,80 @@ class Task:
 
     # ---- examples ----------------------------------------------------
     def add_example(self, data: bytes, label: str, source: str = "") -> Example:
-        """Store an image under ``label`` (creating the class); re-adding an image relabels it."""
-        load_image(data)  # validates before anything is written
-        eid = image_id(data)
-        label = label.strip()
+        """Store an image under ``label`` (creating the class); re-adding an image relabels it.
+
+        Raises ``ValueError`` for an unreadable image or a bad class name.
+        """
+        result = self.add_examples([(data, label, source)])[0]
+        if isinstance(result, ValueError):
+            raise result
+        return result
+
+    def add_examples(self, items: Iterable[tuple[bytes, str, str]],
+                     chunk: int = ADD_CHUNK) -> list[Example | ValueError]:
+        """Store ``(image bytes, label, source)`` items, like ``add_example`` but with one save per
+        ``chunk`` items instead of one per image.
+
+        Returns one entry per item: its ``Example``, or the ``ValueError`` that kept it out (an
+        unreadable image or a bad class name). Images are decoded to check them before the task is
+        locked, so a long import doesn't block other writers for its whole length; ``items`` may be
+        a generator, and only one chunk of image bytes is held at a time.
+        """
+        results: list[Example | ValueError] = []
+        batch: list[tuple[bytes, str, str]] = []
+        for item in items:
+            batch.append(item)
+            if len(batch) >= chunk:
+                results += self._add_batch(batch)
+                batch = []
+        if batch:
+            results += self._add_batch(batch)
+        return results
+
+    def _add_batch(self, batch: list[tuple[bytes, str, str]]) -> list[Example | ValueError]:
+        checked = [_check_item(*item) for item in batch]  # decoding happens here, before locking
+        out: list[Example | ValueError] = []
         with self._writing():
-            if label not in self.class_names():
-                self.upsert_class(label)
-            for e in self.config.examples:
-                if e.id == eid or (len(e.id) == 16 and eid.startswith(e.id)):  # 16 chars: older tasks
-                    e.label = label
-                    self._save()
-                    return e
-            fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
-            ext = {"jpeg": "jpg"}.get(fmt, fmt)
-            rel = f"images/{eid}.{ext}"
-            (self.path / "images").mkdir(exist_ok=True)
-            (self.path / rel).write_bytes(data)
-            ex = Example(id=eid, label=label, file=rel, source=source)
-            self.config.examples.append(ex)
-            self._save()
-            return ex
+            examples = self.config.examples
+            at = {e.id: i for i, e in enumerate(examples)}  # id -> position
+            legacy = {e.id: i for i, e in enumerate(examples) if len(e.id) == 16}  # 16 chars: older tasks
+            for c in checked:
+                if isinstance(c, ValueError):
+                    out.append(c)
+                    continue
+                self._ensure_class(c.label)
+                i = at.get(c.id, legacy.get(c.id[:16]))
+                if i is not None:  # already stored: just relabel
+                    ex = examples[i] = examples[i].model_copy(update={"label": c.label})
+                else:
+                    ex = Example(id=c.id, label=c.label, file=f"images/{c.id}.{c.ext}", source=c.source)
+                    (self.path / "images").mkdir(exist_ok=True)
+                    (self.path / ex.file).write_bytes(c.data)
+                    at[c.id] = len(examples)
+                    examples.append(ex)
+                out.append(ex)
+            if any(not isinstance(r, ValueError) for r in out):
+                self._save()
+        return out
+
+    def _ensure_class(self, label: str) -> None:
+        """Add class ``label`` (already checked) if missing, without saving."""
+        if label not in self.class_names():
+            self.config.classes.append(ClassDef(name=label))
 
     def add_examples_from_dir(self, folder: Path) -> int:
-        """Import a folder laid out as ``folder/<class>/<image>``."""
-        n = 0
-        for cls_dir in sorted(p for p in folder.iterdir() if p.is_dir()):
-            for f in sorted(cls_dir.iterdir()):
-                if f.is_file() and f.suffix.lower() in IMAGE_EXTS:
-                    self.add_example(f.read_bytes(), cls_dir.name, f.name)
-                    n += 1
-        return n
+        """Import a folder laid out as ``folder/<class>/<image>``; returns how many images were added.
+
+        Raises ``ValueError`` for the first image that can't be read (after adding the others).
+        """
+        items = ((f.read_bytes(), d.name, f.name)
+                 for d in sorted(p for p in folder.iterdir() if p.is_dir())
+                 for f in sorted(d.iterdir()) if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+        results = self.add_examples(items)
+        for r in results:
+            if isinstance(r, ValueError):
+                raise r
+        return len(results)
 
     def example(self, eid: str) -> Example:
         """Look up an example by id; raises ``KeyError`` if missing."""
@@ -464,14 +546,13 @@ class Task:
         Raises ``KeyError`` (changing nothing) if any id is unknown; returns how many moved.
         """
         with self._writing():
-            chosen = self._examples(eids)
-            label = label.strip()
-            if label not in self.class_names():
-                self.upsert_class(label)
-            for e in chosen:
-                e.label = label
+            ids = {e.id for e in self._examples(eids)}
+            label = check_class_name(label)
+            self._ensure_class(label)
+            self.config.examples = [e.model_copy(update={"label": label}) if e.id in ids else e
+                                    for e in self.config.examples]
             self._save()
-            return len(chosen)
+            return len(ids)
 
     def delete_example(self, eid: str) -> None:
         """Remove an example and its image file."""

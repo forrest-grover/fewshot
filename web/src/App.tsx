@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
+import { api, AUTH_EVENT, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
 import Evaluate, { type EvalRun } from "./Evaluate";
 import Examples from "./Examples";
 import { usePredictResults } from "./hooks";
@@ -35,6 +35,7 @@ export default function App() {
   const [models, setModels] = useState<ModelInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [signIn, setSignIn] = useState(false); // the server wants its token
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
   // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
   const predictState = usePredictResults(route.task);
@@ -53,6 +54,12 @@ export default function App() {
     () => run(api.tasks()).then((t) => { if (t) setTasks(t); }),
     [run],
   );
+
+  useEffect(() => {
+    const auth = () => { setSignIn(true); };
+    window.addEventListener(AUTH_EVENT, auth);
+    return () => { window.removeEventListener(AUTH_EVENT, auth); };
+  }, []);
 
   useEffect(() => {
     const on = () => { setRoute(parseHash()); };
@@ -88,6 +95,8 @@ export default function App() {
     }
     void refreshTasks();
   };
+
+  if (signIn) return <SignIn />;
 
   return (
     <div className="app">
@@ -156,6 +165,37 @@ export default function App() {
         )}
       </main>
     </div>
+  );
+}
+
+/** Asks for the server's token (set with `fewshot serve --token`); the server keeps it in a cookie. */
+function SignIn() {
+  const [token, setToken] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  return (
+    <main className="sign-in">
+      <form
+        className="new-task"
+        onSubmit={(e) => {
+          e.preventDefault();
+          setBusy(true);
+          api.login(token).then(
+            () => { location.reload(); },
+            (err: unknown) => { setBusy(false); setError(err instanceof Error ? err.message : String(err)); },
+          );
+        }}
+      >
+        <h1>Sign in</h1>
+        <p className="muted">This fewshot server needs its access token (the one it was started with, <code>fewshot serve --token</code>).</p>
+        <ErrorBox error={error} onClose={() => { setError(null); }} />
+        <label>
+          <span>Token</span>
+          <input type="password" autoComplete="current-password" value={token} onChange={(e) => { setToken(e.target.value); }} required autoFocus />
+        </label>
+        <button type="submit" disabled={busy || !token}>{busy ? "Signing in…" : "Sign in"}</button>
+      </form>
+    </main>
   );
 }
 

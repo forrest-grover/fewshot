@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 from fewshot.classifiers import KNNClassifier
-from fewshot.embedders import Embedder, cache_namespace, register_embedder, unregister_embedder
+from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.pipeline import Pipeline, Prediction
 from fewshot.store import image_id
 from tests.conftest import ColorEmbedder, png
@@ -348,3 +348,76 @@ def test_namespace_of_a_replaced_embedder_is_not_kept():
         assert cache_namespace("mine:v2") == "mine:v2#test"  # the replacement's own namespace
     finally:
         unregister_embedder("mine:v2")
+
+
+# ---- chunked embedding, progress and cache checks -------------------------
+def test_embedding_is_chunked_with_progress(ws, emb):
+    """Uncached images are embedded and cached one batch at a time, with progress after each."""
+    get_embedder("fake:color").batch_size = 2  # the registered wrapper is what the pipeline batches with
+    pipe = Pipeline(ws)
+    calls = []
+    items = [(f"k{i}", png(RED, noise=10, seed=i)) for i in range(5)]
+    out = pipe.embed_images("fake:color", items, progress=lambda d, t: calls.append((d, t)))
+    assert out.shape == (5, 3)
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+    assert emb.images == 5
+    pipe.embed_images("fake:color", items, progress=lambda d, t: calls.append((d, t)))
+    assert emb.images == 5  # all cached: no model work and no progress
+    assert len(calls) == 3
+
+
+def test_cancelled_embedding_keeps_finished_batches(ws, emb):  # pylint: disable=unused-argument  # registers the spec
+    """If progress raises (a cancel), the batches already embedded stay cached."""
+    get_embedder("fake:color").batch_size = 2  # the registered wrapper is what the pipeline batches with
+    pipe = Pipeline(ws)
+    items = [(f"k{i}", png(RED, noise=10, seed=i)) for i in range(5)]
+
+    def stop(done, _total):
+        raise KeyboardInterrupt(done)
+
+    with pytest.raises(KeyboardInterrupt):
+        pipe.embed_images("fake:color", items, progress=stop)
+    assert set(pipe.cache.get_many(cache_namespace("fake:color"), [k for k, _ in items])) == {"k0", "k1"}
+
+
+def test_cached_vectors_of_another_length_are_reembedded(ws, emb):
+    """Vectors cached under the spec by a model with another dimension are replaced."""
+    pipe = Pipeline(ws)
+    ns = cache_namespace("fake:color")
+    pipe.cache.put_many(ns, {"a": np.ones(5, np.float32)})
+    pipe.embed_images("fake:color", [("b", png(BLUE))])
+    out = pipe.embed_images("fake:color", [("a", png(RED)), ("b", png(BLUE))])  # mixed lengths in the cache
+    assert out.shape == (2, 3)
+    assert len(pipe.cache.get_many(ns, ["a"])["a"]) == 3
+    assert emb.images == 2
+
+    tns = cache_namespace(TEXT_SPEC)
+    pipe.cache.put_many(tns, {"text:a red thing": np.ones(5, np.float32), "text:a blue thing": np.ones(3, np.float32)})
+    t = pipe.embed_texts(TEXT_SPEC, ["a red thing", "a blue thing"])
+    assert t.shape == (2, 3)
+    assert emb.texts == ["a red thing"]
+
+
+def test_embed_files_reads_each_file_once(ws, emb, tmp_path, monkeypatch):
+    """embed_files hashes and decodes from one read per file, in chunks, with progress."""
+    files = []
+    for i in range(5):
+        f = tmp_path / f"{i}.png"
+        f.write_bytes(png(GREEN, noise=10, seed=i))
+        files.append(f)
+    reads = []
+    real = Path.read_bytes
+    def counted(p):
+        reads.append(p.name)
+        return real(p)
+
+    monkeypatch.setattr(Path, "read_bytes", counted)
+    calls = []
+    pipe = Pipeline(ws)
+    out = pipe.embed_files("fake:color", files, progress=lambda d, t: calls.append((d, t)), chunk=2)
+    assert out.shape == (5, 3)
+    assert sorted(reads) == sorted(f.name for f in files)
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+    np.testing.assert_allclose(out, pipe.embed_images("fake:color", [(None, f) for f in files]))
+    assert pipe.embed_files("fake:color", []).shape == (0, 0)
+    assert emb.images == 10

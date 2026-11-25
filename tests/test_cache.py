@@ -64,3 +64,23 @@ def test_persists_across_instances(tmp_path):
     EmbeddingCache(path).put_many("s", {"k": np.array([4.0])})
     assert EmbeddingCache(path).get_many("s", ["k"])["k"].tolist() == [4.0]
     assert _rows(path) == [("s", "k")]
+
+
+def test_wal_mode_and_busy_timeout(tmp_path):
+    """The cache uses WAL journaling so the server and CLI can share it."""
+    c = EmbeddingCache(tmp_path / "c.sqlite")
+    with sqlite3.connect(str(c.path)) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_stats_and_prune(tmp_path):
+    """prune drops image vectors not in ``keep`` (texts stay); stats sums per namespace."""
+    c = EmbeddingCache(tmp_path / "c.sqlite")
+    c.put_many("s1", {"keep": np.ones(4, np.float32), "old": np.ones(4, np.float32), "text:x": np.ones(4, np.float32)})
+    c.put_many("s2", {"old2": np.ones(2, np.float32)})
+    assert c.stats() == [("s1", 3, 48), ("s2", 1, 8)]
+    assert c.prune({"keep"}, dry_run=True) == 2
+    assert len(_rows(c.path)) == 4
+    assert c.prune({"keep"}) == 2
+    assert _rows(c.path) == [("s1", "keep"), ("s1", "text:x")]
+    assert c.prune({"keep"}) == 0

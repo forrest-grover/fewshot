@@ -101,8 +101,9 @@ def test_create_task_default_embedder_and_bad_name(client):
     assert [t["name"] for t in client.get("/api/tasks").json()] == ["plain"]
 
 
-def test_create_task_bad_embedder(client):
+def test_create_task_bad_embedder(client, monkeypatch):
     """An unloadable embedder spec is rejected before the task is created."""
+    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)  # these specs aren't presets
     r = client.post("/api/tasks", json={"name": "x", "embedder": "bogus:x"})
     assert r.status_code == 400
     assert r.json()["detail"].startswith("Could not load embedder 'bogus:x': Unknown embedder backend")
@@ -114,6 +115,7 @@ def test_create_task_bad_embedder(client):
 
 def test_check_embedder_trims_model_list(client, monkeypatch):
     """open_clip's long 'Available:' list is cut from the error message."""
+    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)  # these specs aren't presets
     def boom(spec):
         raise RuntimeError(f"Model {spec} not found. Available: " + ", ".join(["m"] * 500))
 
@@ -125,6 +127,7 @@ def test_check_embedder_trims_model_list(client, monkeypatch):
 
 def test_update_task_settings(client, task, monkeypatch, request):
     """PATCH settings: classifier params reset, clear_reject, embedder validation."""
+    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)  # these specs aren't presets
     t = client.patch(f"/api/tasks/{task}", json={"classifier": "knn", "classifier_params": {"k": 3}}).json()
     assert t["classifier"] == "knn"
     assert t["classifier_params"] == {"k": 3}
@@ -267,7 +270,7 @@ def test_bulk_relabel_and_delete(client, task, tmp_path):
     rev = client.get(f"/api/tasks/{task}").json()["revision"]
     t = client.patch(f"/api/tasks/{task}/examples", json={"ids": red[:2] + red[:1], "label": "pink"}).json()
     assert {c["name"]: c["count"] for c in t["classes"]} == {"red": 1, "blue": 3, "pink": 2}
-    assert t["revision"] == rev + 2  # one save creates "pink", one moves both examples
+    assert t["revision"] == rev + 1  # one save creates "pink" and moves both examples
 
     r = client.patch(f"/api/tasks/{task}/examples", json={"ids": [red[2], "nope"], "label": "pink"})
     assert r.status_code == 404

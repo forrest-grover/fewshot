@@ -20,10 +20,17 @@ export interface EvalReport {
   per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
   mistakes: { id: string; true: string; pred: string; confidence: number }[];
 }
+export interface Job<T> {
+  id: string; task: string; kind: string; status: "running" | "done" | "failed" | "cancelled";
+  stage: string; done: number; total: number; result: T | null; error: string | null;
+}
 export interface ModelInfo {
   embedders: { spec: string; label: string; supports_text: boolean; notes: string }[];
   classifiers: string[];
 }
+
+/** Fired on window when a request is refused for want of the server's token. */
+export const AUTH_EVENT = "fewshot:auth-required";
 
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method };
@@ -33,6 +40,11 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     init.headers = { "Content-Type": "application/json" };
   }
   const r = await fetch(url, init);
+  if (r.status === 401 && url !== "/api/login") {
+    // The server wants its token: the App shows the sign-in form.
+    window.dispatchEvent(new Event(AUTH_EVENT));
+    throw new Error("Not signed in");
+  }
   if (!r.ok) {
     let msg: unknown = `${String(r.status)} ${r.statusText}`;
     try {
@@ -79,6 +91,10 @@ export const api = {
   deleteExamples: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/examples/delete`, { ids }),
   predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict`, files(fs)),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
+  startEvaluation: (n: string) => req<Job<EvalReport>>("POST", `${t(n)}/evaluate/jobs`),
+  job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${id}`),
+  cancelJob: (id: string) => req<Job<unknown>>("DELETE", `/api/jobs/${id}`),
+  login: (token: string) => req<undefined>("POST", "/api/login", { token }),
   /** An example's image; with ``size``, a JPEG scaled down to fit in that many pixels. */
   imageUrl: (n: string, id: string, size?: number) =>
     `${t(n)}/examples/${id}/image` + (size ? `?size=${String(size)}` : ""),

@@ -11,7 +11,9 @@ import numpy as np
 
 from .classifiers import ClassData, make_classifier
 from .pipeline import Pipeline
-from .store import IMAGE_EXTS, Task, fill_template, image_id
+from .store import IMAGE_EXTS, Task, TaskConfig, fill_template
+
+EvalProgress = Callable[[str, int, int], None]  # (stage, done, total); may raise to cancel
 
 
 def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
@@ -46,14 +48,17 @@ def _folds(y: np.ndarray, k: int, seed: int) -> list[np.ndarray]:
     return [np.flatnonzero(fold_of == f) for f in range(k)]
 
 
-def _cross_val_predict(data: ClassData, task: Task, k: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def _cross_val_predict(data: ClassData, cfg: TaskConfig, k: int, seed: int,
+                       progress: Callable[[int, int], None] | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Held-out predicted class index and confidence per example; -1 where a fold
     left fewer than 2 classes to train on."""
     n = len(data.y)
-    cfg = task.config
     pred = np.full(n, -1)
     conf = np.zeros(n)
-    for test in _folds(data.y, k, seed):
+    folds = _folds(data.y, k, seed)
+    for done, test in enumerate(folds):
+        if progress:
+            progress(done, len(folds))
         sub, back = _subset(data, np.setdiff1d(np.arange(n), test))
         if len(sub.classes) < 2:
             continue
@@ -61,6 +66,8 @@ def _cross_val_predict(data: ClassData, task: Task, k: int, seed: int) -> tuple[
         p, _ = clf.predict(data.X[test])
         pred[test] = back[p.argmax(1)]
         conf[test] = p.max(1)
+    if progress:
+        progress(len(folds), len(folds))
     return pred, conf
 
 
@@ -77,9 +84,9 @@ def _per_class(classes: list[str], cm: np.ndarray) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _mistakes(task: Task, data: ClassData, pred: np.ndarray, conf: np.ndarray) -> list[dict[str, Any]]:
+def _mistakes(cfg: TaskConfig, data: ClassData, pred: np.ndarray, conf: np.ndarray) -> list[dict[str, Any]]:
     """Scored, misclassified examples, most confident first."""
-    exs = task.config.examples
+    exs = cfg.examples
     wrong = np.flatnonzero((pred >= 0) & (pred != data.y))
     mistakes = [
         {"id": exs[i].id, "true": data.classes[data.y[i]], "pred": data.classes[pred[i]],
@@ -90,25 +97,41 @@ def _mistakes(task: Task, data: ClassData, pred: np.ndarray, conf: np.ndarray) -
     return mistakes
 
 
-def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: int = 0) -> dict[str, Any]:
+def _confusion(truth: np.ndarray, pred: np.ndarray, n_classes: int) -> np.ndarray:
+    """Confusion matrix: rows are true classes, columns predicted ones."""
+    cm = np.zeros((n_classes, n_classes), int)
+    np.add.at(cm, (truth, pred), 1)
+    return cm
+
+
+def _stage(progress: EvalProgress | None, stage: str) -> Callable[[int, int], None] | None:
+    """``progress`` with its stage name filled in."""
+    if progress is None:
+        return None
+    return lambda done, total: progress(stage, done, total)
+
+
+def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: int = 0,
+                  progress: EvalProgress | None = None) -> dict[str, Any]:
     """Cross-validate the task's current settings on its own labelled examples.
 
     Defaults to leave-one-out for up to 300 examples, otherwise 5-fold. Every
     held-out example is predicted by a classifier that never saw it.
+    ``progress(stage, done, total)`` is called with stage ``"embedding"`` (images) and then
+    ``"evaluating"`` (folds); it may raise to cancel.
     """
-    data = pipe.class_data(task)
+    cfg = task.config  # one snapshot, so a concurrent edit can't misalign examples and results
+    if folds is not None and folds < 2:
+        raise ValueError(f"folds must be at least 2, got {folds}")
+    data = pipe.class_data(task, cfg=cfg, progress=_stage(progress, "embedding"))
     n, C = len(data.y), len(data.classes)
     if n == 0:
         raise ValueError("Task has no examples to evaluate")
-    if folds is not None and folds < 2:
-        raise ValueError(f"folds must be at least 2, got {folds}")
     k = folds or (n if n <= 300 else 5)
-    pred, conf = _cross_val_predict(data, task, k, seed)
+    pred, conf = _cross_val_predict(data, cfg, k, seed, _stage(progress, "evaluating"))
 
     scored = pred >= 0
-    cm = np.zeros((C, C), int)
-    for t, p in zip(data.y[scored], pred[scored], strict=True):
-        cm[t, p] += 1
+    cm = _confusion(data.y[scored], pred[scored], C)
     return {
         "method": "leave-one-out" if k >= n else f"{k}-fold",
         "n_scored": int(scored.sum()),
@@ -117,7 +140,7 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
         "classes": data.classes,
         "confusion": cm.tolist(),
         "per_class": _per_class(data.classes, cm),
-        "mistakes": _mistakes(task, data, pred, conf),
+        "mistakes": _mistakes(cfg, data, pred, conf),
     }
 
 
@@ -148,7 +171,7 @@ class _EpisodeSampler:
         files = [f for c in names for f in ds[c]]
         if progress:
             progress(f"Embedding {len(files)} images with {embedder} (cached after first run)")
-        E = pipe.embed_images(embedder, [(image_id(f.read_bytes()), f) for f in files])
+        E = pipe.embed_files(embedder, files)
         T = None
         if text_template:
             T = pipe.embed_texts(embedder, [fill_template(text_template, c) for c in names])
