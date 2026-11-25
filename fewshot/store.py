@@ -747,7 +747,9 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
         ids = [e.id for e in self.config.examples]
         out = []
         for p in prefixes:
-            hits = [i for i in ids if i.startswith(p)] if len(p) >= 4 else []
+            if len(p) < 4:
+                raise KeyError(f"Example id {p!r} is too short: give at least 4 characters")
+            hits = [i for i in ids if i.startswith(p)]
             if len(hits) != 1:
                 raise KeyError(f"No example {p!r}" if not hits else f"Example id {p!r} is ambiguous")
             out.append(hits[0])

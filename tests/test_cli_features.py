@@ -149,7 +149,9 @@ def test_predict_csv_json_and_urls(run, task, tmp_path, monkeypatch):
     assert rows[0]["file"] == str(q)
     r = run("predict", task, "http://h/bad.png", q)
     assert r.exit_code == 1
-    assert "http://h/bad.png: Could not fetch" in r.output
+    assert "http://h/bad.png: error: Could not fetch http://h/bad.png: HTTP 404" in r.output
+    data = json.loads(run("predict", task, "http://h/bad.png", "--json").stdout)
+    assert data[0]["error"] == "Could not fetch http://h/bad.png: HTTP 404 Not Found"  # the real reason
     data = json.loads(run("predict", task, q, "--json", "--top", "1").output)
     assert list(data[0]["scores"]) == ["red"]
     assert run("add", task, "blue", "http://h/new.png").exit_code == 0
@@ -204,3 +206,13 @@ def test_cache_prune_removes_unused_images(run, task, root):
     r = run("cache", "prune")
     assert "Deleted 1 stored images no task uses" in r.output
     assert "stored images" not in run("cache", "prune", "--dry-run").output
+
+
+def test_export_to_a_bad_path(run, task, tmp_path):
+    """export to a missing folder or onto a folder fails cleanly, leaving no partial file."""
+    r = run("export", task, tmp_path / "no" / "such" / "t.zip")
+    assert r.exit_code == 1
+    assert "Error: Can't write" in r.output
+    r = run("export", task, tmp_path)
+    assert r.exit_code == 1
+    assert not list(tmp_path.glob("*.part"))

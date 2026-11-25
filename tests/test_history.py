@@ -381,7 +381,7 @@ def test_resolve_ids(ws):
     t = _task(ws)
     eid = t.config.examples[0].id
     assert t.resolve_ids([eid[:6], eid]) == [eid, eid]
-    with pytest.raises(KeyError, match="No example 'abc'"):
+    with pytest.raises(KeyError, match="'abc' is too short: give at least 4 characters"):
         t.resolve_ids(["abc"])
     with pytest.raises(KeyError, match="No example"):
         t.resolve_ids(["zzzzzz"])

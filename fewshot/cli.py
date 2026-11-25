@@ -319,8 +319,14 @@ def export(name: str, file: Path, root: Path | None = ROOT_OPT) -> None:
 
     ws = _ws(root)
     _task(root, name)
-    with open(file, "wb") as f:
-        n = export_task(ws, name, f)
+    part = file.with_name(file.name + ".part")  # renamed into place when complete
+    try:
+        with open(part, "wb") as f:
+            n = export_task(ws, name, f)
+        os.replace(part, file)
+    except OSError as e:
+        part.unlink(missing_ok=True)
+        _fail(f"Can't write {file}: {e.strerror or e}")
     typer.echo(f"Exported {name} ({n} examples) to {file}")
 
 
@@ -427,18 +433,14 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     """Classify images (files, directories or http(s) URLs)."""
     t = _task(root, name)
     files = _expand(paths)
-    images: list[bytes | Path] = []
-    for f in files:
-        try:
-            images.append(f if isinstance(f, Path) else _read(f))
-        except ValueError as e:
-            images.append(b"")
-            typer.secho(f"{f}: {e}", fg="yellow", err=True)
+    images, fetch_errors = _download(files)
     try:
         with _progress("Embedding") as update:
             preds = _pipe(_ws(root)).predict(t, images, top_k=top if as_json else None, progress=update)
     except ValueError as e:
         _fail(str(e))
+    from .pipeline import Prediction  # pylint: disable=import-outside-toplevel,redefined-outer-name  # torch-backed
+    preds = [Prediction.failed(fetch_errors[i]) if i in fetch_errors else p for i, p in enumerate(preds)]
     failed = sum(p.error is not None for p in preds)
     if as_json:
         _echo_json([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds, strict=True)])
@@ -451,6 +453,20 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     if failed:
         typer.secho(f"{failed} of {len(preds)} images could not be read", fg="red", err=True)
         raise typer.Exit(1)
+
+
+def _download(files: list[Source]) -> tuple[list[bytes | Path], dict[int, str]]:
+    """Files as they are and URLs downloaded; a URL that can't be fetched becomes empty bytes, with
+    its error by position in the second result."""
+    images: list[bytes | Path] = []
+    errors: dict[int, str] = {}
+    for i, f in enumerate(files):
+        try:
+            images.append(f if isinstance(f, Path) else _read(f))
+        except ValueError as e:
+            images.append(b"")
+            errors[i] = str(e)
+    return images, errors
 
 
 def _print_predictions(files: list[Source], preds: list[Prediction], top: int) -> None:

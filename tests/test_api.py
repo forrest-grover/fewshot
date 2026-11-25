@@ -120,7 +120,7 @@ def test_check_embedder_trims_model_list(client, monkeypatch):
     def boom(spec):
         raise RuntimeError(f"Model {spec} not found. Available: " + ", ".join(["m"] * 500))
 
-    monkeypatch.setattr(fewshot.embedders, "get_embedder", boom)
+    monkeypatch.setattr(fewshot.embedders, "_build", boom)
     r = client.post("/api/tasks", json={"name": "x", "embedder": "openclip:NotAModel"})
     assert r.status_code == 400
     assert r.json()["detail"] == "Could not load embedder 'openclip:NotAModel': Model openclip:NotAModel not found"

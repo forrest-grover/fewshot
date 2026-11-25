@@ -76,6 +76,7 @@ from .schemas import (
     TaskSummary,
 )
 from .store import MAX_NOTE, Task, Workspace
+from .text import check_class_name, check_tag
 
 log = logging.getLogger(__name__)
 
@@ -165,13 +166,14 @@ async def _guard(request: Request, call_next: Any) -> Response:
     return response
 
 
-class _BodyTooLarge(Exception):
-    pass
-
-
 class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware is just __call__
     """Refuse (413) request bodies over ``limit`` bytes, by Content-Length or while streaming, so an
-    oversized upload isn't spooled to disk first."""
+    oversized upload isn't spooled to disk first.
+
+    A streamed body that passes the limit gets the 413 at once (if no response has started), and
+    the app is told the client went away; whatever it then sends is dropped. Raising from the
+    body stream instead would reach FastAPI as a body-parsing error, which it reports as 400.
+    """
 
     def __init__(self, inner: ASGIApp, limit: int) -> None:
         self.inner, self.limit = inner, limit
@@ -185,30 +187,38 @@ class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware
             await self._refuse(scope, receive, send)
             return
         seen = 0
-        started = False
+        started = refused = False
 
         async def counted() -> Message:
-            nonlocal seen
+            nonlocal seen, started, refused
+            if refused:
+                return {"type": "http.disconnect"}
             msg = await receive()
             seen += len(msg.get("body", b""))
-            if seen > self.limit:
-                raise _BodyTooLarge
-            return msg
+            if seen <= self.limit:
+                return msg
+            refused = True
+            if not started:  # too late for a 413 once a response has begun: just stop
+                started = True
+                await self._refuse(scope, receive, send)
+            return {"type": "http.disconnect"}
 
         async def tracked(msg: Message) -> None:
             nonlocal started
+            if refused:
+                return
             started = started or msg["type"] == "http.response.start"
             await send(msg)
 
         try:
             await self.inner(scope, counted, tracked)
-        except _BodyTooLarge:
-            if not started:
-                await self._refuse(scope, receive, send)
+        except Exception:  # pylint: disable=broad-exception-caught  # the app failing on the cut-off body
+            if not refused:
+                raise
 
     async def _refuse(self, scope: Scope, receive: Receive, send: Send) -> None:
         mb = self.limit / 1024 / 1024
-        await JSONResponse({"detail": f"Request is larger than the {mb:g} MB limit"}, 413)(scope, receive, send)
+        await JSONResponse({"detail": f"Request is larger than the {mb:.3g} MB limit"}, 413)(scope, receive, send)
 
 
 app.add_middleware(LimitBody, limit=MAX_REQUEST_BYTES)  # added last, so it runs first
@@ -618,7 +628,17 @@ class LabelledUrls(Urls):
 def add_examples_by_url(name: str, body: LabelledUrls) -> dict[str, Any]:
     """Download images (server started with --allow-urls) and add them as examples of ``label``."""
     t = _task(name)
-    return _add_blobs(t, body.label, _downloads(body.urls))
+    try:
+        label = check_class_name(body.label)  # before downloading anything
+    except ValueError as e:
+        raise _bad(e) from e
+    return _add_blobs(t, label, _downloads(body.urls))
+
+
+def _check_tags(tags: list[str]) -> None:
+    """Raise ``ValueError`` for the first bad tag."""
+    for tag in tags:
+        check_tag(tag)
 
 
 class ExampleEdit(_Body):
@@ -634,6 +654,8 @@ def edit_example(name: str, eid: str, body: ExampleEdit) -> dict[str, Any]:
     """Move an example to another (possibly new) class, and/or set its tags or note."""
     t = _task(name)
     try:
+        t.example(eid)  # 404 for an unknown id, even if the edit is empty
+        _check_tags(body.tags or [])  # all checks before any change, so a bad tag changes nothing
         if body.label is not None:
             t.relabel(eid, body.label)
         if body.tags is not None or body.note is not None:
@@ -676,6 +698,9 @@ def edit_examples(name: str, body: BulkEdit) -> dict[str, Any]:
     changes nothing (404)."""
     t = _task(name)
     try:
+        for eid in body.ids:
+            t.example(eid)  # 404 for an unknown id, even if the edit is empty
+        _check_tags(body.add_tags + body.remove_tags)
         if body.label is not None:
             t.relabel_many(body.ids, body.label)
         if body.add_tags or body.remove_tags:

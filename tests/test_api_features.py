@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import fewshot.api
+import fewshot.embedders
 import fewshot.store
 from tests.conftest import png
 
@@ -215,3 +216,61 @@ def test_openapi_has_typed_responses(client):
     assert {"TaskDetail", "PredictionOut", "EvalReport", "JobOut", "Health"} <= set(schemas)
     ok = spec["paths"]["/api/tasks/{name}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
     assert ok == {"$ref": "#/components/schemas/TaskDetail"}
+
+
+# ---- second review: API correctness -------------------------------------
+def test_model_that_cannot_load_is_a_400(client, task, monkeypatch):
+    """If a task's model can't be loaded (offline, removed), predict, duplicates and evaluate say
+    so with 400, and an evaluation job fails with the reason, instead of a 500."""
+    def offline(spec):
+        raise RuntimeError("couldn't reach huggingface.co")
+
+    t = fewshot.api.ws.get(task)
+    t.update_settings(embedder="timm:gone")
+    monkeypatch.setattr(fewshot.embedders, "_build", offline)
+    files = [("files", ("q.png", png(RED), "image/png"))]
+    for r in (client.post(f"/api/tasks/{task}/predict", files=files), client.get(f"/api/tasks/{task}/duplicates"),
+              client.post(f"/api/tasks/{task}/evaluate")):
+        assert r.status_code == 400
+        assert r.json()["detail"] == "Could not load embedder 'timm:gone': couldn't reach huggingface.co"
+
+
+def test_streamed_body_over_the_limit_is_413(tmp_path, monkeypatch):
+    """A body without Content-Length that grows past the limit is refused with 413, not 400."""
+    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
+    monkeypatch.setenv("FEWSHOT_MAX_REQUEST_MB", "0.01")
+    c = TestClient(importlib.reload(fewshot.api).app)
+
+    def chunks():
+        for _ in range(20):
+            yield b" " * 1024
+
+    r = c.post("/api/tasks", content=chunks(), headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert r.json()["detail"] == "Request is larger than the 0.01 MB limit"
+
+
+def test_patch_checks_everything_before_changing_anything(client, task):
+    """A bad tag fails the whole edit (the label isn't changed either), and an unknown id is 404
+    even when the edit is empty."""
+    t = client.get(f"/api/tasks/{task}").json()
+    eid, rev = t["examples"][0]["id"], t["revision"]
+    r = client.patch(f"/api/tasks/{task}/examples/{eid}", json={"label": "green", "tags": ["x" * 60]})
+    assert r.status_code == 400
+    r = client.patch(f"/api/tasks/{task}/examples", json={"ids": [eid], "label": "purple", "add_tags": [""]})
+    assert r.status_code == 400
+    t = client.get(f"/api/tasks/{task}").json()
+    assert (t["examples"][0]["label"], t["revision"]) == ("red", rev)
+    assert client.patch(f"/api/tasks/{task}/examples/nope", json={}).status_code == 404
+    assert client.patch(f"/api/tasks/{task}/examples", json={"ids": ["nope"]}).status_code == 404
+
+
+def test_urls_check_the_label_before_downloading(client, task, monkeypatch):
+    """A bad label is refused before any URL is fetched."""
+    monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
+    fetched = []
+    monkeypatch.setattr(fewshot.api, "fetch_url", lambda url, *a, **k: fetched.append(url))
+    for label in ("  ", "a/b"):
+        r = client.post(f"/api/tasks/{task}/examples/urls", json={"label": label, "urls": ["http://h/x.png"] * 5})
+        assert r.status_code == 400
+    assert not fetched

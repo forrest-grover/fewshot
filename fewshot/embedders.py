@@ -356,6 +356,8 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
     """Load (once per process) and return the embedder for ``spec``.
 
     Loading one model (which may mean downloading it) doesn't block requests for other models.
+    Raises ``ValueError`` with a short reason if the model can't be loaded (a bad spec, no network,
+    a model that doesn't exist).
     """
     with _load_lock:
         if spec in _loaded:
@@ -366,7 +368,12 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
         with _load_lock:
             if spec in _loaded:  # another thread loaded it while we waited
                 return _loaded[spec]
-        emb = _build(spec)
+        try:
+            emb = _build(spec)
+        # Model loaders (open_clip, timm, hub downloads) raise many unrelated exception types.
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            msg = str(e).split(". Available:", maxsplit=1)[0]  # open_clip appends every known model name
+            raise ValueError(f"Could not load embedder {spec!r}: {msg[:300]}") from e
         with _load_lock:
             if spec in _loaded:  # registered while we were loading: the registration wins
                 return _loaded[spec]
@@ -423,12 +430,7 @@ def check_embedder(spec: str) -> None:
     """
     if not spec.strip():
         raise ValueError("Embedder spec is empty")
-    try:
-        get_embedder(spec)
-    # Model loaders (open_clip, timm, hub downloads) raise many unrelated exception types for a bad name.
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        msg = str(e).split(". Available:", maxsplit=1)[0]  # open_clip appends every known model name
-        raise ValueError(f"Could not load embedder {spec!r}: {msg[:300]}") from e
+    get_embedder(spec)
 
 
 def register_embedder(spec: str, embedder: Embedder) -> None:

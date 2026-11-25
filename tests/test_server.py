@@ -276,3 +276,24 @@ def test_no_warm_by_default(client):  # pylint: disable=unused-argument  # loads
     """Without FEWSHOT_WARM, startup loads nothing in the background."""
     with TestClient(fewshot.api.app):
         assert not any(t.name == "fewshot-warm" for t in threading.enumerate())
+
+
+def test_request_size_limit_cuts_off_the_app():
+    """Past the limit the app sees a disconnect (and keeps seeing it); if it then fails, that is
+    not an error, while an app error before the limit still is."""
+
+    async def fails_after_disconnect(_scope, receive, send):
+        while (await receive())["type"] != "http.disconnect":
+            pass
+        assert (await receive())["type"] == "http.disconnect"
+        await send({"type": "http.response.start", "status": 400, "headers": []})  # dropped
+        raise RuntimeError("body cut off")
+
+    sent = _asgi([b"123456", b"789012"], fails_after_disconnect)
+    assert [m.get("status") for m in sent if m["type"] == "http.response.start"] == [413]
+
+    async def broken(_scope, _receive, _send):
+        raise RuntimeError("bug")
+
+    with pytest.raises(RuntimeError, match="bug"):
+        _asgi([b"1"], broken)
