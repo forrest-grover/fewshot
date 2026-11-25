@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .classifiers import CLASSIFIERS
 from .embedders import PRESETS, check_embedder, spec_supports_text
@@ -291,6 +291,42 @@ def delete_example(name: str, eid: str) -> dict[str, Any]:
     t = _task(name)
     try:
         t.delete_example(eid)
+    except KeyError as e:
+        raise _missing(e) from e
+    return _detail(t)
+
+
+class ExampleIds(_Body):
+    """Body of POST .../examples/delete."""
+
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkRelabel(ExampleIds):
+    """Body of PATCH .../examples."""
+
+    label: str
+
+
+@app.patch("/api/tasks/{name}/examples")
+def relabel_many(name: str, body: BulkRelabel) -> dict[str, Any]:
+    """Move several examples to another (possibly new) class; an unknown id changes nothing (404)."""
+    t = _task(name)
+    try:
+        t.relabel_many(body.ids, body.label)
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
+    return _detail(t)
+
+
+@app.post("/api/tasks/{name}/examples/delete")
+def delete_examples(name: str, body: ExampleIds) -> dict[str, Any]:
+    """Delete several examples; an unknown id deletes nothing (404)."""
+    t = _task(name)
+    try:
+        t.delete_examples(body.ids)
     except KeyError as e:
         raise _missing(e) from e
     return _detail(t)

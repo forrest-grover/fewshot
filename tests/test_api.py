@@ -260,6 +260,31 @@ def test_examples_errors(client, task):
     assert client.get("/api/tasks/missing/examples/nope/image").status_code == 404
 
 
+def test_bulk_relabel_and_delete(client, task, tmp_path):
+    """Several examples move or go in one request; an unknown id or bad label changes nothing."""
+    ex = client.get(f"/api/tasks/{task}").json()["examples"]
+    red = [e["id"] for e in ex if e["label"] == "red"]
+    rev = client.get(f"/api/tasks/{task}").json()["revision"]
+    t = client.patch(f"/api/tasks/{task}/examples", json={"ids": red[:2] + red[:1], "label": "pink"}).json()
+    assert {c["name"]: c["count"] for c in t["classes"]} == {"red": 1, "blue": 3, "pink": 2}
+    assert t["revision"] == rev + 2  # one save creates "pink", one moves both examples
+
+    r = client.patch(f"/api/tasks/{task}/examples", json={"ids": [red[2], "nope"], "label": "pink"})
+    assert r.status_code == 404
+    assert r.json()["detail"] == "No example 'nope'"
+    assert client.patch(f"/api/tasks/{task}/examples", json={"ids": [red[2]], "label": " "}).status_code == 400
+    assert client.patch(f"/api/tasks/{task}/examples", json={"ids": [], "label": "x"}).status_code == 422
+    assert client.patch("/api/tasks/missing/examples", json={"ids": ["a"], "label": "x"}).status_code == 404
+
+    images = tmp_path / "ws" / "tasks" / task / "images"
+    assert client.post(f"/api/tasks/{task}/examples/delete", json={"ids": [red[0], "nope"]}).status_code == 404
+    assert len(list(images.iterdir())) == 6
+    t = client.post(f"/api/tasks/{task}/examples/delete", json={"ids": red[:2]}).json()
+    assert {c["name"]: c["count"] for c in t["classes"]} == {"red": 1, "blue": 3, "pink": 0}
+    assert len(list(images.iterdir())) == 4
+    assert client.post("/api/tasks/missing/examples/delete", json={"ids": ["a"]}).status_code == 404
+
+
 def test_image_thumbnails(client, task, tmp_path):
     """``?size=`` serves a JPEG scaled down to fit; bad sizes, missing and corrupt files are errors."""
     big = io.BytesIO()

@@ -1,29 +1,5 @@
 import { useRef, useState, type ReactNode } from "react";
-
-const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
-
-/** Collect image files from a drop, including files inside dropped folders. */
-async function filesFromDrop(dt: DataTransfer): Promise<File[]> {
-  const entries = Array.from(dt.items)
-    .map((i) => i.webkitGetAsEntry())
-    .filter((e): e is FileSystemEntry => e !== null);
-  if (!entries.length) return Array.from(dt.files);
-  const out: File[] = [];
-  const walk = async (e: FileSystemEntry): Promise<void> => {
-    if (e.isFile) {
-      out.push(await new Promise<File>((res, rej) => { (e as FileSystemFileEntry).file(res, rej); }));
-    } else if (e.isDirectory) {
-      const reader = (e as FileSystemDirectoryEntry).createReader();
-      let batch: FileSystemEntry[];
-      do {
-        batch = await new Promise((res, rej) => { reader.readEntries(res, rej); });
-        for (const c of batch) await walk(c);
-      } while (batch.length);
-    }
-  };
-  for (const e of entries) await walk(e);
-  return out;
-}
+import { filesFromDrop, isImage } from "./hooks";
 
 export function DropZone(props: {
   onFiles: (files: File[]) => void;
@@ -34,17 +10,20 @@ export function DropZone(props: {
   const [over, setOver] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const accept = (fs: File[]) => {
-    const imgs = fs.filter((f) => f.type.startsWith("image/") || IMAGE_RE.test(f.name));
+    const imgs = fs.filter(isImage);
     if (imgs.length) props.onFiles(imgs);
   };
+  const hasFiles = (dt: DataTransfer) => dt.types.includes("Files"); // not a dragged thumbnail
   return (
     <div
       className={`drop ${over ? "over" : ""} ${props.compact ? "compact" : ""} ${props.disabled ? "disabled" : ""}`}
-      onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+      onDragOver={(e) => { if (hasFiles(e.dataTransfer)) { e.preventDefault(); setOver(true); } }}
       onDragLeave={() => { setOver(false); }}
       onDrop={(e) => {
-        e.preventDefault();
         setOver(false);
+        if (!hasFiles(e.dataTransfer)) return;
+        e.preventDefault();
+        e.stopPropagation(); // handled here, not again by an enclosing drop target
         if (!props.disabled) void filesFromDrop(e.dataTransfer).then(accept);
       }}
       onClick={() => { if (!props.disabled) input.current?.click(); }}

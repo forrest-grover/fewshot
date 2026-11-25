@@ -75,6 +75,8 @@ export const api = {
       "POST", `${t(n)}/examples`, files(fs, { label })),
   relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, { label }),
   deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", `${t(n)}/examples/${id}`),
+  relabelMany: (n: string, ids: string[], label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, label }),
+  deleteExamples: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/examples/delete`, { ids }),
   predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict`, files(fs)),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
   /** An example's image; with ``size``, a JPEG scaled down to fit in that many pixels. */

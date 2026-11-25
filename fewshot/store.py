@@ -31,7 +31,7 @@ import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -455,21 +455,51 @@ class Task:
     def relabel(self, eid: str, label: str) -> Example:
         """Move an example to ``label``, creating the class if needed."""
         with self._writing():
-            e = self.example(eid)
+            self.relabel_many([eid], label)
+            return self.example(eid)
+
+    def relabel_many(self, eids: Iterable[str], label: str) -> int:
+        """Move several examples to ``label`` in one save, creating the class if needed.
+
+        Raises ``KeyError`` (changing nothing) if any id is unknown; returns how many moved.
+        """
+        with self._writing():
+            chosen = self._examples(eids)
             label = label.strip()
             if label not in self.class_names():
                 self.upsert_class(label)
-            e.label = label
+            for e in chosen:
+                e.label = label
             self._save()
-            return e
+            return len(chosen)
 
     def delete_example(self, eid: str) -> None:
         """Remove an example and its image file."""
+        self.delete_examples([eid])
+
+    def delete_examples(self, eids: Iterable[str]) -> int:
+        """Remove several examples and their image files in one save.
+
+        Raises ``KeyError`` (changing nothing) if any id is unknown; returns how many were removed.
+        """
         with self._writing():
-            e = self.example(eid)
-            self.config.examples = [x for x in self.config.examples if x.id != eid]
-            self._save()
-            (self.path / e.file).unlink(missing_ok=True)
+            gone = self._examples(eids)
+            ids = {e.id for e in gone}
+            self.config.examples = [x for x in self.config.examples if x.id not in ids]
+            self._save()  # before deleting files, so task.json never names a missing image
+            for e in gone:
+                (self.path / e.file).unlink(missing_ok=True)
+            return len(gone)
+
+    def _examples(self, eids: Iterable[str]) -> list[Example]:
+        """The examples with these ids (each once, in task order); ``KeyError`` names the first unknown."""
+        by_id = {e.id: e for e in self.config.examples}
+        wanted = list(dict.fromkeys(eids))
+        for eid in wanted:
+            if eid not in by_id:
+                raise KeyError(f"No example {eid!r}")
+        keep = set(wanted)
+        return [e for e in self.config.examples if e.id in keep]
 
     def image_path(self, eid: str) -> Path:
         """Path of an example's image file."""

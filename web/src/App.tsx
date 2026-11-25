@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
-import Evaluate from "./Evaluate";
+import Evaluate, { type EvalRun } from "./Evaluate";
 import Examples from "./Examples";
+import { usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import { ErrorBox } from "./ui";
@@ -35,6 +36,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
+  // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
+  const predictState = usePredictResults(route.task);
+  const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
 
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
     try {
@@ -60,6 +64,7 @@ export default function App() {
 
   useEffect(() => {
     currentTask.current = route.task;
+    setEvalRun(null);
     setError(null);
     setTask(null);
     setLoadFailed(false);
@@ -141,8 +146,8 @@ export default function App() {
             </div>
             <div id="tab-panel" role="tabpanel" aria-labelledby={`tab-${route.tab}`}>
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
-              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} />}
-              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} />}
+              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} />}
+              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun} />}
               {route.tab === "settings" && (
                 <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }} />
               )}

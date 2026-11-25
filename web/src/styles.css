@@ -422,6 +422,7 @@ label.disabled {
 }
 
 .thumb {
+  position: relative;
   margin: 0;
   width: 120px;
   display: flex;
@@ -664,4 +665,87 @@ label.disabled {
 
 .confusion td.off {
   background: color-mix(in srgb, var(--danger) calc(20% + var(--a) * 60%), transparent);
+}
+
+/* selection, dragging and keyboard hints */
+kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font: 11px/1.5 ui-monospace, monospace;
+  text-align: center;
+}
+
+.keys {
+  font-size: 12px;
+  margin: 8px 0;
+}
+
+.bulk-bar {
+  position: sticky;
+  top: 8px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+
+.class-card.drop-target {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.class-card header kbd {
+  align-self: center;
+}
+
+.thumb[draggable="true"] img {
+  cursor: grab;
+}
+
+.thumb.picked img {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.thumb .pick {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  display: block;
+  padding: 2px;
+  border-radius: 4px;
+  background: var(--panel);
+  line-height: 0;
+  opacity: 0;
+  transition: opacity .1s;
+}
+
+.thumb:hover .pick, .thumb .pick:focus-within, .thumb.picked .pick, .examples:has(.bulk-bar) .pick {
+  opacity: 1;
+}
+
+.thumb .pick input {
+  margin: 0;
+  padding: 0;
+}
+
+.result.current {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.result:focus {
+  outline: none; /* the highlighted (current) result is the focused one, and is styled above */
 }

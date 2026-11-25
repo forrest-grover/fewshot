@@ -1,19 +1,30 @@
-import { useState } from "react";
+import { type Dispatch, type SetStateAction } from "react";
 import { api, type EvalReport, type TaskDetail } from "./api";
 import { pct } from "./format";
 
-interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
+/** The last evaluation of a task, kept by the App so it survives switching tabs. */
+export interface EvalRun { task: string; report: EvalReport | null; rev: number | null; busy: boolean }
 
-export default function Evaluate({ task, setTask, run }: Props) {
-  const [report, setReport] = useState<EvalReport | null>(null);
-  const [rev, setRev] = useState<number | null>(null);
-  const [busy, setBusy] = useState(false);
+interface Props {
+  task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
+  state: EvalRun | null; setState: Dispatch<SetStateAction<EvalRun | null>>;
+}
+
+export default function Evaluate({ task, setTask, run, state, setState }: Props) {
+  const mine = state?.task === task.name ? state : null; // never show another task's report
+  const report = mine?.report ?? null;
+  const busy = mine?.busy ?? false;
+  const rev = mine?.rev ?? null;
+  const update = (p: Partial<EvalRun>) => {
+    // A run that finishes after the user opened another task is dropped.
+    setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, busy: false, ...s, ...p }));
+  };
 
   const go = async () => {
-    setBusy(true);
+    const revision = task.revision;
+    update({ busy: true });
     const r = await run(api.evaluate(task.name));
-    setBusy(false);
-    if (r) { setReport(r); setRev(task.revision); }
+    update(r ? { busy: false, report: r, rev: revision } : { busy: false });
   };
   const fix = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
   const stale = report && rev !== task.revision;
