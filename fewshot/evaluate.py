@@ -11,7 +11,7 @@ import numpy as np
 
 from .classifiers import ClassData, make_classifier
 from .pipeline import Pipeline
-from .store import IMAGE_EXTS, Task, image_id
+from .store import IMAGE_EXTS, Task, fill_template, image_id
 
 
 def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
@@ -99,6 +99,8 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     n, C = len(data.y), len(data.classes)
     if n == 0:
         raise ValueError("Task has no examples to evaluate")
+    if folds is not None and folds < 2:
+        raise ValueError(f"folds must be at least 2, got {folds}")
     k = folds or (n if n <= 300 else 5)
     pred, conf = _cross_val_predict(data, task, k, seed)
 
@@ -148,7 +150,7 @@ class _EpisodeSampler:
         E = pipe.embed_images(embedder, [(image_id(f.read_bytes()), f) for f in files])
         T = None
         if text_template:
-            T = pipe.embed_texts(embedder, [text_template.format(c.replace("_", " ")) for c in names])
+            T = pipe.embed_texts(embedder, [fill_template(text_template, c) for c in names])
         return cls(names, [len(ds[c]) for c in names], E, T)
 
     def sample(self, rng: np.random.Generator, way: int, shot: int, query: int

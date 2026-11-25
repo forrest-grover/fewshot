@@ -133,18 +133,18 @@ def test_unknown_task_is_a_clean_error(run, command):
 
 def test_config(run, root, task):
     """`config` updates settings, merges params and clears the threshold."""
-    r = run("config", task, "--classifier", "knn", "--param", "k=3", "--param", 'metric="cos"',
+    r = run("config", task, "--classifier", "knn", "--param", "k=3", "--param", "scale=20",
             "--text-weight", "0.5", "--reject-below", "0.7")
     assert r.exit_code == 0
     assert "classifier: knn" in r.output
     c = load(root).config
     assert (c.classifier, c.classifier_params, c.text_weight, c.reject_below) == (
-        "knn", {"k": 3, "metric": "cos"}, 0.5, 0.7)
+        "knn", {"k": 3, "scale": 20}, 0.5, 0.7)
 
     # A --param on its own extends the existing params; a negative --reject-below clears the threshold.
     assert run("config", task, "--param", "k=5", "--reject-below", "-1").exit_code == 0
     c = load(root).config
-    assert c.classifier_params == {"k": 5, "metric": "cos"}
+    assert c.classifier_params == {"k": 5, "scale": 20}
     assert c.reject_below is None
 
     # Changing the classifier resets its params, and --embedder is stored as given.
@@ -158,6 +158,9 @@ def test_config(run, root, task):
     (["--param", "k"], "Bad --param 'k'"),
     (["--param", "=3"], "Bad --param '=3'"),
     (["--param", "k=three"], "Bad --param 'k=three'"),
+    (["--param", "bogus=1"], "Unknown parameter 'bogus' for prototype"),
+    (["--classifier", "knn", "--param", 'k="x"'], "'k' must be an integer"),
+    (["--reject-below", "2"], "reject_below must be between -1 and 1"),
 ])
 def test_config_errors(run, root, task, args, message):
     """Invalid settings and malformed --param values fail without changing the task."""
@@ -259,6 +262,10 @@ def test_import(run, root, photos):
     assert "broken.png" in r.output
     assert load(root).summary()["counts"] == {"blue": 4, "green": 4, "red": 4}
 
+    r = run("import", "colors", photos, "--shots", "0")
+    assert r.exit_code == 2
+    assert "--shots" in r.output
+
     r = run("import", "colors", photos / "missing")
     assert r.exit_code == 1
     assert "Not a directory" in r.output
@@ -291,7 +298,7 @@ def test_predict_unknown(run, task, tmp_path):
     """Predictions under reject_below are shown as unknown."""
     q = tmp_path / "q.png"
     q.write_bytes(png((128, 128, 128), seed=7))
-    run("config", task, "--reject-below", "1.5")
+    run("config", task, "--reject-below", "0.999")
     r = run("predict", task, q)
     assert r.exit_code == 0
     assert "unknown (closest:" in r.output
@@ -302,12 +309,25 @@ def test_predict_unknown(run, task, tmp_path):
 
 
 def test_predict_errors(run, task, tmp_path):
-    """Unreadable and missing images are reported as errors."""
+    """Unreadable images are reported without stopping the others; missing paths are errors."""
     bad = tmp_path / "bad.png"
     bad.write_bytes(b"junk")
-    r = run("predict", task, bad)
+    good = tmp_path / "good.png"
+    good.write_bytes(png(RED, seed=5))
+    r = run("predict", task, bad, good)
     assert r.exit_code == 1
-    assert "Not a readable image" in r.output
+    assert f"{bad}: error: Not a readable image" in r.output
+    assert f"{good}: red" in r.output
+    assert "1 of 2 images could not be read" in r.output
+    r = run("predict", task, bad, good, "--json")
+    assert r.exit_code == 1
+    assert '"error": "Not a readable image: unrecognised file format"' in r.output
+
+    run("create", "lonely", "--embedder", "fake:color")
+    run("add", "lonely", "red", good)
+    r = run("predict", "lonely", good)
+    assert r.exit_code == 1
+    assert "Need at least 2 classes" in r.output
 
     r = run("predict", task, tmp_path / "nope.png")
     assert r.exit_code == 1
@@ -419,6 +439,10 @@ def test_bench_default_embedder_and_errors(run, bench_data, monkeypatch):
     r = run("bench", bench_data, "--embedder", "fake:color", "--way", "5", "--shot", "1", "--query", "2")
     assert r.exit_code == 1
     assert "Only 3 classes have >= 3 images; need 5" in r.output
+
+    r = run("bench", bench_data / "missing", "--embedder", "fake:color")
+    assert r.exit_code == 1
+    assert "Not a directory" in r.output
 
 
 def test_serve(monkeypatch, tmp_path):

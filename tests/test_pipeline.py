@@ -5,7 +5,7 @@ import pytest
 from PIL import Image
 
 from fewshot.classifiers import KNNClassifier
-from fewshot.embedders import register_embedder, unregister_embedder
+from fewshot.embedders import Embedder, register_embedder, unregister_embedder
 from fewshot.pipeline import Pipeline, Prediction
 from fewshot.store import image_id
 from tests.conftest import ColorEmbedder, png
@@ -35,11 +35,26 @@ class CountingEmbedder(ColorEmbedder):
         return (v / np.linalg.norm(v, axis=1, keepdims=True)).astype(np.float32)
 
 
+class ImageOnly(Embedder):
+    """Image-only view of another embedder, so both specs share its counters."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    @property
+    def dim(self):
+        return self.inner.dim
+
+    def _embed_image_batch(self, images):
+        return self.inner._embed_image_batch(images)  # pylint: disable=protected-access
+
+
 @pytest.fixture(name="emb")
 def fixture_emb():
-    """A counting embedder registered both as "fake:color" and as a text-capable CLIP-like spec."""
+    """A counting embedder registered as a text-capable CLIP-like spec and, image-only, as "fake:color"."""
     e = CountingEmbedder()
-    register_embedder("fake:color", e)
+    register_embedder("fake:color", ImageOnly(e))
     register_embedder(TEXT_SPEC, e)
     yield e
     unregister_embedder(TEXT_SPEC)
@@ -58,7 +73,10 @@ def test_prediction_to_dict():
     """to_dict exposes every field."""
     p = Prediction("a", "a", 0.9, 0.8, False, {"a": 0.9, "b": 0.1})
     assert p.to_dict() == {"label": "a", "top_label": "a", "confidence": 0.9, "similarity": 0.8,
-                           "rejected": False, "scores": {"a": 0.9, "b": 0.1}}
+                           "rejected": False, "scores": {"a": 0.9, "b": 0.1}, "error": None}
+    assert Prediction.failed("bad").to_dict() == {"label": None, "top_label": "", "confidence": 0.0,
+                                                  "similarity": 0.0, "rejected": False, "scores": {},
+                                                  "error": "bad"}
 
 
 # ---- embeddings --------------------------------------------------------
@@ -220,13 +238,39 @@ def test_predict_threshold_keeps_confident_labels(ws, emb):
 
 
 def test_predict_rejects_unreadable_input(ws, emb):
-    """Undecodable query bytes raise ValueError; a missing path raises FileNotFoundError."""
+    """An undecodable image gets an error result while the rest are classified; a missing path raises."""
     t = make_task(ws)
     pipe = Pipeline(ws)
+    bad, good = pipe.predict(t, [b"junk", png(RED, seed=9)])
+    assert bad.error == "Not a readable image: unrecognised file format"
+    assert (bad.label, bad.scores) == (None, {})
+    assert (good.error, good.label) == (None, "red")
     with pytest.raises(ValueError, match="Not a readable image"):
-        pipe.predict(t, [b"junk"])
+        pipe.embed_images("fake:color", [(None, b"junk")])
     with pytest.raises(FileNotFoundError):
         pipe.predict(t, ["/nonexistent/x.png"])
     with pytest.raises(KeyError, match="No task 'nope'"):
         pipe.predict("nope", [png(RED)])
     assert emb.texts == []
+
+
+def test_empty_class_is_left_out(ws):
+    """A class with no examples and no description doesn't stop predict, and isn't scored."""
+    t = make_task(ws)
+    t.upsert_class("purple")
+    pipe = Pipeline(ws)
+    assert pipe.class_data(t).classes == ["red", "green", "blue"]
+    (p,) = pipe.predict(t, [png(BLUE, seed=9)])
+    assert p.label == "blue"
+    assert set(p.scores) == {"red", "green", "blue"}
+
+
+def test_registered_embedder_decides_text_support(ws, emb):
+    """Descriptions are used for any spec whose registered embedder supports text, whatever its name."""
+    register_embedder("mine:v1", emb)
+    try:
+        t = make_task(ws, embedder="mine:v1")
+        t.upsert_class("red", "a red thing")
+        assert sorted(Pipeline(ws).class_data(t).text) == [0]
+    finally:
+        unregister_embedder("mine:v1")

@@ -12,6 +12,7 @@ export interface TaskDetail {
 export interface Prediction {
   file: string; label: string | null; top_label: string; confidence: number;
   similarity: number; rejected: boolean; scores: Record<string, number>;
+  error: string | null; // set when the image could not be read; the other fields are then empty
 }
 export interface EvalReport {
   method: string; n_scored: number; n_examples: number; accuracy: number | null; classes: string[];

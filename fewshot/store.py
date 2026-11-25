@@ -24,9 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from .classifiers import CLASSIFIERS
+from .classifiers import CLASSIFIERS, check_params
 from .embedders import DEFAULT_SPEC
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
@@ -48,9 +48,21 @@ def load_image(data: bytes) -> Image.Image:
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
-    except (UnidentifiedImageError, OSError) as e:
+    except UnidentifiedImageError as e:
+        raise ValueError("Not a readable image: unrecognised file format") from e
+    except Image.DecompressionBombError as e:  # not an OSError subclass
+        raise ValueError(f"Not a readable image: {e}") from e
+    except OSError as e:
         raise ValueError(f"Not a readable image: {e}") from e
     return ImageOps.exif_transpose(im).convert("RGB")
+
+
+def fill_template(template: str, name: str) -> str:
+    """Text for class ``name`` from a template such as 'a photo of a {}' (underscores become spaces).
+
+    Only the literal ``{}`` is substituted; any other braces are kept as written.
+    """
+    return template.replace("{}", name.replace("_", " "))
 
 
 def _now() -> str:
@@ -118,11 +130,17 @@ class Task:
         bad = set(kw) - allowed
         if bad:
             raise ValueError(f"Unknown settings: {sorted(bad)}")
-        if "classifier" in kw and kw["classifier"] not in CLASSIFIERS:
-            raise ValueError(f"Unknown classifier {kw['classifier']!r}")
         with self._lock:
-            for k, v in kw.items():
-                setattr(self.config, k, v)
+            try:
+                new = TaskConfig.model_validate({**self.config.model_dump(), **kw})
+            except ValidationError as e:
+                err = e.errors()[0]
+                raise ValueError(f"{'.'.join(map(str, err['loc']))}: {err['msg']}") from None
+            if new.reject_below is not None and not -1.0 <= new.reject_below <= 1.0:
+                raise ValueError(f"reject_below must be between -1 and 1, got {new.reject_below}")
+            check_params(new.classifier, {"text_weight": new.text_weight, **new.classifier_params})
+            for k in kw:
+                setattr(self.config, k, getattr(new, k))
             self.save()
 
     # ---- classes -----------------------------------------------------
@@ -155,7 +173,7 @@ class Task:
         with self._lock:
             for c in self.config.classes:
                 if overwrite or not c.description.strip():
-                    c.description = template.format(c.name.replace("_", " "))
+                    c.description = fill_template(template, c.name)
                     n += 1
             self.save()
         return n
@@ -293,7 +311,7 @@ class Workspace:
             if name in self._tasks:
                 return self._tasks[name]
             p = self.root / "tasks" / name
-            if not NAME_RE.match(name) or not (p / "task.json").exists():
+            if not NAME_RE.fullmatch(name) or not (p / "task.json").exists():
                 raise KeyError(f"No task {name!r}")
             t = Task(p, TaskConfig.model_validate_json((p / "task.json").read_text()))
             self._tasks[name] = t
@@ -301,15 +319,17 @@ class Workspace:
 
     def create(self, name: str, **settings: Any) -> Task:
         """Create a new task folder; raises ``ValueError`` for bad or taken names."""
-        if not NAME_RE.match(name):
+        if not NAME_RE.fullmatch(name):
             raise ValueError("Task names use letters, digits, '_', '-', '.' (max 64 chars)")
         p = self.root / "tasks" / name
-        if p.exists():
-            raise ValueError(f"Task {name!r} already exists")
         cfg = TaskConfig(name=name, **settings)
         if cfg.classifier not in CLASSIFIERS:
             raise ValueError(f"Unknown classifier {cfg.classifier!r}")
-        (p / "images").mkdir(parents=True)
+        try:
+            p.mkdir()  # atomic: of two concurrent creates, exactly one succeeds
+        except FileExistsError:
+            raise ValueError(f"Task {name!r} already exists") from None
+        (p / "images").mkdir()
         t = Task(p, cfg)
         t.save()
         with self._lock:

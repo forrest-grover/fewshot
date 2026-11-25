@@ -224,8 +224,13 @@ def delete_class(name: str, label: str) -> dict[str, Any]:
 # ---- examples -----------------------------------------------------------
 @app.post("/api/tasks/{name}/examples", status_code=201)
 def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    """Upload images as examples of ``label``; unreadable files are reported in ``errors``."""
+    """Upload images as examples of ``label``; unreadable files are reported in ``errors``.
+
+    Returns 400 when the label is blank or no file could be added.
+    """
     t = _task(name)
+    if not label.strip():
+        raise HTTPException(400, "Class name is empty")
     added: list[dict[str, Any]] = []
     errors: list[dict[str, str | None]] = []
     for f in files:
@@ -233,6 +238,8 @@ def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = Fi
             added.append(t.add_example(f.file.read(), label, f.filename or "").model_dump())
         except ValueError as e:
             errors.append({"file": f.filename, "error": str(e)})
+    if not added:
+        raise HTTPException(400, "No images added: " + "; ".join(f"{e['file']}: {e['error']}" for e in errors))
     return {"added": added, "errors": errors, "task": _detail(t)}
 
 
@@ -250,6 +257,8 @@ def relabel(name: str, eid: str, body: Relabel) -> dict[str, Any]:
         t.relabel(eid, body.label)
     except KeyError as e:
         raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
     return _detail(t)
 
 
@@ -277,7 +286,7 @@ def example_image(name: str, eid: str) -> FileResponse:
 # ---- inference ----------------------------------------------------------
 @app.post("/api/tasks/{name}/predict")
 def predict(name: str, files: list[UploadFile] = File(...)) -> list[dict[str, Any]]:
-    """Classify uploaded images."""
+    """Classify uploaded images; an unreadable file gets ``error`` set instead of a label."""
     t = _task(name)
     blobs = [f.file.read() for f in files]
     try:

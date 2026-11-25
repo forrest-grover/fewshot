@@ -2,6 +2,7 @@
 
 import io
 import json
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -87,7 +88,7 @@ def test_create_writes_task_folder(ws):
     assert ws.get("pets") is t
 
 
-@pytest.mark.parametrize("name", ["", "-x", "a b", "../x", "x" * 65, "é"])
+@pytest.mark.parametrize("name", ["", "-x", "a b", "../x", "x" * 65, "é", "foo\n"])
 def test_create_rejects_bad_names(ws, name):
     """Names must be safe folder names."""
     with pytest.raises(ValueError, match="Task names use"):
@@ -145,8 +146,16 @@ def test_update_settings(ws):
         t.update_settings(name="other")
     with pytest.raises(ValueError, match="Unknown classifier 'svm'"):
         t.update_settings(classifier="svm")
+    with pytest.raises(ValueError, match="text_weight: Input should be a valid number"):
+        t.update_settings(text_weight="abc")
+    with pytest.raises(ValueError, match="reject_below must be between -1 and 1"):
+        t.update_settings(reject_below=-5)
+    with pytest.raises(ValueError, match="Unknown parameter 'k' for logreg"):
+        t.update_settings(classifier_params={"k": 3})
     assert t.config.classifier == "logreg"
+    assert t.config.text_weight == 1.0
     assert t.config.revision == 2
+    assert [x.name for x in ws.list_tasks()] == ["t"]  # still loadable
 
 
 # ---- classes ----------------------------------------------------------
@@ -178,6 +187,9 @@ def test_describe_classes(ws):
     assert [c.description for c in t.config.classes] == ["a photo of a golden retriever", "kept"]
     assert t.describe_classes("{}!", overwrite=True) == 2
     assert [c["description"] for c in saved(t)["classes"]] == ["golden retriever!", "cat!"]
+    # Only the literal {} is substituted; other braces are kept, and every {} is filled.
+    t.describe_classes("{} {name} {}", overwrite=True)
+    assert t.config.classes[1].description == "cat {name} cat"
 
 
 def test_rename_class(ws):
@@ -308,3 +320,30 @@ def test_task_config_defaults():
     assert cfg.embedder == embedders.DEFAULT_SPEC
     assert cfg.classifier == "prototype"
     assert cfg.revision == 0
+
+
+def test_create_race_is_a_clean_error(ws, monkeypatch):
+    """If another create wins between the name check and mkdir, the loser gets ValueError."""
+    real_mkdir = Path.mkdir
+
+    def mkdir_after_rival(self, *args, **kwargs):
+        if self.name == "t" and not self.exists():
+            real_mkdir(self)  # a concurrent create got there first
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_after_rival)
+    with pytest.raises(ValueError, match="Task 't' already exists"):
+        ws.create("t")
+
+
+def test_load_image_reports_decompression_bombs(monkeypatch):
+    """Pillow's DecompressionBombError (not an OSError) becomes ValueError."""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)
+    with pytest.raises(ValueError, match="Not a readable image: Image size"):
+        load_image(png(RED, size=8))
+
+
+def test_load_image_reports_truncated_files():
+    """Truncated data that Pillow recognises is reported with Pillow's message."""
+    with pytest.raises(ValueError, match="Not a readable image: image file is truncated"):
+        load_image(png(RED, size=64, noise=50)[:-40])

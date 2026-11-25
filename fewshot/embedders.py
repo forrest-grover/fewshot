@@ -239,5 +239,11 @@ def unregister_embedder(spec: str) -> None:
 
 
 def spec_supports_text(spec: str) -> bool:
-    """Whether embedders for ``spec`` can embed text (only the OpenCLIP backend can)."""
-    return spec.startswith("openclip:")
+    """Whether the embedder for ``spec`` can embed text.
+
+    A registered or already-loaded embedder answers through its ``supports_text`` flag; for any other
+    spec, only the OpenCLIP backend can.
+    """
+    with _load_lock:
+        emb = _loaded.get(spec)
+    return emb.supports_text if emb is not None else spec.startswith("openclip:")

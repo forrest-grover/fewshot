@@ -206,3 +206,33 @@ def test_logreg_respects_regularisation():
     strong = make_classifier("logreg", C=100.0).fit(data).predict(q)[0][0, 0]
     assert 0.5 < weak < strong
     assert isinstance(make_classifier("logreg"), LogRegClassifier)
+
+
+def test_knn_low_similarities_still_decide():
+    """With every similarity far below 1, the nearer class still wins clearly (no flattening by the floor)."""
+    X = unit([[1, 0, 0], [0, 1, 0]]).astype(np.float32)
+    data = ClassData(["a", "b"], X, np.array([0, 1]))
+    q = unit([[0.3, 0.1, 1.0]]).astype(np.float32)  # sim 0.29 to a, 0.10 to b
+    probs, _ = make_classifier("knn", k=2).fit(data).predict(q)
+    expected, _ = make_classifier("prototype").fit(data).predict(q)
+    np.testing.assert_allclose(probs, expected, atol=1e-5)
+    assert probs[0, 0] > 0.99
+
+
+@pytest.mark.parametrize(("name", "params", "message"), [
+    ("nope", {}, "Unknown classifier 'nope'"),
+    ("knn", {"bogus": 1}, "Unknown parameter 'bogus' for knn"),
+    ("knn", {"k": "abc"}, "'k' must be an integer"),
+    ("knn", {"k": 2.5}, "'k' must be an integer"),
+    ("knn", {"k": True}, "'k' must be an integer"),
+    ("knn", {"k": 0}, "'k' must be > 0"),
+    ("logreg", {"C": 0}, "'C' must be > 0"),
+    ("prototype", {"scale": -1}, "'scale' must be >= 0"),
+    ("prototype", {"scale": float("nan")}, "'scale' must be >= 0"),
+    ("prototype", {"text_weight": "x"}, "'text_weight' must be a number"),
+])
+def test_make_classifier_rejects_bad_params(name, params, message):
+    """Bad classifier names and parameters raise ValueError up front, not at predict time."""
+    with pytest.raises(ValueError, match=message):
+        make_classifier(name, **params)
+    make_classifier("prototype", scale=0, text_weight=0)  # zero is allowed for these

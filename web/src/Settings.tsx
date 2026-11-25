@@ -40,7 +40,10 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
 
   const presets = models?.embedders ?? [];
   const isPreset = presets.some((p) => p.spec === embedder);
-  const supportsText = embedder.startsWith("openclip:");
+  // The server knows about custom registered embedders; fall back to the spec prefix for a typed-in spec.
+  const supportsText = embedder === task.embedder
+    ? task.supports_text
+    : presets.find((p) => p.spec === embedder)?.supports_text ?? embedder.startsWith("openclip:");
 
   const save = async () => {
     setSaving(true);

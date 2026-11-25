@@ -78,7 +78,7 @@ task = ws.create("parts", embedder="mine:v1")
 
 ## REST API
 
-`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `GET .../examples/{id}/image`, `POST .../predict` (multipart `files`), `POST .../evaluate`. OpenAPI docs are served at `/docs`.
+`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `GET .../examples/{id}/image`, `POST .../predict` (multipart `files`; an unreadable file gets an `error` field instead of a label), `POST .../evaluate`. OpenAPI docs are served at `/docs`.
 
 ## Tests and checks
 

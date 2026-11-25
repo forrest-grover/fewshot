@@ -29,6 +29,12 @@ class Prediction:
     similarity: float
     rejected: bool
     scores: dict[str, float]
+    error: str | None = None  # set (with every other field empty) when the image could not be read
+
+    @classmethod
+    def failed(cls, error: str) -> Prediction:
+        """Result for an image that could not be decoded."""
+        return cls(label=None, top_label="", confidence=0.0, similarity=0.0, rejected=False, scores={}, error=error)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-ready dict of the fields."""
@@ -51,18 +57,24 @@ class Pipeline:
         self._lock = threading.Lock()
 
     # ---- embeddings --------------------------------------------------
-    def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]]) -> Vectors:
-        """Embed ``(cache_key or None, image)`` pairs, using and filling the cache."""
+    def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],
+                     errors: dict[int, str] | None = None) -> Vectors:
+        """Embed ``(cache_key or None, image)`` pairs, using and filling the cache.
+
+        An undecodable image raises ``ValueError``, unless ``errors`` is given: then the message is
+        stored there under the item's index and that row is all zeros.
+        """
         keys = [k for k, _ in items if k]
         hit = self.cache.get_many(spec, keys) if keys else {}
         todo = [(i, k, im) for i, (k, im) in enumerate(items) if not (k and k in hit)]
         out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
         if todo:
             emb = get_embedder(spec)
-            ims = [_to_pil(im) for _, _, im in todo]
-            vecs = emb.embed_images(ims)
+            decoded = _decode(todo, errors)
+            out.update({i: np.zeros(emb.dim, np.float32) for i in errors or {}})
+            vecs = emb.embed_images([im for _, _, im in decoded])
             new: dict[str, Vectors] = {}
-            for (i, k, _), v in zip(todo, vecs, strict=True):
+            for (i, k, _), v in zip(decoded, vecs, strict=True):
                 out[i] = v
                 if k:
                     new[k] = v
@@ -105,6 +117,14 @@ class Pipeline:
             if described:
                 T = self.embed_texts(cfg.embedder, [d for _, d in described])
                 text = {i: T[j] for j, (i, _) in enumerate(described)}
+        # A class with neither examples nor text (e.g. just created) has nothing to fit; leave it out.
+        labelled = set(y.tolist())
+        used = [i for i in range(len(classes)) if i in text or i in labelled]
+        if len(used) < len(classes):
+            remap = {old: new for new, old in enumerate(used)}
+            classes = [classes[i] for i in used]
+            y = np.array([remap[i] for i in y], int)
+            text = {remap[i]: v for i, v in text.items()}
         return ClassData(classes, X, y, text)
 
     def _new_classifier(self, task: Task) -> Classifier:
@@ -125,15 +145,21 @@ class Pipeline:
 
     # ---- prediction --------------------------------------------------
     def predict(self, task: Task | str, images: Sequence[ImageInput]) -> list[Prediction]:
-        """Classify images given as bytes, file paths or PIL images."""
+        """Classify images given as bytes, file paths or PIL images.
+
+        An image that cannot be decoded gets a ``Prediction`` with ``error`` set; the others are
+        still classified. Classes with neither examples nor a description are left out.
+        """
         task = self.ws.get(task) if isinstance(task, str) else task
         clf = self.fitted(task)
         if not images:
             return []
         items = [(_key(im), im) for im in images]
-        Q = self.embed_images(task.config.embedder, items)
+        errors: dict[int, str] = {}
+        Q = self.embed_images(task.config.embedder, items, errors)
         probs, sims = clf.predict(Q)
-        return [self._to_pred(task, clf, p, s) for p, s in zip(probs, sims, strict=True)]
+        return [Prediction.failed(errors[i]) if i in errors else self._to_pred(task, clf, p, s)
+                for i, (p, s) in enumerate(zip(probs, sims, strict=True))]
 
     def _to_pred(self, task: Task, clf: Classifier, p: np.ndarray, s: float) -> Prediction:
         j = int(p.argmax())
@@ -155,6 +181,20 @@ def _key(im: ImageInput) -> str | None:
     if isinstance(im, (str, Path)):
         return image_id(Path(im).read_bytes())
     return None  # PIL images are not cached
+
+
+def _decode(todo: list[tuple[int, str | None, ImageInput]], errors: dict[int, str] | None
+            ) -> list[tuple[int, str | None, Image.Image]]:
+    """Decode each ``(index, key, image)``; failures raise, or go to ``errors`` when it is given."""
+    decoded = []
+    for i, k, im in todo:
+        try:
+            decoded.append((i, k, _to_pil(im)))
+        except ValueError as e:
+            if errors is None:
+                raise
+            errors[i] = str(e)
+    return decoded
 
 
 def _to_pil(im: ImageInput) -> Image.Image:

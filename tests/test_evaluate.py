@@ -197,7 +197,7 @@ def test_benchmark_is_seeded_and_passes_classifier_params(ws, tmp_path):
     assert runs[0] == runs[1]
     assert runs[0]["classifier"] == "knn"
     assert len({r["accuracy"] for r in runs}) > 1  # different seeds draw different episodes
-    with pytest.raises(TypeError, match="'k'"):
+    with pytest.raises(ValueError, match="Unknown parameter 'k' for prototype"):
         benchmark(pipe, folder, "fake:color", way=2, shot=1, query=1, episodes=1, k=1)  # prototype has no k
 
 

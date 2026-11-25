@@ -14,7 +14,7 @@ from .embedders import DEFAULT_SPEC, PRESETS, spec_supports_text
 from .store import IMAGE_EXTS, Task, Workspace
 
 if TYPE_CHECKING:
-    from .pipeline import Pipeline
+    from .pipeline import Pipeline, Prediction
 
 app = typer.Typer(help="Embedding-based few-shot image classification.", no_args_is_help=True)
 cls_app = typer.Typer(help="Manage a task's classes.", no_args_is_help=True)
@@ -229,7 +229,7 @@ def add(name: str, label: str, paths: list[Path], root: Path | None = ROOT_OPT) 
 def import_dir(
     name: str,
     folder: Path,
-    shots: int | None = typer.Option(None, help="Take at most this many images per class"),
+    shots: int | None = typer.Option(None, min=1, help="Take at most this many images per class"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Import FOLDER/<class>/<image> into a task."""
@@ -258,10 +258,21 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         preds = _pipe(_ws(root)).predict(t, files)
     except ValueError as e:
         _fail(str(e))
+    failed = sum(p.error is not None for p in preds)
     if as_json:
         typer.echo(json.dumps([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds, strict=True)], indent=2))
-        return
+    else:
+        _print_predictions(files, preds, top)
+    if failed:
+        typer.secho(f"{failed} of {len(preds)} images could not be read", fg="red", err=True)
+        raise typer.Exit(1)
+
+
+def _print_predictions(files: list[Path], preds: list[Prediction], top: int) -> None:
     for f, p in zip(files, preds, strict=True):
+        if p.error is not None:
+            typer.secho(f"{f}: error: {p.error}", fg="yellow", err=True)
+            continue
         best = sorted(p.scores.items(), key=lambda kv: -kv[1])[:top]
         label = p.label if p.label is not None else f"unknown (closest: {p.top_label})"
         scores = "  ".join(f"{c}={v:.2f}" for c, v in best)
@@ -346,6 +357,8 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Episodic N-way K-shot benchmark over FOLDER/<class>/<image>."""
+    if not folder.is_dir():
+        _fail(f"Not a directory: {folder}")
     pipe = _pipe(_ws(root))
     opts = {"way": way, "query": query, "episodes": episodes}
     for run in _bench_runs(embedder or [DEFAULT_SPEC], classifier, shot, text_template):

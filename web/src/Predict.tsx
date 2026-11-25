@@ -53,6 +53,18 @@ export default function Predict({ task, setTask, run }: Props) {
       )}
       <div className="results">
         {items.map((it, idx) => {
+          if (it.pred.error) {
+            return (
+              <article key={it.url} className="result">
+                <img src={it.url} alt={it.file.name} />
+                <div className="result-body">
+                  <strong className="unknown">Could not read image</strong>
+                  <div className="muted file">{it.file.name}</div>
+                  <div className="muted">{it.pred.error}</div>
+                </div>
+              </article>
+            );
+          }
           const top = Object.entries(it.pred.scores).sort((a, b) => b[1] - a[1]).slice(0, 3);
           return (
             <article key={it.url} className="result">

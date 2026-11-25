@@ -47,8 +47,8 @@ def test_end_to_end(client):
         assert len(r.json()["added"]) == 3
     junk = [("files", ("x.png", b"junk", "image/png"))]
     bad = client.post("/api/tasks/c/examples", data={"label": "red"}, files=junk)
-    assert bad.json()["added"] == []
-    assert bad.json()["errors"][0]["file"] == "x.png"
+    assert bad.status_code == 400
+    assert bad.json()["detail"].startswith("No images added: x.png: Not a readable image")
 
     r = client.post("/api/tasks/c/predict", files=_query((210, 40, 40)))
     assert r.status_code == 200
@@ -285,17 +285,57 @@ def test_predict(client, task):
 
 
 def test_predict_errors(client):
-    """Predict is 404 for unknown tasks and 400 for one class or unreadable images."""
+    """Predict is 404 for unknown tasks and 400 for one class; unreadable images get a per-file error."""
     assert client.post("/api/tasks/missing/predict", files=_query(RED)).status_code == 404
     client.post("/api/tasks", json={"name": "one", "embedder": "fake:color"})
     _upload(client, "one", "red", RED)
     r = client.post("/api/tasks/one/predict", files=_query(RED))
     assert r.status_code == 400
-    assert r.json()["detail"] == "Need at least 2 classes"
+    assert r.json()["detail"] == "Need at least 2 classes with examples or descriptions"
     _upload(client, "one", "blue", BLUE, seeds=range(10, 13))
-    r = client.post("/api/tasks/one/predict", files=[("files", ("x.png", b"junk", "image/png"))])
+    r = client.post("/api/tasks/one/predict", files=[("files", ("x.png", b"junk", "image/png")), *_query(BLUE)])
+    assert r.status_code == 200
+    bad, good = r.json()
+    assert (bad["file"], bad["label"]) == ("x.png", None)
+    assert bad["error"] == "Not a readable image: unrecognised file format"
+    assert (good["label"], good["error"]) == ("blue", None)
+
+
+def test_predict_ignores_empty_class(client, task):
+    """A freshly created class with no examples doesn't break predict."""
+    client.post(f"/api/tasks/{task}/classes", json={"name": "green"})
+    r = client.post(f"/api/tasks/{task}/predict", files=_query(BLUE))
+    assert r.status_code == 200
+    assert r.json()[0]["label"] == "blue"
+
+
+@pytest.mark.parametrize(("settings", "message"), [
+    ({"classifier_params": {"bogus": 1}}, "Unknown parameter 'bogus' for prototype"),
+    ({"classifier": "knn", "classifier_params": {"k": "abc"}}, "'k' must be an integer"),
+    ({"text_weight": -1}, "'text_weight' must be >= 0"),
+    ({"reject_below": 99}, "reject_below must be between -1 and 1"),
+])
+def test_update_task_rejects_bad_settings(client, task, settings, message):
+    """Invalid settings are a 400 and leave the task predicting as before."""
+    r = client.patch(f"/api/tasks/{task}", json=settings)
     assert r.status_code == 400
-    assert "Not a readable image" in r.json()["detail"]
+    assert message in r.json()["detail"]
+    assert client.post(f"/api/tasks/{task}/predict", files=_query(BLUE)).status_code == 200
+
+
+def test_bad_input_is_400_not_500(client, task):
+    """Blank labels, folds below 2 and odd templates are client errors or handled."""
+    eid = client.get(f"/api/tasks/{task}").json()["examples"][0]["id"]
+    r = client.patch(f"/api/tasks/{task}/examples/{eid}", json={"label": "  "})
+    assert (r.status_code, r.json()["detail"]) == (400, "Class name is empty")
+    r = client.post(f"/api/tasks/{task}/examples", data={"label": " "}, files=_query(RED))
+    assert (r.status_code, r.json()["detail"]) == (400, "Class name is empty")
+    for folds in (1, 0, -1):
+        r = client.post(f"/api/tasks/{task}/evaluate", params={"folds": folds})
+        assert (r.status_code, r.json()["detail"]) == (400, f"folds must be at least 2, got {folds}")
+    r = client.post(f"/api/tasks/{task}/describe", json={"template": "{x} {} {}", "overwrite": True})
+    assert r.status_code == 200
+    assert r.json()["classes"][0]["description"] == "{x} red red"
 
 
 def test_evaluate(client, task):

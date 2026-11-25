@@ -19,6 +19,7 @@ CLIP zero-shot.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -97,7 +98,7 @@ class Classifier:
         """Fit on ``data``; every class needs at least one image or a text embedding."""
         C = len(data.classes)
         if C < 2:
-            raise ValueError("Need at least 2 classes")
+            raise ValueError("Need at least 2 classes with examples or descriptions")
         with_images = set(data.y.tolist())
         missing = [c for i, c in enumerate(data.classes) if i not in with_images and i not in data.text]
         if missing:
@@ -192,10 +193,12 @@ class KNNClassifier(Classifier):
         k = min(self.k, S.shape[1])
         top = np.argpartition(-S, k - 1, axis=1)[:, :k]
         scores = np.full((len(Q), len(self.classes)), 1e-6, np.float64)
+        top_s = np.take_along_axis(S, top, axis=1)
+        # Votes are relative to each query's nearest neighbour, so the 1e-6 floor for classes with no
+        # neighbour in the top k stays negligible however low the absolute similarities are.
+        votes = w[top] * np.exp(self.scale * (top_s - top_s.max(axis=1, keepdims=True)))
         rows = np.repeat(np.arange(len(Q)), k)
-        cols = top.ravel()
-        votes = w[cols] * np.exp(self.scale * (S[rows, cols] - 1.0))
-        np.add.at(scores, (rows, y[cols]), votes)
+        np.add.at(scores, (rows, y[top.ravel()]), votes.ravel())
         return np.log(scores / scores.sum(axis=1, keepdims=True))
 
 
@@ -227,8 +230,33 @@ CLASSIFIERS: dict[str, type[Classifier]] = {
 }
 
 
-def make_classifier(name: str, **params: Any) -> Classifier:
-    """Instantiate the classifier registered as ``name`` with keyword ``params``."""
+def check_params(name: str, params: dict[str, Any]) -> None:
+    """Raise ``ValueError`` unless ``params`` are valid keyword arguments for classifier ``name``.
+
+    Every parameter is a non-negative number; ``k`` must be a positive integer and ``C`` positive.
+    """
     if name not in CLASSIFIERS:
         raise ValueError(f"Unknown classifier {name!r}; choose from {sorted(CLASSIFIERS)}")
+    defaults = {
+        p.name: p.default for p in inspect.signature(CLASSIFIERS[name].__init__).parameters.values()
+        if p.default is not inspect.Parameter.empty
+    }
+    for key, value in params.items():
+        if key not in defaults:
+            raise ValueError(f"Unknown parameter {key!r} for {name}; choose from {sorted(defaults)}")
+        want_int = isinstance(defaults[key], int)
+        if isinstance(value, bool) or not isinstance(value, int if want_int else (int, float)):
+            raise ValueError(f"{name} parameter {key!r} must be {'an integer' if want_int else 'a number'}, "
+                             f"got {value!r}")
+        positive = key in {"k", "C"}
+        if not np.isfinite(value) or value < 0 or (positive and value == 0):
+            raise ValueError(f"{name} parameter {key!r} must be {'> 0' if positive else '>= 0'}, got {value!r}")
+
+
+def make_classifier(name: str, **params: Any) -> Classifier:
+    """Instantiate the classifier registered as ``name`` with keyword ``params``.
+
+    Raises ``ValueError`` for an unknown classifier or invalid parameters.
+    """
+    check_params(name, params)
     return CLASSIFIERS[name](**params)
