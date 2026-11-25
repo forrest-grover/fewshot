@@ -306,7 +306,7 @@ def test_rename_errors(ws, monkeypatch):
 # ---- export and import --------------------------------------------------
 def _export(ws, name="t"):
     buf = io.BytesIO()
-    n = export_task(ws, name, buf)
+    n, _ = export_task(ws, name, buf)
     buf.seek(0)
     return buf, n
 

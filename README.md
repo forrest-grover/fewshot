@@ -100,7 +100,7 @@ task = ws.create("parts", embedder="mine:v1")
 
 Evaluation of a large task can take a while, so it can also run as a background job: `POST .../evaluate/jobs` returns a job; `GET /api/jobs/{id}` reports `status` (`running`, `done`, `failed`, `cancelled`), `stage` (`embedding` counts images, `evaluating` counts folds), `done`/`total`, and the report as `result` once done; `DELETE /api/jobs/{id}` cancels it. The web UI uses this to show progress and a Cancel button.
 
-When the server was started with a token, send it as `Authorization: Bearer <token>`, or `POST /api/login` with `{"token": ...}` to get a cookie. `/api/health` and `/api/login` need no token.
+When the server was started with a token, send it as `Authorization: Bearer <token>`, or `POST /api/login` with `{"token": ...}` to get a cookie. After 10 wrong tokens within a minute from one address, `/api/login` answers 429 for the rest of that minute; over HTTPS the cookie is `Secure`. At most 4 background jobs run at once (429 beyond that), and starting an evaluation that is already running returns that job. URL downloads share a budget per request: the request size limit in total and 2 minutes in all, 4 at a time. `serve --max-upload-mb/--max-request-mb` set the size limits. `POST /api/tasks/import` also takes an `embedder` field to import with another model; the export's `X-Fewshot-Skipped` header counts examples left out because their image was missing. `/api/health` and `/api/login` need no token.
 
 ## Tests and checks
 

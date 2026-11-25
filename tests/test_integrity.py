@@ -175,7 +175,7 @@ def test_export_holds_the_task_lock(ws, monkeypatch):
     th = threading.Thread(target=rename)
     th.start()
     buf = io.BytesIO()
-    assert export_task(ws, "t", buf) == 4
+    assert export_task(ws, "t", buf) == (4, 0)
     th.join(5)
     assert renamed.is_set()
     with zipfile.ZipFile(buf) as z:

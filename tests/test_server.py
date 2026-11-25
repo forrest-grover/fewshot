@@ -297,3 +297,67 @@ def test_request_size_limit_cuts_off_the_app():
 
     with pytest.raises(RuntimeError, match="bug"):
         _asgi([b"1"], broken)
+
+
+# ---- second review: server limits ---------------------------------------
+def test_url_fetches_have_a_budget(client, monkeypatch):
+    """URLs share a time and size budget per request; what doesn't fit is reported per URL."""
+    task = _task(client, n=1)
+    monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
+    monkeypatch.setattr(fewshot.api, "fetch_url", lambda url, max_bytes, timeout=20.0, public_only=False: png(RED))
+    monkeypatch.setattr(fewshot.api, "MAX_REQUEST_BYTES", len(png(RED)) + 1)
+    preds = client.post(f"/api/tasks/{task}/predict/urls", json={"urls": ["http://h/a.png", "http://h/b.png"]}).json()
+    assert sorted(p["error"] is None for p in preds) == [False, True]
+    assert any("exceed the" in (p["error"] or "") for p in preds)
+    monkeypatch.setattr(fewshot.api, "URL_FETCH_SECONDS", 0.0)
+    preds = client.post(f"/api/tasks/{task}/predict/urls", json={"urls": ["http://h/a.png"]}).json()
+    assert "budget for URLs ran out" in preds[0]["error"]
+
+
+def test_jobs_are_capped_and_shared(client, monkeypatch):
+    """The same evaluation already running is shared; past MAX_JOBS running jobs, 429."""
+    task = _task(client, n=1)
+    release = threading.Event()
+
+    def slow(_pipe, _task, _folds, progress):
+        progress("evaluating", 0, 1)
+        release.wait(5)
+
+    monkeypatch.setattr(fewshot.api, "evaluate_task", slow)
+    monkeypatch.setattr(fewshot.api, "MAX_JOBS", 1)
+    first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()
+    assert client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"] == first["id"]  # shared
+    r = client.post(f"/api/tasks/{task}/evaluate/jobs", params={"folds": 2})
+    assert r.status_code == 429
+    release.set()
+    _wait(client, first["id"])
+
+
+def test_login_is_rate_limited_and_secure_over_https(tmp_path, monkeypatch):
+    """Too many wrong tokens get 429 for a while; over HTTPS the cookie is Secure."""
+    api = _reload(tmp_path, monkeypatch, FEWSHOT_TOKEN="s3cret")
+    monkeypatch.setattr(api, "LOGIN_FAILURES", 2)
+    c = TestClient(api.app)
+    assert c.post("/api/login", json={"token": "a"}).status_code == 401
+    assert c.post("/api/login", json={"token": "b"}).status_code == 401
+    r = c.post("/api/login", json={"token": "s3cret"})
+    assert (r.status_code, r.json()["detail"]) == (429, "Too many wrong tokens; try again in a minute")
+    monkeypatch.setattr(api, "LOGIN_WINDOW", 0.0)  # the window has passed
+    r = c.post("/api/login", json={"token": "s3cret"})
+    assert r.status_code == 204
+    assert "secure" not in r.headers["set-cookie"].lower()
+    https = TestClient(api.app, base_url="https://testserver")
+    assert "secure" in https.post("/api/login", json={"token": "s3cret"}).headers["set-cookie"].lower()
+
+
+def test_export_headers_and_import_with_another_embedder(client):
+    """The export says its size and how many examples were left out; import can switch embedder."""
+    task = _task(client, n=1)
+    t = fewshot.api.ws.get(task)
+    (t.path / t.config.examples[0].file).unlink()
+    r = client.get(f"/api/tasks/{task}/export")
+    assert r.headers["content-length"] == str(len(r.content))
+    assert r.headers["x-fewshot-skipped"] == "1"
+    up = client.post("/api/tasks/import", files={"file": ("c.zip", r.content, "application/zip")},
+                     data={"name": "copy", "embedder": "fake:color"})
+    assert (up.status_code, up.json()["embedder"]) == (201, "fake:color")

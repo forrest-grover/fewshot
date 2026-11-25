@@ -219,3 +219,28 @@ def test_export_to_a_bad_path(run, task, tmp_path):
     r = run("export", task, tmp_path)
     assert r.exit_code == 1
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_more_cli_options(run, task, tmp_path, root):
+    """dupes --limit, CSV scores, import-task --embedder and the skipped count of export."""
+    assert len(json.loads(run("dupes", task, "--threshold", "0.5", "--limit", "2", "--json").output)) == 2
+    q = tmp_path / "q.png"
+    q.write_bytes(png(RED, seed=8))
+    row = next(csv.DictReader(io.StringIO(run("predict", task, q, "--csv", "--top", "1").output)))
+    assert row["scores"].startswith("red=")
+    t = Workspace(root).get(task)
+    (t.path / t.config.examples[0].file).unlink()
+    out = tmp_path / "t.zip"
+    assert "1 examples were left out" in run("export", task, out).output
+    r = run("import-task", out, "--name", "copy", "--embedder", "fake:color")
+    assert r.exit_code == 0
+    assert Workspace(root).get("copy").config.embedder == "fake:color"
+
+
+def test_serve_size_limits(monkeypatch):
+    """serve passes its upload and request size limits to the API."""
+    import uvicorn  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+    CliRunner().invoke(cli.app, ["serve", "--max-upload-mb", "5", "--max-request-mb", "100.5"])
+    assert (os.environ["FEWSHOT_MAX_UPLOAD_MB"], os.environ["FEWSHOT_MAX_REQUEST_MB"]) == ("5", "100.5")

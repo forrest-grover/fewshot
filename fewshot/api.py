@@ -33,8 +33,9 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +86,11 @@ ALLOW_ANY_MODEL = os.environ.get("FEWSHOT_ALLOW_ANY_MODEL") == "1"
 WARM = os.environ.get("FEWSHOT_WARM") == "1"
 ALLOW_URLS = os.environ.get("FEWSHOT_ALLOW_URLS") == "1"
 MAX_URLS = 100  # per request
+URL_FETCH_SECONDS = 120.0  # time budget for all of one request's URLs
+URL_FETCH_WORKERS = 4  # URLs fetched at once
+MAX_JOBS = 4  # background jobs running at once
+LOGIN_FAILURES = 10  # wrong tokens per client within LOGIN_WINDOW before /api/login answers 429
+LOGIN_WINDOW = 60.0
 ALLOWED_HOSTS = {h.strip().strip("[]").lower()
                  for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "localhost,127.0.0.1,::1").split(",") if h.strip()}
 MAX_REQUEST_BYTES = int(float(os.environ.get("FEWSHOT_MAX_REQUEST_MB", "1024")) * 1024 * 1024)
@@ -317,13 +323,32 @@ class Login(_Body):
     token: str
 
 
+_failed_logins: dict[str, deque[float]] = {}  # client address -> times of recent wrong tokens
+_login_lock = threading.Lock()
+
+
 @app.post("/api/login", status_code=204)
-def login(body: Login, response: Response) -> None:
-    """Check the server token and remember it in an HttpOnly cookie (30 days)."""
-    if not _token_ok(body.token):
-        raise HTTPException(401, "Wrong token")
+def login(body: Login, request: Request, response: Response) -> None:
+    """Check the server token and remember it in an HttpOnly cookie (30 days; Secure over HTTPS).
+
+    After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds, further
+    attempts get 429 until the window has passed, so the token can't be guessed quickly.
+    """
+    client = request.client.host if request.client else "?"
+    now = time.monotonic()
+    with _login_lock:
+        recent = _failed_logins.setdefault(client, deque())
+        while recent and now - recent[0] > LOGIN_WINDOW:
+            recent.popleft()
+        if len(recent) >= LOGIN_FAILURES:
+            raise HTTPException(429, "Too many wrong tokens; try again in a minute")
+        if not _token_ok(body.token):
+            recent.append(now)
+            raise HTTPException(401, "Wrong token")
+        _failed_logins.pop(client, None)
     if TOKEN is not None:
-        response.set_cookie(AUTH_COOKIE, TOKEN, max_age=30 * 86400, httponly=True, samesite="strict")
+        https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        response.set_cookie(AUTH_COOKIE, TOKEN, max_age=30 * 86400, httponly=True, samesite="strict", secure=https)
 
 
 @app.post("/api/logout", status_code=204)
@@ -470,10 +495,11 @@ def export_task(name: str) -> StreamingResponse:
     _task(name)
     buf = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)  # noqa: SIM115  # pylint: disable=consider-using-with  # closed by the response
     try:
-        write_export(ws, name, buf)
+        _, skipped = write_export(ws, name, buf)
     except KeyError as e:
         buf.close()
         raise _missing(e) from e
+    size = buf.seek(0, os.SEEK_END)
     buf.seek(0)
 
     def chunks() -> Iterator[bytes]:
@@ -481,15 +507,18 @@ def export_task(name: str) -> StreamingResponse:
             while chunk := buf.read(1024 * 1024):
                 yield chunk
 
-    return StreamingResponse(chunks(), media_type="application/zip",
-                             headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
+    headers = {"Content-Disposition": f'attachment; filename="{name}.zip"', "Content-Length": str(size),
+               "X-Fewshot-Skipped": str(skipped)}  # examples left out: their image file was missing
+    return StreamingResponse(chunks(), media_type="application/zip", headers=headers)
 
 
 @app.post("/api/tasks/import", status_code=201, response_model=TaskDetail)
-def import_task(file: UploadFile = File(...), name: str | None = Form(None)) -> dict[str, Any]:
-    """Create a task from a zip made by .../export, named ``name`` or as exported."""
+def import_task(file: UploadFile = File(...), name: str | None = Form(None),
+                embedder: str | None = Form(None)) -> dict[str, Any]:
+    """Create a task from a zip made by .../export, named ``name`` or as exported, optionally
+    with another ``embedder`` (say, a preset, when the exported one isn't allowed here)."""
     try:
-        return _detail(read_export(ws, file.file, name or None, embedder_ok=_check_embedder))
+        return _detail(read_export(ws, file.file, name or None, embedder_ok=_check_embedder, embedder=embedder or None))
     except ValueError as e:
         raise _bad(e) from e
 
@@ -610,13 +639,31 @@ def _downloads(urls: list[str]) -> list[Blob]:
     if not ALLOW_URLS:
         raise HTTPException(403, "This server doesn't fetch URLs; start it with --allow-urls "
                                  "(FEWSHOT_ALLOW_URLS=1)")
-    out: list[Blob] = []
-    for url in urls:
+    # A few at a time, with a budget for the whole request: at most MAX_REQUEST_BYTES in all and
+    # URL_FETCH_SECONDS overall, so one request can't hold gigabytes or a worker for hours.
+    deadline = time.monotonic() + URL_FETCH_SECONDS
+    total = 0
+    budget_lock = threading.Lock()
+
+    def one(url: str) -> Blob:
+        nonlocal total
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return url, None, f"Not fetched: the request's {URL_FETCH_SECONDS:g} s budget for URLs ran out"
         try:
-            out.append((url, fetch_url(url, MAX_UPLOAD_BYTES, public_only=True), None))
+            data = fetch_url(url, MAX_UPLOAD_BYTES, timeout=min(20.0, left), public_only=True)
         except ValueError as e:
-            out.append((url, None, str(e)))
-    return out
+            return url, None, str(e)
+        with budget_lock:
+            total += len(data)
+            over = total > MAX_REQUEST_BYTES
+        if over:
+            mb = MAX_REQUEST_BYTES / 1024 / 1024
+            return url, None, f"Not used: the images together exceed the {mb:.3g} MB request limit"
+        return url, data, None
+
+    with ThreadPoolExecutor(max_workers=URL_FETCH_WORKERS) as pool:
+        return list(pool.map(one, urls))
 
 
 @app.post("/api/tasks/{name}/examples", status_code=201, response_model=AddResult)
@@ -825,6 +872,7 @@ class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job'
 
     task: str
     kind: str
+    revision: int = 0  # of the task when the job started
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = "running"  # running | done | failed | cancelled
     stage: str = "starting"
@@ -890,8 +938,16 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
     t = _task(name)
     if folds is not None and folds < 2:
         raise HTTPException(400, f"folds must be at least 2, got {folds}")
-    return _start_job(Job(task=name, kind="evaluate"),
-                      lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
+    kind = "evaluate" if folds is None else f"evaluate:{folds}"
+    with _jobs_lock:
+        running = [j for j in _jobs.values() if j.status == "running"]
+    same = next((j for j in running if (j.task, j.kind) == (name, kind) and j.revision == t.config.revision), None)
+    if same is not None:  # the same evaluation is already running: share it
+        return same.to_dict()
+    if len(running) >= MAX_JOBS:
+        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
+    job = Job(task=name, kind=kind, revision=t.config.revision)
+    return _start_job(job, lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
 
 
 @app.get("/api/jobs/{jid}", response_model=JobOut)

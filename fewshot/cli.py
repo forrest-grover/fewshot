@@ -336,18 +336,21 @@ def export(name: str, file: Path, root: Path | None = ROOT_OPT) -> None:
     part = file.with_name(file.name + ".part")  # renamed into place when complete
     try:
         with open(part, "wb") as f:
-            n = export_task(ws, name, f)
+            n, skipped = export_task(ws, name, f)
         os.replace(part, file)
     except OSError as e:
         part.unlink(missing_ok=True)
         _fail(f"Can't write {file}: {e.strerror or e}")
     typer.echo(f"Exported {name} ({n} examples) to {file}")
+    if skipped:
+        typer.secho(f"{skipped} examples were left out: their image files are missing", fg="yellow", err=True)
 
 
 @app.command("import-task")
 def import_task(
     file: Path,
     name: str | None = typer.Option(None, help="Name for the task [default: the exported name]"),
+    embedder: str | None = typer.Option(None, help="Use this embedder instead of the exported one"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Create a task from a zip made by `fewshot export`."""
@@ -356,7 +359,9 @@ def import_task(
     if not file.is_file():
         _fail(f"No such file: {file}")
     try:
-        t = read_export(_ws(root), file, name)
+        if embedder:
+            _check_embedder(embedder)
+        t = read_export(_ws(root), file, name, embedder=embedder)
     except ValueError as e:
         _fail(str(e))
     typer.echo(f"Imported task {t.name} ({len(t.config.examples)} examples)")
@@ -459,9 +464,11 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     if as_json:
         _echo_json([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds, strict=True)])
     elif as_csv:
-        _write_csv(["file", "label", "labels", "top_label", "confidence", "similarity", "rejected", "error"],
+        _write_csv(["file", "label", "labels", "top_label", "confidence", "similarity", "rejected", "error", "scores"],
                    [[str(f), p.label or "", ";".join(p.labels), p.top_label, f"{p.confidence:.4f}",
-                     f"{p.similarity:.4f}", p.rejected, p.error or ""] for f, p in zip(files, preds, strict=True)])
+                     f"{p.similarity:.4f}", p.rejected, p.error or "",
+                     ";".join(f"{c}={v:.4f}" for c, v in list(p.scores.items())[:top])]
+                    for f, p in zip(files, preds, strict=True)])
     else:
         _print_predictions(files, preds, top)
     if failed:
@@ -550,12 +557,13 @@ def dupes(
     name: str,
     threshold: float = typer.Option(0.95, min=0.5, max=1.0, help="Cosine similarity at or above which "
                                                                   "two examples count as near-duplicates"),
+    limit: int = typer.Option(200, min=1, help="Show at most this many pairs"),
     as_json: bool = JSON_OPT,
     root: Path | None = ROOT_OPT,
 ) -> None:
     """List near-duplicate examples, most similar first; pairs with different labels are marked."""
     t = _task(root, name)
-    pairs = _pipe(_ws(root)).near_duplicates(t, threshold)
+    pairs = _pipe(_ws(root)).near_duplicates(t, threshold, limit)
     if as_json:
         _echo_json(pairs)
         return
@@ -628,6 +636,8 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     allow_urls: bool = typer.Option(False, "--allow-urls",
                                     help="Let API callers send image URLs for the server to download "
                                          "(public addresses only)"),
+    max_upload_mb: float = typer.Option(50, help="Largest image accepted per upload"),
+    max_request_mb: float = typer.Option(1024, help="Largest request body accepted"),
     allowed_host: list[str] = typer.Option(
         [], "--allowed-host", help="Host name clients use to reach the server; others are refused. Repeatable. "
                                    "[default: localhost names when serving locally, else any]"),
@@ -642,10 +652,13 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     local = host in {"127.0.0.1", "localhost", "::1"}
     hosts = allowed_host or (["localhost", "127.0.0.1", "::1"] if local else ["*"])
     # fewshot.api reads its settings from the environment when uvicorn imports it.
-    for name, value in (("FEWSHOT_TOKEN", token or ""), ("FEWSHOT_ALLOW_ANY_MODEL", "1" if allow_any_model else ""),
-                        ("FEWSHOT_WARM", "1" if warm else ""), ("FEWSHOT_ALLOW_URLS", "1" if allow_urls else ""),
-                        ("FEWSHOT_ALLOWED_HOSTS", ",".join(hosts))):
-        os.environ[name] = value
+    settings = {
+        "FEWSHOT_TOKEN": token or "", "FEWSHOT_ALLOW_ANY_MODEL": "1" if allow_any_model else "",
+        "FEWSHOT_WARM": "1" if warm else "", "FEWSHOT_ALLOW_URLS": "1" if allow_urls else "",
+        "FEWSHOT_ALLOWED_HOSTS": ",".join(hosts),
+        "FEWSHOT_MAX_UPLOAD_MB": f"{max_upload_mb:g}", "FEWSHOT_MAX_REQUEST_MB": f"{max_request_mb:g}",
+    }
+    os.environ.update(settings)
     if not token and not local:
         typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
                     "change every task.", fg="yellow", err=True)

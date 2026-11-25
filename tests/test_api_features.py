@@ -187,8 +187,9 @@ def test_urls(client, task, monkeypatch):
     monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
     fetched = []
 
-    def fake_fetch(url, max_bytes, public_only=False):
+    def fake_fetch(url, max_bytes, timeout=20.0, public_only=False):
         fetched.append((url, max_bytes, public_only))
+        assert 0 < timeout <= 20
         if "bad" in url:
             raise ValueError(f"Could not fetch {url}: HTTP 404 Not Found")
         return png(BLUE, seed=len(fetched))

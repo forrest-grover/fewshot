@@ -23,9 +23,10 @@ MAX_IMPORT_CONFIG = 64 * 1024 * 1024
 MAX_IMPORT_TOTAL = 10 * 1024 * 1024 * 1024
 
 
-def export_task(ws: Workspace, name: str, out: IO[bytes]) -> int:
-    """Write task ``name`` (task.json and images, not its history) as a zip to ``out``;
-    returns the number of examples. Raises ``KeyError`` if there is no such task.
+def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
+    """Write task ``name`` (task.json and images, not its history) as a zip to ``out``; returns
+    the number of examples written and of examples left out because their image file was
+    missing. Raises ``KeyError`` if there is no such task.
 
     The task is locked meanwhile, so another process can't rename or change it half-way; an image
     file missing from the task (only if it was damaged) is left out with its example.
@@ -43,21 +44,25 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> int:
             examples.append(e)
         z.writestr("task.json", cfg.model_copy(update={"examples": examples}).model_dump_json(indent=2),
                    zipfile.ZIP_DEFLATED)
-    return len(examples)
+        skipped = len(cfg.examples) - len(examples)
+    return len(examples), skipped
 
 
-def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,
-                embedder_ok: Callable[[str], None] | None = None) -> Task:
+def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                embedder_ok: Callable[[str], None] | None = None, embedder: str | None = None) -> Task:
     """Create a task from a zip written by ``export_task``, named ``name`` or as exported.
 
     Every image must decode, have the extension of its real format, and hash to its id; the total
     unpacked size is limited. ``embedder_ok`` is called with the task's embedder spec before
     anything is written, and may raise to refuse it (the server uses this to apply its model
-    allowlist). Raises ``ValueError`` if the zip isn't a valid export or the name is bad or taken.
+    allowlist). ``embedder`` replaces the exported embedder (e.g. one this server doesn't allow).
+    Raises ``ValueError`` if the zip isn't a valid export or the name is bad or taken.
     """
     try:
         with zipfile.ZipFile(src) as z:
             cfg, images = _read_export(z)
+            if embedder:
+                cfg = cfg.model_copy(update={"embedder": embedder})
             if embedder_ok is not None:
                 embedder_ok(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
