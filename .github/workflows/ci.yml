@@ -12,6 +12,8 @@ concurrency:
 jobs:
   python:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # only used to publish the coverage badge data to the `badges` branch
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,7 +31,31 @@ jobs:
       - name: pylint
         run: pylint --fail-under=10 fewshot tests
       - name: pytest with coverage (fails under 100%)
+        id: pytest
         run: pytest -q --cov --cov-report=term-missing
+      - name: Publish coverage badge data
+        # Runs even when the coverage step failed, so the badge shows the real number.
+        if: >-
+          always() && steps.pytest.outcome != 'skipped'
+          && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pct=$(coverage report --format=total || true)  # non-zero exit when under fail_under
+          if [ -z "$pct" ]; then echo "No coverage data"; exit 0; fi
+          if   [ "$pct" -ge 100 ]; then color=brightgreen
+          elif [ "$pct" -ge 90 ];  then color=green
+          elif [ "$pct" -ge 75 ];  then color=yellow
+          else color=red; fi
+          dir=$(mktemp -d)
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > "$dir/coverage.json"
+          cd "$dir"
+          git init -q -b badges
+          git add coverage.json
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -qm "Coverage ${pct}% at ${GITHUB_SHA::7}"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
 
   web:
     runs-on: ubuntu-latest

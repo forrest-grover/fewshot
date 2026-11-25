@@ -1,6 +1,6 @@
 # fewshot
 
-[![CI](https://github.com/forrest-grover/fewshot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/forrest-grover/fewshot/actions/workflows/ci.yml)
+[![CI](https://github.com/forrest-grover/fewshot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/forrest-grover/fewshot/actions/workflows/ci.yml) [![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/forrest-grover/fewshot/badges/coverage.json)](https://github.com/forrest-grover/fewshot/actions/workflows/ci.yml)
 
 Few-shot image classification from a handful of labeled examples per class. Images are embedded with a pretrained vision model (CLIP or DINOv2) and classified against the class examples, so there is no training run: adding, removing, or relabeling an example changes predictions immediately.
 
