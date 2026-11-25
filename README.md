@@ -78,6 +78,16 @@ task = ws.create("parts", embedder="mine:v1")
 
 `GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `GET .../examples/{id}/image`, `POST .../predict` (multipart `files`), `POST .../evaluate`. OpenAPI docs are served at `/docs`.
 
-## Tests
+## Tests and checks
 
-`./.env/bin/python -m pytest tests` runs in about 2 seconds with a fake colour embedder and needs no model download.
+`scripts/check.sh` runs everything CI runs (`.github/workflows/ci.yml`):
+
+| Check | Requirement |
+|---|---|
+| `ruff check .` | no findings |
+| `mypy` | `--strict` on `fewshot`; relaxed annotations for `tests` |
+| `pylint fewshot tests` | 10.00/10 |
+| `pytest --cov` | 100% line and branch coverage (`fail_under = 100`) |
+| `npm run typecheck` / `lint` / `build` in `web/` | `tsc`, ESLint (typescript-eslint strict type-checked) and Stylelint with zero warnings |
+
+The Python tests take about 10 seconds and download no models: they use fake embedders registered with `register_embedder`, and mock open_clip, timm and CUDA.
