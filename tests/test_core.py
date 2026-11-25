@@ -1,0 +1,97 @@
+import numpy as np
+import pytest
+
+from fewshot import ClassData, Pipeline, evaluate_task, make_classifier
+
+from conftest import png
+
+RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
+
+
+def make_task(ws, classifier="prototype", n=4):
+    t = ws.create("colors", embedder="fake:color", classifier=classifier)
+    for label, rgb in [("red", RED), ("green", GREEN), ("blue", BLUE)]:
+        for i in range(n):
+            t.add_example(png(rgb, noise=20, seed=hash((label, i)) % 1000), label, f"{label}{i}.png")
+    return t
+
+
+@pytest.mark.parametrize("clf", ["prototype", "knn", "logreg"])
+def test_predict_and_evaluate(ws, clf):
+    t = make_task(ws, clf)
+    pipe = Pipeline(ws)
+    preds = pipe.predict(t, [png(RED, seed=99), png(BLUE, seed=98)])
+    assert [p.label for p in preds] == ["red", "blue"]
+    assert abs(sum(preds[0].scores.values()) - 1) < 1e-6
+    r = evaluate_task(pipe, t)
+    assert r["method"] == "leave-one-out" and r["accuracy"] == 1.0
+    assert np.trace(np.array(r["confusion"])) == 12
+
+
+def test_duplicate_image_relabels_instead_of_duplicating(ws):
+    t = ws.create("d", embedder="fake:color")
+    a = t.add_example(png(RED), "red")
+    b = t.add_example(png(RED), "blue")
+    assert a.id == b.id and len(t.config.examples) == 1 and t.config.examples[0].label == "blue"
+
+
+def test_rejects_non_images(ws):
+    t = ws.create("d", embedder="fake:color")
+    with pytest.raises(ValueError):
+        t.add_example(b"not an image", "x")
+    assert t.config.examples == []
+
+
+def test_reject_threshold_marks_unknown(ws):
+    t = make_task(ws)
+    t.update_settings(reject_below=0.999)
+    p = Pipeline(ws).predict(t, [png((128, 128, 128))])[0]
+    assert p.rejected and p.label is None and p.top_label in {"red", "green", "blue"}
+
+
+def test_refit_after_change_and_persistence(ws):
+    from fewshot import Workspace
+
+    t = make_task(ws)
+    pipe = Pipeline(ws)
+    assert pipe.predict(t, [png(GREEN, seed=5)])[0].label == "green"
+    t.rename_class("green", "verde")
+    assert pipe.predict(t, [png(GREEN, seed=5)])[0].label == "verde"
+    t.delete_class("blue")
+    t2 = Workspace(ws.root).get("colors")  # fresh load from disk
+    assert t2.class_names() == ["red", "verde"] and len(t2.config.examples) == 8
+    assert len(list((t2.path / "images").iterdir())) == 8
+
+
+def test_singleton_class_is_skipped_not_crashing_in_loo(ws):
+    t = make_task(ws, n=3)
+    t.add_example(png((200, 200, 0)), "yellow")
+    r = evaluate_task(Pipeline(ws), t)
+    assert r["n_examples"] == 10 and r["per_class"]["yellow"]["support"] == 1
+
+
+def test_text_only_class_zero_shot_and_modality_shift():
+    rng = np.random.default_rng(0)
+    d = 16
+    proto = rng.normal(size=(3, d))
+    gap = rng.normal(size=d) * 3  # text lives far from images
+
+    def unit(v):
+        return v / np.linalg.norm(v, axis=-1, keepdims=True)
+
+    X = unit(np.concatenate([proto[i] + 0.1 * rng.normal(size=(3, d)) for i in range(2)]))
+    y = np.repeat([0, 1], 3)
+    text = {i: unit(proto[i] + gap) for i in range(3)}  # class 2 has text only
+    data = ClassData(["a", "b", "c"], X.astype(np.float32), y, {k: v.astype(np.float32) for k, v in text.items()})
+    for name in ["prototype", "knn", "logreg"]:
+        clf = make_classifier(name).fit(data)
+        q = unit(proto + 0.05 * rng.normal(size=(3, d))).astype(np.float32)
+        assert clf.predict(q)[0].argmax(1).tolist() == [0, 1, 2], name
+
+    zs = make_classifier("prototype").fit(ClassData(["a", "b", "c"], np.zeros((0, d), np.float32), np.zeros(0, int), data.text))
+    assert zs.predict(unit(proto + gap).astype(np.float32))[0].argmax(1).tolist() == [0, 1, 2]
+
+
+def test_class_without_data_is_an_error():
+    with pytest.raises(ValueError, match="no images and no text"):
+        make_classifier("prototype").fit(ClassData(["a", "b"], np.eye(2, dtype=np.float32)[:1], np.array([0])))
