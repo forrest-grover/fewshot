@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 
 import numpy as np
 import pytest
@@ -22,13 +23,31 @@ def root_fixture(tmp_path):
     return tmp_path / "ws"
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class PlainResult:
+    """A click Result with ANSI styling removed from ``output``.
+
+    Typer forces coloured error output when GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS is set,
+    and the escape codes split text such as ``--shots`` that tests look for.
+    """
+
+    def __init__(self, result):
+        self._result = result
+        self.output = ANSI.sub("", result.output)
+
+    def __getattr__(self, name):
+        return getattr(self._result, name)
+
+
 @pytest.fixture(name="run")
 def run_fixture(root):
-    """Invoke the CLI against the temporary workspace; returns the click Result."""
+    """Invoke the CLI against the temporary workspace; returns the Result with plain-text output."""
     runner = CliRunner()
 
     def invoke(*args, stdin=None):
-        return runner.invoke(cli.app, [str(a) for a in args] + ["--root", str(root)], input=stdin)
+        return PlainResult(runner.invoke(cli.app, [str(a) for a in args] + ["--root", str(root)], input=stdin))
 
     return invoke
 

@@ -41,7 +41,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          pct=$(coverage report --format=total || true)  # non-zero exit when under fail_under
+          # --fail-under=0: below the threshold, coverage would also print its failure message here.
+          pct=$(coverage report --format=total --fail-under=0 || true)
           if [ -z "$pct" ]; then echo "No coverage data"; exit 0; fi
           if   [ "$pct" -ge 100 ]; then color=brightgreen
           elif [ "$pct" -ge 90 ];  then color=green
