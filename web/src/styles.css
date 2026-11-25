@@ -243,6 +243,16 @@ main {
     height: auto;
     border-right: none;
     border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+  }
+
+  /* The task list folds away on phones, so the task itself is on screen first. */
+  .sidebar:not(.open) nav, .sidebar:not(.open) > button {
+    display: none;
+  }
+
+  .brand-row .menu-toggle {
+    display: inline-block;
   }
 
   main {
@@ -1014,4 +1024,91 @@ label.inline {
 
 .table td:first-child {
   overflow-wrap: anywhere;
+}
+
+.brand-row {
+  justify-content: space-between;
+}
+
+.menu-toggle {
+  display: none;
+  max-width: 60vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  max-width: calc(100vw - 32px);
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 15%);
+  z-index: 20;
+}
+
+.confusion th.total, .confusion td.total {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* tag editor */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgb(0 0 0 / 35%);
+  z-index: 30;
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(440px, 100%);
+  padding: 16px;
+  border-radius: var(--radius);
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.modal-title {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 0 0 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  font-size: 13px;
+}
+
+.chip.new {
+  outline: 1px dashed var(--accent);
+}
+
+.chip.removed {
+  text-decoration: line-through;
+  opacity: 0.6;
 }

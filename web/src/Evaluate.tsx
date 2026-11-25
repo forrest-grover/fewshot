@@ -65,7 +65,10 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
 
   const fix = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
   const filter = cell?.task === task.name ? cell : null;
-  const mistakes = report ? report.mistakes.filter((m) => !filter || (m.true === filter.t && m.pred === filter.p)) : [];
+  // A picked cell lists its examples (right or wrong), most confident first; otherwise all mistakes.
+  const listed = !report ? [] : filter
+    ? report.predictions.filter((m) => m.true === filter.t && m.pred === filter.p).sort((a, b) => b.confidence - a.confidence)
+    : report.mistakes;
   const pairs = dupes?.task === task.name ? dupes.pairs : null;
   const findDupes = async () => {
     setFinding(true);
@@ -97,6 +100,12 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
           <progress max={job.total || 1} value={job.total ? job.done : undefined} />
           <button className="ghost small" onClick={() => { void run(api.cancelJob(job.id)); }}>Cancel</button>
         </div>
+      )}
+      {report && report.n_scored === 0 && (
+        <p className="hint">
+          Nothing could be scored: each example is predicted by a classifier trained on the others, so a class needs at least two
+          examples (and the task two classes, or one class for an outlier detector) before any prediction can be checked.
+        </p>
       )}
       {stale && <p className="hint">The task changed since this evaluation ran. Re-run it to see the effect.</p>}
       {report && (
@@ -133,10 +142,10 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
           </table>
           </div>
 
-          <h3>Confusion matrix <span className="muted">(rows: true class, columns: predicted; click a cell to list its mistakes)</span></h3>
+          <h3>Confusion matrix <span className="muted">(rows: true class, columns: predicted; click a cell to list its examples)</span></h3>
           <div className="scroll-x">
             <table className="confusion">
-              <thead><tr><th />{report.classes.map((c) => <th key={c} title={c}><span>{c}</span></th>)}</tr></thead>
+              <thead><tr><th />{report.classes.map((c) => <th key={c} title={c}><span>{c}</span></th>)}<th className="total">Total</th></tr></thead>
               <tbody>
                 {report.confusion.map((row, i) => (
                   <tr key={i}>
@@ -147,33 +156,35 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
                         selected={filter?.t === report.classes[i] && filter.p === report.classes[j]}
                         onPick={(on) => { setCell(on ? { task: task.name, t: report.classes[i], p: report.classes[j] } : null); }} />
                     ))}
+                    <td className="total">{row.reduce((a, b) => a + b, 0)}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
 
-          {report.mistakes.length > 0 && (
+          {(report.mistakes.length > 0 || filter) && (
             <>
-              <h3>Mistakes <span className="muted">(most confident first; these are often mislabeled examples)</span></h3>
+              {filter
+                ? <h3>{filter.t} predicted as {filter.p} <span className="muted">({listed.length}, most confident first)</span></h3>
+                : <h3>Mistakes <span className="muted">(most confident first; these are often mislabeled examples)</span></h3>}
               {filter && (
                 <p className="row">
-                  Showing {filter.t} predicted as {filter.p}.
                   <button className="ghost small" onClick={() => { setCell(null); }}>Show all mistakes</button>
                 </p>
               )}
               <div className="thumbs">
-                {mistakes.map((m) => {
+                {listed.map((m) => {
                   const exists = task.examples.find((e) => e.id === m.id);
                   return (
                     <figure key={m.id} className="thumb wide">
                       {/* 400 px: 2x the 200 px tile */}
                       <img src={api.imageUrl(task.name, m.id, 400)} alt="" loading="lazy" />
                       <figcaption className="col">
-                        <span><b>{m.true}</b> → {m.pred} ({pct(m.confidence)})</span>
+                        <span><b>{m.true}</b>{m.correct ? " ✓" : ` → ${m.pred}`} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (
                           <span className="row">
-                            <button className="small secondary" onClick={() => { void fix(api.relabel(task.name, m.id, m.pred)); }}>Relabel as {m.pred}</button>
+                            {m.true !== m.pred && <button className="small secondary" onClick={() => { void fix(api.relabel(task.name, m.id, m.pred)); }}>Relabel as {m.pred}</button>}
                             <button className="small ghost danger" onClick={() => { void fix(api.deleteExample(task.name, m.id)); }}>Delete</button>
                           </span>
                         ) : <span className="ok">{exists ? `Now ${exists.label}` : "Deleted"}</span>}
@@ -198,21 +209,31 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
       {pairs && pairs.length > 0 && (
         <div className="dupes">
           {pairs.map((d) => {
-            const exists = (id: string) => task.examples.some((e) => e.id === id);
+            const now = (id: string) => task.examples.find((e) => e.id === id); // labels as they are now
+            const exists = (id: string) => now(id) !== undefined;
+            const [la, lb] = [now(d.a)?.label ?? d.labels[0], now(d.b)?.label ?? d.labels[1]];
+            const same = la === lb;
+            const both = exists(d.a) && exists(d.b);
             return (
-              <div key={`${d.a}-${d.b}`} className={`dupe ${d.same_label ? "" : "conflict"}`}>
+              <div key={`${d.a}-${d.b}`} className={`dupe ${same ? "" : "conflict"}`}>
                 {[d.a, d.b].map((id, i) => (
                   <figure key={id} className="thumb">
                     <img src={api.imageUrl(task.name, id, 240)} alt="" loading="lazy" />
                     <figcaption className="col">
-                      <span>{d.labels[i]}</span>
+                      <span>{i === 0 ? la : lb}</span>
                       {exists(id)
                         ? <button className="small ghost danger" onClick={() => { void fix(api.deleteExample(task.name, id)); }}>Delete</button>
                         : <span className="ok">Deleted</span>}
                     </figcaption>
                   </figure>
                 ))}
-                <span className="muted">{d.similarity.toFixed(3)}{d.same_label ? "" : " · different labels"}</span>
+                <span className="col">
+                  <span className="muted">{d.similarity.toFixed(3)}{same ? "" : " · different labels"}</span>
+                  {!same && both && [la, lb].map((label, i) => (
+                    <button key={label} className="small secondary"
+                      onClick={() => { void fix(api.relabel(task.name, i === 0 ? d.b : d.a, label)); }}>Make both {label}</button>
+                  ))}
+                </span>
               </div>
             );
           })}
@@ -222,14 +243,14 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
   );
 }
 
-/** One confusion-matrix cell; an off-diagonal cell with mistakes is a toggle button listing them. */
+/** One confusion-matrix cell; a cell with examples is a toggle button listing them. */
 function ConfusionCell({ value, diagonal, max, truth, pred, selected, onPick }: {
   value: number; diagonal: boolean; max: number; truth: string; pred: string; selected: boolean;
   onPick: (on: boolean) => void;
 }) {
   const kind = diagonal ? "diag" : value ? "off" : "";
   const style = { ["--a" as string]: value / max };
-  if (diagonal || !value) return <td className={kind} style={style}>{value || ""}</td>;
+  if (!value) return <td className={kind} style={style} />;
   return (
     <td className={`${kind}${selected ? " selected" : ""}`} style={style}>
       <button className="cell" aria-pressed={selected} onClick={() => { onPick(!selected); }}

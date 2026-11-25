@@ -2,6 +2,7 @@ import { useRef, useState, type DragEvent } from "react";
 import { api, type Example, type TaskDetail } from "./api";
 import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
+import TagEditor, { type TagEdit } from "./TagEditor";
 import { DropZone } from "./ui";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
@@ -19,6 +20,7 @@ export default function Examples({ task, setTask, run }: Props) {
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set()); // selected example ids
   const [dropOn, setDropOn] = useState<string | null>(null); // class card under a drag
   const [tagFilter, setTagFilter] = useState(""); // show only examples with this tag
+  const [editing, setEditing] = useState<{ one: Example } | { ids: string[] } | null>(null); // tag editor
   const pointed = useRef<string | null>(null); // class card last hovered or focused: where a paste goes
   const anchor = useRef<string | null>(null); // last ticked example, for Shift+click ranges
 
@@ -57,23 +59,17 @@ export default function Examples({ task, setTask, run }: Props) {
     const moving = ids.filter((id) => labelOf.get(id) !== label);
     if (moving.length && (await save(api.relabelMany(task.name, moving, label)))) setPicked(new Set());
   };
-  const tagSelection = async (ids: string[]) => {
-    const text = prompt(`Tags to add to ${String(ids.length)} example${ids.length === 1 ? "" : "s"} (comma-separated; prefix with - to remove)`);
-    if (!text) return;
-    const words = text.split(",").map((w) => w.trim()).filter(Boolean);
-    const add = words.filter((w) => !w.startsWith("-"));
-    const drop = words.filter((w) => w.startsWith("-")).map((w) => w.slice(1).trim()).filter(Boolean);
-    if (add.length || drop.length) await save(api.tagMany(task.name, ids, add, drop));
-  };
-  /** Edit one example's tags and note in two prompts (Cancel keeps a value as it was). */
-  const annotate = async (ex: Example) => {
-    const tags = prompt("Tags (comma-separated)", ex.tags.join(", "));
-    const note = prompt("Note", ex.note);
-    if (tags === null && note === null) return;
-    await save(api.annotate(task.name, ex.id, {
-      ...(tags === null ? {} : { tags: tags.split(",").map((w) => w.trim()).filter(Boolean) }),
-      ...(note === null ? {} : { note }),
-    }));
+  const tagSelection = (ids: string[]) => { setEditing({ ids }); };
+  const annotate = (ex: Example) => { setEditing({ one: ex }); };
+  /** Save what the tag editor returns, and close it if that worked. */
+  const saveTags = async (edit: TagEdit) => {
+    if (!editing) return;
+    let ok = true;
+    if ("tags" in edit && "one" in editing) ok = await save(api.annotate(task.name, editing.one.id, edit));
+    else if ("add" in edit && "ids" in editing && (edit.add.length || edit.remove.length)) {
+      ok = await save(api.tagMany(task.name, editing.ids, edit.add, edit.remove));
+    }
+    if (ok) setEditing(null);
   };
   const remove = async (ids: string[]) => {
     if (!confirm(`Delete ${String(ids.length)} example${ids.length === 1 ? "" : "s"}?`)) return;
@@ -141,8 +137,18 @@ export default function Examples({ task, setTask, run }: Props) {
     },
   });
 
+  const editedIds = editing ? ("one" in editing ? [editing.one.id] : editing.ids) : [];
+  const editedTags = [...new Set(task.examples.filter((e) => editedIds.includes(e.id)).flatMap((e) => e.tags))];
+
   return (
     <div className="examples">
+      {editing && (
+        <TagEditor
+          title={"one" in editing ? `Tags and note: ${editing.one.source || editing.one.id.slice(0, 12)}`
+            : `Tag ${String(editing.ids.length)} examples`}
+          allTags={allTags} tags={editedTags} note={"one" in editing ? editing.one.note : undefined}
+          onSave={(edit) => { void saveTags(edit); }} onClose={() => { setEditing(null); }} />
+      )}
       <form
         className="row add-class"
         onSubmit={(e) => {
@@ -202,7 +208,7 @@ export default function Examples({ task, setTask, run }: Props) {
             <option value="">Move to…</option>
             {task.classes.map((c, i) => <option key={c.name} value={c.name}>{i < 9 ? `${String(i + 1)} · ` : ""}{c.name}</option>)}
           </select>
-          <button className="small secondary" onClick={() => { void tagSelection(selection); }}>Tag…</button>
+          <button className="small secondary" onClick={() => { tagSelection(selection); }}>Tag…</button>
           <button className="small danger" onClick={() => { void remove(selection); }}>Delete</button>
           <button className="ghost small" onClick={() => { setPicked(new Set()); }}>Clear selection <kbd>Esc</kbd></button>
         </div>
@@ -306,7 +312,7 @@ export default function Examples({ task, setTask, run }: Props) {
                     >
                       {task.classes.map((k) => <option key={k.name}>{k.name}</option>)}
                     </select>
-                    <button className="ghost small" aria-label="Tags and note" title="Tags and note" onClick={() => { void annotate(ex); }}>✎</button>
+                    <button className="ghost small" aria-label="Tags and note" title="Tags and note" onClick={() => { annotate(ex); }}>✎</button>
                     <button className="ghost small danger" aria-label="Delete example" onClick={() => { void save(api.deleteExample(task.name, ex.id)); }}>×</button>
                   </figcaption>
                 </figure>

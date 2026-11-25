@@ -14,6 +14,9 @@ interface Props {
 
 let nextKey = 0;
 
+/** The http(s) URLs in text separated by whitespace. */
+const urlsIn = (text: string) => text.split(/\s+/).filter((u) => /^https?:\/\/\S+/i.test(u));
+
 export default function Predict({ task, setTask, run, state, urlFetch }: Props) {
   const [urlText, setUrlText] = useState("");
   const { setResults, urls } = state;
@@ -52,7 +55,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     }
   };
   const classifyUrls = async () => {
-    const list = urlText.split(/\s+/).filter((u) => /^https?:\/\//i.test(u));
+    const list = urlsIn(urlText);
     if (!list.length) return;
     update((r) => ({ ...r, busy: true }));
     try {
@@ -127,7 +130,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
         <form className="row url-form" onSubmit={(e) => { e.preventDefault(); void classifyUrls(); }}>
           <input value={urlText} onChange={(e) => { setUrlText(e.target.value); }} className="url-input" placeholder="Or image URLs (https://…), separated by spaces"
             aria-label="Image URLs to classify" disabled={!ready || busy} />
-          <button type="submit" className="secondary" disabled={!ready || busy || !/https?:\/\//i.test(urlText)}>Classify URLs</button>
+          <button type="submit" className="secondary" disabled={!ready || busy || urlsIn(urlText).length === 0}>Classify URLs</button>
         </form>
       )}
       {items.length > 0 && (

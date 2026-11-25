@@ -37,6 +37,8 @@ export default function App() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [signIn, setSignIn] = useState(false); // the server wants its token
   const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
+  const [toast, setToast] = useState<{ text: string; then: "undo" | "redo" | null; key: number } | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
   // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
   const predictState = usePredictResults(route.task);
@@ -75,6 +77,8 @@ export default function App() {
 
   useEffect(() => {
     currentTask.current = route.task;
+    setMenuOpen(false);
+    setToast(null);
     setEvalRun((s) => (s?.task === route.task ? s : null)); // kept when this is the task's new name
     setError(null);
     setTask(null);
@@ -100,20 +104,36 @@ export default function App() {
     void refreshTasks();
   };
 
-  const undo = async () => {
-    if (!task?.can_undo) return;
-    const t = await run(api.undo(task.name));
-    if (t) updateTask(t);
+  /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse. */
+  const step = async (which: "undo" | "redo") => {
+    if (!task || !(which === "undo" ? task.can_undo : task.can_redo)) return;
+    const what = which === "undo" ? task.undo_label : task.redo_label;
+    const t = await run(which === "undo" ? api.undo(task.name) : api.redo(task.name));
+    if (!t) return;
+    updateTask(t);
+    setToast({
+      text: `${which === "undo" ? "Undid" : "Redid"} ${what || "the last change"}`,
+      then: which === "undo" ? (t.can_redo ? "redo" : null) : (t.can_undo ? "undo" : null),
+      key: Date.now(),
+    });
   };
-  // Ctrl/Cmd+Z undoes the task's last change, unless typing in a field (where it undoes the typing).
-  const undoRef = useRef(undo);
-  undoRef.current = undo;
+  const undo = () => step("undo");
+  useEffect(() => { // the toast goes after a few seconds
+    if (!toast) return;
+    const timer = setTimeout(() => { setToast(null); }, 6000);
+    return () => { clearTimeout(timer); };
+  }, [toast]);
+  // Ctrl/Cmd+Z undoes the task's last change and Ctrl/Cmd+Shift+Z (or Ctrl+Y) redoes it, unless
+  // typing in a field (where they undo the typing).
+  const stepRef = useRef(step);
+  stepRef.current = step;
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== "z") return;
+      const key = e.key.toLowerCase();
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || (key !== "z" && key !== "y")) return;
       if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
       e.preventDefault();
-      void undoRef.current();
+      void stepRef.current(key === "y" || e.shiftKey ? "redo" : "undo");
     };
     window.addEventListener("keydown", on);
     return () => { window.removeEventListener("keydown", on); };
@@ -123,9 +143,15 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
-        <a className="brand" href="#">fewshot</a>
-        <nav>
+      <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
+        <div className="row brand-row">
+          <a className="brand" href="#">fewshot</a>
+          <button className="ghost small menu-toggle" aria-expanded={menuOpen} aria-controls="task-list"
+            onClick={() => { setMenuOpen((o) => !o); }}>
+            {route.task ?? "Tasks"} ({tasks.length}) {menuOpen ? "▴" : "▾"}
+          </button>
+        </div>
+        <nav id="task-list">
           {tasks.map((t) => (
             <a key={t.name} href={`#/${encodeURIComponent(t.name)}/examples`} className={route.task === t.name ? "active" : ""}>
               <span>{t.name}</span>
@@ -151,7 +177,9 @@ export default function App() {
               </span>
               <span className="spacer" />
               <button className="ghost small" disabled={!task.can_undo} onClick={() => { void undo(); }}
-                title="Undo the last change to this task: examples, classes or settings (Ctrl+Z)">↶ Undo</button>
+                title={`Undo ${task.undo_label || "the last change"} (Ctrl+Z)`}>↶ Undo</button>
+              <button className="ghost small" disabled={!task.can_redo} onClick={() => { void step("redo"); }}
+                title={`Redo ${task.redo_label || "the last undone change"} (Ctrl+Shift+Z)`}>↷ Redo</button>
             </header>
             <div className="tabs" role="tablist" aria-label="Task views" onKeyDown={(e) => {
               // Arrow keys, Home and End move between tabs (the WAI-ARIA tabs pattern).
@@ -197,6 +225,17 @@ export default function App() {
           </>
         )}
       </main>
+      {toast && (
+        <div className="toast" role="status" key={toast.key}>
+          <span>{toast.text}</span>
+          {toast.then && (
+            <button className="small secondary" onClick={() => { const then = toast.then; setToast(null); if (then) void step(then); }}>
+              {toast.then === "redo" ? "Redo" : "Undo"}
+            </button>
+          )}
+          <button className="ghost small" aria-label="Dismiss" onClick={() => { setToast(null); }}>×</button>
+        </div>
+      )}
     </div>
   );
 }

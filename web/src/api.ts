@@ -9,7 +9,8 @@ export interface Example {
 export interface TaskDetail {
   name: string; embedder: string; supports_text: boolean; classifier: string;
   classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
-  reject_below_zero_shot: number | null; flip: boolean; can_undo: boolean;
+  reject_below_zero_shot: number | null; flip: boolean;
+  can_undo: boolean; can_redo: boolean; undo_label: string; redo_label: string; // labels: e.g. "delete 3 examples"
   revision: number; classes: ClassInfo[]; examples: Example[];
 }
 export interface Prediction {
@@ -104,6 +105,7 @@ export const api = {
   predictUrls: (n: string, urls: string[]) => req<Prediction[]>("POST", `${t(n)}/predict/urls`, { urls }),
   duplicates: (n: string, threshold: number) => req<DuplicatePair[]>("GET", `${t(n)}/duplicates?threshold=${String(threshold)}`),
   undo: (n: string) => req<TaskDetail>("POST", `${t(n)}/undo`),
+  redo: (n: string) => req<TaskDetail>("POST", `${t(n)}/redo`),
   rename: (n: string, name: string) => req<TaskDetail>("POST", `${t(n)}/rename`, { name }),
   exportUrl: (n: string) => `${t(n)}/export`,
   importTask: (file: File, name?: string) => {
