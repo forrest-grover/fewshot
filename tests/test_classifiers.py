@@ -33,9 +33,13 @@ def test_registry_and_factory():
     assert sorted(CLASSIFIERS) == sorted(ALL)
     assert CLASSIFIERS["knn"] is KNNClassifier
     clf = make_classifier("knn", k=2, text_weight=0.5)
-    assert isinstance(clf, KNNClassifier) and clf.k == 2 and clf.text_weight == 0.5
+    assert isinstance(clf, KNNClassifier)
+    assert clf.k == 2
+    assert clf.text_weight == 0.5
     assert isinstance(make_classifier("prototype"), PrototypeClassifier)
-    assert make_classifier("logreg", C=1.0).C == 1.0
+    logreg = make_classifier("logreg", C=1.0)
+    assert isinstance(logreg, LogRegClassifier)
+    assert logreg.C == 1.0
 
 
 def test_unknown_classifier_lists_choices():
@@ -47,7 +51,8 @@ def test_unknown_classifier_lists_choices():
 def test_dim_from_images_or_text():
     """dim comes from X, or from the text vectors when there are no images."""
     assert two_clusters().dim == 3
-    zero_shot = ClassData(["a", "b"], np.zeros((0, 0), np.float32), np.zeros(0, int), {0: np.ones(7), 1: np.ones(7)})
+    text = {0: np.ones(7, np.float32), 1: np.ones(7, np.float32)}
+    zero_shot = ClassData(["a", "b"], np.zeros((0, 0), np.float32), np.zeros(0, int), text)
     assert zero_shot.dim == 7
 
 
@@ -63,12 +68,15 @@ def test_needs_two_classes(name):
 def test_separable_clusters(name):
     """Each classifier separates two clusters with normalised probabilities."""
     clf = make_classifier(name).fit(two_clusters())
-    assert clf.classes == ["x", "y"] and not clf.zero_shot and clf.Pt is None
+    assert clf.classes == ["x", "y"]
+    assert not clf.zero_shot
+    assert clf.Pt is None
     probs, sims = clf.predict(unit([[1, 0.05, 0], [0, 1, 0.05]]))
     assert probs.shape == (2, 2)
     np.testing.assert_allclose(probs.sum(1), 1, rtol=1e-6)
     assert probs.argmax(1).tolist() == [0, 1]
-    assert np.all(sims > 0.98) and np.all(sims <= 1 + 1e-6)
+    assert np.all(sims > 0.98)
+    assert np.all(sims <= 1 + 1e-6)
 
 
 def test_fit_returns_self_and_copies_class_list():
@@ -115,6 +123,13 @@ def test_knn_k_larger_than_support_and_k1_vote():
     np.testing.assert_allclose(probs[0], [0.25, 0.75], atol=1e-5)
 
 
+@pytest.mark.parametrize("name", ALL)
+def test_predict_before_fit_is_an_error(name):
+    """Predicting with an unfitted classifier raises a clear error instead of failing on None."""
+    with pytest.raises(RuntimeError, match=r"not fitted; call fit\(\) first"):
+        make_classifier(name).predict(unit([[1, 0, 0]]))
+
+
 def test_base_classifier_requires_subclass_hooks():
     """The base class leaves image fitting and scoring to subclasses."""
     with pytest.raises(NotImplementedError):
@@ -136,10 +151,13 @@ def test_image_only_class_gets_shifted_text_vector(name):
     """Image-only classes get a text-side vector moved across the modality gap."""
     data, _ = text_task()
     clf = make_classifier(name).fit(data)
+    assert clf.Pt is not None
     assert clf.Pt.shape == (3, 4)
     np.testing.assert_allclose(clf.Pt[0], data.text[0], atol=1e-6)
     # 'b' centroid (y axis) moved from image space into text space: mostly y plus the gap direction.
-    assert clf.Pt[1].argmax() in (1, 3) and clf.Pt[1][1] > 0.25 and clf.Pt[1][3] > 0.5
+    assert clf.Pt[1].argmax() in (1, 3)
+    assert clf.Pt[1][1] > 0.25
+    assert clf.Pt[1][3] > 0.5
     np.testing.assert_allclose(np.linalg.norm(clf.Pt, axis=1), 1, atol=1e-6)
     # Text-only 'c' is reachable from an image near the z axis; a/b still work.
     q = unit([[1, 0, 0.05, 0], [0, 1, 0.05, 0], [0.1, 0.1, 1, 0]])

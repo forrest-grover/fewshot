@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Any
 
 import numpy as np
 from PIL import Image
 
 from .cache import EmbeddingCache
-from .classifiers import Classifier, ClassData, make_classifier
-from .embedders import get_embedder, spec_supports_text
+from .classifiers import ClassData, Classifier, make_classifier
+from .embedders import Vectors, get_embedder, spec_supports_text
 from .store import Task, Workspace, image_id, load_image
 
-ImageInput = Union[bytes, str, Path, Image.Image]
+ImageInput = bytes | str | Path | Image.Image
 
 
 @dataclass
@@ -29,7 +30,7 @@ class Prediction:
     rejected: bool
     scores: dict[str, float]
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """JSON-ready dict of the fields."""
         return asdict(self)
 
@@ -50,39 +51,39 @@ class Pipeline:
         self._lock = threading.Lock()
 
     # ---- embeddings --------------------------------------------------
-    def embed_images(self, spec: str, items: Sequence[tuple[str | None, Image.Image | bytes | Path]]) -> np.ndarray:
+    def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]]) -> Vectors:
         """Embed ``(cache_key or None, image)`` pairs, using and filling the cache."""
         keys = [k for k, _ in items if k]
         hit = self.cache.get_many(spec, keys) if keys else {}
         todo = [(i, k, im) for i, (k, im) in enumerate(items) if not (k and k in hit)]
-        out: list[np.ndarray | None] = [hit.get(k) if k else None for k, _ in items]
+        out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
         if todo:
             emb = get_embedder(spec)
             ims = [_to_pil(im) for _, _, im in todo]
             vecs = emb.embed_images(ims)
-            new = {}
-            for (i, k, _), v in zip(todo, vecs):
+            new: dict[str, Vectors] = {}
+            for (i, k, _), v in zip(todo, vecs, strict=True):
                 out[i] = v
                 if k:
                     new[k] = v
             self.cache.put_many(spec, new)
         if not items:
             return np.zeros((0, 0), np.float32)
-        return np.stack(out).astype(np.float32)
+        return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
 
-    def embed_texts(self, spec: str, texts: Sequence[str]) -> np.ndarray:
+    def embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
         """Embed strings (rows in input order), using and filling the cache."""
         keys = ["text:" + t for t in texts]
         hit = self.cache.get_many(spec, keys)
         missing = [t for t in dict.fromkeys(texts) if "text:" + t not in hit]
         if missing:
             vecs = get_embedder(spec).embed_texts(missing)
-            new = {"text:" + t: v for t, v in zip(missing, vecs)}
+            new = {"text:" + t: v for t, v in zip(missing, vecs, strict=True)}
             self.cache.put_many(spec, new)
             hit.update(new)
         return np.stack([hit[k] for k in keys]) if texts else np.zeros((0, 0), np.float32)
 
-    def example_embeddings(self, task: Task) -> np.ndarray:
+    def example_embeddings(self, task: Task) -> Vectors:
         """Embeddings of the task's examples, in ``task.config.examples`` order."""
         exs = task.config.examples
         return self.embed_images(task.config.embedder, [(e.id, task.path / e.file) for e in exs])
@@ -98,7 +99,7 @@ class Pipeline:
         if exclude:
             keep = np.array([i not in exclude for i in range(len(y))], bool)
             X, y = X[keep], y[keep]
-        text: dict[int, np.ndarray] = {}
+        text: dict[int, Vectors] = {}
         if spec_supports_text(cfg.embedder):
             described = [(i, c.description) for i, c in enumerate(cfg.classes) if c.description.strip()]
             if described:
@@ -132,7 +133,7 @@ class Pipeline:
         items = [(_key(im), im) for im in images]
         Q = self.embed_images(task.config.embedder, items)
         probs, sims = clf.predict(Q)
-        return [self._to_pred(task, clf, p, s) for p, s in zip(probs, sims)]
+        return [self._to_pred(task, clf, p, s) for p, s in zip(probs, sims, strict=True)]
 
     def _to_pred(self, task: Task, clf: Classifier, p: np.ndarray, s: float) -> Prediction:
         j = int(p.argmax())
@@ -144,7 +145,7 @@ class Pipeline:
             confidence=float(p[j]),
             similarity=float(s),
             rejected=rejected,
-            scores={c: float(v) for c, v in zip(clf.classes, p)},
+            scores={c: float(v) for c, v in zip(clf.classes, p, strict=True)},
         )
 
 

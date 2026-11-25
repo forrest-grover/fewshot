@@ -20,10 +20,19 @@ CLIP zero-shot.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
 import numpy as np
+import numpy.typing as npt
+
+from .embedders import Vectors
 
 CLIP_LOGIT_SCALE = 100.0
+
+Labels = npt.NDArray[np.int_]  # class indices
+Scores = npt.NDArray[np.floating[Any]]  # log-probabilities, probabilities or similarities
+
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -31,26 +40,34 @@ class ClassData:
     """Training data for a classifier: labelled image embeddings plus optional text embeddings."""
 
     classes: list[str]
-    X: np.ndarray  # (n, d) image embeddings
-    y: np.ndarray  # (n,) int class indices into ``classes``
-    text: dict[int, np.ndarray] = field(default_factory=dict)  # class index -> (d,) text embedding
+    X: Vectors  # (n, d) image embeddings
+    y: Labels  # (n,) int class indices into ``classes``
+    text: dict[int, Vectors] = field(default_factory=dict)  # class index -> (d,) text embedding
 
     @property
     def dim(self) -> int:
         """Embedding dimension, taken from the images or, for zero-shot data, the text."""
         if len(self.X):
-            return self.X.shape[1]
-        return next(iter(self.text.values())).shape[0]
+            return int(self.X.shape[1])
+        return int(next(iter(self.text.values())).shape[0])
 
 
-def _unit(v: np.ndarray) -> np.ndarray:
-    return (v / np.linalg.norm(v, axis=-1, keepdims=True).clip(1e-12)).astype(np.float32)
+def _unit(v: npt.NDArray[np.floating[Any]]) -> Vectors:
+    out: Vectors = (v / np.linalg.norm(v, axis=-1, keepdims=True).clip(1e-12)).astype(np.float32)
+    return out
 
 
-def _softmax(z: np.ndarray) -> np.ndarray:
+def _softmax(z: Scores) -> Scores:
     z = z - z.max(axis=1, keepdims=True)
     e = np.exp(z)
     return e / e.sum(axis=1, keepdims=True)
+
+
+def _fitted(value: _T | None) -> _T:
+    """``value`` if ``fit`` has set it; raises RuntimeError on an unfitted classifier."""
+    if value is None:
+        raise RuntimeError("Classifier is not fitted; call fit() first")
+    return value
 
 
 class Classifier:
@@ -62,21 +79,21 @@ class Classifier:
         self.text_weight = text_weight
         self.classes: list[str] = []
         self.zero_shot = False
-        self.Pt: np.ndarray | None = None  # (C, d) text-side vector per class, if any text is used
-        self._X: np.ndarray | None = None  # image-space support points (examples + text anchors)
+        self.Pt: Vectors | None = None  # (C, d) text-side vector per class, if any text is used
+        self._X: Vectors | None = None  # image-space support points (examples + text anchors)
 
     # Subclasses implement these on image-space data where every class has >= 1 point.
-    def _fit_image(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> None:
+    def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         raise NotImplementedError
 
-    def _image_logprobs(self, Q: np.ndarray) -> np.ndarray:
+    def _image_logprobs(self, Q: Vectors) -> Scores:
         raise NotImplementedError
 
-    def _image_similarity(self, Q: np.ndarray) -> np.ndarray:
+    def _image_similarity(self, Q: Vectors) -> Scores:
         """Cosine similarity of each query to its nearest support point/prototype."""
-        return (Q @ self._X.T).max(axis=1)
+        return (Q @ _fitted(self._X).T).max(axis=1)
 
-    def fit(self, data: ClassData) -> "Classifier":
+    def fit(self, data: ClassData) -> Classifier:
         """Fit on ``data``; every class needs at least one image or a text embedding."""
         C = len(data.classes)
         if C < 2:
@@ -91,7 +108,7 @@ class Classifier:
 
         if data.text and (self.zero_shot or self.text_weight > 0):
             mean_t = np.mean(list(data.text.values()), axis=0)
-            mean_x = data.X.mean(0) if len(data.X) else None
+            mean_x = data.X.mean(0) if len(data.X) else mean_t  # mean_x is only used when there are images
             Pt = np.zeros((C, data.dim), np.float32)
             for i in range(C):
                 if i in data.text:
@@ -114,15 +131,16 @@ class Classifier:
         self._fit_image(X, y, w)
         return self
 
-    def predict(self, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def predict(self, Q: Vectors) -> tuple[Scores, Scores]:
         """Return (probs (m, C), similarity of each query to its best match (m,)).
 
         Similarity is image-to-image cosine, except for zero-shot tasks where it
         is image-to-text cosine (typically 0.2-0.35 for CLIP), so reject
-        thresholds are not interchangeable between the two.
+        thresholds are not interchangeable between the two. Raises RuntimeError
+        if called before ``fit``.
         """
         if self.zero_shot:
-            S = Q @ self.Pt.T
+            S = Q @ _fitted(self.Pt).T
             return _softmax(CLIP_LOGIT_SCALE * S), S.max(axis=1)
         logits = self._image_logprobs(Q)
         if self.Pt is not None and self.text_weight > 0:
@@ -138,20 +156,20 @@ class PrototypeClassifier(Classifier):
     def __init__(self, text_weight: float = 1.0, scale: float = 30.0) -> None:
         super().__init__(text_weight)
         self.scale = scale
-        self.P: np.ndarray | None = None
+        self.P: Vectors | None = None
 
-    def _fit_image(self, X, y, w):
+    def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         P = np.zeros((len(self.classes), X.shape[1]), np.float32)
         np.add.at(P, y, X * w[:, None])
         self.P = _unit(P)
 
-    def _image_logprobs(self, Q):
-        z = self.scale * (Q @ self.P.T)
+    def _image_logprobs(self, Q: Vectors) -> Scores:
+        z = self.scale * (Q @ _fitted(self.P).T)
         z = z - z.max(1, keepdims=True)
         return z - np.log(np.exp(z).sum(1, keepdims=True))
 
-    def _image_similarity(self, Q):
-        return (Q @ self.P.T).max(axis=1)
+    def _image_similarity(self, Q: Vectors) -> Scores:
+        return (Q @ _fitted(self.P).T).max(axis=1)
 
 
 class KNNClassifier(Classifier):
@@ -162,21 +180,22 @@ class KNNClassifier(Classifier):
     def __init__(self, text_weight: float = 1.0, k: int = 5, scale: float = 30.0) -> None:
         super().__init__(text_weight)
         self.k, self.scale = k, scale
-        self.y: np.ndarray | None = None
-        self.w: np.ndarray | None = None
+        self.y: Labels | None = None
+        self.w: Vectors | None = None
 
-    def _fit_image(self, X, y, w):
+    def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         self.y, self.w = y, w
 
-    def _image_logprobs(self, Q):
-        S = Q @ self._X.T
+    def _image_logprobs(self, Q: Vectors) -> Scores:
+        S = Q @ _fitted(self._X).T
+        y, w = _fitted(self.y), _fitted(self.w)
         k = min(self.k, S.shape[1])
         top = np.argpartition(-S, k - 1, axis=1)[:, :k]
-        scores = np.full((len(Q), len(self.classes)), 1e-6)
+        scores = np.full((len(Q), len(self.classes)), 1e-6, np.float64)
         rows = np.repeat(np.arange(len(Q)), k)
         cols = top.ravel()
-        votes = self.w[cols] * np.exp(self.scale * (S[rows, cols] - 1.0))
-        np.add.at(scores, (rows, self.y[cols]), votes)
+        votes = w[cols] * np.exp(self.scale * (S[rows, cols] - 1.0))
+        np.add.at(scores, (rows, y[cols]), votes)
         return np.log(scores / scores.sum(axis=1, keepdims=True))
 
 
@@ -188,17 +207,18 @@ class LogRegClassifier(Classifier):
     def __init__(self, text_weight: float = 1.0, C: float = 10.0) -> None:
         super().__init__(text_weight)
         self.C = C
-        self.model = None
+        self.model: Any = None  # sklearn LogisticRegression once fitted (sklearn is untyped)
 
-    def _fit_image(self, X, y, w):
+    def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         # Lazy import: sklearn is slow to import and only this classifier needs it.
         from sklearn.linear_model import LogisticRegression  # pylint: disable=import-outside-toplevel
 
         self.model = LogisticRegression(C=self.C, max_iter=2000).fit(X, y, sample_weight=w)
 
-    def _image_logprobs(self, Q):
-        lp = np.full((len(Q), len(self.classes)), -1e9)
-        lp[:, self.model.classes_] = self.model.predict_log_proba(Q)
+    def _image_logprobs(self, Q: Vectors) -> Scores:
+        model = _fitted(self.model)
+        lp = np.full((len(Q), len(self.classes)), -1e9, np.float64)
+        lp[:, model.classes_] = model.predict_log_proba(Q)
         return lp
 
 
@@ -207,7 +227,7 @@ CLASSIFIERS: dict[str, type[Classifier]] = {
 }
 
 
-def make_classifier(name: str, **params) -> Classifier:
+def make_classifier(name: str, **params: Any) -> Classifier:
     """Instantiate the classifier registered as ``name`` with keyword ``params``."""
     if name not in CLASSIFIERS:
         raise ValueError(f"Unknown classifier {name!r}; choose from {sorted(CLASSIFIERS)}")

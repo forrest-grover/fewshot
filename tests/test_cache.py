@@ -20,16 +20,17 @@ def test_creates_parent_folder_and_round_trips(tmp_path):
     c.put_many("s", {"a": np.array([1.0, 2.0, 3.0]), "b": np.array([0.5, 0.25], np.float64)})
     got = c.get_many("s", ["a", "b", "missing"])
     assert set(got) == {"a", "b"}
-    assert got["a"].dtype == np.float32 and got["a"].tolist() == [1.0, 2.0, 3.0]
+    assert got["a"].dtype == np.float32
+    assert got["a"].tolist() == [1.0, 2.0, 3.0]
     assert got["b"].tolist() == [0.5, 0.25]
 
 
 def test_specs_are_separate_and_put_replaces(tmp_path):
     """The same key under two specs holds two vectors; re-putting overwrites."""
     c = EmbeddingCache(tmp_path / "c.sqlite")
-    c.put_many("s1", {"k": np.ones(2)})
-    c.put_many("s2", {"k": np.zeros(2)})
-    c.put_many("s1", {"k": np.full(2, 7.0)})
+    c.put_many("s1", {"k": np.ones(2, np.float32)})
+    c.put_many("s2", {"k": np.zeros(2, np.float32)})
+    c.put_many("s1", {"k": np.full(2, 7.0, np.float32)})
     assert c.get_many("s1", ["k"])["k"].tolist() == [7.0, 7.0]
     assert c.get_many("s2", ["k"])["k"].tolist() == [0.0, 0.0]
     assert not c.get_many("s3", ["k"])
@@ -51,7 +52,9 @@ def test_lookup_of_more_keys_than_one_query_chunk(tmp_path):
     c.put_many("s", {k: np.array([float(i)]) for i, k in enumerate(keys) if i % 2 == 0})
     got = c.get_many("s", keys)
     assert len(got) == 602
-    assert got["k0"].tolist() == [0.0] and got["k600"].tolist() == [600.0] and got["k1202"].tolist() == [1202.0]
+    assert got["k0"].tolist() == [0.0]
+    assert got["k600"].tolist() == [600.0]
+    assert got["k1202"].tolist() == [1202.0]
     assert "k1" not in got
 
 

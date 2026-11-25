@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -103,7 +104,7 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
 
     scored = pred >= 0
     cm = np.zeros((C, C), int)
-    for t, p in zip(data.y[scored], pred[scored]):
+    for t, p in zip(data.y[scored], pred[scored], strict=True):
         cm[t, p] += 1
     return {
         "method": "leave-one-out" if k >= n else f"{k}-fold",
@@ -138,7 +139,7 @@ class _EpisodeSampler:
 
     @classmethod
     def embed(cls, pipe: Pipeline, ds: dict[str, list[Path]], embedder: str, text_template: str | None,
-              progress: Callable[[str], None] | None) -> "_EpisodeSampler":
+              progress: Callable[[str], None] | None) -> _EpisodeSampler:
         """Embed every image in ``ds`` (and each class's ``text_template`` text, if given)."""
         names = sorted(ds)
         files = [f for c in names for f in ds[c]]

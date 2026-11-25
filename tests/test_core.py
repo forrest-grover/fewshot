@@ -5,10 +5,10 @@ import sys
 
 import numpy as np
 import pytest
-from conftest import png
 
 import fewshot
 from fewshot import ClassData, Pipeline, Workspace, evaluate_task, make_classifier, store
+from tests.conftest import png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
 
@@ -31,7 +31,8 @@ def test_predict_and_evaluate(ws, clf):
     assert [p.label for p in preds] == ["red", "blue"]
     assert abs(sum(preds[0].scores.values()) - 1) < 1e-6
     r = evaluate_task(pipe, t)
-    assert r["method"] == "leave-one-out" and r["accuracy"] == 1.0
+    assert r["method"] == "leave-one-out"
+    assert r["accuracy"] == 1.0
     assert np.trace(np.array(r["confusion"])) == 12
 
 
@@ -40,13 +41,15 @@ def test_duplicate_image_relabels_instead_of_duplicating(ws):
     t = ws.create("d", embedder="fake:color")
     a = t.add_example(png(RED), "red")
     b = t.add_example(png(RED), "blue")
-    assert a.id == b.id and len(t.config.examples) == 1 and t.config.examples[0].label == "blue"
+    assert a.id == b.id
+    assert len(t.config.examples) == 1
+    assert t.config.examples[0].label == "blue"
 
 
 def test_rejects_non_images(ws):
     """Undecodable bytes are refused before anything is stored."""
     t = ws.create("d", embedder="fake:color")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Not a readable image"):
         t.add_example(b"not an image", "x")
     assert t.config.examples == []
 
@@ -56,7 +59,9 @@ def test_reject_threshold_marks_unknown(ws):
     t = make_task(ws)
     t.update_settings(reject_below=0.999)
     p = Pipeline(ws).predict(t, [png((128, 128, 128))])[0]
-    assert p.rejected and p.label is None and p.top_label in {"red", "green", "blue"}
+    assert p.rejected
+    assert p.label is None
+    assert p.top_label in {"red", "green", "blue"}
 
 
 def test_refit_after_change_and_persistence(ws):
@@ -68,7 +73,8 @@ def test_refit_after_change_and_persistence(ws):
     assert pipe.predict(t, [png(GREEN, seed=5)])[0].label == "verde"
     t.delete_class("blue")
     t2 = Workspace(ws.root).get("colors")  # fresh load from disk
-    assert t2.class_names() == ["red", "verde"] and len(t2.config.examples) == 8
+    assert t2.class_names() == ["red", "verde"]
+    assert len(t2.config.examples) == 8
     assert len(list((t2.path / "images").iterdir())) == 8
 
 
@@ -77,7 +83,8 @@ def test_singleton_class_is_skipped_not_crashing_in_loo(ws):
     t = make_task(ws, n=3)
     t.add_example(png((200, 200, 0)), "yellow")
     r = evaluate_task(Pipeline(ws), t)
-    assert r["n_examples"] == 10 and r["per_class"]["yellow"]["support"] == 1
+    assert r["n_examples"] == 10
+    assert r["per_class"]["yellow"]["support"] == 1
 
 
 def test_text_only_class_zero_shot_and_modality_shift():
@@ -112,7 +119,8 @@ def test_class_without_data_is_an_error():
 
 def test_package_exports_are_lazy():
     """Top-level names resolve to their submodule objects without importing torch or the pipeline."""
-    assert fewshot.Workspace is store.Workspace and set(fewshot.__all__) >= {"Pipeline", "Workspace"}
+    assert fewshot.Workspace is store.Workspace
+    assert set(fewshot.__all__) >= {"Pipeline", "Workspace", "register_embedder"}
     with pytest.raises(AttributeError, match="has no attribute 'nope'"):
         _ = fewshot.nope
     code = "import sys, fewshot; fewshot.Workspace; print('torch' in sys.modules, 'fewshot.pipeline' in sys.modules)"

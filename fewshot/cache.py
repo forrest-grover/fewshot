@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .embedders import Vectors
+
 
 class EmbeddingCache:
     """Thread-safe embedding store; vectors are float32 blobs."""
@@ -27,9 +29,9 @@ class EmbeddingCache:
             )
             self._conn.commit()
 
-    def get_many(self, spec: str, keys: list[str]) -> dict[str, np.ndarray]:
+    def get_many(self, spec: str, keys: list[str]) -> dict[str, Vectors]:
         """Return the cached vectors among ``keys`` (missing keys are simply absent)."""
-        found: dict[str, np.ndarray] = {}
+        found: dict[str, Vectors] = {}
         with self._lock:
             for i in range(0, len(keys), 500):
                 chunk = keys[i : i + 500]
@@ -38,7 +40,7 @@ class EmbeddingCache:
                     found[k] = np.frombuffer(blob, dtype=np.float32)
         return found
 
-    def put_many(self, spec: str, items: dict[str, np.ndarray]) -> None:
+    def put_many(self, spec: str, items: dict[str, Vectors]) -> None:
         """Insert or replace vectors for ``spec``."""
         if not items:
             return

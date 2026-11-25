@@ -4,11 +4,11 @@ import io
 import json
 
 import pytest
-from conftest import png
 from PIL import Image
 
-from fewshot import store
+from fewshot import embedders, store
 from fewshot.store import TaskConfig, Workspace, image_id, load_image
+from tests.conftest import png
 
 RED, GREEN = (220, 30, 30), (30, 220, 30)
 
@@ -42,13 +42,16 @@ def test_default_root_uses_env_or_local_folder(monkeypatch, tmp_path):
 def test_image_id_is_short_content_hash():
     """Same bytes give the same 16-hex id; different bytes differ."""
     a = image_id(b"abc")
-    assert a == "ba7816bf8f01cfea" and image_id(b"abc") == a and image_id(b"abd") != a
+    assert a == "ba7816bf8f01cfea"
+    assert image_id(b"abc") == a
+    assert image_id(b"abd") != a
 
 
 def test_load_image_converts_to_upright_rgb():
     """Greyscale becomes RGB and EXIF rotation is applied."""
     grey = load_image(jpeg(mode="L"))
-    assert grey.mode == "RGB" and grey.size == (4, 2)
+    assert grey.mode == "RGB"
+    assert grey.size == (4, 2)
     rotated = load_image(jpeg(orientation=6))
     assert rotated.size == (2, 4)
 
@@ -65,17 +68,22 @@ def test_workspace_default_root(monkeypatch, tmp_path):
     """Without a root the workspace lives in $FEWSHOT_HOME and creates tasks/."""
     monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "home"))
     w = Workspace()
-    assert w.root == (tmp_path / "home").resolve() and (w.root / "tasks").is_dir()
+    assert w.root == (tmp_path / "home").resolve()
+    assert (w.root / "tasks").is_dir()
     assert w.cache_path == w.root / "cache.sqlite"
 
 
 def test_create_writes_task_folder(ws):
     """A new task has an images folder and a task.json at revision 1."""
     t = ws.create("pets", embedder="fake:color", classifier="knn", text_weight=0.5)
-    assert t.name == "pets" and t.path == ws.root / "tasks" / "pets"
-    assert (t.path / "images").is_dir() and not (t.path / "task.json.tmp").exists()
+    assert t.name == "pets"
+    assert t.path == ws.root / "tasks" / "pets"
+    assert (t.path / "images").is_dir()
+    assert not (t.path / "task.json.tmp").exists()
     on_disk = saved(t)
-    assert on_disk["revision"] == 1 and on_disk["classifier"] == "knn" and on_disk["text_weight"] == 0.5
+    assert on_disk["revision"] == 1
+    assert on_disk["classifier"] == "knn"
+    assert on_disk["text_weight"] == 0.5
     assert ws.get("pets") is t
 
 
@@ -105,7 +113,8 @@ def test_get_list_and_reload(ws):
     assert [t.name for t in ws.list_tasks()] == ["a", "b"]
     fresh = Workspace(ws.root)
     loaded = fresh.get("a")
-    assert loaded is not ws.get("a") and loaded.config == ws.get("a").config
+    assert loaded is not ws.get("a")
+    assert loaded.config == ws.get("a").config
     assert fresh.get("a") is loaded
     for name in ["missing", "not-a-task", "../tasks/a"]:
         with pytest.raises(KeyError, match="No task"):
@@ -116,7 +125,8 @@ def test_delete_removes_folder(ws):
     """Deleting a task removes its folder; it can then no longer be loaded."""
     t = ws.create("gone")
     ws.delete("gone")
-    assert not t.path.exists() and ws.list_tasks() == []
+    assert not t.path.exists()
+    assert ws.list_tasks() == []
     with pytest.raises(KeyError):
         ws.get("gone")
 
@@ -127,13 +137,16 @@ def test_update_settings(ws):
     t = ws.create("t")
     t.update_settings(classifier="logreg", classifier_params={"C": 2.0}, reject_below=0.5)
     on_disk = saved(t)
-    assert on_disk["classifier"] == "logreg" and on_disk["classifier_params"] == {"C": 2.0}
-    assert on_disk["reject_below"] == 0.5 and on_disk["revision"] == 2
+    assert on_disk["classifier"] == "logreg"
+    assert on_disk["classifier_params"] == {"C": 2.0}
+    assert on_disk["reject_below"] == 0.5
+    assert on_disk["revision"] == 2
     with pytest.raises(ValueError, match=r"Unknown settings: \['name'\]"):
         t.update_settings(name="other")
     with pytest.raises(ValueError, match="Unknown classifier 'svm'"):
         t.update_settings(classifier="svm")
-    assert t.config.classifier == "logreg" and t.config.revision == 2
+    assert t.config.classifier == "logreg"
+    assert t.config.revision == 2
 
 
 # ---- classes ----------------------------------------------------------
@@ -141,10 +154,13 @@ def test_upsert_class(ws):
     """Upsert strips names, creates once, and only overwrites an explicit description."""
     t = ws.create("t")
     c = t.upsert_class("  cat ", "a cat")
-    assert c.name == "cat" and c.description == "a cat"
-    assert t.upsert_class("cat") is c and c.description == "a cat"
+    assert c.name == "cat"
+    assert c.description == "a cat"
+    assert t.upsert_class("cat") is c
+    assert c.description == "a cat"
     t.upsert_class("cat", "")
-    assert c.description == "" and t.class_names() == ["cat"]
+    assert c.description == ""
+    assert t.class_names() == ["cat"]
     t.upsert_class("dog")
     assert [x["name"] for x in saved(t)["classes"]] == ["cat", "dog"]
     with pytest.raises(ValueError, match="Class name is empty"):
@@ -171,7 +187,8 @@ def test_rename_class(ws):
     g = t.add_example(png(GREEN), "green")
     t.rename_class("red", " rouge ")
     assert t.class_names() == ["rouge", "green"]
-    assert t.example(r.id).label == "rouge" and t.example(g.id).label == "green"
+    assert t.example(r.id).label == "rouge"
+    assert t.example(g.id).label == "green"
     with pytest.raises(ValueError, match="already exists"):
         t.rename_class("rouge", "green")
     with pytest.raises(ValueError, match="Class name is empty"):
@@ -190,8 +207,10 @@ def test_delete_class_removes_examples_and_files(ws):
     red_file = t.image_path(r1.id)
     (t.path / t.config.examples[1].file).unlink()  # an already-missing file is fine
     assert t.delete_class("red") == 2
-    assert not red_file.exists() and t.image_path(g.id).exists()
-    assert t.class_names() == ["green"] and [e.id for e in t.config.examples] == [g.id]
+    assert not red_file.exists()
+    assert t.image_path(g.id).exists()
+    assert t.class_names() == ["green"]
+    assert [e.id for e in t.config.examples] == [g.id]
     with pytest.raises(KeyError, match="No class 'red'"):
         t.delete_class("red")
 
@@ -203,13 +222,18 @@ def test_add_example_stores_file_and_creates_class(ws):
     t.upsert_class("red")
     p = t.add_example(png(RED), "red", "r.png")
     j = t.add_example(jpeg(), " new ", "x.jpg")
-    assert p.file == f"images/{image_id(png(RED))}.png" and p.source == "r.png"
-    assert j.file.endswith(".jpg") and j.label == "new"
+    assert p.file == f"images/{image_id(png(RED))}.png"
+    assert p.source == "r.png"
+    assert j.file.endswith(".jpg")
+    assert j.label == "new"
     assert (t.path / j.file).read_bytes() == jpeg()
     assert t.class_names() == ["red", "new"]
     assert [e["id"] for e in saved(t)["examples"]] == [p.id, j.id]
     again = t.add_example(png(RED), "new", "copy.png")
-    assert again is p and p.label == "new" and p.source == "r.png" and len(t.config.examples) == 2
+    assert again is p
+    assert p.label == "new"
+    assert p.source == "r.png"
+    assert len(t.config.examples) == 2
 
 
 def test_add_example_recreates_missing_images_folder(ws):
@@ -225,7 +249,8 @@ def test_add_example_rejects_empty_label(ws):
     t = ws.create("t")
     with pytest.raises(ValueError, match="Class name is empty"):
         t.add_example(png(RED), "  ")
-    assert t.config.examples == [] and not list((t.path / "images").iterdir())
+    assert t.config.examples == []
+    assert not list((t.path / "images").iterdir())
 
 
 def test_add_examples_from_dir(ws, tmp_path):
@@ -252,11 +277,14 @@ def test_example_lookup_relabel_and_delete(ws):
     with pytest.raises(KeyError, match="No example 'nope'"):
         t.example("nope")
     assert t.relabel(e.id, "blue").label == "blue"
-    assert t.relabel(e.id, " green ").label == "green" and t.class_names() == ["red", "blue", "green"]
+    assert t.relabel(e.id, " green ").label == "green"
+    assert t.class_names() == ["red", "blue", "green"]
     assert saved(t)["examples"][0]["label"] == "green"
     path = t.image_path(e.id)
     t.delete_example(e.id)
-    assert not path.exists() and t.config.examples == [] and saved(t)["examples"] == []
+    assert not path.exists()
+    assert t.config.examples == []
+    assert saved(t)["examples"] == []
     with pytest.raises(KeyError):
         t.delete_example(e.id)
 
@@ -277,4 +305,6 @@ def test_summary_counts_every_class(ws):
 def test_task_config_defaults():
     """A bare config uses the default embedder and the prototype classifier."""
     cfg = TaskConfig(name="x")
-    assert cfg.embedder == store.DEFAULT_SPEC and cfg.classifier == "prototype" and cfg.revision == 0
+    assert cfg.embedder == embedders.DEFAULT_SPEC
+    assert cfg.classifier == "prototype"
+    assert cfg.revision == 0

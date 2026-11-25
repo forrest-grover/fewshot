@@ -2,11 +2,13 @@
 
 import numpy as np
 import pytest
-from conftest import REGISTRY, ColorEmbedder, png
 from PIL import Image
 
+from fewshot.classifiers import KNNClassifier
+from fewshot.embedders import register_embedder, unregister_embedder
 from fewshot.pipeline import Pipeline, Prediction
 from fewshot.store import image_id
+from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
 TEXT_SPEC = "openclip:fake-color"
@@ -37,10 +39,10 @@ class CountingEmbedder(ColorEmbedder):
 def fixture_emb():
     """A counting embedder registered both as "fake:color" and as a text-capable CLIP-like spec."""
     e = CountingEmbedder()
-    REGISTRY["fake:color"] = e
-    REGISTRY[TEXT_SPEC] = e
+    register_embedder("fake:color", e)
+    register_embedder(TEXT_SPEC, e)
     yield e
-    REGISTRY.pop(TEXT_SPEC, None)
+    unregister_embedder(TEXT_SPEC)
 
 
 def make_task(ws, name="t", embedder="fake:color", **settings):
@@ -66,19 +68,25 @@ def test_embed_images_uses_and_fills_cache(ws, emb):
     red, green = png(RED), png(GREEN)
     blue_im = Image.new("RGB", (4, 4), BLUE)
     out = pipe.embed_images("fake:color", [("r", red), (None, blue_im)])
-    assert out.shape == (2, 3) and out.dtype == np.float32 and emb.images == 2
+    assert out.shape == (2, 3)
+    assert out.dtype == np.float32
+    assert emb.images == 2
     assert set(pipe.cache.get_many("fake:color", ["r", "g"])) == {"r"}
     out2 = pipe.embed_images("fake:color", [("g", green), ("r", red), (None, blue_im)])
     assert emb.images == 4  # only "g" and the PIL image
     np.testing.assert_allclose(out2[1], out[0], atol=1e-6)
     np.testing.assert_allclose(out2[2], out[1], atol=1e-6)
-    assert out2[0].argmax() == 1 and out2[1].argmax() == 0 and out2[2].argmax() == 2
-    assert pipe.embed_images("fake:color", [("g", green)]).shape == (1, 3) and emb.images == 4
+    assert out2[0].argmax() == 1
+    assert out2[1].argmax() == 0
+    assert out2[2].argmax() == 2
+    assert pipe.embed_images("fake:color", [("g", green)]).shape == (1, 3)
+    assert emb.images == 4
 
 
 def test_embed_images_empty(ws, emb):
     """No items gives an empty matrix without touching the model."""
-    assert Pipeline(ws).embed_images("fake:color", []).shape == (0, 0) and emb.images == 0
+    assert Pipeline(ws).embed_images("fake:color", []).shape == (0, 0)
+    assert emb.images == 0
 
 
 def test_embed_texts_caches_and_dedupes(ws, emb):
@@ -86,7 +94,8 @@ def test_embed_texts_caches_and_dedupes(ws, emb):
     pipe = Pipeline(ws)
     out = pipe.embed_texts(TEXT_SPEC, ["a red thing", "blue", "a red thing"])
     assert emb.texts == ["a red thing", "blue"]
-    assert out.shape == (3, 3) and [int(r.argmax()) for r in out] == [0, 2, 0]
+    assert out.shape == (3, 3)
+    assert [int(r.argmax()) for r in out] == [0, 2, 0]
     out2 = pipe.embed_texts(TEXT_SPEC, ["blue", "green"])
     assert emb.texts == ["a red thing", "blue", "green"]
     np.testing.assert_allclose(out2[0], out[1])
@@ -101,10 +110,14 @@ def test_class_data_and_exclude(ws, emb):
     t.upsert_class("red", "a red thing")
     pipe = Pipeline(ws)
     d = pipe.class_data(t)
-    assert d.classes == ["red", "green", "blue"] and d.y.tolist() == [0, 0, 1, 1, 2, 2]
-    assert d.X.shape == (6, 3) and not d.text and emb.texts == []
+    assert d.classes == ["red", "green", "blue"]
+    assert d.y.tolist() == [0, 0, 1, 1, 2, 2]
+    assert d.X.shape == (6, 3)
+    assert not d.text
+    assert emb.texts == []
     d2 = pipe.class_data(t, exclude={0, 3})
-    assert d2.y.tolist() == [0, 1, 2, 2] and d2.X.shape == (4, 3)
+    assert d2.y.tolist() == [0, 1, 2, 2]
+    assert d2.X.shape == (4, 3)
     np.testing.assert_allclose(d2.X[0], d.X[1])
 
 
@@ -117,8 +130,10 @@ def test_class_data_text_for_described_classes(ws, emb):
     t.upsert_class("red", "   ")
     t.upsert_class("purple", "a green-ish purple")
     d = pipe.class_data(t)
-    assert sorted(d.text) == [2, 3] and emb.texts == ["something blue", "a green-ish purple"]
-    assert d.text[2].argmax() == 2 and d.text[3].argmax() == 1
+    assert sorted(d.text) == [2, 3]
+    assert emb.texts == ["something blue", "a green-ish purple"]
+    assert d.text[2].argmax() == 2
+    assert d.text[3].argmax() == 1
 
 
 def test_text_only_class_is_predicted(ws, emb):
@@ -138,12 +153,17 @@ def test_fitted_is_reused_until_task_changes(ws, emb):
     t = make_task(ws, classifier="knn", classifier_params={"k": 3}, text_weight=0.25)
     pipe = Pipeline(ws)
     clf = pipe.fitted(t)
-    assert clf.k == 3 and clf.text_weight == 0.25
+    assert isinstance(clf, KNNClassifier)
+    assert clf.k == 3
+    assert clf.text_weight == 0.25
     n = emb.images
-    assert pipe.fitted(t) is clf and emb.images == n
+    assert pipe.fitted(t) is clf
+    assert emb.images == n
     t.update_settings(classifier_params={"k": 1})
     clf2 = pipe.fitted(t)
-    assert clf2 is not clf and clf2.k == 1
+    assert isinstance(clf2, KNNClassifier)
+    assert clf2 is not clf
+    assert clf2.k == 1
     assert emb.images == n  # refit reused cached example embeddings
 
 
@@ -176,7 +196,8 @@ def test_predict_accepts_bytes_paths_and_pil(ws, emb, tmp_path):
     preds = pipe.predict("t", [red, str(tmp_path / "g.png"), tmp_path / "b.png", pil])
     assert [p.label for p in preds] == ["red", "green", "blue", preds[3].top_label]
     assert all(not p.rejected and abs(sum(p.scores.values()) - 1) < 1e-6 for p in preds)
-    assert preds[0].confidence == max(preds[0].scores.values()) and 0 < preds[0].similarity <= 1
+    assert preds[0].confidence == max(preds[0].scores.values())
+    assert 0 < preds[0].similarity <= 1
     cached = pipe.cache.get_many("fake:color", [image_id(b) for b in (red, green, blue)])
     assert len(cached) == 3
     n = emb.images
@@ -189,8 +210,12 @@ def test_predict_threshold_keeps_confident_labels(ws, emb):
     """With reject_below set, similar images keep their label and dissimilar ones are rejected."""
     t = make_task(ws, reject_below=0.95)
     preds = Pipeline(ws).predict(t, [png(RED, seed=4), png((128, 128, 128))])
-    assert preds[0].label == "red" and not preds[0].rejected and preds[0].similarity >= 0.95
-    assert preds[1].label is None and preds[1].rejected and preds[1].similarity < 0.95
+    assert preds[0].label == "red"
+    assert not preds[0].rejected
+    assert preds[0].similarity >= 0.95
+    assert preds[1].label is None
+    assert preds[1].rejected
+    assert preds[1].similarity < 0.95
     assert emb.texts == []
 
 

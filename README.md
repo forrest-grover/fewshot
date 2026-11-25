@@ -66,6 +66,14 @@ task.add_example(open("crack.jpg", "rb").read(), "crack")
 pred = Pipeline(ws).predict(task, ["new.jpg"])[0]   # .label, .confidence, .similarity, .scores
 ```
 
+To use your own model, subclass `fewshot.embedders.Embedder` (implement `dim` and `_embed_image_batch`, returning L2-normalised float32 rows) and register it under any spec string; `unregister_embedder` removes it again.
+
+```python
+from fewshot import register_embedder
+register_embedder("mine:v1", MyEmbedder())
+task = ws.create("parts", embedder="mine:v1")
+```
+
 ## REST API
 
 `GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `GET .../examples/{id}/image`, `POST .../predict` (multipart `files`), `POST .../evaluate`. OpenAPI docs are served at `/docs`.

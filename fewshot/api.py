@@ -6,7 +6,7 @@ The built web UI (web/dist) is served at / when present.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -68,7 +68,7 @@ def _detail(t: Task) -> dict[str, Any]:
 
 # ---- metadata -----------------------------------------------------------
 @app.get("/api/models")
-def models():
+def models() -> dict[str, Any]:
     """List embedder presets and classifier names."""
     return {
         "embedders": [p.__dict__ for p in PRESETS],
@@ -81,29 +81,29 @@ class TaskCreate(BaseModel):
     """Body of POST /api/tasks."""
 
     name: str
-    embedder: Optional[str] = None
+    embedder: str | None = None
     classifier: str = "prototype"
 
 
 class TaskSettings(BaseModel):
     """Body of PATCH /api/tasks/{name}; omitted fields are left unchanged."""
 
-    embedder: Optional[str] = None
-    classifier: Optional[str] = None
-    classifier_params: Optional[dict[str, Any]] = None
-    text_weight: Optional[float] = None
-    reject_below: Optional[float] = None
+    embedder: str | None = None
+    classifier: str | None = None
+    classifier_params: dict[str, Any] | None = None
+    text_weight: float | None = None
+    reject_below: float | None = None
     clear_reject: bool = False
 
 
 @app.get("/api/tasks")
-def list_tasks():
+def list_tasks() -> list[dict[str, Any]]:
     """Summaries of all tasks."""
     return [t.summary() for t in ws.list_tasks()]
 
 
 @app.post("/api/tasks", status_code=201)
-def create_task(body: TaskCreate):
+def create_task(body: TaskCreate) -> dict[str, Any]:
     """Create a task, validating the embedder spec first."""
     kw = {"classifier": body.classifier}
     if body.embedder:
@@ -116,13 +116,13 @@ def create_task(body: TaskCreate):
 
 
 @app.get("/api/tasks/{name}")
-def get_task(name: str):
+def get_task(name: str) -> dict[str, Any]:
     """Full detail of one task."""
     return _detail(_task(name))
 
 
 @app.patch("/api/tasks/{name}")
-def update_task(name: str, body: TaskSettings):
+def update_task(name: str, body: TaskSettings) -> dict[str, Any]:
     """Change task settings; switching classifier resets its params unless new ones are given."""
     t = _task(name)
     kw = body.model_dump(exclude_none=True, exclude={"clear_reject"})
@@ -140,7 +140,7 @@ def update_task(name: str, body: TaskSettings):
 
 
 @app.delete("/api/tasks/{name}", status_code=204)
-def delete_task(name: str):
+def delete_task(name: str) -> None:
     """Delete a task and its images."""
     _task(name)
     ws.delete(name)
@@ -151,18 +151,18 @@ class ClassBody(BaseModel):
     """Body of POST .../classes."""
 
     name: str
-    description: Optional[str] = None
+    description: str | None = None
 
 
 class ClassPatch(BaseModel):
     """Body of PATCH .../classes/{label}: rename and/or set the description."""
 
-    name: Optional[str] = None
-    description: Optional[str] = None
+    name: str | None = None
+    description: str | None = None
 
 
 @app.post("/api/tasks/{name}/classes", status_code=201)
-def add_class(name: str, body: ClassBody):
+def add_class(name: str, body: ClassBody) -> dict[str, Any]:
     """Add a class, or update the description of an existing one."""
     t = _task(name)
     try:
@@ -173,7 +173,7 @@ def add_class(name: str, body: ClassBody):
 
 
 @app.patch("/api/tasks/{name}/classes/{label}")
-def patch_class(name: str, label: str, body: ClassPatch):
+def patch_class(name: str, label: str, body: ClassPatch) -> dict[str, Any]:
     """Rename a class (relabelling its examples) and/or set its description."""
     t = _task(name)
     if label not in t.class_names():
@@ -200,7 +200,7 @@ class Describe(BaseModel):
 
 
 @app.post("/api/tasks/{name}/describe")
-def describe_classes(name: str, body: Describe):
+def describe_classes(name: str, body: Describe) -> dict[str, Any]:
     """Fill class descriptions from a template such as 'a photo of a {}'."""
     t = _task(name)
     try:
@@ -211,7 +211,7 @@ def describe_classes(name: str, body: Describe):
 
 
 @app.delete("/api/tasks/{name}/classes/{label}")
-def delete_class(name: str, label: str):
+def delete_class(name: str, label: str) -> dict[str, Any]:
     """Delete a class and all of its examples."""
     t = _task(name)
     try:
@@ -223,10 +223,11 @@ def delete_class(name: str, label: str):
 
 # ---- examples -----------------------------------------------------------
 @app.post("/api/tasks/{name}/examples", status_code=201)
-def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = File(...)):
+def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = File(...)) -> dict[str, Any]:
     """Upload images as examples of ``label``; unreadable files are reported in ``errors``."""
     t = _task(name)
-    added, errors = [], []
+    added: list[dict[str, Any]] = []
+    errors: list[dict[str, str | None]] = []
     for f in files:
         try:
             added.append(t.add_example(f.file.read(), label, f.filename or "").model_dump())
@@ -242,7 +243,7 @@ class Relabel(BaseModel):
 
 
 @app.patch("/api/tasks/{name}/examples/{eid}")
-def relabel(name: str, eid: str, body: Relabel):
+def relabel(name: str, eid: str, body: Relabel) -> dict[str, Any]:
     """Move an example to another (possibly new) class."""
     t = _task(name)
     try:
@@ -253,7 +254,7 @@ def relabel(name: str, eid: str, body: Relabel):
 
 
 @app.delete("/api/tasks/{name}/examples/{eid}")
-def delete_example(name: str, eid: str):
+def delete_example(name: str, eid: str) -> dict[str, Any]:
     """Delete one example."""
     t = _task(name)
     try:
@@ -264,7 +265,7 @@ def delete_example(name: str, eid: str):
 
 
 @app.get("/api/tasks/{name}/examples/{eid}/image")
-def example_image(name: str, eid: str):
+def example_image(name: str, eid: str) -> FileResponse:
     """Serve an example's image file (content-addressed, so cached forever)."""
     t = _task(name)
     try:
@@ -275,7 +276,7 @@ def example_image(name: str, eid: str):
 
 # ---- inference ----------------------------------------------------------
 @app.post("/api/tasks/{name}/predict")
-def predict(name: str, files: list[UploadFile] = File(...)):
+def predict(name: str, files: list[UploadFile] = File(...)) -> list[dict[str, Any]]:
     """Classify uploaded images."""
     t = _task(name)
     blobs = [f.file.read() for f in files]
@@ -283,11 +284,11 @@ def predict(name: str, files: list[UploadFile] = File(...)):
         preds = pipe.predict(t, blobs)
     except ValueError as e:
         raise _bad(e) from e
-    return [{"file": f.filename, **p.to_dict()} for f, p in zip(files, preds)]
+    return [{"file": f.filename, **p.to_dict()} for f, p in zip(files, preds, strict=True)]
 
 
 @app.post("/api/tasks/{name}/evaluate")
-def evaluate(name: str, folds: Optional[int] = None):
+def evaluate(name: str, folds: int | None = None) -> dict[str, Any]:
     """Cross-validate the task (leave-one-out unless ``folds`` is given)."""
     try:
         return evaluate_task(pipe, _task(name), folds)
@@ -304,7 +305,7 @@ def mount_ui(application: FastAPI, dist: Path) -> None:
     application.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
 
     @application.get("/{path:path}", include_in_schema=False)
-    def spa(path: str):
+    def spa(path: str) -> FileResponse:
         if path == "api" or path.startswith("api/"):
             raise HTTPException(404, "Not Found")  # unknown API routes must not get the HTML page
         f = dist / path

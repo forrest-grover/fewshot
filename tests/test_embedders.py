@@ -1,6 +1,7 @@
 """Tests for fewshot.embedders using tiny fake OpenCLIP/timm models (no downloads, no GPU required)."""
 
 import contextlib
+from types import SimpleNamespace
 
 import numpy as np
 import open_clip
@@ -10,6 +11,7 @@ import timm.data
 import torch
 from PIL import Image
 
+import fewshot
 from fewshot import embedders
 from fewshot.embedders import (
     DEFAULT_SPEC,
@@ -18,8 +20,11 @@ from fewshot.embedders import (
     OpenCLIPEmbedder,
     TimmEmbedder,
     get_embedder,
+    register_embedder,
     spec_supports_text,
+    unregister_embedder,
 )
+from tests.conftest import ColorEmbedder
 
 CLIP_DIM = 4
 TIMM_DIM = 5
@@ -59,8 +64,7 @@ class FakeCLIP(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.visual = torch.nn.Module()
-        self.visual.output_dim = CLIP_DIM
+        self.visual = SimpleNamespace(output_dim=CLIP_DIM)  # only output_dim is read
         self.image_batches = []
         self.text_batches = []
 
@@ -166,7 +170,7 @@ def fixture_fake_cuda(monkeypatch):
     """Pretend a GPU is present without needing one.
 
     ``Tensor.to("cuda")`` is redirected to a no-op and ``torch.autocast`` is replaced by a recorder, so the CUDA code
-    path runs on any machine. Yields the lists of tensor-move devices and autocast calls.
+    path runs on any machine. Returns the lists of tensor-move devices and autocast calls.
     """
     moves, autocasts = [], []
     real_to = torch.Tensor.to
@@ -186,7 +190,7 @@ def fixture_fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.Tensor, "to", to)
     monkeypatch.setattr(torch, "autocast", autocast)
-    yield moves, autocasts
+    return moves, autocasts
 
 
 # --- module-level helpers -------------------------------------------------------------------------------------------
@@ -235,7 +239,7 @@ def test_l2_normalises_to_float32():
 
 def test_presets_and_spec_supports_text():
     """Text support is decided by backend and agrees with every preset."""
-    assert DEFAULT_SPEC == PRESETS[0].spec
+    assert PRESETS[0].spec == DEFAULT_SPEC
     assert all(isinstance(p, EmbedderInfo) for p in PRESETS)
     for p in PRESETS:
         assert spec_supports_text(p.spec) == p.supports_text
@@ -436,10 +440,29 @@ def test_get_embedder_rejects_unknown_backend():
     assert not embedders._loaded  # pylint: disable=protected-access  # nothing cached on failure
 
 
-def test_get_embedder_returns_preloaded_instance():
-    """Anything already in the cache is returned as is, whatever its backend."""
-    # conftest preloads a fake embedder under a spec whose backend get_embedder could not build itself.
+def test_get_embedder_returns_registered_instance():
+    """A registered embedder is returned as is, whatever its backend."""
+    # conftest registers a fake embedder under a spec whose backend get_embedder could not build itself.
     emb = get_embedder("fake:color")
-    assert emb is embedders._loaded["fake:color"]  # pylint: disable=protected-access  # cache populated by conftest
+    assert isinstance(emb, ColorEmbedder)
     out = emb.embed_images([solid((255, 0, 0))])
     assert out.shape == (1, 3)
+
+
+def test_register_and_unregister_embedder():
+    """register_embedder adds or replaces a spec; unregister_embedder removes it and ignores unknown specs."""
+    first, second = ColorEmbedder(), ColorEmbedder()
+    register_embedder("custom:mine", first)
+    assert get_embedder("custom:mine") is first
+    register_embedder("custom:mine", second)
+    assert get_embedder("custom:mine") is second
+    unregister_embedder("custom:mine")
+    with pytest.raises(ValueError, match="Unknown embedder backend 'custom'"):
+        get_embedder("custom:mine")
+    unregister_embedder("custom:mine")  # already gone: no error
+    unregister_embedder("never:registered")
+
+
+def test_register_embedder_is_exported_lazily():
+    """The top-level package re-exports register_embedder."""
+    assert fewshot.register_embedder is register_embedder

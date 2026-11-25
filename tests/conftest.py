@@ -6,11 +6,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from fewshot import Workspace, embedders
-from fewshot.embedders import Embedder
-
-# Tests inject into the embedder registry directly; there is no public registration API.
-REGISTRY = embedders._loaded  # pylint: disable=protected-access
+from fewshot import Workspace
+from fewshot.embedders import Embedder, register_embedder, unregister_embedder
 
 
 # Image-only on purpose: the inherited text path raises NotImplementedError, like DINOv2.
@@ -40,9 +37,9 @@ def png(rgb, size=8, noise=0, seed=0):
 @pytest.fixture(autouse=True)
 def fake_embedder():
     """Register the "fake:color" spec so no real model is ever loaded."""
-    REGISTRY["fake:color"] = ColorEmbedder()
+    register_embedder("fake:color", ColorEmbedder())
     yield
-    REGISTRY.pop("fake:color", None)
+    unregister_embedder("fake:color")
 
 
 @pytest.fixture

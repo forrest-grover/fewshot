@@ -1,12 +1,15 @@
 """Tests for fewshot.evaluate: cross-validation of tasks and episodic folder benchmarks."""
 
+from typing import Any
+
 import numpy as np
 import pytest
 
-from conftest import ColorEmbedder, png
-from fewshot import Pipeline, benchmark, embedders, evaluate_task
+from fewshot import Pipeline, benchmark, evaluate_task
 from fewshot.classifiers import ClassData
+from fewshot.embedders import register_embedder, unregister_embedder
 from fewshot.evaluate import _folds, _subset, load_folder_dataset  # pylint: disable=protected-access  # unit tests
+from tests.conftest import ColorEmbedder, png
 
 COLORS = {"red": (220, 30, 30), "green": (30, 220, 30), "blue": (30, 30, 220), "yellow": (220, 220, 30)}
 TEXT_SPEC = "openclip:fake-color"  # "openclip:" prefix makes the pipeline use class descriptions
@@ -27,9 +30,9 @@ class ColorTextEmbedder(ColorEmbedder):
 @pytest.fixture(name="text_embedder")
 def fixture_text_embedder():
     """Register the text-capable fake embedder for the duration of a test."""
-    embedders._loaded[TEXT_SPEC] = ColorTextEmbedder()  # pylint: disable=protected-access  # test registry
+    register_embedder(TEXT_SPEC, ColorTextEmbedder())
     yield TEXT_SPEC
-    embedders._loaded.pop(TEXT_SPEC, None)  # pylint: disable=protected-access  # test registry
+    unregister_embedder(TEXT_SPEC)
 
 
 def colour_task(ws, n=3, classes=("red", "green", "blue"), embedder="fake:color", **settings):
@@ -66,7 +69,8 @@ def test_subset_drops_empty_classes_but_keeps_text_ones():
     data = ClassData(["a", "b", "c", "d"], X, np.array([0, 1, 1, 3]), {2: np.ones(4, np.float32)})
     sub, back = _subset(data, np.array([1, 3]))
     assert sub.classes == ["b", "c", "d"]
-    assert sub.y.tolist() == [0, 2] and back.tolist() == [1, 2, 3]
+    assert sub.y.tolist() == [0, 2]
+    assert back.tolist() == [1, 2, 3]
     assert list(sub.text) == [1]
     np.testing.assert_array_equal(sub.X, X[[1, 3]])
 
@@ -85,7 +89,8 @@ def test_k_fold_report(ws):
     t = colour_task(ws, n=4)
     r = evaluate_task(Pipeline(ws), t, folds=2)
     assert r["method"] == "2-fold"
-    assert r["n_examples"] == r["n_scored"] == 12 and r["accuracy"] == 1.0
+    assert r["n_examples"] == r["n_scored"] == 12
+    assert r["accuracy"] == 1.0
     assert r["classes"] == ["red", "green", "blue"]
     assert r["confusion"] == [[4, 0, 0], [0, 4, 0], [0, 0, 4]]
     assert r["per_class"]["green"] == {"support": 4, "recall": 1.0, "precision": 1.0}
@@ -100,7 +105,8 @@ def test_mislabelled_example_is_reported_as_mistake(ws):
     assert r["method"] == "leave-one-out"
     assert len(r["mistakes"]) == 1
     m = r["mistakes"][0]
-    assert (m["id"], m["true"], m["pred"]) == (bad.id, "blue", "red") and 0.5 < m["confidence"] <= 1.0
+    assert (m["id"], m["true"], m["pred"]) == (bad.id, "blue", "red")
+    assert 0.5 < m["confidence"] <= 1.0
     assert r["accuracy"] == pytest.approx(9 / 10)
     assert r["confusion"][2][0] == 1
     assert r["per_class"]["blue"]["recall"] == pytest.approx(3 / 4)
@@ -122,8 +128,11 @@ def test_nothing_scorable_gives_none_metrics(ws):
     # Two singleton classes: every LOO fold leaves only one class to train on.
     t = colour_task(ws, n=1, classes=("red", "green"))
     r = evaluate_task(Pipeline(ws), t)
-    assert r["n_scored"] == 0 and r["n_examples"] == 2 and r["accuracy"] is None
-    assert r["confusion"] == [[0, 0], [0, 0]] and r["mistakes"] == []
+    assert r["n_scored"] == 0
+    assert r["n_examples"] == 2
+    assert r["accuracy"] is None
+    assert r["confusion"] == [[0, 0], [0, 0]]
+    assert r["mistakes"] == []
     assert r["per_class"]["red"] == {"support": 0, "recall": None, "precision": None}
 
 
@@ -134,7 +143,8 @@ def test_described_class_stays_trainable_in_every_fold(ws, text_embedder):
     t.add_example(png(COLORS["blue"]), "blue")
     t.upsert_class("blue", "something blue")
     r = evaluate_task(Pipeline(ws), t)
-    assert r["n_scored"] == 5 and r["accuracy"] == 1.0
+    assert r["n_scored"] == 5
+    assert r["accuracy"] == 1.0
     assert r["per_class"]["blue"]["recall"] == 1.0
 
 
@@ -168,7 +178,7 @@ def test_load_folder_dataset_filters(tmp_path):
 def test_benchmark_separable_colours(ws, tmp_path):
     """Separable colours score 100% and progress is reported once."""
     folder = make_folder(tmp_path / "data")
-    messages = []
+    messages: list[str] = []
     r = benchmark(Pipeline(ws), folder, "fake:color", way=3, shot=2, query=3, episodes=5, progress=messages.append)
     assert r == {
         "embedder": "fake:color", "classifier": "prototype", "way": 3, "shot": 2, "query": 3,
@@ -182,9 +192,10 @@ def test_benchmark_is_seeded_and_passes_classifier_params(ws, tmp_path):
     folder = make_folder(tmp_path / "data", per_class=4, classes=("red", "yellow"))
     (folder / "red" / "0.png").write_bytes(png(COLORS["yellow"]))  # one confusing image
     pipe = Pipeline(ws)
-    kw = {"way": 2, "shot": 1, "query": 1, "episodes": 6, "classifier": "knn", "k": 1}
+    kw: dict[str, Any] = {"way": 2, "shot": 1, "query": 1, "episodes": 6, "classifier": "knn", "k": 1}
     runs = [benchmark(pipe, folder, "fake:color", seed=s, **kw) for s in (0, 0, 1, 2, 3)]
-    assert runs[0] == runs[1] and runs[0]["classifier"] == "knn"
+    assert runs[0] == runs[1]
+    assert runs[0]["classifier"] == "knn"
     assert len({r["accuracy"] for r in runs}) > 1  # different seeds draw different episodes
     with pytest.raises(TypeError, match="'k'"):
         benchmark(pipe, folder, "fake:color", way=2, shot=1, query=1, episodes=1, k=1)  # prototype has no k
@@ -194,7 +205,9 @@ def test_benchmark_single_episode_has_zero_ci(ws, tmp_path):
     """One episode reports a zero-width confidence interval."""
     folder = make_folder(tmp_path / "data", classes=("red", "blue"))
     r = benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=1, query=1, episodes=1)
-    assert r["episodes"] == 1 and r["ci95"] == 0.0 and r["accuracy"] == 1.0
+    assert r["episodes"] == 1
+    assert r["ci95"] == 0.0
+    assert r["accuracy"] == 1.0
 
 
 def test_benchmark_ci_from_varying_episodes(ws, tmp_path):
@@ -203,7 +216,8 @@ def test_benchmark_ci_from_varying_episodes(ws, tmp_path):
     # Swap one image so 'red' contains a yellow one: episodes that query it score 0.5.
     (folder / "red" / "0.png").write_bytes(png(COLORS["yellow"]))
     r = benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=1, query=1, episodes=30)
-    assert 0.5 < r["accuracy"] < 1.0 and r["ci95"] > 0.0
+    assert 0.5 < r["accuracy"] < 1.0
+    assert r["ci95"] > 0.0
 
 
 def test_benchmark_too_few_classes(ws, tmp_path):
@@ -221,7 +235,9 @@ def test_benchmark_zero_shot_with_text_template(ws, tmp_path, text_embedder):
     (folder / "red").rename(folder / "dark_red")  # underscores become spaces in the prompt
     r = benchmark(Pipeline(ws), folder, text_embedder, way=4, shot=0, query=3, episodes=4,
                   text_template="a photo of something {}")
-    assert r["shot"] == 0 and r["text_template"] == "a photo of something {}" and r["accuracy"] == 1.0
+    assert r["shot"] == 0
+    assert r["text_template"] == "a photo of something {}"
+    assert r["accuracy"] == 1.0
     cached = Pipeline(ws).cache.get_many(text_embedder, ["text:a photo of something dark red"])
     assert len(cached) == 1
 

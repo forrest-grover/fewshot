@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint"]
+dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint", "ruff", "mypy"]
 
 [project.scripts]
 fewshot = "fewshot.cli:app"
@@ -43,12 +43,39 @@ show_missing = true
 fail_under = 100
 exclude_also = ["if __name__ == .__main__.:"]
 
-[tool.pylint.main]
-init-hook = "import sys; sys.path.insert(0, 'tests')"
-
 [tool.pylint.format]
 max-line-length = 120
 
 [tool.pylint.basic]
 # One- and two-character names are standard notation for embeddings and matrices (X, y, Q, P, k).
 good-names-rgxs = ["^[_a-zA-Z][_a-zA-Z0-9]?$"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["web"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "NPY", "PT"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer and FastAPI declare parameters with these calls in argument defaults by design.
+extend-immutable-calls = ["typer.Option", "typer.Argument", "fastapi.File", "fastapi.Form"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["fewshot", "tests"]
+
+[[tool.mypy.overrides]]
+# These ML libraries have no (or incomplete) type information; treat them as Any.
+module = ["open_clip", "open_clip.*", "timm", "timm.*", "torchvision.*", "sklearn.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# Tests: check bodies and calls, but don't require annotations on every test function and fixture.
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false

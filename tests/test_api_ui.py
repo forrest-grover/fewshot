@@ -31,7 +31,8 @@ def test_index_and_spa_fallback(ui):
     """The root and unknown client-side routes get index.html."""
     for path in ["/", "/tasks/pets", "/does/not/exist.js", "/assets"]:
         r = ui.get(path)
-        assert r.status_code == 200 and r.text == "<html>INDEX</html>", path
+        assert r.status_code == 200, path
+        assert r.text == "<html>INDEX</html>", path
         assert r.headers["content-type"].startswith("text/html")
 
 
@@ -39,7 +40,8 @@ def test_real_files(ui):
     """Files in dist and dist/assets are served as-is."""
     assert ui.get("/favicon.svg").text == "<svg/>"
     r = ui.get("/assets/app.js")
-    assert r.status_code == 200 and r.text == "console.log('app')"
+    assert r.status_code == 200
+    assert r.text == "console.log('app')"
     assert ui.get("/assets/missing.js").status_code == 404
 
 
@@ -55,7 +57,8 @@ def test_unknown_api_route_is_404(ui):
     """Unmatched /api paths are a JSON 404, not the HTML page."""
     assert ui.get("/api").status_code == 404
     r = ui.get("/api/nope")
-    assert r.status_code == 404 and r.json() == {"detail": "Not Found"}
+    assert r.status_code == 404
+    assert r.json() == {"detail": "Not Found"}
     assert ui.get("/apiary").text == "<html>INDEX</html>"
 
 

@@ -13,14 +13,21 @@ from __future__ import annotations
 import contextlib
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 from PIL import Image
 
 # torch is imported inside functions so that importing this module (for PRESETS)
 # stays fast for the CLI.
+if TYPE_CHECKING:
+    import torch
+
+Vectors = npt.NDArray[np.float32]  # L2-normalised embeddings, one per row
 
 
 @dataclass(frozen=True)
@@ -70,7 +77,7 @@ def _device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _autocast(device: str):
+def _autocast(device: str) -> AbstractContextManager[Any]:
     """Half-precision autocast on CUDA; a no-op context on CPU."""
     if device != "cuda":
         return contextlib.nullcontext()
@@ -79,10 +86,11 @@ def _autocast(device: str):
     return torch.autocast("cuda", dtype=torch.float16)
 
 
-def _l2(x) -> np.ndarray:
+def _l2(x: torch.Tensor) -> Vectors:
     x = x.float()
     x = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    return x.cpu().numpy().astype(np.float32)
+    out: Vectors = x.cpu().numpy().astype(np.float32)
+    return out
 
 
 class Embedder(ABC):
@@ -91,7 +99,7 @@ class Embedder(ABC):
     spec: str
     supports_text: bool = False
     # Text hook: embedders that set ``supports_text`` provide this; ``embed_texts`` checks the flag first.
-    _embed_text_batch: Callable[[list[str]], np.ndarray]
+    _embed_text_batch: Callable[[list[str]], Vectors]
     batch_size: int = 64
 
     def __init__(self) -> None:
@@ -99,27 +107,27 @@ class Embedder(ABC):
         self._lock = threading.Lock()
 
     @abstractmethod
-    def _embed_image_batch(self, images: Sequence[Image.Image]) -> np.ndarray: ...
+    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors: ...
 
     @property
     @abstractmethod
     def dim(self) -> int:
         """Length of each embedding vector."""
 
-    def embed_images(self, images: Sequence[Image.Image]) -> np.ndarray:
+    def embed_images(self, images: Sequence[Image.Image]) -> Vectors:
         """Embed images (converted to RGB) in batches of ``batch_size``; returns an ``(n, dim)`` array."""
         if not images:
             return np.zeros((0, self.dim), dtype=np.float32)
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
-        out = []
+        out: list[Vectors] = []
         with self._lock, torch.inference_mode():
             for i in range(0, len(images), self.batch_size):
                 batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
                 out.append(self._embed_image_batch(batch))
         return np.concatenate(out)
 
-    def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
+    def embed_texts(self, texts: Sequence[str]) -> Vectors:
         """Embed texts into the image embedding space; raises NotImplementedError if unsupported."""
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
@@ -153,14 +161,14 @@ class OpenCLIPEmbedder(Embedder):
     def dim(self) -> int:
         return self._dim
 
-    def _embed_image_batch(self, images):
+    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors:
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
         with _autocast(self.device):
             return _l2(self.model.encode_image(x))
 
-    def _embed_text_batch(self, texts):
+    def _embed_text_batch(self, texts: list[str]) -> Vectors:
         tok = self.tokenizer(texts).to(self.device)
         with _autocast(self.device):
             return _l2(self.model.encode_text(tok))
@@ -184,7 +192,7 @@ class TimmEmbedder(Embedder):
     def dim(self) -> int:
         return self._dim
 
-    def _embed_image_batch(self, images):
+    def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors:
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
@@ -213,6 +221,21 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
             raise ValueError(f"Unknown embedder backend {backend!r} (use 'openclip' or 'timm')")
         _loaded[spec] = emb
         return emb
+
+
+def register_embedder(spec: str, embedder: Embedder) -> None:
+    """Make ``get_embedder(spec)`` return ``embedder``, replacing any embedder loaded under ``spec``.
+
+    Use this to plug in your own ``Embedder`` subclass under any spec string.
+    """
+    with _load_lock:
+        _loaded[spec] = embedder
+
+
+def unregister_embedder(spec: str) -> None:
+    """Forget the embedder registered or loaded under ``spec``; does nothing if there is none."""
+    with _load_lock:
+        _loaded.pop(spec, None)
 
 
 def spec_supports_text(spec: str) -> bool:

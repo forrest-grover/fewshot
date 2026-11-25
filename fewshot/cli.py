@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
-from typing import List, NoReturn, Optional
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import typer
 
 from .embedders import DEFAULT_SPEC, PRESETS, spec_supports_text
 from .store import IMAGE_EXTS, Task, Workspace
+
+if TYPE_CHECKING:
+    from .pipeline import Pipeline
 
 app = typer.Typer(help="Embedding-based few-shot image classification.", no_args_is_help=True)
 cls_app = typer.Typer(help="Manage a task's classes.", no_args_is_help=True)
@@ -29,26 +33,26 @@ def _error_text(e: Exception) -> str:
     return str(e.args[0]) if isinstance(e, KeyError) and e.args else str(e)
 
 
-def _ws(root: Optional[Path]) -> Workspace:
+def _ws(root: Path | None) -> Workspace:
     return Workspace(root)
 
 
-def _task(root: Optional[Path], name: str) -> Task:
+def _task(root: Path | None, name: str) -> Task:
     try:
         return _ws(root).get(name)
     except KeyError as e:
         _fail(_error_text(e))
 
 
-def _pipe(ws: Workspace):
+def _pipe(ws: Workspace) -> Pipeline:
     # Pipeline imports torch; importing it lazily keeps `fewshot --help` fast.
     from .pipeline import Pipeline  # pylint: disable=import-outside-toplevel
 
     return Pipeline(ws)
 
 
-def _expand(paths: List[Path]) -> List[Path]:
-    out = []
+def _expand(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
     for p in paths:
         if not p.exists():
             _fail(f"No such file or directory: {p}")
@@ -59,7 +63,7 @@ def _expand(paths: List[Path]) -> List[Path]:
     return out
 
 
-def _add_files(task: Task, label: str, files: List[Path]) -> int:
+def _add_files(task: Task, label: str, files: list[Path]) -> int:
     """Add ``files`` as examples of ``label``, skipping unreadable images; returns how many were added."""
     n = 0
     for f in files:
@@ -73,7 +77,7 @@ def _add_files(task: Task, label: str, files: List[Path]) -> int:
 
 
 @app.command()
-def models():
+def models() -> None:
     """List preset embedders (any openclip:/timm: spec also works)."""
     for p in PRESETS:
         typer.echo(f"{p.spec}\n    {p.label}. {p.notes}")
@@ -82,10 +86,10 @@ def models():
 @app.command("create")
 def create(
     name: str,
-    embedder: Optional[str] = typer.Option(None, help="Embedder spec; see `fewshot models`"),
+    embedder: str | None = typer.Option(None, help="Embedder spec; see `fewshot models`"),
     classifier: str = typer.Option("prototype", help="prototype | knn | logreg"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Create a task."""
     kw = {"classifier": classifier}
     if embedder:
@@ -98,7 +102,7 @@ def create(
 
 
 @app.command("list")
-def list_tasks(root: Optional[Path] = ROOT_OPT):
+def list_tasks(root: Path | None = ROOT_OPT) -> None:
     """List tasks."""
     for t in _ws(root).list_tasks():
         s = t.summary()
@@ -107,7 +111,7 @@ def list_tasks(root: Optional[Path] = ROOT_OPT):
 
 
 @app.command()
-def show(name: str, root: Optional[Path] = ROOT_OPT):
+def show(name: str, root: Path | None = ROOT_OPT) -> None:
     """Show a task's settings and per-class example counts."""
     t = _task(root, name)
     c = t.config
@@ -119,7 +123,7 @@ def show(name: str, root: Optional[Path] = ROOT_OPT):
         typer.echo(f"  {cd.name:24} {counts.get(cd.name, 0):5}{desc}")
 
 
-def _parse_params(param: List[str], base: dict) -> dict:
+def _parse_params(param: list[str], base: dict[str, Any]) -> dict[str, Any]:
     params = dict(base)
     for p in param:
         k, sep, v = p.partition("=")
@@ -135,16 +139,16 @@ def _parse_params(param: List[str], base: dict) -> dict:
 @app.command()
 def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     name: str,
-    embedder: Optional[str] = None,
-    classifier: Optional[str] = None,
-    param: List[str] = typer.Option([], help="Classifier param KEY=VALUE (e.g. k=3, scale=20). Repeatable."),
-    text_weight: Optional[float] = None,
-    reject_below: Optional[float] = typer.Option(None, help="Similarity threshold for 'unknown'; negative clears it"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    embedder: str | None = None,
+    classifier: str | None = None,
+    param: list[str] = typer.Option([], help="Classifier param KEY=VALUE (e.g. k=3, scale=20). Repeatable."),
+    text_weight: float | None = None,
+    reject_below: float | None = typer.Option(None, help="Similarity threshold for 'unknown'; negative clears it"),
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Change task settings."""
     t = _task(root, name)
-    kw = {}
+    kw: dict[str, Any] = {}
     if embedder:
         kw["embedder"] = embedder
     if classifier:
@@ -164,7 +168,7 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments 
 
 
 @app.command()
-def delete(name: str, yes: bool = typer.Option(False, "--yes", "-y"), root: Optional[Path] = ROOT_OPT):
+def delete(name: str, yes: bool = typer.Option(False, "--yes", "-y"), root: Path | None = ROOT_OPT) -> None:
     """Delete a task and its images."""
     _task(root, name)
     if not yes:
@@ -178,8 +182,8 @@ def class_add(
     name: str,
     label: str,
     description: str = typer.Option("", "--desc", help="Text prompt, e.g. 'a photo of a cracked weld'"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Add a class, or set an existing class's description."""
     try:
         _task(root, name).upsert_class(label, description)
@@ -193,8 +197,8 @@ def class_describe(
     template: str = typer.Argument(
         "a photo of a {}", help="'{}' is replaced by the class name (underscores become spaces)"),
     overwrite: bool = typer.Option(False, help="Also replace descriptions that are already set"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Fill class descriptions from a template, e.g. 'a photo of a {}, a type of pet'."""
     try:
         n = _task(root, name).describe_classes(template, overwrite)
@@ -204,7 +208,7 @@ def class_describe(
 
 
 @cls_app.command("rm")
-def class_rm(name: str, label: str, root: Optional[Path] = ROOT_OPT):
+def class_rm(name: str, label: str, root: Path | None = ROOT_OPT) -> None:
     """Delete a class and its examples."""
     try:
         n = _task(root, name).delete_class(label)
@@ -214,7 +218,7 @@ def class_rm(name: str, label: str, root: Optional[Path] = ROOT_OPT):
 
 
 @app.command()
-def add(name: str, label: str, paths: List[Path], root: Optional[Path] = ROOT_OPT):
+def add(name: str, label: str, paths: list[Path], root: Path | None = ROOT_OPT) -> None:
     """Add images (files or directories) as examples of LABEL."""
     t = _task(root, name)
     _add_files(t, label, _expand(paths))
@@ -225,9 +229,9 @@ def add(name: str, label: str, paths: List[Path], root: Optional[Path] = ROOT_OP
 def import_dir(
     name: str,
     folder: Path,
-    shots: Optional[int] = typer.Option(None, help="Take at most this many images per class"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    shots: int | None = typer.Option(None, help="Take at most this many images per class"),
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Import FOLDER/<class>/<image> into a task."""
     t = _task(root, name)
     if not folder.is_dir():
@@ -242,11 +246,11 @@ def import_dir(
 @app.command()
 def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     name: str,
-    paths: List[Path],
+    paths: list[Path],
     as_json: bool = typer.Option(False, "--json"),
     top: int = typer.Option(3, help="Scores to show per image"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Classify images (files or directories)."""
     t = _task(root, name)
     files = _expand(paths)
@@ -255,16 +259,16 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     except ValueError as e:
         _fail(str(e))
     if as_json:
-        typer.echo(json.dumps([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds)], indent=2))
+        typer.echo(json.dumps([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds, strict=True)], indent=2))
         return
-    for f, p in zip(files, preds):
+    for f, p in zip(files, preds, strict=True):
         best = sorted(p.scores.items(), key=lambda kv: -kv[1])[:top]
         label = p.label if p.label is not None else f"unknown (closest: {p.top_label})"
         scores = "  ".join(f"{c}={v:.2f}" for c, v in best)
         typer.echo(f"{f}: {label}  sim={p.similarity:.3f}  {scores}")
 
 
-def _print_eval(r: dict) -> None:
+def _print_eval(r: dict[str, Any]) -> None:
     acc = r["accuracy"]
     if acc is None:
         typer.echo("Nothing scored")
@@ -283,11 +287,11 @@ def _print_eval(r: dict) -> None:
 @app.command("eval")
 def eval_cmd(
     name: str,
-    folds: Optional[int] = typer.Option(
+    folds: int | None = typer.Option(
         None, help="Number of folds [default: leave-one-out up to 300 examples, else 5]"),
     as_json: bool = typer.Option(False, "--json"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Cross-validate a task on its own examples."""
     # evaluate imports the torch-backed pipeline; importing it lazily keeps `fewshot --help` fast.
     from .evaluate import evaluate_task  # pylint: disable=import-outside-toplevel
@@ -303,7 +307,8 @@ def eval_cmd(
         _print_eval(r)
 
 
-def _bench_runs(specs: List[str], classifiers: List[str], shots: List[int], text_template: Optional[str]):
+def _bench_runs(specs: list[str], classifiers: list[str], shots: list[int], text_template: str | None
+                ) -> Iterator[tuple[str, str, int, str | None]]:
     """Yield (embedder, classifier, shot, text_template) combinations; text is used only by CLIP embedders,
     and 0-shot runs need it, so they are skipped otherwise."""
     for e in specs:
@@ -314,7 +319,7 @@ def _bench_runs(specs: List[str], classifiers: List[str], shots: List[int], text
                     yield e, c, s, tt
 
 
-def _bench_one(pipe, folder: Path, run: tuple, opts: dict) -> str:
+def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | None], opts: dict[str, int]) -> str:
     # evaluate imports the torch-backed pipeline; importing it lazily keeps `fewshot --help` fast.
     from .evaluate import benchmark  # pylint: disable=import-outside-toplevel
 
@@ -330,16 +335,16 @@ def _bench_one(pipe, folder: Path, run: tuple, opts: dict) -> str:
 @app.command()
 def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     folder: Path,
-    embedder: List[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
-    classifier: List[str] = typer.Option(["prototype"], help="Classifier(s) to compare"),
+    embedder: list[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
+    classifier: list[str] = typer.Option(["prototype"], help="Classifier(s) to compare"),
     way: int = 5,
-    shot: List[int] = typer.Option([1, 5], help="Shot count(s)"),
+    shot: list[int] = typer.Option([1, 5], help="Shot count(s)"),
     query: int = 15,
     episodes: int = 200,
-    text_template: Optional[str] = typer.Option(
+    text_template: str | None = typer.Option(
         None, help="e.g. 'a photo of a {}' to use class names as text (CLIP only)"),
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Episodic N-way K-shot benchmark over FOLDER/<class>/<image>."""
     pipe = _pipe(_ws(root))
     opts = {"way": way, "query": query, "episodes": episodes}
@@ -351,8 +356,8 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
-    root: Optional[Path] = ROOT_OPT,
-):
+    root: Path | None = ROOT_OPT,
+) -> None:
     """Run the REST API and web UI."""
     # uvicorn is only needed here; importing it lazily keeps other commands fast.
     import uvicorn  # pylint: disable=import-outside-toplevel
