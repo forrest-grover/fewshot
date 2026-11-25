@@ -4,17 +4,19 @@ const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
 
 /** Collect image files from a drop, including files inside dropped folders. */
 async function filesFromDrop(dt: DataTransfer): Promise<File[]> {
-  const entries = Array.from(dt.items).map((i) => i.webkitGetAsEntry?.()).filter(Boolean) as FileSystemEntry[];
+  const entries = Array.from(dt.items)
+    .map((i) => i.webkitGetAsEntry())
+    .filter((e): e is FileSystemEntry => e !== null);
   if (!entries.length) return Array.from(dt.files);
   const out: File[] = [];
   const walk = async (e: FileSystemEntry): Promise<void> => {
     if (e.isFile) {
-      out.push(await new Promise<File>((res, rej) => (e as FileSystemFileEntry).file(res, rej)));
+      out.push(await new Promise<File>((res, rej) => { (e as FileSystemFileEntry).file(res, rej); }));
     } else if (e.isDirectory) {
       const reader = (e as FileSystemDirectoryEntry).createReader();
       let batch: FileSystemEntry[];
       do {
-        batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        batch = await new Promise((res, rej) => { reader.readEntries(res, rej); });
         for (const c of batch) await walk(c);
       } while (batch.length);
     }
@@ -39,16 +41,16 @@ export function DropZone(props: {
     <div
       className={`drop ${over ? "over" : ""} ${props.compact ? "compact" : ""} ${props.disabled ? "disabled" : ""}`}
       onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-      onDragLeave={() => setOver(false)}
-      onDrop={async (e) => {
+      onDragLeave={() => { setOver(false); }}
+      onDrop={(e) => {
         e.preventDefault();
         setOver(false);
-        if (!props.disabled) accept(await filesFromDrop(e.dataTransfer));
+        if (!props.disabled) void filesFromDrop(e.dataTransfer).then(accept);
       }}
-      onClick={() => !props.disabled && input.current?.click()}
+      onClick={() => { if (!props.disabled) input.current?.click(); }}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && input.current?.click()}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") input.current?.click(); }}
     >
       <input
         ref={input}
@@ -67,7 +69,7 @@ export function Bar({ value, label, strong }: { value: number; label: string; st
   return (
     <div className={`bar ${strong ? "strong" : ""}`}>
       <span className="bar-label" title={label}>{label}</span>
-      <span className="bar-track"><span className="bar-fill" style={{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }} /></span>
+      <span className="bar-track"><span className="bar-fill" style={{ width: `${String(Math.max(0, Math.min(1, value)) * 100)}%` }} /></span>
       <span className="bar-value">{(value * 100).toFixed(1)}%</span>
     </div>
   );
@@ -82,5 +84,3 @@ export function ErrorBox({ error, onClose }: { error: string | null; onClose: ()
     </div>
   );
 }
-
-export const pct = (v: number | null | undefined) => (v == null ? "–" : `${(v * 100).toFixed(1)}%`);

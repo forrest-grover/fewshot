@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api, type ModelInfo, type TaskDetail } from "./api";
 
-type Props = {
+interface Props {
   task: TaskDetail; models: ModelInfo | null; setTask: (t: TaskDetail) => void;
   run: <T>(p: Promise<T>) => Promise<T | undefined>; onDeleted: () => void;
-};
+}
 
 const PARAMS: Record<string, { key: string; label: string; help: string; def: number }[]> = {
   prototype: [{ key: "scale", label: "Scale", help: "Sharpness of image-similarity scores (default 30)", def: 30 }],
@@ -15,6 +15,11 @@ const PARAMS: Record<string, { key: string; label: string; help: string; def: nu
   logreg: [{ key: "C", label: "C", help: "Inverse regularisation strength (default 10)", def: 10 }],
 };
 
+/** Display value for a classifier parameter; params are numbers (or numeric strings) from the server. */
+function paramValue(v: unknown, def: number): string {
+  return typeof v === "number" || typeof v === "string" ? String(v) : String(def);
+}
+
 export default function Settings({ task, models, setTask, run, onDeleted }: Props) {
   const [embedder, setEmbedder] = useState(task.embedder);
   const [classifier, setClassifier] = useState(task.classifier);
@@ -23,10 +28,15 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
   const [reject, setReject] = useState(task.reject_below == null ? "" : String(task.reject_below));
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
+  // Reset the form whenever the saved task changes (another task, or a new revision after a save).
+  // Done during render rather than in an effect: https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes
+  const taskKey = `${task.name}\u0000${String(task.revision)}`;
+  const [formKey, setFormKey] = useState(taskKey);
+  if (formKey !== taskKey) {
+    setFormKey(taskKey);
     setEmbedder(task.embedder); setClassifier(task.classifier); setParams(task.classifier_params);
     setTextWeight(task.text_weight); setReject(task.reject_below == null ? "" : String(task.reject_below));
-  }, [task.name, task.revision]); // eslint-disable-line react-hooks/exhaustive-deps
+  }
 
   const presets = models?.embedders ?? [];
   const isPreset = presets.some((p) => p.spec === embedder);
@@ -48,11 +58,11 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
     <div className="settings">
       <label>
         <span>Embedder</span>
-        <select value={isPreset ? embedder : "__custom"} onChange={(e) => setEmbedder(e.target.value === "__custom" ? "" : e.target.value)}>
+        <select value={isPreset ? embedder : "__custom"} onChange={(e) => { setEmbedder(e.target.value === "__custom" ? "" : e.target.value); }}>
           {presets.map((p) => <option key={p.spec} value={p.spec}>{p.label}</option>)}
           <option value="__custom">Custom spec…</option>
         </select>
-        {!isPreset && <input value={embedder} onChange={(e) => setEmbedder(e.target.value)} placeholder="openclip:ViT-B-16@laion2b_s34b_b88k or timm:<model>" />}
+        {!isPreset && <input value={embedder} onChange={(e) => { setEmbedder(e.target.value); }} placeholder="openclip:ViT-B-16@laion2b_s34b_b88k or timm:<model>" />}
         <small className="muted">{presets.find((p) => p.spec === embedder)?.notes ?? "Any open_clip (openclip:<arch>@<pretrained>) or timm (timm:<model>) model."} Switching embedders re-embeds every example once; results are cached.</small>
       </label>
 
@@ -69,8 +79,8 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
       {(PARAMS[classifier] ?? []).map((p) => (
         <label key={p.key}>
           <span>{p.label}</span>
-          <input type="number" step="any" value={String(params[p.key] ?? p.def)}
-            onChange={(e) => setParams({ ...params, [p.key]: e.target.value === "" ? p.def : Number(e.target.value) })} />
+          <input type="number" step="any" value={paramValue(params[p.key], p.def)}
+            onChange={(e) => { setParams({ ...params, [p.key]: e.target.value === "" ? p.def : Number(e.target.value) }); }} />
           <small className="muted">{p.help}</small>
         </label>
       ))}
@@ -78,7 +88,7 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
       <label className={supportsText ? "" : "disabled"}>
         <span>Text weight: {textWeight.toFixed(2)}</span>
         <input type="range" min={0} max={3} step={0.05} value={textWeight} disabled={!supportsText}
-          onChange={(e) => setTextWeight(Number(e.target.value))} />
+          onChange={(e) => { setTextWeight(Number(e.target.value)); }} />
         <small className="muted">{supportsText
           ? "How much class descriptions count relative to example images. 0 ignores descriptions."
           : "Only CLIP embedders use text descriptions."}</small>
@@ -86,7 +96,7 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
 
       <label>
         <span>Reject below similarity</span>
-        <input type="number" step="0.01" min={0} max={1} value={reject} placeholder="off" onChange={(e) => setReject(e.target.value)} />
+        <input type="number" step="0.01" min={0} max={1} value={reject} placeholder="off" onChange={(e) => { setReject(e.target.value); }} />
         <small className="muted">
           Images whose best similarity falls below this value are returned as "unknown". Start near 0.7 for image examples, and tune it
           with the similarity values shown on the Predict tab. Tasks that only have text descriptions score lower (about 0.2–0.35).
@@ -94,15 +104,14 @@ export default function Settings({ task, models, setTask, run, onDeleted }: Prop
       </label>
 
       <div className="row">
-        <button onClick={save} disabled={saving || !embedder}>{saving ? "Saving…" : "Save settings"}</button>
+        <button onClick={() => { void save(); }} disabled={saving || !embedder}>{saving ? "Saving…" : "Save settings"}</button>
       </div>
 
       <hr />
       <div className="row">
-        <button className="danger" onClick={async () => {
-          if (confirm(`Delete task "${task.name}" and all ${task.examples.length} images? This cannot be undone.`)) {
-            const ok = await run(api.deleteTask(task.name).then(() => true));
-            if (ok) onDeleted();
+        <button className="danger" onClick={() => {
+          if (confirm(`Delete task "${task.name}" and all ${String(task.examples.length)} images? This cannot be undone.`)) {
+            void run(api.deleteTask(task.name).then(() => true)).then((ok) => { if (ok) onDeleted(); });
           }
         }}>Delete task</button>
       </div>

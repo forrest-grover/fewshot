@@ -33,25 +33,28 @@ export default function App() {
     }
   }, []);
 
-  const refreshTasks = useCallback(() => run(api.tasks()).then((t) => t && setTasks(t)), [run]);
+  const refreshTasks = useCallback(
+    () => run(api.tasks()).then((t) => { if (t) setTasks(t); }),
+    [run],
+  );
 
   useEffect(() => {
-    const on = () => setRoute(parseHash());
+    const on = () => { setRoute(parseHash()); };
     window.addEventListener("hashchange", on);
-    refreshTasks();
-    run(api.models()).then((m) => m && setModels(m));
-    return () => window.removeEventListener("hashchange", on);
+    void refreshTasks();
+    void run(api.models()).then((m) => { if (m) setModels(m); });
+    return () => { window.removeEventListener("hashchange", on); };
   }, [refreshTasks, run]);
 
   useEffect(() => {
     setError(null);
     setTask(null);
-    if (route.task) run(api.task(route.task)).then((t) => t && setTask(t));
+    if (route.task) void run(api.task(route.task)).then((t) => { if (t) setTask(t); });
   }, [route.task, run]);
 
   const updateTask = (t: TaskDetail) => {
     setTask(t);
-    refreshTasks();
+    void refreshTasks();
   };
 
   return (
@@ -66,12 +69,12 @@ export default function App() {
             </a>
           ))}
         </nav>
-        <button className="secondary" onClick={() => go(null)}>+ New task</button>
+        <button className="secondary" onClick={() => { go(null); }}>+ New task</button>
       </aside>
 
       <main>
-        <ErrorBox error={error} onClose={() => setError(null)} />
-        {!route.task && <NewTask models={models} run={run} onCreated={(t) => { refreshTasks(); go(t.name); }} />}
+        <ErrorBox error={error} onClose={() => { setError(null); }} />
+        {!route.task && <NewTask models={models} run={run} onCreated={(t) => { void refreshTasks(); go(t.name); }} />}
         {route.task && !task && <p className="muted">Loading…</p>}
         {task && (
           <>
@@ -83,7 +86,7 @@ export default function App() {
             </header>
             <div className="tabs" role="tablist">
               {TABS.map((t) => (
-                <button key={t} role="tab" aria-selected={route.tab === t} className={route.tab === t ? "tab active" : "tab"} onClick={() => go(task.name, t)}>
+                <button key={t} role="tab" aria-selected={route.tab === t} className={route.tab === t ? "tab active" : "tab"} onClick={() => { go(task.name, t); }}>
                   {t[0].toUpperCase() + t.slice(1)}
                 </button>
               ))}
@@ -92,7 +95,7 @@ export default function App() {
             {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} />}
             {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} />}
             {route.tab === "settings" && (
-              <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { refreshTasks(); go(null); }} />
+              <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }} />
             )}
           </>
         )}
@@ -107,16 +110,17 @@ function NewTask({ models, run, onCreated }: {
   const [name, setName] = useState("");
   const [embedder, setEmbedder] = useState("");
   const [busy, setBusy] = useState(false);
-  const spec = embedder || models?.embedders[0]?.spec || "";
+  const spec = embedder || (models?.embedders[0]?.spec ?? "");
   return (
     <form
       className="new-task"
-      onSubmit={async (e) => {
+      onSubmit={(e) => {
         e.preventDefault();
         setBusy(true);
-        const t = await run(api.createTask(name.trim(), spec, "prototype"));
-        setBusy(false);
-        if (t) onCreated(t);
+        void run(api.createTask(name.trim(), spec, "prototype")).then((t) => {
+          setBusy(false);
+          if (t) onCreated(t);
+        });
       }}
     >
       <h1>New task</h1>
@@ -126,11 +130,11 @@ function NewTask({ models, run, onCreated }: {
       </p>
       <label>
         <span>Name</span>
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. weld-defects" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" required autoFocus />
+        <input value={name} onChange={(e) => { setName(e.target.value); }} placeholder="e.g. weld-defects" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" required autoFocus />
       </label>
       <label>
         <span>Embedder</span>
-        <select value={spec} onChange={(e) => setEmbedder(e.target.value)}>
+        <select value={spec} onChange={(e) => { setEmbedder(e.target.value); }}>
           {models?.embedders.map((m) => <option key={m.spec} value={m.spec}>{m.label}</option>)}
         </select>
         <small className="muted">{models?.embedders.find((m) => m.spec === spec)?.notes}</small>

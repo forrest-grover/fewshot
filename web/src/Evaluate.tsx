@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { api, type EvalReport, type TaskDetail } from "./api";
-import { pct } from "./ui";
+import { pct } from "./format";
 
-type Props = { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> };
+interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
 
 export default function Evaluate({ task, setTask, run }: Props) {
   const [report, setReport] = useState<EvalReport | null>(null);
@@ -22,7 +22,7 @@ export default function Evaluate({ task, setTask, run }: Props) {
   return (
     <div>
       <div className="row">
-        <button onClick={go} disabled={busy || task.examples.length < 2}>{busy ? "Evaluating…" : report ? "Re-run evaluation" : "Run evaluation"}</button>
+        <button onClick={() => { void go(); }} disabled={busy || task.examples.length < 2}>{busy ? "Evaluating…" : report ? "Re-run evaluation" : "Run evaluation"}</button>
         <span className="muted">
           Cross-validates the current settings on this task's examples: each image is predicted by a classifier fitted without it.
         </span>
@@ -77,8 +77,8 @@ export default function Evaluate({ task, setTask, run }: Props) {
                         <span><b>{m.true}</b> → {m.pred} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (
                           <span className="row">
-                            <button className="small secondary" onClick={() => fix(api.relabel(task.name, m.id, m.pred))}>Relabel as {m.pred}</button>
-                            <button className="small ghost danger" onClick={() => fix(api.deleteExample(task.name, m.id))}>Delete</button>
+                            <button className="small secondary" onClick={() => { void fix(api.relabel(task.name, m.id, m.pred)); }}>Relabel as {m.pred}</button>
+                            <button className="small ghost danger" onClick={() => { void fix(api.deleteExample(task.name, m.id)); }}>Delete</button>
                           </span>
                         ) : <span className="ok">{exists ? `Now ${exists.label}` : "Deleted"}</span>}
                       </figcaption>

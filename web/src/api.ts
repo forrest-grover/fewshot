@@ -1,28 +1,28 @@
-export type TaskSummary = {
+export interface TaskSummary {
   name: string; embedder: string; classifier: string;
   n_classes: number; n_examples: number; counts: Record<string, number>; created: string;
-};
-export type ClassInfo = { name: string; description: string; count: number };
-export type Example = { id: string; label: string; file: string; source: string; added: string };
-export type TaskDetail = {
+}
+export interface ClassInfo { name: string; description: string; count: number }
+export interface Example { id: string; label: string; file: string; source: string; added: string }
+export interface TaskDetail {
   name: string; embedder: string; supports_text: boolean; classifier: string;
   classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
   revision: number; classes: ClassInfo[]; examples: Example[];
-};
-export type Prediction = {
+}
+export interface Prediction {
   file: string; label: string | null; top_label: string; confidence: number;
   similarity: number; rejected: boolean; scores: Record<string, number>;
-};
-export type EvalReport = {
+}
+export interface EvalReport {
   method: string; n_scored: number; n_examples: number; accuracy: number | null; classes: string[];
   confusion: number[][];
   per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
   mistakes: { id: string; true: string; pred: string; confidence: number }[];
-};
-export type ModelInfo = {
+}
+export interface ModelInfo {
   embedders: { spec: string; label: string; supports_text: boolean; notes: string }[];
   classifiers: string[];
-};
+}
 
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method };
@@ -33,18 +33,23 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   }
   const r = await fetch(url, init);
   if (!r.ok) {
-    let msg = `${r.status} ${r.statusText}`;
-    try { msg = (await r.json()).detail ?? msg; } catch { /* not JSON */ }
+    let msg: unknown = `${String(r.status)} ${r.statusText}`;
+    try {
+      // Error bodies are FastAPI's {"detail": ...}; anything else falls back to the status line.
+      const body = (await r.json()) as { detail?: unknown } | null;
+      msg = body?.detail ?? msg;
+    } catch { /* not JSON */ }
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
-  return r.status === 204 ? (undefined as T) : r.json();
+  // The server's response schemas are mirrored by the interfaces above; this is the one untyped boundary.
+  return r.status === 204 ? (undefined as T) : ((await r.json()) as T);
 }
 
 const t = (name: string) => `/api/tasks/${encodeURIComponent(name)}`;
 const files = (fs: File[], extra: Record<string, string> = {}) => {
   const fd = new FormData();
-  fs.forEach((f) => fd.append("files", f));
-  Object.entries(extra).forEach(([k, v]) => fd.append(k, v));
+  fs.forEach((f) => { fd.append("files", f); });
+  Object.entries(extra).forEach(([k, v]) => { fd.append(k, v); });
   return fd;
 };
 
@@ -55,7 +60,7 @@ export const api = {
   createTask: (name: string, embedder: string, classifier: string) =>
     req<TaskDetail>("POST", "/api/tasks", { name, embedder, classifier }),
   updateTask: (n: string, s: Record<string, unknown>) => req<TaskDetail>("PATCH", t(n), s),
-  deleteTask: (n: string) => req<void>("DELETE", t(n)),
+  deleteTask: (n: string) => req<undefined>("DELETE", t(n)),
   addClass: (n: string, name: string, description = "") =>
     req<TaskDetail>("POST", `${t(n)}/classes`, { name, description }),
   patchClass: (n: string, c: string, p: { name?: string; description?: string }) =>

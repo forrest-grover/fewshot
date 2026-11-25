@@ -1,21 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, type Prediction, type TaskDetail } from "./api";
 import { Bar, DropZone } from "./ui";
 
-type Props = { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> };
-type Item = { file: File; url: string; pred: Prediction; addedAs?: string };
+interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
+interface Item { file: File; url: string; pred: Prediction; addedAs?: string }
 
 export default function Predict({ task, setTask, run }: Props) {
   const [items, setItems] = useState<Item[]>([]);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => () => items.forEach((i) => URL.revokeObjectURL(i.url)), []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Every preview object URL created by this tab, revoked when the tab unmounts.
+  const objectUrls = useRef(new Set<string>());
+  useEffect(() => {
+    const urls = objectUrls.current;
+    return () => {
+      urls.forEach((u) => { URL.revokeObjectURL(u); });
+      urls.clear();
+    };
+  }, []);
 
   const classify = async (files: File[]) => {
     setBusy(true);
     const preds = await run(api.predict(task.name, files));
     setBusy(false);
-    if (preds) setItems((old) => [...files.map((f, i) => ({ file: f, url: URL.createObjectURL(f), pred: preds[i] })), ...old]);
+    if (preds) {
+      const added = files.map((f, i) => ({ file: f, url: URL.createObjectURL(f), pred: preds[i] }));
+      added.forEach((it) => objectUrls.current.add(it.url));
+      setItems((old) => [...added, ...old]);
+    }
   };
 
   const addAs = async (idx: number, label: string) => {
@@ -30,13 +42,13 @@ export default function Predict({ task, setTask, run }: Props) {
   return (
     <div>
       {!ready && <p className="hint">Add at least two classes on the Examples tab first.</p>}
-      <DropZone disabled={!ready || busy} onFiles={classify}>
+      <DropZone disabled={!ready || busy} onFiles={(fs) => { void classify(fs); }}>
         {busy ? "Classifying… (the first run loads the model, which can take several seconds)" : "Drop images to classify, or click to choose"}
       </DropZone>
       {items.length > 0 && (
         <div className="row" style={{ justifyContent: "space-between", margin: "12px 0" }}>
           <span className="muted">{items.length} result{items.length === 1 ? "" : "s"}. Add correct or corrected images as examples to improve the task.</span>
-          <button className="ghost small" onClick={() => setItems([])}>Clear</button>
+          <button className="ghost small" onClick={() => { setItems([]); }}>Clear</button>
         </div>
       )}
       <div className="results">
@@ -61,8 +73,8 @@ export default function Predict({ task, setTask, run }: Props) {
                     <span className="ok">Added as {it.addedAs}</span>
                   ) : (
                     <>
-                      <button className="small" onClick={() => addAs(idx, it.pred.top_label)}>Add as {it.pred.top_label}</button>
-                      <select className="small" value="" onChange={(e) => e.target.value && addAs(idx, e.target.value)} aria-label="Add as another class">
+                      <button className="small" onClick={() => { void addAs(idx, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
+                      <select className="small" value="" onChange={(e) => { if (e.target.value) void addAs(idx, e.target.value); }} aria-label="Add as another class">
                         <option value="">Add as other…</option>
                         {task.classes.filter((c) => c.name !== it.pred.top_label).map((c) => <option key={c.name}>{c.name}</option>)}
                       </select>
