@@ -80,6 +80,9 @@ class TaskDetail(BaseModel):
     flip: bool
     revision: int
     can_undo: bool
+    can_redo: bool
+    undo_label: str  # what undo would take back, e.g. "delete 3 examples" ("" if unknown)
+    redo_label: str
     classes: list[ClassOut]
     examples: list[ExampleOut]
 

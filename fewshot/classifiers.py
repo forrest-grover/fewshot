@@ -167,7 +167,13 @@ class Classifier:
         return self
 
     def predict(self, Q: Vectors) -> tuple[Scores, Scores]:
-        """Return (probs (m, C), similarity of each query to its predicted class (m,)).
+        """``predict_full`` without the per-class similarities."""
+        probs, sims, _ = self.predict_full(Q)
+        return probs, sims
+
+    def predict_full(self, Q: Vectors) -> tuple[Scores, Scores, Scores]:
+        """Return (probs (m, C), similarity of each query to its predicted class (m,), and its
+        similarity to every class (m, C), see ``class_similarity``).
 
         The similarity is that of the most probable class (see ``class_similarity``), not of the
         nearest one, which can differ when descriptions tip the scores: a reject threshold on it
@@ -186,7 +192,7 @@ class Classifier:
             if self.Pt is not None and self.text_weight > 0:
                 logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
             probs = _softmax(logits)
-        return probs, per_class[np.arange(len(Q)), probs.argmax(axis=1)]
+        return probs, per_class[np.arange(len(Q)), probs.argmax(axis=1)], per_class
 
 
 class PrototypeClassifier(Classifier):

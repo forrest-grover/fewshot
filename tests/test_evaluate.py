@@ -244,9 +244,9 @@ def test_benchmark_zero_shot_with_text_template(ws, tmp_path, text_embedder):
 
 
 def test_benchmark_zero_shot_without_text_fails(ws, tmp_path):
-    """shot=0 without a text template has nothing to classify with."""
+    """shot=0 without a text template has nothing to classify with: refused before embedding."""
     folder = make_folder(tmp_path / "data", classes=("red", "blue"))
-    with pytest.raises(ValueError, match="no images and no text"):
+    with pytest.raises(ValueError, match=r"shot=0 .* needs a text_template"):
         benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=0, query=2, episodes=1)
 
 

@@ -85,6 +85,9 @@ def test_rename_and_undo(run, task, root):
     run("create", "empty")
     r = run("undo", "empty")
     assert (r.exit_code, r.output.strip()) == (1, "Error: Nothing to undo")
+    assert run("redo", "u").output.strip() == "u: redid add class green (6 examples)"
+    r = run("redo", "u")
+    assert (r.exit_code, r.output.strip()) == (1, "Error: Nothing to redo")
 
 
 def test_export_and_import(run, task, tmp_path):

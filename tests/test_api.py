@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import fewshot.api
-import fewshot.store
+import fewshot.history
 from tests.conftest import png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
@@ -237,7 +237,7 @@ def test_describe_classes(client, task):
 
 def test_delete_class(client, task, tmp_path, monkeypatch):
     """Deleting a class removes its examples and (with no undo history kept) image files."""
-    monkeypatch.setattr(fewshot.store, "HISTORY_KEPT", 0)
+    monkeypatch.setattr(fewshot.history, "HISTORY_KEPT", 0)
     t = client.delete(f"/api/tasks/{task}/classes/red").json()
     assert [c["name"] for c in t["classes"]] == ["blue"]
     assert {e["label"] for e in t["examples"]} == {"blue"}
@@ -282,7 +282,7 @@ def test_bulk_relabel_and_delete(client, task, tmp_path, monkeypatch):
     assert client.patch("/api/tasks/missing/examples", json={"ids": ["a"], "label": "x"}).status_code == 404
 
     images = tmp_path / "ws" / "tasks" / task / "images"
-    monkeypatch.setattr(fewshot.store, "HISTORY_KEPT", 0)  # delete image files at once
+    monkeypatch.setattr(fewshot.history, "HISTORY_KEPT", 0)  # delete image files at once
     assert client.post(f"/api/tasks/{task}/examples/delete", json={"ids": [red[0], "nope"]}).status_code == 404
     assert len(list(images.iterdir())) == 6
     t = client.post(f"/api/tasks/{task}/examples/delete", json={"ids": red[:2]}).json()

@@ -609,6 +609,10 @@ def test_cache_info_and_prune(run, root, task):
     info = run("cache", "info")
     assert info.exit_code == 0
     assert "fake:color#test: 12 vectors" in info.output
+    assert "Would delete 0 cached image vectors" in run("cache", "prune", "--dry-run").output  # undo may need it
+    t.upsert_class("x")  # an undoable change, then no undo history at all:
+    for f in (t.path / "history").glob("*"):
+        f.unlink()
     dry = run("cache", "prune", "--dry-run")
     assert "Would delete 1 cached image vectors" in dry.output
     assert "Deleted 1 cached image vectors" in run("cache", "prune").output

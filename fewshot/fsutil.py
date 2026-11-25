@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import os
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover  # Windows: no cross-process lock
+except ImportError:  # pragma: no cover  # Windows: msvcrt below
     fcntl = None  # type: ignore[assignment]
+msvcrt: Any = None
+if fcntl is None:  # pragma: no cover  # Windows only
+    msvcrt = importlib.import_module("msvcrt")
 
 
 FileStamp = tuple[int, int, int]  # (inode, mtime_ns, size): changes whenever task.json is replaced
@@ -24,17 +29,15 @@ def stamp(st: os.stat_result) -> FileStamp:
 
 @contextlib.contextmanager
 def file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive ``flock`` on ``path`` (created if missing) across processes.
+    """Hold an exclusive lock on ``path`` (created if missing) across processes: ``flock`` on
+    Linux and macOS, ``msvcrt.locking`` on Windows.
 
     Raises ``FileNotFoundError`` if the folder holding ``path`` is gone.
     """
-    if fcntl is None:  # pragma: no cover
-        yield
-        return
     while True:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            _lock(fd)
             # If the task was deleted (and maybe recreated) while we waited, we hold a lock on a
             # file that is no longer at ``path``; start again on the current one.
             with contextlib.suppress(FileNotFoundError):
@@ -48,6 +51,19 @@ def file_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         os.close(fd)  # releases the lock
+
+
+def _lock(fd: int) -> None:
+    """Block until this process holds the exclusive lock on open file ``fd``."""
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:  # pragma: no cover  # Windows: LK_LOCK gives up after 10 one-second tries
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            return
+        except OSError:
+            continue
 
 
 def write_atomic(path: Path, data: bytes) -> None:

@@ -131,7 +131,7 @@ def test_failed_save_rolls_back_and_cleans_up(pair, monkeypatch):
     assert t.class_names() == ["one"]
     assert t.config.revision == 2
     assert sorted(os.listdir(t.path)) == [".lock", "history", "images", "task.json"]
-    assert len(os.listdir(t.path / "history")) == 1  # just the version before "one"
+    assert sorted(os.listdir(t.path / "history")) == ["0000000001.json", "0000000001.label"]  # before "one"
 
 
 def test_delete_files_after_saving(pair, monkeypatch):

@@ -7,7 +7,7 @@ import zipfile
 
 import pytest
 
-from fewshot import store
+from fewshot import history, store
 from fewshot.archive import export_task, import_task
 from fewshot.images import image_id
 from fewshot.store import Example, TaskConfig, Workspace
@@ -57,17 +57,84 @@ def test_undo_brings_back_deleted_images(ws):
     assert len(t.config.examples) == 4
 
 
-def test_undo_deletes_images_the_undone_change_added(ws):
-    """Undoing an add deletes the new image file, unless an older kept version still uses it."""
+def test_undone_images_go_once_redo_is_impossible(ws):
+    """An undone add keeps its image for redo; a new change drops it, unless a kept version
+    still uses it."""
     t = _task(ws, n=1)
     new = t.add_example(png(BLUE), "blue")
     t.undo()
+    assert (t.path / new.file).exists()  # redo may bring it back
+    t.upsert_class("x")
     assert not (t.path / new.file).exists()
     first = t.config.examples[0]
-    t.delete_example(first.id)  # v1 has it, v2 doesn't
-    t.add_example(png(RED, noise=10, seed=0), "red")  # back again in v3
-    t.undo()  # back to v2: the file is still named by the kept v1
+    t.delete_example(first.id)  # an older version has it, this one doesn't
+    t.add_example(png(RED, noise=10, seed=0), "red")  # back again
+    t.undo()
+    t.upsert_class("y")  # clears redo: the file is still named by the kept older version
     assert (t.path / first.file).exists()
+
+
+def test_redo(ws):
+    """Redo makes undone changes again, newest undo first, with images; a new change ends it.
+    Each step has a label describing the change."""
+    t = _task(ws, n=1)
+    new = t.add_example(png(BLUE), "blue")
+    t.delete_class("red")
+    assert t.undo_label() == "delete class red"
+    t.undo()
+    assert t.undo_label() == "add 1 example to blue"
+    t.undo()
+    assert t.undo_label() == "add 1 example to green"
+    assert (t.can_redo(), t.redo_label()) == (True, "add 1 example to blue")
+    t.redo()
+    assert t.example(new.id).label == "blue"
+    assert t.image_path(new.id).exists()
+    assert t.redo_label() == "delete class red"
+    t.redo()
+    assert t.class_names() == ["green", "blue"]
+    assert not t.can_redo()
+    assert t.undo_label() == "delete class red"  # redone changes can be undone again
+    with pytest.raises(ValueError, match="Nothing to redo"):
+        t.redo()
+    t.undo()
+    t.upsert_class("z")
+    assert not t.can_redo()
+    assert t.redo_label() == ""
+
+
+def test_labels(ws):
+    """Every kind of change describes itself for undo."""
+    t = _task(ws, n=1)
+    ids = [e.id for e in t.config.examples]
+    steps = [
+        (lambda: t.update_settings(classifier="knn"), "change settings"),
+        (lambda: t.upsert_class("blue"), "add class blue"),
+        (lambda: t.upsert_class("blue", "a blue thing"), "edit class blue"),
+        (lambda: t.describe_classes("a {}", overwrite=True), "describe classes"),
+        (lambda: t.rename_class("blue", "navy"), "rename class blue to navy"),
+        (lambda: t.relabel_many(ids, "navy"), "move 2 examples to navy"),
+        (lambda: t.annotate(ids[:1], add_tags=["x"]), "tag 1 example"),
+        (lambda: t.annotate(ids[:1], note="hm"), "edit 1 example"),
+        (lambda: t.delete_examples(ids[:1]), "delete 1 example"),
+        (lambda: t.add_examples([(png(BLUE, seed=i), f"c{i}", "") for i in range(5)]),
+         "add 5 examples to c0, c1, c2, ..."),
+    ]
+    for step, label in steps:
+        step()
+        assert t.undo_label() == label
+    (t.path / "history").joinpath(sorted((t.path / "history").glob("*.json"))[-1].stem + ".label").write_bytes(b"\xff")
+    assert t.undo_label() == ""
+
+
+def test_broken_redo_version(ws):
+    """A damaged redo version is removed with an error, like a damaged undo one."""
+    t = _task(ws, n=1)
+    t.upsert_class("x")
+    t.undo()
+    next((t.path / "history" / "redo").glob("*.json")).write_text("{bad")
+    with pytest.raises(ValueError, match=r"Can't redo: .* is invalid and was removed"):
+        t.redo()
+    assert not t.can_redo()
 
 
 def test_nothing_to_undo_and_broken_history(ws):
@@ -92,7 +159,7 @@ def test_nothing_to_undo_and_broken_history(ws):
 def test_history_is_pruned_and_old_images_deleted(ws, monkeypatch):
     """Only HISTORY_KEPT versions are kept; an image goes once the last version naming it does,
     but not if a later version drops it again (that one deletes it later)."""
-    monkeypatch.setattr(store, "HISTORY_KEPT", 2)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 2)
     t = _task(ws, n=1)
     red, green = t.config.examples
     t.delete_example(red.id)
@@ -133,7 +200,7 @@ def test_images_are_stored_once_across_tasks(ws, monkeypatch):
     ws.delete("a")
     assert blob.stat().st_nlink == 2
     b.delete_example(ea.id)
-    monkeypatch.setattr(store, "HISTORY_KEPT", 0)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 0)
     b.upsert_class("x")  # prunes the version holding the image
     assert not blob.exists()
 

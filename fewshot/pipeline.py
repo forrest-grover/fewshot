@@ -87,8 +87,20 @@ class Pipeline:
         emb, hit = self._cached(spec, ns, [k for k, _ in items])
         out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
         if emb is not None:
-            todo = [(i, k, im) for i, (k, im) in enumerate(items) if i not in out]
+            first: dict[str, int] = {}  # key -> first row with it: the same image is embedded once
+            todo = []
+            for i, (k, im) in enumerate(items):
+                if i in out or (k and k in first):
+                    continue
+                if k:
+                    first[k] = i
+                todo.append((i, k, im))
             out.update(self._embed_uncached(emb, ns, todo, errors, progress, flip))
+            for i, (k, _) in enumerate(items):
+                if i not in out and k:  # a repeat of an image embedded (or failed) above
+                    out[i] = out[first[k]]
+                    if errors is not None and first[k] in errors:
+                        errors[i] = errors[first[k]]
         return np.stack([out[i] for i in range(len(items))]).astype(np.float32)
 
     def _cached(self, spec: str, ns: str, keys: list[str | None]) -> tuple[Embedder | None, dict[str, Vectors]]:
@@ -219,7 +231,10 @@ class Pipeline:
                 return hit[1]
         clf = self._new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
         with self._lock:
-            self._fitted[cfg.name] = (stamp, clf)
+            # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
+            cur = self._fitted.get(cfg.name)
+            if cur is None or cur[0][0] != stamp[0] or cur[0][1] <= stamp[1]:
+                self._fitted[cfg.name] = (stamp, clf)
         return clf
 
     # ---- prediction --------------------------------------------------
@@ -241,10 +256,10 @@ class Pipeline:
             return []
         errors: dict[int, str] = {}
         Q = self.embed_images(cfg.embedder, _keyed(images, errors), errors, progress, cfg.flip)
-        probs, sims = clf.predict(Q)
+        probs, sims, per_class = clf.predict_full(Q)
         thr = threshold_for(cfg, clf)
         return [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)
-                for i, row in enumerate(zip(probs, sims, clf.class_similarity(Q), strict=True))]
+                for i, row in enumerate(zip(probs, sims, per_class, strict=True))]
 
     # ---- data checks -------------------------------------------------
     def near_duplicates(self, task: Task, threshold: float = 0.95, limit: int = 500) -> list[dict[str, Any]]:

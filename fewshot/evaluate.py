@@ -83,7 +83,7 @@ def _cross_val_predict(data: ClassData, cfg: TaskConfig, k: int, seed: int,
     """Held-out predictions per example. A fold whose training part has fewer than 2 classes (or,
     for a one-class task, none) leaves its examples unscored."""
     n, C = len(data.y), len(data.classes)
-    if k >= n and not data.text and cfg.classifier in {"prototype", "knn"}:
+    if k >= n and cfg.classifier in {"prototype", "knn"} and _text_unused(data, cfg):
         return _fast_leave_one_out(data, cfg, progress)
     out = HeldOut.empty(n, C)
     folds = _folds(data.y, k, seed)
@@ -107,6 +107,15 @@ def _fold(data: ClassData, cfg: TaskConfig, test: np.ndarray, out: HeldOut) -> N
     full = np.zeros((len(test), C))  # probabilities over all classes, 0 for those left out
     full[:, back] = p
     out.record(test, full, s, data.y[test], np.isin(data.y[test], back))
+
+
+def _text_unused(data: ClassData, cfg: TaskConfig) -> bool:
+    """Whether descriptions play no part in any leave-one-out fold: there are none, or their
+    weight is 0 and every class keeps an example when one is held out (a class left with only
+    its description would score through it)."""
+    if not data.text:
+        return True
+    return cfg.text_weight == 0 and int(np.bincount(data.y, minlength=len(data.classes)).min()) >= 2
 
 
 def _ranks(probs: np.ndarray, truth: np.ndarray, known: np.ndarray) -> np.ndarray:
@@ -357,6 +366,8 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     for arg, value, low in (("way", way, 2), ("shot", shot, 0), ("query", query, 1), ("episodes", episodes, 1)):
         if value < low:
             raise ValueError(f"{arg} must be at least {low}, got {value}")
+    if shot == 0 and not text_template:  # checked before embedding the whole dataset
+        raise ValueError("shot=0 (zero-shot) needs a text_template such as 'a photo of a {}'")
     ds = {c: fs for c, fs in load_folder_dataset(folder).items() if len(fs) >= shot + query}
     if len(ds) < way:
         raise ValueError(f"Only {len(ds)} classes have >= {shot + query} images; need {way}")

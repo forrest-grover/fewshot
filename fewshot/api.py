@@ -292,6 +292,9 @@ def _detail(t: Task) -> dict[str, Any]:
         "flip": c.flip,
         "revision": c.revision,
         "can_undo": t.can_undo(),
+        "can_redo": t.can_redo(),
+        "undo_label": t.undo_label(),
+        "redo_label": t.redo_label(),
         "classes": [{"name": k.name, "description": k.description, "count": counts.get(k.name, 0)} for k in c.classes],
         "examples": [e.model_dump() for e in c.examples],
     }
@@ -435,10 +438,24 @@ def rename_task(name: str, body: Rename) -> dict[str, Any]:
 
 @app.post("/api/tasks/{name}/undo", response_model=TaskDetail)
 def undo(name: str) -> dict[str, Any]:
-    """Undo the task's last change (400 if there is nothing to undo)."""
+    """Undo the task's last change (400 if there is nothing to undo); ``undo_label`` in the task
+    says what it was before the call."""
     t = _task(name)
     try:
         t.undo()
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
+    return _detail(t)
+
+
+@app.post("/api/tasks/{name}/redo", response_model=TaskDetail)
+def redo(name: str) -> dict[str, Any]:
+    """Make the last undone change again (400 if there is nothing to redo, as after any new change)."""
+    t = _task(name)
+    try:
+        t.redo()
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:

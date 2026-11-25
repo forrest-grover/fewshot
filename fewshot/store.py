@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import json
 import logging
 import os
 import re
@@ -54,6 +53,7 @@ from .fsutil import create_exclusive as _create_exclusive
 from .fsutil import file_lock as _file_lock
 from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
+from .history import TaskHistory
 from .images import IMAGE_EXTS, image_ext, image_id
 from .text import check_class_name, check_tag, check_template, fill_template, prompts
 
@@ -66,7 +66,6 @@ EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}(?:[0-9a-f]{16})?\.[a-z0-9]{1
 # Images saved per task.json write by Task.add_examples.
 ADD_CHUNK = 256
 MAX_NOTE = 2000
-HISTORY_KEPT = 20  # earlier task.json versions kept for undo
 # A task folder without task.json (or a .tmp-/.trash- folder) this old is left over from a crash.
 STALE_SECONDS = 600
 SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "reject_below",
@@ -215,7 +214,7 @@ def check_settings(cfg: TaskConfig) -> None:
     check_params(cfg.classifier, {"text_weight": cfg.text_weight, **cfg.classifier_params})
 
 
-class Task:  # pylint: disable=too-many-public-methods  # the whole editing API of a task
+class Task(TaskHistory):  # pylint: disable=too-many-public-methods  # the whole editing API of a task
     """A task folder: its config plus example images. Every mutation is saved immediately.
 
     Mutations are serialised across threads and processes, and start from the latest
@@ -282,12 +281,13 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                 finally:
                     self._depth = 0
 
-    def _save(self, gone: Iterable[str] = (), record: bool = True) -> None:
+    def _save(self, gone: Iterable[str] = (), record: bool = True, label: str = "", keep_redo: bool = False) -> None:
         """Bump the revision and write ``task.json`` atomically and durably. Call inside ``_writing``.
 
-        With ``record``, the version being replaced is kept in ``history/`` for ``undo``; ``gone``
-        names the image files this change stopped using, which are deleted once no kept version
-        uses them.
+        With ``record``, the version being replaced is kept in ``history/`` for ``undo``, with
+        ``label`` describing the change, and (unless ``keep_redo``) undone changes can no longer
+        be redone. ``gone`` names the image files this change stopped using, which are deleted
+        once no kept version uses them.
         """
         old_rev = self.config.revision
         self.config.revision += 1
@@ -299,7 +299,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                 f.flush()
                 os.fsync(f.fileno())
             if record and (self.path / "task.json").exists():
-                made = self._snapshot(old_rev, sorted(set(gone)))
+                made = self._snapshot(old_rev, sorted(set(gone)), label)
             os.replace(tmp, self.path / "task.json")
         except BaseException:
             for leftover in [Path(tmp), *made]:  # a version that never got replaced is no step to undo
@@ -308,6 +308,8 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             raise
         self._stamp = _stamp(os.stat(self.path / "task.json"))
         if record:
+            if not keep_redo:
+                self._clear_redo()
             self._prune_history()
         if hasattr(os, "O_DIRECTORY"):  # pragma: no branch  # make the rename itself durable (POSIX)
             dfd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
@@ -315,120 +317,6 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
-
-    # ---- history and undo --------------------------------------------
-    def _snapshot(self, rev: int, gone: list[str]) -> list[Path]:
-        """Keep the current task.json (revision ``rev``) as ``history/<rev>.json``, plus the image
-        files the change being saved drops, in ``<rev>.gone``; returns the files written."""
-        hist = self.path / "history"
-        hist.mkdir(exist_ok=True)
-        snap = hist / f"{rev:010d}.json"
-        snap.unlink(missing_ok=True)
-        try:
-            os.link(self.path / "task.json", snap)  # free: task.json is about to be replaced, not changed
-        except OSError:  # pragma: no cover  # filesystems without hard links
-            shutil.copyfile(self.path / "task.json", snap)
-        if not gone:
-            return [snap]
-        _write_atomic(snap.with_suffix(".gone"), json.dumps(gone).encode())
-        return [snap, snap.with_suffix(".gone")]
-
-    def _history(self) -> list[tuple[int, Path]]:
-        """Kept versions as ``(revision, path)``, oldest first."""
-        hist = self.path / "history"
-        if not hist.is_dir():
-            return []
-        return sorted((int(f.stem), f) for f in hist.glob("*.json") if f.stem.isdigit())
-
-    @staticmethod
-    def _gone(snap: Path) -> set[str]:
-        """Image files dropped by the change after version ``snap``. An unreadable list names
-        none, so those files are kept (``Workspace.gc`` finds them later) rather than lost."""
-        try:
-            files = json.loads(snap.with_suffix(".gone").read_text())
-        except FileNotFoundError:
-            return set()
-        except (OSError, ValueError):
-            log.warning("Ignoring unreadable %s", snap.with_suffix(".gone"))
-            return set()
-        return {f for f in files if isinstance(f, str)} if isinstance(files, list) else set()
-
-    def _prune_history(self) -> None:
-        """Forget versions beyond ``HISTORY_KEPT`` and delete images that only they used."""
-        snaps = self._history()
-        cut = max(0, len(snaps) - HISTORY_KEPT)
-        old, kept = snaps[:cut], snaps[cut:]
-        if not old:
-            return
-        gone = set().union(*(self._gone(p) for _, p in old))
-        for _, p in old:
-            p.unlink(missing_ok=True)
-            p.with_suffix(".gone").unlink(missing_ok=True)
-        # A file dropped again later is deleted when that later version goes.
-        gone -= {e.file for e in self.config.examples}
-        gone -= set().union(*(self._gone(p) for _, p in kept))
-        for f in gone:
-            self._drop_file(f)
-
-    def _drop_unused_images(self) -> int:
-        """Delete image files that neither the task nor any kept version names; returns how many."""
-        with self._writing():
-            used = {e.file for e in self.config.examples}
-            used |= set().union(*(self._files_in(p) for _, p in self._history()))
-            images = self.path / "images"
-            unused = [f"images/{f.name}" for f in images.iterdir() if f.is_file()] if images.is_dir() else []
-            unused = [f for f in unused if f not in used]
-            for f in unused:
-                self._drop_file(f)
-            return len(unused)
-
-    def can_undo(self) -> bool:
-        """Whether there is an earlier version to go back to."""
-        return bool(self._history())
-
-    def undo(self) -> int:
-        """Go back to the version before the last change (of any kind); returns its revision.
-
-        Deleted examples come back with their images. The task keeps its name and its revision
-        still increases. Raises ``ValueError`` if there is nothing to undo.
-        """
-        with self._writing():
-            snaps = self._history()
-            if not snaps:
-                raise ValueError("Nothing to undo")
-            rev, snap = snaps[-1]
-            try:
-                old = TaskConfig.model_validate_json(snap.read_bytes())
-            except ValidationError as e:
-                # Drop it, so the next undo can go further back instead of failing here forever.
-                snap.unlink()
-                snap.with_suffix(".gone").unlink(missing_ok=True)
-                raise ValueError(f"Can't undo: {snap.name} is invalid and was removed; undo again to go "
-                                 "further back") from e
-            missing = [e.file for e in old.examples if not (self.path / e.file).exists()]
-            if missing:
-                raise ValueError(f"Can't undo: {len(missing)} image files are gone, e.g. {missing[0]}")
-            before = {e.file for e in self.config.examples}
-            self.config = old.model_copy(update={"name": self.config.name, "uid": self.config.uid,
-                                                 "revision": self.config.revision})
-            self._save(record=False)
-            snap.unlink()
-            snap.with_suffix(".gone").unlink(missing_ok=True)
-            # Images the undone change added are deleted unless a kept version still uses them.
-            dropped = before - {e.file for e in self.config.examples}
-            if dropped:
-                used = set().union(*(self._files_in(p) for _, p in self._history()))
-                for f in dropped - used:
-                    self._drop_file(f)
-            return rev
-
-    @staticmethod
-    def _files_in(snap: Path) -> set[str]:
-        """Image files named by a kept version (read without full validation)."""
-        try:
-            return {e["file"] for e in json.loads(snap.read_bytes()).get("examples", [])}
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            return set()
 
     # ---- image files -------------------------------------------------
     def _blob(self, file: str) -> Path | None:
@@ -485,7 +373,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
         task or a ``.trash-`` folder that ``Workspace.gc`` removes, never a half-deleted task.
         """
         with self._writing():
-            files = {e.file for e in self.config.examples}
+            files = {e.file for e in self.config.examples} | self._redo_files()
             files |= set().union(*(self._gone(p) for _, p in self._history()))
             trash = self.path.parent / f".trash-{uuid.uuid4().hex}"
             os.rename(self.path, trash)
@@ -511,7 +399,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             check_settings(new)
             for k in kw:
                 setattr(self.config, k, getattr(new, k))
-            self._save()
+            self._save(label="change settings")
 
     # ---- classes -----------------------------------------------------
     def class_names(self) -> list[str]:
@@ -529,11 +417,11 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                 if c.name == name:
                     if description is not None:
                         c = self.config.classes[i] = c.model_copy(update={"description": description})
-                    self._save()
+                    self._save(label=f"edit class {name}")
                     return c
             c = ClassDef(name=check_class_name(name), description=description or "")
             self.config.classes.append(c)
-            self._save()
+            self._save(label=f"add class {c.name}")
             return c
 
     def describe_classes(self, template: str, overwrite: bool = False) -> int:
@@ -550,7 +438,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                 if overwrite or not c.description.strip():
                     classes[i] = c.model_copy(update={"description": fill_template(template, c.name)})
                     n += 1
-            self._save()
+            self._save(label="describe classes")
         return n
 
     def rename_class(self, old: str, new: str) -> None:
@@ -563,7 +451,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             cfg = self.config
             cfg.classes = [c.model_copy(update={"name": new}) if c.name == old else c for c in cfg.classes]
             cfg.examples = [e.model_copy(update={"label": new}) if e.label == old else e for e in cfg.examples]
-            self._save()
+            self._save(label=f"rename class {old} to {new}")
 
     def delete_class(self, name: str) -> int:
         """Delete a class and its examples; returns the number of examples removed."""
@@ -572,7 +460,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             gone = [e for e in self.config.examples if e.label == name]
             self.config.examples = [e for e in self.config.examples if e.label != name]
             self.config.classes = [c for c in self.config.classes if c.name != name]
-            self._save(gone=[e.file for e in gone])  # the files stay while undo may need them
+            self._save(gone=[e.file for e in gone], label=f"delete class {name}")  # files stay while undo needs them
             return len(gone)
 
     def _class(self, name: str) -> ClassDef:
@@ -640,7 +528,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                 out.append(ex)
             try:
                 if any(not isinstance(r, ValueError) for r in out):
-                    self._save(record=record)
+                    self._save(record=record, label=_add_label(out))
             except BaseException:
                 for f in created:  # not named by any saved version
                     self._drop_file(f)
@@ -690,7 +578,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             self._ensure_class(label)
             self.config.examples = [e.model_copy(update={"label": label}) if e.id in ids else e
                                     for e in self.config.examples]
-            self._save()
+            self._save(label=f"move {_n(len(ids))} to {label}")
             return len(ids)
 
     def delete_example(self, eid: str) -> None:
@@ -706,7 +594,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
             gone = self._examples(eids)
             ids = {e.id for e in gone}
             self.config.examples = [x for x in self.config.examples if x.id not in ids]
-            self._save(gone=[e.file for e in gone])
+            self._save(gone=[e.file for e in gone], label=f"delete {_n(len(gone))}")
             return len(gone)
 
     def annotate(self, eids: Iterable[str], *, tags: Iterable[str] | None = None, add_tags: Iterable[str] = (),
@@ -731,7 +619,7 @@ class Task:  # pylint: disable=too-many-public-methods  # the whole editing API 
                     if note is not None:
                         update["note"] = note.strip()
                     examples[i] = e.model_copy(update=update)
-            self._save()
+            self._save(label=f"tag {_n(len(ids))}" if note is None else f"edit {_n(len(ids))}")
             return len(ids)
 
     def find_examples(self, label: str | None = None, tag: str | None = None) -> list[Example]:
@@ -950,3 +838,15 @@ def _abandoned(folder: Path) -> bool:
     except FileNotFoundError:
         return False
     return age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
+
+
+def _n(count: int) -> str:
+    """ "1 example", "3 examples"."""
+    return f"{count} example{'' if count == 1 else 's'}"
+
+
+def _add_label(results: list[Example | ValueError]) -> str:
+    """Undo description of an add: "add 3 examples to red" (classes listed, at most three)."""
+    labels = list(dict.fromkeys(r.label for r in results if isinstance(r, Example)))
+    where = ", ".join(labels[:3]) + (", ..." if len(labels) > 3 else "")
+    return f"add {_n(sum(isinstance(r, Example) for r in results))} to {where}"

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import fewshot
-from fewshot import ClassData, Pipeline, Workspace, evaluate_task, make_classifier, store
+from fewshot import ClassData, Pipeline, Workspace, evaluate_task, history, make_classifier, store
 from tests.conftest import png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
@@ -66,7 +66,7 @@ def test_reject_threshold_marks_unknown(ws):
 
 def test_refit_after_change_and_persistence(ws, monkeypatch):
     """Renames and deletions take effect on the next prediction and persist to disk."""
-    monkeypatch.setattr(store, "HISTORY_KEPT", 0)  # no undo: deleted images go at once
+    monkeypatch.setattr(history, "HISTORY_KEPT", 0)  # no undo: deleted images go at once
     t = make_task(ws)
     pipe = Pipeline(ws)
     assert pipe.predict(t, [png(GREEN, seed=5)])[0].label == "green"

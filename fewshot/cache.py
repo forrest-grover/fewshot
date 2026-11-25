@@ -7,13 +7,19 @@ images that the new model has not seen before.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
 from .embedders import Vectors
+
+log = logging.getLogger(__name__)
 
 BUSY_TIMEOUT = 30.0  # seconds to wait for another process's write to finish
 
@@ -24,18 +30,33 @@ class EmbeddingCache:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self._lock = threading.Lock()
+        try:
+            self._conn = self._open()
+        except sqlite3.DatabaseError as e:
+            # It is only a cache: move a damaged file aside (for inspection) and start afresh,
+            # rather than leaving the server and CLI unable to start.
+            aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            log.warning("Embedding cache %s is unreadable (%s); moved it to %s and starting a new one", path, e, aside)
+            for suffix in ("", "-wal", "-shm"):
+                with contextlib.suppress(FileNotFoundError):
+                    os.replace(f"{path}{suffix}", f"{aside}{suffix}")
+            self._conn = self._open()
+
+    def _open(self) -> sqlite3.Connection:
         # The server and CLI may share this file: wait up to BUSY_TIMEOUT for the other's write
         # instead of failing with "database is locked".
-        self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=BUSY_TIMEOUT)
-        self._lock = threading.Lock()
-        with self._lock:
+        conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=BUSY_TIMEOUT)
+        try:
             # WAL: readers never block on a writer, and a writer blocks only other writers.
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")  # durable enough for a cache, much faster
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS emb (spec TEXT, key TEXT, vec BLOB, PRIMARY KEY (spec, key))"
-            )
-            self._conn.commit()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")  # durable enough for a cache, much faster
+            conn.execute("CREATE TABLE IF NOT EXISTS emb (spec TEXT, key TEXT, vec BLOB, PRIMARY KEY (spec, key))")
+            conn.commit()
+        except sqlite3.DatabaseError:
+            conn.close()
+            raise
+        return conn
 
     def get_many(self, spec: str, keys: list[str]) -> dict[str, Vectors]:
         """Return the cached vectors among ``keys`` (missing keys are simply absent)."""

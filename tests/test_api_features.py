@@ -274,3 +274,28 @@ def test_urls_check_the_label_before_downloading(client, task, monkeypatch):
         r = client.post(f"/api/tasks/{task}/examples/urls", json={"label": label, "urls": ["http://h/x.png"] * 5})
         assert r.status_code == 400
     assert not fetched
+
+
+def test_redo(client, task):
+    """Redo makes an undone change again; labels say what undo and redo would do."""
+    t = client.get(f"/api/tasks/{task}").json()
+    eid = t["examples"][0]["id"]
+    t = client.delete(f"/api/tasks/{task}/examples/{eid}").json()
+    assert t["undo_label"] == "delete 1 example"
+    t = client.post(f"/api/tasks/{task}/undo").json()
+    assert (t["can_redo"], t["redo_label"], len(t["examples"])) == (True, "delete 1 example", 6)
+    t = client.post(f"/api/tasks/{task}/redo").json()
+    assert (t["can_redo"], len(t["examples"])) == (False, 5)
+    r = client.post(f"/api/tasks/{task}/redo")
+    assert (r.status_code, r.json()["detail"]) == (400, "Nothing to redo")
+    assert client.post("/api/tasks/nope/redo").status_code == 404
+
+
+def test_redo_of_a_task_deleted_meanwhile(client, task, monkeypatch):
+    """A task that disappears between lookup and redo is a 404."""
+
+    def gone(_self):
+        raise KeyError("No task 'c'")
+
+    monkeypatch.setattr(fewshot.store.Task, "redo", gone)
+    assert client.post(f"/api/tasks/{task}/redo").status_code == 404

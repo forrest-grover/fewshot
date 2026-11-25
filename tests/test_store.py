@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from fewshot import embedders, store
+from fewshot import embedders, history, store
 from fewshot.images import image_id, load_image
 from fewshot.store import TaskConfig, Workspace
 from fewshot.text import check_class_name
@@ -214,7 +214,7 @@ def test_rename_class(ws):
 def test_delete_class_removes_examples_and_files(ws, monkeypatch):
     """Deleting a class deletes its examples and (with no undo history kept) image files, and
     returns how many."""
-    monkeypatch.setattr(store, "HISTORY_KEPT", 0)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 0)
     t = ws.create("t")
     r1 = t.add_example(png(RED), "red")
     t.add_example(png(RED, noise=5), "red")
@@ -287,7 +287,7 @@ def test_add_examples_from_dir(ws, tmp_path):
 
 def test_example_lookup_relabel_and_delete(ws, monkeypatch):
     """Examples can be found, moved between classes and deleted with their file."""
-    monkeypatch.setattr(store, "HISTORY_KEPT", 0)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 0)
     t = ws.create("t")
     e = t.add_example(png(RED), "red")
     t.upsert_class("blue")

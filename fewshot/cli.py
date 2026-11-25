@@ -305,11 +305,25 @@ def rename(name: str, new_name: str, root: Path | None = ROOT_OPT) -> None:
 def undo(name: str, root: Path | None = ROOT_OPT) -> None:
     """Undo a task's last change (settings, classes or examples); repeat to go further back."""
     t = _task(root, name)
+    label = t.undo_label()
     try:
         rev = t.undo()
     except (KeyError, ValueError) as e:
         _fail(_error_text(e))
-    typer.echo(f"{name}: back to revision {rev} ({len(t.config.examples)} examples)")
+    typer.echo(f"{name}: undid {label or 'the last change'}, back to revision {rev} "
+               f"({len(t.config.examples)} examples)")
+
+
+@app.command()
+def redo(name: str, root: Path | None = ROOT_OPT) -> None:
+    """Make the last undone change again (until another change is made)."""
+    t = _task(root, name)
+    label = t.redo_label()
+    try:
+        t.redo()
+    except (KeyError, ValueError) as e:
+        _fail(_error_text(e))
+    typer.echo(f"{name}: redid {label or 'the last undone change'} ({len(t.config.examples)} examples)")
 
 
 @app.command()
@@ -670,7 +684,10 @@ def cache_prune(
         _fail(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
     from .pipeline import FLIP_KEY  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
-    keep = {k for t in tasks for e in t.config.examples for k in (e.id, e.id + FLIP_KEY)}
+    # Images undo or redo may bring back keep their vectors too.
+    ids = {e.id for t in tasks for e in t.config.examples}
+    ids |= {f.split("/", 1)[1].rsplit(".", 1)[0] for t in tasks for f in t.kept_files()}
+    keep = {k for i in ids for k in (i, i + FLIP_KEY)}
     cache = EmbeddingCache(ws.cache_path)
     n = cache.prune(keep, dry_run=dry_run)
     typer.echo(f"{'Would delete' if dry_run else 'Deleted'} {n} cached image vectors; "

@@ -12,7 +12,7 @@ import zipfile
 import pytest
 from typer.testing import CliRunner
 
-from fewshot import archive, cli, store
+from fewshot import archive, cli, history, store
 from fewshot.archive import export_task, import_task
 from fewshot.fsutil import create_exclusive
 from fewshot.images import image_id
@@ -39,7 +39,7 @@ def _age(path, seconds=3600):
 def test_unreadable_gone_list_keeps_the_task_working(ws, monkeypatch):
     """A truncated .gone file (a crash while writing it) doesn't break later edits or deletion;
     its files are kept rather than lost."""
-    monkeypatch.setattr(store, "HISTORY_KEPT", 1)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 1)
     t = _task(ws)
     gone = t.config.examples[0]
     t.delete_example(gone.id)
@@ -148,6 +148,8 @@ def test_one_undo_takes_back_a_whole_bulk_add(ws):
     assert len(t.config.examples) == 6
     t.undo()
     assert len(t.config.examples) == 1
+    assert len(list((t.path / "images").iterdir())) == 6  # kept for redo...
+    t.upsert_class("x")  # ...until another change makes redo impossible
     assert len(list((t.path / "images").iterdir())) == 1
 
 
@@ -241,7 +243,7 @@ def test_create_exclusive(tmp_path):
 def test_gc(ws, monkeypatch):
     """gc removes old leftover folders, image files no version names, and unused blobs; it keeps
     young leftovers (maybe in progress) and images undo may still need."""
-    monkeypatch.setattr(store, "HISTORY_KEPT", 5)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 5)
     t = _task(ws, n=2)
     deleted = t.config.examples[0]
     t.delete_example(deleted.id)  # undo still needs its image

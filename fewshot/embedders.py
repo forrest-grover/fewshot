@@ -15,7 +15,7 @@ import hashlib
 import os
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     import torch
 
 Vectors = npt.NDArray[np.float32]  # L2-normalised embeddings, one per row
+GROW_AFTER = 20  # batches that must fit before a batch size halved by an out-of-memory error doubles
 
 
 @dataclass(frozen=True)
@@ -93,9 +94,14 @@ def _device() -> str:
 
     if forced := os.environ.get("FEWSHOT_DEVICE", "").strip():
         try:
-            torch.device(forced)
+            dev = torch.device(forced)
         except RuntimeError as e:
             raise ValueError(f"FEWSHOT_DEVICE={forced!r} is not a torch device: {e}") from None
+        # Checked now, so a missing device fails with a clear message rather than inside a model load.
+        if dev.type == "cuda" and (dev.index or 0) >= torch.cuda.device_count():
+            raise ValueError(f"FEWSHOT_DEVICE={forced!r}: this machine has {torch.cuda.device_count()} CUDA devices")
+        if dev.type == "mps" and not torch.backends.mps.is_available():
+            raise ValueError(f"FEWSHOT_DEVICE={forced!r}: Apple's GPU (MPS) is not available here")
         return forced
     if torch.cuda.is_available():
         return "cuda"
@@ -144,6 +150,19 @@ class Embedder(ABC):
         # Models are shared across API request threads; serialise GPU use. The lock is taken per batch
         # and only around the forward pass, so one long job doesn't hold off other requests.
         self._lock = threading.Lock()
+        self.users = 0  # embed calls in progress; a model in use is never unloaded
+        self._full_batch: int | None = None  # batch_size before out-of-memory halving
+        self._good_batches = 0  # batches that fitted since the last halving
+
+    @contextlib.contextmanager
+    def _in_use(self) -> Iterator[None]:
+        with _load_lock:
+            self.users += 1
+        try:
+            yield
+        finally:
+            with _load_lock:
+                self.users -= 1
 
     @abstractmethod
     def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors: ...
@@ -175,10 +194,11 @@ class Embedder(ABC):
 
         out: list[Vectors] = []
         i = 0
-        while i < len(images):
-            batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
-            out.append(self._embed_halving(self._prepare_images(batch), len(batch), self._embed_prepared))
-            i += len(batch)
+        with self._in_use():
+            while i < len(images):
+                batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
+                out.append(self._embed_halving(self._prepare_images(batch), len(batch), self._embed_prepared))
+                i += len(batch)
         return np.concatenate(out)
 
     def _embed_halving(self, batch: Any, n: int, forward: Callable[[Any], Vectors]) -> Vectors:
@@ -189,7 +209,9 @@ class Embedder(ABC):
 
         try:
             with self._lock, torch.inference_mode():
-                return self._checked(forward(batch), n)
+                vecs = self._checked(forward(batch), n)
+            self._fitted_batch()
+            return vecs
         except Exception as e:  # pylint: disable=broad-exception-caught  # only OOM is handled; re-raised
             if n == 1 or not _is_oom(e):
                 raise
@@ -197,9 +219,22 @@ class Embedder(ABC):
         # the failed forward pass's tensors alive, so freeing memory couldn't help the retry.
         _free_gpu_memory()
         half = n // 2
+        self._full_batch = self._full_batch or self.batch_size
+        self._good_batches = 0
         self.batch_size = max(1, min(self.batch_size, half))
         return np.concatenate([self._embed_halving(batch[:half], half, forward),
                                self._embed_halving(batch[half:], n - half, forward)])
+
+    def _fitted_batch(self) -> None:
+        """Count a batch that fitted; after ``GROW_AFTER`` in a row, double a halved ``batch_size``
+        again (up to its original size), since an out-of-memory error may have been caused by
+        another job that has finished since."""
+        if self._full_batch is None or self.batch_size >= self._full_batch:
+            return
+        self._good_batches += 1
+        if self._good_batches >= GROW_AFTER:
+            self.batch_size = min(self._full_batch, self.batch_size * 2)
+            self._good_batches = 0
 
     def embed_texts(self, texts: Sequence[str]) -> Vectors:
         """Embed texts into the image embedding space, ``batch_size`` at a time; raises
@@ -211,10 +246,11 @@ class Embedder(ABC):
         texts = list(texts)
         out = []
         i = 0
-        while i < len(texts):  # in batches, like images, so a long prompt ensemble fits in memory
-            batch = texts[i : i + self.batch_size]
-            out.append(self._embed_halving(batch, len(batch), self._embed_text_batch))
-            i += len(batch)
+        with self._in_use():
+            while i < len(texts):  # in batches, like images, so a long prompt ensemble fits in memory
+                batch = texts[i : i + self.batch_size]
+                out.append(self._embed_halving(batch, len(batch), self._embed_text_batch))
+                i += len(batch)
         return np.concatenate(out)
 
     def _checked(self, vecs: Any, n: int) -> Vectors:
@@ -317,7 +353,11 @@ _namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once
 def max_models() -> int:
     """Most built-in models kept loaded at once (``$FEWSHOT_MAX_MODELS``, default 2); loading
     another unloads the least recently used. Registered embedders don't count and stay loaded."""
-    return max(1, int(os.environ.get("FEWSHOT_MAX_MODELS", "2")))
+    raw = os.environ.get("FEWSHOT_MAX_MODELS", "2")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        raise ValueError(f"FEWSHOT_MAX_MODELS must be a whole number, got {raw!r}") from None
 
 
 def _probe_image() -> Image.Image:
@@ -378,7 +418,7 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
             if spec in _loaded:  # registered while we were loading: the registration wins
                 return _loaded[spec]
             _loaded[spec] = emb
-            evicted = _evict_locked()
+            evicted = _evict_locked(keep=spec)
     if evicted:
         _free_gpu_memory()
     return emb
@@ -396,10 +436,15 @@ def _build(spec: str) -> Embedder:
     raise ValueError(f"Unknown embedder backend {backend!r} (use 'openclip' or 'timm')")
 
 
-def _evict_locked() -> list[str]:
-    """Drop least recently used built-in models beyond ``max_models()``; returns their specs."""
+def _evict_locked(keep: str | None = None) -> list[str]:
+    """Drop least recently used built-in models beyond ``max_models()``; returns their specs.
+
+    A model in use (embedding right now) is skipped, so a later request can't load a second copy
+    of it while the first still holds its memory; the limit may be exceeded until it is free.
+    """
     built_in = [s for s in _loaded if s not in _registered]
-    gone = built_in[: max(0, len(built_in) - max_models())]
+    idle = [s for s in built_in if _loaded[s].users == 0 and s != keep]  # never the model just loaded
+    gone = idle[: max(0, len(built_in) - max_models())]
     for spec in gone:
         del _loaded[spec]
     return gone
@@ -414,6 +459,8 @@ def _free_gpu_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def loaded_embedders() -> list[str]:
