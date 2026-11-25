@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -231,6 +232,8 @@ class Pipeline:
         description are left out. ``top_k`` keeps only that many of the highest ``scores``;
         ``progress`` counts images embedded (see ``embed_images``).
         """
+        if top_k is not None and top_k < 1:
+            raise ValueError(f"top_k must be at least 1, got {top_k}")
         task = self.ws.get(task) if isinstance(task, str) else task
         cfg = task.config
         clf = self.fitted(task, cfg)
@@ -253,13 +256,16 @@ class Pipeline:
         X = self.example_embeddings(task, cfg)
         exs = cfg.examples
         pairs: list[tuple[float, int, int]] = []
-        for start in range(0, len(X), 1024):
-            S = X[start : start + 1024] @ X.T
-            rows, cols = np.nonzero(np.greater_equal(S, threshold))
-            for r, c in zip(rows.tolist(), cols.tolist(), strict=True):
-                if c > start + r:
-                    pairs.append((float(S[r, c]), start + r, c))
-        pairs.sort(key=lambda t: -t[0])
+        floor = threshold - 1e-5  # float32 rounding: identical images can score 0.99999976
+        for start in range(0, len(X), 512):
+            S = X[start : start + 512] @ X.T
+            S[np.arange(len(S))[:, None] >= np.arange(len(X))[None, :] - start] = -np.inf  # each pair once
+            flat = S.ravel()
+            hits = np.flatnonzero(flat >= floor)
+            if len(hits) > limit:  # keep only this chunk's best few, so memory stays bounded
+                hits = hits[np.argpartition(-flat[hits], limit - 1)[:limit]]
+            pairs += [(float(flat[h]), start + h // len(X), h % len(X)) for h in hits.tolist()]
+            pairs = heapq.nlargest(limit, pairs)
         return [{"a": exs[i].id, "b": exs[j].id, "similarity": round(sim, 4),
                  "labels": [exs[i].label, exs[j].label], "same_label": exs[i].label == exs[j].label}
                 for sim, i, j in pairs[:limit]]
@@ -291,7 +297,8 @@ def _keyed(images: Sequence[ImageInput], errors: dict[int, str]) -> list[tuple[s
 
 def _to_pred(clf: Classifier, thr: float | None, row: tuple[np.ndarray, float, np.ndarray],
              top_k: int | None) -> Prediction:
-    """The prediction from one image's (probabilities, best similarity, similarity per class)."""
+    """The prediction from one image's (probabilities, similarity to the predicted class,
+    similarity per class)."""
     p, s, per_class = row
     j = int(p.argmax())
     rejected = thr is not None and float(s) < thr

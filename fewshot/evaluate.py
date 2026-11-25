@@ -111,9 +111,11 @@ def _fold(data: ClassData, cfg: TaskConfig, test: np.ndarray, out: HeldOut) -> N
 
 def _ranks(probs: np.ndarray, truth: np.ndarray, known: np.ndarray) -> np.ndarray:
     """Rank of each row's true class (0 = most probable); the number of classes where the true
-    class wasn't among those trained on (``known`` False)."""
+    class wasn't among those trained on (``known`` False). Ties count against the true class: kNN
+    gives every class without a near neighbour the same tiny score, and counting those ties in the
+    true class's favour would credit it with a top-k place it never earned."""
     true_p = probs[np.arange(len(truth)), truth]
-    ranks: np.ndarray = np.where(known, (probs > true_p[:, None]).sum(1), probs.shape[1])
+    ranks: np.ndarray = np.where(known, (probs >= true_p[:, None]).sum(1) - 1, probs.shape[1])
     return ranks
 
 
@@ -169,7 +171,8 @@ def _loo_prototype(clf: PrototypeClassifier, X: np.ndarray, y: np.ndarray, rows:
 
 def _loo_knn(clf: KNNClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
              present: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Probabilities and best similarity for ``rows``, each voted on by the other examples."""
+    """Probabilities and the similarity to the predicted class (its nearest other example) for
+    ``rows``, each voted on by the other examples."""
     C = present.shape[1]
     S = X[rows] @ X.T
     S[np.arange(len(rows)), rows] = -np.inf  # not its own neighbour
@@ -181,7 +184,9 @@ def _loo_knn(clf: KNNClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
     votes = np.exp(clf.scale * (top_s - top_s.max(axis=1, keepdims=True)))
     scores = np.where(present, 1e-6, 0.0)  # the same floor as KNNClassifier, for classes still present
     np.add.at(scores, (np.repeat(np.arange(len(rows)), k), y[top.ravel()]), votes.ravel())
-    return scores / scores.sum(1, keepdims=True), S.max(1)
+    pred = scores.argmax(1)
+    sim = np.array([S[i, y == c].max() for i, c in enumerate(pred)])
+    return scores / scores.sum(1, keepdims=True), sim
 
 
 def _per_class(classes: list[str], cm: np.ndarray) -> dict[str, dict[str, Any]]:

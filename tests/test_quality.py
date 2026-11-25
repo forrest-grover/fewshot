@@ -458,3 +458,116 @@ def test_fetch_https_is_pinned_too(server, monkeypatch):
     with pytest.raises(ValueError, match="Could not fetch"):
         fetch.fetch_url(f"https://pinned.invalid:{port}/img", 10_000, public_only=True)
     assert looked_up == ["pinned.invalid", "pinned.invalid"]
+
+
+# ---- second review: wrong results ---------------------------------------
+def test_ties_count_against_the_true_class():
+    """A true class tied with others is ranked below all of them, so ties never earn top-k credit."""
+    probs = np.array([[0.5, 0.25, 0.25, 0.0], [0.4, 0.2, 0.2, 0.2]])
+    assert ev._ranks(probs, np.array([1, 3]), np.array([True, True])).tolist() == [2, 3]  # pylint: disable=protected-access
+
+
+def test_top_k_is_not_inflated_by_knn_ties(ws):
+    """Random labels with kNN (k=1) give chance-level top-2, not 100%."""
+    t = ws.create("t", embedder="fake:color", classifier="knn", classifier_params={"k": 1})
+    rng = np.random.default_rng(0)
+    for i in range(40):
+        t.add_example(png(tuple(int(c) for c in rng.integers(0, 255, 3)), seed=i), f"c{rng.integers(5)}")
+    r = evaluate_task(Pipeline(ws), t)
+    assert r["top_k_accuracy"]["2"] < 0.9
+
+
+def test_threshold_applies_to_the_predicted_class():
+    """When a description tips the vote to a class the image is less similar to, predict reports
+    that class's own similarity, so a threshold between the two rejects it instead of accepting
+    it below the line."""
+    from fewshot.classifiers import make_classifier  # pylint: disable=import-outside-toplevel
+    from fewshot.pipeline import _to_pred  # pylint: disable=import-outside-toplevel
+
+    X = np.array([[1, 0, 0], [0, 1, 0]], np.float32)
+    data = ClassData(["a", "b"], X, np.array([0, 1]), {1: np.array([0.6, 0.8, 0], np.float32)})
+    clf = make_classifier("prototype", text_weight=3.0).fit(data)
+    q = np.array([[0.8, 0.6, 0]], np.float32)
+    probs, sims = clf.predict(q)
+    per_class = clf.class_similarity(q)[0]
+    assert per_class[0] > per_class[1]  # nearer to a...
+    assert probs[0].argmax() == 1  # ...but b's description wins
+    assert sims[0] == pytest.approx(per_class[1])
+    p = _to_pred(clf, 0.7, (probs[0], float(sims[0]), per_class), None)
+    assert (p.rejected, p.label, p.labels) == (True, None, [])
+
+
+def test_top_k_must_be_positive(ws):
+    """top_k below 1 is a ValueError, not a silent trim from the end."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_example(png(RED), "red")
+    with pytest.raises(ValueError, match="top_k must be at least 1"):
+        Pipeline(ws).predict(t, [png(RED)], top_k=0)
+
+
+def test_near_duplicates_stays_bounded_and_finds_identical(ws):
+    """Only the best ``limit`` pairs are kept while scanning, and threshold 1.0 still finds
+    embeddings that are identical up to float rounding."""
+    t = ws.create("t", embedder="fake:color")
+    for size in (8, 9, 10):  # same colour, different files: identical embeddings
+        t.add_example(png(RED, size=size), "red")
+    t.add_example(png(GREEN), "green")
+    pipe = Pipeline(ws)
+    assert len(pipe.near_duplicates(t, threshold=1.0)) == 3
+    assert len(pipe.near_duplicates(t, threshold=0.5, limit=2)) == 2
+
+
+class _Activation:  # pylint: disable=too-few-public-methods
+    """Stands in for a forward pass's GPU tensors."""
+
+
+class Leaky(ColorEmbedder):
+    """Runs out of memory on batches over 2; records weak references to each pass's 'activations'."""
+
+    def __init__(self):
+        super().__init__()
+        self.refs = []
+        self.alive_at_retry = []
+
+    def _embed_prepared(self, batch):
+        import gc  # pylint: disable=import-outside-toplevel
+        import weakref  # pylint: disable=import-outside-toplevel
+
+        gc.collect()
+        self.alive_at_retry.append(any(r() is not None for r in self.refs))
+        act = _Activation()  # held by this frame, so by a traceback through it
+        self.refs.append(weakref.ref(act))
+        if len(batch) > 2:
+            raise RuntimeError("CUDA out of memory")
+        return super()._embed_prepared(batch)
+
+
+def test_out_of_memory_retry_frees_the_failed_pass(monkeypatch):
+    """The halves run after the failed pass's memory is released, not while its traceback holds it."""
+    monkeypatch.setattr(embedders, "_free_gpu_memory", lambda: None)
+    emb = Leaky()
+    emb.batch_size = 8
+    emb.embed_images([Image.new("RGB", (4, 4), (i * 30, 0, 0)) for i in range(8)])
+    assert not any(emb.alive_at_retry)
+
+
+def test_texts_are_embedded_in_batches_with_oom_halving(monkeypatch):
+    """Texts go through the model batch_size at a time, and halve on OOM like images."""
+    monkeypatch.setattr(embedders, "_free_gpu_memory", lambda: None)
+    sizes = []
+
+    class Texts(TextColor):
+        """Text embedder that runs out of memory above 2 texts."""
+
+        def _embed_text_batch(self, texts):
+            if len(texts) > 2:
+                raise RuntimeError("CUDA out of memory")
+            sizes.append(len(texts))
+            return super()._embed_text_batch(texts)
+
+    emb = Texts()
+    emb.batch_size = 4
+    v = emb.embed_texts(["red", "green", "blue", "red", "blue"])
+    assert v.shape == (5, 3)
+    assert sizes == [2, 2, 1]
+    assert emb.batch_size == 2

@@ -421,7 +421,7 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     paths: list[str],
     as_json: bool = JSON_OPT,
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: one row per image"),
-    top: int = typer.Option(3, help="Scores to show per image (and to include, with --json)"),
+    top: int = typer.Option(3, min=1, help="Scores to show per image (and to include, with --json)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Classify images (files, directories or http(s) URLs)."""

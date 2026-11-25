@@ -177,40 +177,45 @@ class Embedder(ABC):
         i = 0
         while i < len(images):
             batch = [im.convert("RGB") for im in images[i : i + self.batch_size]]
-            out.append(self._embed_halving(self._prepare_images(batch), len(batch)))
+            out.append(self._embed_halving(self._prepare_images(batch), len(batch), self._embed_prepared))
             i += len(batch)
         return np.concatenate(out)
 
-    def _embed_halving(self, prepared: Any, n: int) -> Vectors:
-        """Embed a prepared batch of ``n`` images. If the GPU runs out of memory, free what it can,
-        halve ``batch_size`` for the rest of this embedder's life, and embed the batch in halves."""
+    def _embed_halving(self, batch: Any, n: int, forward: Callable[[Any], Vectors]) -> Vectors:
+        """Run ``forward`` (under the model lock) on a batch of ``n`` prepared images or texts. If
+        the GPU runs out of memory, free what it can, halve ``batch_size`` for the rest of this
+        embedder's life, and run the batch in halves."""
         import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
         try:
             with self._lock, torch.inference_mode():
-                vecs = self._embed_prepared(prepared)
+                return self._checked(forward(batch), n)
         except Exception as e:  # pylint: disable=broad-exception-caught  # only OOM is handled; re-raised
             if n == 1 or not _is_oom(e):
                 raise
-            del e  # the traceback holds the failed batch's GPU tensors
-            _free_gpu_memory()
-            half = n // 2
-            self.batch_size = max(1, min(self.batch_size, half))
-            return np.concatenate([self._embed_halving(prepared[:half], half),
-                                   self._embed_halving(prepared[half:], n - half)])
-        return self._checked(vecs, n)
+        # Retry only here, outside the except block: inside it, the exception's traceback would keep
+        # the failed forward pass's tensors alive, so freeing memory couldn't help the retry.
+        _free_gpu_memory()
+        half = n // 2
+        self.batch_size = max(1, min(self.batch_size, half))
+        return np.concatenate([self._embed_halving(batch[:half], half, forward),
+                               self._embed_halving(batch[half:], n - half, forward)])
 
     def embed_texts(self, texts: Sequence[str]) -> Vectors:
-        """Embed texts into the image embedding space; raises NotImplementedError if unsupported."""
+        """Embed texts into the image embedding space, ``batch_size`` at a time; raises
+        NotImplementedError if unsupported."""
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
         if not self.supports_text:
             raise NotImplementedError(f"{self.spec} does not support text embeddings")
-        import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
-
-        with self._lock, torch.inference_mode():
-            vecs = self._embed_text_batch(list(texts))
-        return self._checked(vecs, len(texts))
+        texts = list(texts)
+        out = []
+        i = 0
+        while i < len(texts):  # in batches, like images, so a long prompt ensemble fits in memory
+            batch = texts[i : i + self.batch_size]
+            out.append(self._embed_halving(batch, len(batch), self._embed_text_batch))
+            i += len(batch)
+        return np.concatenate(out)
 
     def _checked(self, vecs: Any, n: int) -> Vectors:
         """``vecs`` as ``(n, dim)`` float32 unit rows; ``ValueError`` names the embedder if it can't be."""

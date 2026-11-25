@@ -167,22 +167,26 @@ class Classifier:
         return self
 
     def predict(self, Q: Vectors) -> tuple[Scores, Scores]:
-        """Return (probs (m, C), similarity of each query to its best match (m,)).
+        """Return (probs (m, C), similarity of each query to its predicted class (m,)).
 
-        Similarity is image-to-image cosine, except for zero-shot tasks where it
-        is image-to-text cosine (typically 0.2-0.35 for CLIP), so reject
-        thresholds are not interchangeable between the two. Raises RuntimeError
-        if called before ``fit``.
+        The similarity is that of the most probable class (see ``class_similarity``), not of the
+        nearest one, which can differ when descriptions tip the scores: a reject threshold on it
+        then never accepts a class the image is less similar to than the threshold. It is
+        image-to-image cosine, except for zero-shot tasks where it is image-to-text cosine
+        (typically 0.2-0.35 for CLIP), so reject thresholds are not interchangeable between the
+        two. Raises RuntimeError if called before ``fit``.
         """
-        sims = self.class_similarity(Q).max(axis=1)
+        per_class = self.class_similarity(Q)
         if self.zero_shot:
-            return _softmax(CLIP_LOGIT_SCALE * (Q @ _fitted(self.Pt).T)), sims
-        if len(self.classes) == 1:
-            return np.ones((len(Q), 1)), sims
-        logits = self._image_logprobs(Q)
-        if self.Pt is not None and self.text_weight > 0:
-            logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
-        return _softmax(logits), sims
+            probs = _softmax(CLIP_LOGIT_SCALE * per_class)
+        elif len(self.classes) == 1:
+            probs = np.ones((len(Q), 1))
+        else:
+            logits = self._image_logprobs(Q)
+            if self.Pt is not None and self.text_weight > 0:
+                logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
+            probs = _softmax(logits)
+        return probs, per_class[np.arange(len(Q)), probs.argmax(axis=1)]
 
 
 class PrototypeClassifier(Classifier):
