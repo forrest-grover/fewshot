@@ -26,7 +26,7 @@ def root_fixture(tmp_path):
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
-class PlainResult:
+class PlainResult:  # pylint: disable=too-few-public-methods  # stands in for click's Result
     """A click Result with ANSI styling removed from ``output``.
 
     Typer forces coloured error output when GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS is set,
