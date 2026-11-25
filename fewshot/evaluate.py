@@ -316,6 +316,7 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     cm = _confusion(data.y[scored], h.pred[scored], C)
     predictions = _predictions(cfg, data, h)
     return {
+        "revision": cfg.revision,
         "method": "leave-one-out" if k >= n else f"{k}-fold",
         "n_scored": int(scored.sum()),
         "n_examples": n,

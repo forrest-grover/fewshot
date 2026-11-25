@@ -398,6 +398,27 @@ def rename_task(name: str, body: Rename) -> dict[str, Any]:
         raise _bad(e) from e
 
 
+class Duplicate(_Body):
+    """Body of POST .../duplicate."""
+
+    name: str
+    examples: bool = True  # copy the examples (else only settings and classes)
+    inbox: bool = False
+
+
+@app.post("/api/tasks/{name}/duplicate", status_code=201, response_model=TaskDetail)
+def duplicate_task(name: str, body: Duplicate) -> dict[str, Any]:
+    """Copy a task under a new name, e.g. to try other settings without touching it (400 if the
+    name is bad or taken)."""
+    _task(name)
+    try:
+        return _detail(ws.duplicate(name, body.name, body.examples, body.inbox))
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
+
+
 @app.post("/api/tasks/{name}/undo", response_model=TaskDetail)
 def undo(name: str) -> dict[str, Any]:
     """Undo the task's last change (400 if there is nothing to undo); ``undo_label`` in the task
@@ -868,10 +889,17 @@ def duplicates(name: str, threshold: float = Query(0.95, ge=0.5, le=1.0),
 def evaluate(name: str, folds: int | None = None) -> dict[str, Any]:
     """Cross-validate the task (leave-one-out unless ``folds`` is given). For a large task, prefer
     POST .../evaluate/jobs, which reports progress and can be cancelled."""
+    t = _task(name)
     try:
-        return evaluate_task(pipe, _task(name), folds)
+        return _evaluated(t, evaluate_task(pipe, t, folds))
     except ValueError as e:
         raise _bad(e) from e
+
+
+def _evaluated(t: Task, report: dict[str, Any]) -> dict[str, Any]:
+    """``report``, after recording its headline for the dashboard."""
+    t.record_evaluation(report)
+    return report
 
 
 # ---- background jobs ----------------------------------------------------
@@ -897,7 +925,7 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
     if len(running) >= MAX_JOBS:
         raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
     job = Job(task=name, kind=kind, revision=t.config.revision)
-    return jobs.start(job, lambda progress: evaluate_task(pipe, t, folds, progress=progress)).to_dict()
+    return jobs.start(job, lambda progress: _evaluated(t, evaluate_task(pipe, t, folds, progress=progress))).to_dict()
 
 
 @app.get("/api/jobs/{jid}", response_model=JobOut)

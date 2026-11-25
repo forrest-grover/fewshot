@@ -201,8 +201,13 @@ def list_tasks(as_json: bool = JSON_OPT, root: Path | None = ROOT_OPT) -> None:
         return
     for t in _ws(root).list_tasks():
         s = t.summary()
-        typer.echo(f"{s['name']:24} {s['n_classes']:3} classes {s['n_examples']:5} examples  "
-                   f"{s['classifier']:9} {s['embedder']}")
+        ev = s["last_evaluation"]
+        acc = "      -" if not ev or ev["accuracy"] is None else f"acc {ev['accuracy']:.2f}"
+        stale = "*" if ev and ev["revision"] != s["revision"] else " "
+        typer.echo(f"{s['name']:24} {s['n_classes']:3} classes {s['n_examples']:5} examples {s['n_inbox']:4} inbox  "
+                   f"{acc}{stale} {s['classifier']:9} {s['embedder']}")
+        for w in s["warnings"]:
+            typer.secho(f"    ! {w}", fg="yellow")
 
 
 @app.command()
@@ -306,6 +311,22 @@ def rename(name: str, new_name: str, root: Path | None = ROOT_OPT) -> None:
     except (KeyError, ValueError) as e:
         _fail(_error_text(e))
     typer.echo(f"Renamed task {name} to {new_name}")
+
+
+@app.command("copy")
+def copy_task(
+    name: str,
+    new_name: str,
+    no_examples: bool = typer.Option(False, "--no-examples", help="Copy only settings and classes"),
+    inbox: bool = typer.Option(False, "--inbox", help="Copy the inbox too"),
+    root: Path | None = ROOT_OPT,
+) -> None:
+    """Copy a task under a new name, e.g. to try other settings without touching the original."""
+    try:
+        t = _ws(root).duplicate(name, new_name, examples=not no_examples, inbox=inbox)
+    except (KeyError, ValueError) as e:
+        _fail(_error_text(e))
+    typer.echo(f"Copied {name} to {t.name} ({len(t.config.examples)} examples)")
 
 
 @app.command()
@@ -567,6 +588,7 @@ def eval_cmd(
             r = evaluate_task(_pipe(_ws(root)), t, folds, progress=lambda _stage, done, total: update(done, total))
     except ValueError as e:
         _fail(str(e))
+    t.record_evaluation(r)
     if as_json:
         _echo_json(r)
     elif as_csv:

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import json
 import logging
 import os
 import re
@@ -690,12 +691,44 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
                 return self.path / x.file
         return self.path / self.example(eid).file
 
+    def record_evaluation(self, report: dict[str, Any]) -> None:
+        """Remember the headline of an evaluation (in ``eval.json``, outside undo history) for the
+        dashboard: when, at which revision, and how well."""
+        keep = ("revision", "method", "accuracy", "macro_f1", "n_scored", "n_examples")
+        _write_atomic(self.path / "eval.json", json.dumps({"at": _now(), **{k: report.get(k) for k in keep}}).encode())
+
+    def last_evaluation(self) -> dict[str, Any] | None:
+        """What ``record_evaluation`` last stored, or None."""
+        try:
+            data = json.loads((self.path / "eval.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def warnings(self, counts: dict[str, int]) -> list[str]:
+        """Problems worth fixing, given the examples per class: classes that can't be scored or
+        predicted, strong imbalance."""
+        out = []
+        described = {c.name for c in self.config.classes if prompts(c.description)}
+        thin = [c for c, n in counts.items() if n < 2 and c not in described]
+        if thin:
+            out.append(f"Fewer than 2 examples in {', '.join(thin[:3])}{', ...' if len(thin) > 3 else ''}: "
+                       "evaluation can't score them")
+        sizes = [n for n in counts.values() if n]
+        if len(sizes) > 1 and max(sizes) > 5 * min(sizes):
+            out.append(f"Classes are unbalanced ({min(sizes)} to {max(sizes)} examples)")
+        if len(counts) < 2 and not self.config.examples:
+            out.append("Add classes and examples to start")
+        return out
+
     def summary(self) -> dict[str, Any]:
-        """Overview of the task: settings and per-class example counts."""
+        """Overview of the task: settings, per-class example counts, the last evaluation and warnings."""
         counts = {c.name: 0 for c in self.config.classes}
         for e in self.config.examples:
             counts[e.label] = counts.get(e.label, 0) + 1
         return {
+            "last_evaluation": self.last_evaluation(),
+            "warnings": self.warnings(counts),
             "name": self.name,
             "embedder": self.config.embedder,
             "classifier": self.config.classifier,
@@ -811,6 +844,29 @@ class Workspace:
             out["images"] += t._drop_unused_images()  # pylint: disable=protected-access
         out["blobs"] = self.gc_blobs()
         return out
+
+    def duplicate(self, name: str, new: str, examples: bool = True, inbox: bool = False) -> Task:
+        """A copy of task ``name`` as ``new``, with its settings and classes, and its examples and
+        inbox if asked; images are shared through the image store, the history starts empty."""
+        src = self.get(name)
+        with src._writing():  # pylint: disable=protected-access  # a consistent copy, not one mid-change
+            cfg = src.config
+            copy_cfg = cfg.model_copy(update={
+                "name": new, "uid": uuid.uuid4().hex, "revision": 0, "created": _now(),
+                "examples": list(cfg.examples) if examples else [], "inbox": list(cfg.inbox) if inbox else []})
+            p = self._reserve(new)
+            try:
+                (p / "images").mkdir()
+                t = Task(p, copy_cfg, blobs=self.blobs)
+                for e in [*copy_cfg.examples, *copy_cfg.inbox]:
+                    t._store_image(e.file, (src.path / e.file).read_bytes())  # pylint: disable=protected-access
+                t._save(record=False)  # pylint: disable=protected-access
+            except BaseException:
+                shutil.rmtree(p, ignore_errors=True)
+                raise
+        with self._lock:
+            self._tasks[new] = t
+        return t
 
     def rename(self, old: str, new: str) -> Task:
         """Rename task ``old`` to ``new``; raises ``KeyError`` if ``old`` is missing and

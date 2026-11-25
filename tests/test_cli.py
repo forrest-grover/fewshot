@@ -104,8 +104,9 @@ def test_create_list_show(run, root):
     assert load(root, "plain").config.embedder == embedders.DEFAULT_SPEC
 
     r = run("list")
-    lines = r.output.splitlines()
+    lines = [line for line in r.output.splitlines() if not line.startswith("    !")]  # without warnings
     assert len(lines) == 2
+    assert "    ! Add classes and examples to start" in r.output
     assert lines[0].startswith("pets")
     assert "knn" in lines[0]
     assert "fake:color" in lines[0]

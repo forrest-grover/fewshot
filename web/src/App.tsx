@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, AUTH_EVENT, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
 import Evaluate, { type EvalRun } from "./Evaluate";
+import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
 import { usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
+import Shortcuts from "./Shortcuts";
 import { ErrorBox } from "./ui";
 
 const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
@@ -40,6 +42,7 @@ export default function App() {
   const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
   const [toast, setToast] = useState<{ text: string; then: "undo" | "redo" | null; key: number } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
+  const [help, setHelp] = useState(false); // the keyboard shortcuts
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
   // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
   const predictState = usePredictResults(route.task);
@@ -73,8 +76,26 @@ export default function App() {
     void refreshTasks();
     void run(api.models()).then((m) => { if (m) setModels(m); });
     void api.health().then((h) => { setUrlFetch(h.url_fetch); }, () => { /* an old server: no URL fetching */ });
-    return () => { window.removeEventListener("hashchange", on); };
+    // Tasks made or changed elsewhere (the CLI, another tab) show up when the window comes back.
+    const back = () => { if (document.visibilityState === "visible") void refreshTasks(); };
+    window.addEventListener("focus", back);
+    document.addEventListener("visibilitychange", back);
+    return () => {
+      window.removeEventListener("hashchange", on);
+      window.removeEventListener("focus", back);
+      document.removeEventListener("visibilitychange", back);
+    };
   }, [refreshTasks, run]);
+  useEffect(() => { // "?" shows the keyboard shortcuts
+    const on = (e: KeyboardEvent) => {
+      if (e.key !== "?" || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      e.preventDefault();
+      setHelp(true);
+    };
+    window.addEventListener("keydown", on);
+    return () => { window.removeEventListener("keydown", on); };
+  }, []);
 
   useEffect(() => {
     currentTask.current = route.task;
@@ -161,10 +182,12 @@ export default function App() {
           ))}
         </nav>
         <button className="secondary" onClick={() => { go(null); }}>+ New task</button>
+        <button className="ghost small" onClick={() => { setHelp(true); }} title="Keyboard shortcuts (?)">Keyboard shortcuts <kbd>?</kbd></button>
       </aside>
 
       <main>
         <ErrorBox error={error} onClose={() => { setError(null); }} />
+        {!route.task && <Dashboard tasks={tasks} />}
         {!route.task && <NewTask models={models} run={run} onCreated={(t) => { void refreshTasks(); go(t.name); }} />}
         {route.task && !task && (loadFailed
           ? <p className="muted">Task “{route.task}” could not be loaded. <a href="#">Back to tasks</a></p>
@@ -215,6 +238,7 @@ export default function App() {
               {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun} />}
               {route.tab === "settings" && (
                 <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }}
+                  onDuplicated={(t) => { void refreshTasks(); go(t.name); }}
                   onRenamed={(t) => {
                     // Results move with the task to its new name.
                     predictState.rename(t.name);
@@ -227,6 +251,7 @@ export default function App() {
           </>
         )}
       </main>
+      {help && <Shortcuts onClose={() => { setHelp(false); }} />}
       {toast && (
         <div className="toast" role="status" key={toast.key}>
           <span>{toast.text}</span>

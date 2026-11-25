@@ -2,6 +2,7 @@ import { useRef, useState, type DragEvent } from "react";
 import { api, type Example, type TaskDetail } from "./api";
 import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
+import Lightbox from "./Lightbox";
 import TagEditor, { type TagEdit } from "./TagEditor";
 import { DropZone } from "./ui";
 
@@ -20,6 +21,10 @@ export default function Examples({ task, setTask, run }: Props) {
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set()); // selected example ids
   const [dropOn, setDropOn] = useState<string | null>(null); // class card under a drag
   const [tagFilter, setTagFilter] = useState(""); // show only examples with this tag
+  const [query, setQuery] = useState(""); // show only examples whose source, tags, note or id contain this
+  const [order, setOrder] = useState<"task" | "newest" | "oldest" | "source">("task");
+  const [folded, setFolded] = useState<ReadonlySet<string>>(() => loadFolded(task.name)); // collapsed classes
+  const [viewer, setViewer] = useState<{ ids: string[]; index: number } | null>(null); // full-size viewer
   const [editing, setEditing] = useState<{ one: Example } | { ids: string[] } | null>(null); // tag editor
   const pointed = useRef<string | null>(null); // class card last hovered or focused: where a paste goes
   const anchor = useRef<string | null>(null); // last ticked example, for Shift+click ranges
@@ -51,7 +56,26 @@ export default function Examples({ task, setTask, run }: Props) {
   if (tagFilter && !allTags.includes(tagFilter)) setTagFilter(""); // its tag is gone: don't revive it later
   const filter = allTags.includes(tagFilter) ? tagFilter : "";
   const byClass = new Map<string, Example[]>(task.classes.map((c) => [c.name, []]));
-  for (const e of task.examples) if (!filter || e.tags.includes(filter)) byClass.get(e.label)?.push(e);
+  const q = query.trim().toLowerCase();
+  const matches = (e: Example) => !q || [e.source, e.note, e.id, ...e.tags].some((v) => v.toLowerCase().includes(q));
+  for (const e of task.examples) if ((!filter || e.tags.includes(filter)) && matches(e)) byClass.get(e.label)?.push(e);
+  if (order !== "task") {
+    const key = (e: Example) => (order === "source" ? e.source.toLowerCase() : e.added);
+    for (const list of byClass.values()) {
+      list.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+      if (order === "newest") list.reverse();
+    }
+  }
+  const fold = (c: string) => {
+    setFolded((f) => {
+      const next = new Set(f);
+      if (next.has(c)) next.delete(c); else next.add(c);
+      saveFolded(task.name, next);
+      return next;
+    });
+  };
+  const byId = new Map(task.examples.map((e) => [e.id, e]));
+  const open = (list: Example[], ex: Example) => { setViewer({ ids: list.map((e) => e.id), index: list.indexOf(ex) }); };
   const labelOf = new Map(task.examples.map((e) => [e.id, e.label]));
   const selection = [...picked].filter((id) => labelOf.has(id)); // ids still in the task
 
@@ -140,8 +164,46 @@ export default function Examples({ task, setTask, run }: Props) {
   const editedIds = editing ? ("one" in editing ? [editing.one.id] : editing.ids) : [];
   const editedTags = [...new Set(task.examples.filter((e) => editedIds.includes(e.id)).flatMap((e) => e.tags))];
 
+  const viewed = viewer ? viewer.ids.map((id) => byId.get(id)).filter((e): e is Example => e !== undefined) : [];
+  const shownEx = viewer ? (viewed[Math.min(viewer.index, viewed.length - 1)] as Example | undefined) : undefined;
+
   return (
     <div className="examples">
+      {viewer && viewed.length > 0 && (
+        <Lightbox
+          items={viewed.map((e) => ({
+            url: api.imageUrl(task.name, e.id, 1024), title: `${e.label}: ${e.source || e.id.slice(0, 12)}`,
+            details: [`Added ${e.added.slice(0, 16).replace("T", " ")}`, e.tags.length ? `Tags: ${e.tags.join(", ")}` : "",
+              e.note ? `Note: ${e.note}` : ""].filter(Boolean),
+          }))}
+          index={Math.min(viewer.index, viewed.length - 1)}
+          onIndex={(i) => { setViewer((v) => (v ? { ...v, index: i } : v)); }}
+          onClose={() => { setViewer(null); }}
+          onKey={(e, i) => {
+            const ex = viewed[i];
+            if (/^[1-9]$/.test(e.key)) {
+              const c = task.classes[Number(e.key) - 1] as TaskDetail["classes"][number] | undefined;
+              if (c && c.name !== ex.label) void save(api.relabel(task.name, ex.id, c.name));
+              return true;
+            }
+            if (e.key === "Delete" || e.key === "Backspace") {
+              void save(api.deleteExample(task.name, ex.id));
+              return true;
+            }
+            return false;
+          }}
+          footer={shownEx && (
+            <div className="row">
+              <select value={shownEx.label} aria-label="Move to class"
+                onChange={(e) => { void save(api.relabel(task.name, shownEx.id, e.target.value)); }}>
+                {task.classes.map((k, i) => <option key={k.name} value={k.name}>{i < 9 ? `${String(i + 1)} · ` : ""}{k.name}</option>)}
+              </select>
+              <button className="small ghost" onClick={() => { annotate(shownEx); }}>Tags and note</button>
+              <button className="small ghost danger" onClick={() => { void save(api.deleteExample(task.name, shownEx.id)); }}>Delete <kbd>Del</kbd></button>
+            </div>
+          )}
+        />
+      )}
       {editing && (
         <TagEditor
           title={"one" in editing ? `Tags and note: ${editing.one.source || editing.one.id.slice(0, 12)}`
@@ -181,18 +243,39 @@ export default function Examples({ task, setTask, run }: Props) {
           {task.supports_text && " With CLIP, a class can also work from its text description alone."}
         </p>
       )}
-      {allTags.length > 0 && (
+      {task.examples.length > 0 && (
         <div className="row tag-filter">
+          <input type="search" className="search" value={query} placeholder="Search file names, tags, notes…" aria-label="Search examples"
+            onChange={(e) => { setQuery(e.target.value); setPicked(new Set()); }} />
+          {allTags.length > 0 && (
+            <label className="inline">
+              <span>Show</span>
+              <select value={filter} onChange={(e) => {
+                setTagFilter(e.target.value);
+                setPicked(new Set()); // bulk actions must not reach examples the filter hides
+              }}>
+                <option value="">all examples</option>
+                {allTags.map((t) => <option key={t} value={t}>tagged “{t}”</option>)}
+              </select>
+            </label>
+          )}
           <label className="inline">
-            <span>Show</span>
-            <select value={filter} onChange={(e) => {
-              setTagFilter(e.target.value);
-              setPicked(new Set()); // bulk actions must not reach examples the filter hides
-            }}>
-              <option value="">all examples</option>
-              {allTags.map((t) => <option key={t} value={t}>tagged “{t}”</option>)}
+            <span>Order</span>
+            <select value={order} onChange={(e) => { setOrder(e.target.value as typeof order); }}>
+              <option value="task">as added</option>
+              <option value="newest">newest first</option>
+              <option value="oldest">oldest first</option>
+              <option value="source">by file name</option>
             </select>
           </label>
+          {task.classes.length > 1 && (
+            <button className="ghost small" onClick={() => {
+              const all = folded.size < task.classes.length;
+              const next = new Set(all ? task.classes.map((c) => c.name) : []);
+              saveFolded(task.name, next);
+              setFolded(next);
+            }}>{folded.size < task.classes.length ? "Collapse all" : "Expand all"}</button>
+          )}
         </div>
       )}
       {task.examples.length > 0 && selection.length === 0 && (
@@ -232,9 +315,11 @@ export default function Examples({ task, setTask, run }: Props) {
             {...cardDrag(c.name)}
           >
             <header>
+              <button className="ghost small fold" aria-expanded={!folded.has(c.name)} aria-label={`${folded.has(c.name) ? "Expand" : "Collapse"} ${c.name}`}
+                onClick={() => { fold(c.name); }}>{folded.has(c.name) ? "▸" : "▾"}</button>
               {ci < 9 && <kbd title={`Press ${String(ci + 1)} to move ticked examples here`}>{ci + 1}</kbd>}
               <h3>{c.name}</h3>
-              <span className="muted">{c.count} example{c.count === 1 ? "" : "s"}{filter ? ` (${String(list.length)} tagged)` : ""}</span>
+              <span className="muted">{c.count} example{c.count === 1 ? "" : "s"}{filter || q ? ` (${String(list.length)} shown)` : ""}</span>
               <span className="spacer" />
               {list.length > 0 && (
                 <button className="ghost small" onClick={() => {
@@ -253,7 +338,7 @@ export default function Examples({ task, setTask, run }: Props) {
                 if (confirm(`Delete class "${c.name}" and its ${String(c.count)} example(s)?`)) void save(api.deleteClass(task.name, c.name));
               }}>Delete</button>
             </header>
-            {task.supports_text && (
+            {!folded.has(c.name) && task.supports_text && (
               <textarea
                 className="desc"
                 key={c.description}
@@ -269,7 +354,7 @@ export default function Examples({ task, setTask, run }: Props) {
                 }}
               />
             )}
-            <div className="thumbs">
+            {!folded.has(c.name) && <div className="thumbs">
               {list.slice(0, limit).map((ex) => (
                 <figure
                   key={ex.id}
@@ -302,7 +387,9 @@ export default function Examples({ task, setTask, run }: Props) {
                     alt={ex.source || ex.id}
                     loading="lazy"
                     draggable={false}
-                    onClick={(e) => { if (selection.length) toggle(ex, e.shiftKey); }}
+                    tabIndex={0}
+                    onClick={(e) => { if (selection.length) toggle(ex, e.shiftKey); else open(list, ex); }}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); open(list, ex); } }}
                   />
                   <figcaption>
                     <select
@@ -328,7 +415,7 @@ export default function Examples({ task, setTask, run }: Props) {
               <DropZone compact onFiles={(fs) => { void upload(c.name, fs); }}>
                 {uploading[c.name] ? "Uploading…" : "+ Add images"}
               </DropZone>
-            </div>
+            </div>}
             {skip.length > 0 && (
               <div className="error skipped" role="alert">
                 <div>
@@ -343,4 +430,21 @@ export default function Examples({ task, setTask, run }: Props) {
       })}
     </div>
   );
+}
+
+const FOLD_KEY = "fewshot:folded:";
+
+/** Collapsed classes of a task, remembered in this browser (if storage works). */
+function loadFolded(task: string): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(FOLD_KEY + task) ?? "[]") as string[]);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveFolded(task: string, folded: ReadonlySet<string>) {
+  try {
+    localStorage.setItem(FOLD_KEY + task, JSON.stringify([...folded]));
+  } catch { /* private mode: not remembered */ }
 }

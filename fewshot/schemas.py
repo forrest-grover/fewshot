@@ -33,6 +33,18 @@ class ModelsOut(BaseModel):
     classifiers: list[str]
 
 
+class LastEvaluation(BaseModel):
+    """The headline of a task's last evaluation."""
+
+    at: str
+    revision: int | None
+    method: str | None
+    accuracy: float | None
+    macro_f1: float | None
+    n_scored: int | None
+    n_examples: int | None
+
+
 class TaskSummary(BaseModel):
     """One entry of GET /api/tasks."""
 
@@ -45,6 +57,8 @@ class TaskSummary(BaseModel):
     counts: dict[str, int]  # examples per class
     created: str
     revision: int
+    last_evaluation: LastEvaluation | None  # the last evaluation's headline, if any
+    warnings: list[str]  # problems worth fixing
 
 
 class ClassOut(BaseModel):
@@ -218,6 +232,7 @@ class Calibration(BaseModel):
 class EvalReport(BaseModel):
     """Cross-validation report."""
 
+    revision: int  # of the task when evaluated
     method: str
     n_scored: int
     n_examples: int

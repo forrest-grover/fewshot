@@ -2,6 +2,7 @@ import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { api, type DuplicatePair, type EvalReport, type Job, type TaskDetail } from "./api";
 import { downloadCsv } from "./csv";
 import { pct } from "./format";
+import Lightbox from "./Lightbox";
 import Threshold from "./Threshold";
 
 /** The last evaluation of a task, kept by the App so it survives switching tabs. While it runs,
@@ -29,6 +30,7 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
   const [cell, setCell] = useState<{ task: string; t: string; p: string } | null>(null); // confusion cell filtering mistakes
   const [dupes, setDupes] = useState<{ task: string; pairs: DuplicatePair[] } | null>(null);
   const [finding, setFinding] = useState(false);
+  const [viewing, setViewing] = useState<number | null>(null); // index into the listed examples, full size
   const update = (p: Partial<EvalRun>) => {
     // A run that finishes after the user opened another task is dropped.
     setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, job: null, jobRev: null, ...s, ...p }));
@@ -195,7 +197,9 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
                   return (
                     <figure key={m.id} className="thumb wide">
                       {/* 400 px: 2x the 200 px tile */}
-                      <img src={api.imageUrl(task.name, m.id, 400)} alt="" loading="lazy" />
+                      <img src={api.imageUrl(task.name, m.id, 400)} alt="" loading="lazy" tabIndex={0} className="zoomable"
+                        onClick={() => { setViewing(listed.indexOf(m)); }}
+                        onKeyDown={(e) => { if (e.key === "Enter") setViewing(listed.indexOf(m)); }} />
                       <figcaption className="col">
                         <span><b>{m.true}</b>{m.correct ? " ✓" : ` → ${m.pred}`} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (
@@ -212,6 +216,15 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
             </>
           )}
         </>
+      )}
+
+      {viewing !== null && listed.length > 0 && (
+        <Lightbox
+          items={listed.map((m) => ({
+            url: api.imageUrl(task.name, m.id, 1024), title: m.correct ? `${m.true} ✓` : `${m.true} → predicted ${m.pred}`,
+            details: [`Confidence ${pct(m.confidence)}, similarity ${m.similarity.toFixed(3)}`],
+          }))}
+          index={Math.min(viewing, listed.length - 1)} onIndex={setViewing} onClose={() => { setViewing(null); }} />
       )}
 
       <h3>Near-duplicates</h3>

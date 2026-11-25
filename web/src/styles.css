@@ -1198,3 +1198,103 @@ label.inline {
   gap: 4px;
   font-size: 13px;
 }
+
+/* full-size viewer, shortcuts, dashboard, search */
+.lightbox-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(1100px, 100%);
+  max-height: calc(100vh - 32px);
+  padding: 12px;
+  border-radius: var(--radius);
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.lightbox-box:focus {
+  outline: none;
+}
+
+.lightbox-img {
+  min-height: 0;
+  max-height: calc(100vh - 180px);
+  object-fit: contain;
+  background: var(--bg);
+  border-radius: 6px;
+}
+
+.lightbox-details {
+  font-size: 13px;
+}
+
+.zoomable {
+  cursor: zoom-in;
+}
+
+.shortcuts {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+.shortcuts h4 {
+  margin: 8px 0 4px;
+}
+
+.shortcuts dl {
+  margin: 0;
+}
+
+.shortcuts dt {
+  min-width: 190px;
+}
+
+.shortcuts dd {
+  margin: 0;
+}
+
+.dashboard {
+  margin-bottom: 32px;
+}
+
+.task-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.task-card:hover {
+  border-color: var(--accent);
+}
+
+.small-text {
+  font-size: 12px;
+}
+
+.warn {
+  font-size: 12px;
+}
+
+.search {
+  flex: 1;
+  min-width: 160px;
+  max-width: 320px;
+}
+
+.fold {
+  padding: 0 4px;
+}

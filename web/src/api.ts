@@ -1,6 +1,8 @@
 export interface TaskSummary {
-  name: string; embedder: string; classifier: string;
-  n_classes: number; n_examples: number; counts: Record<string, number>; created: string;
+  name: string; embedder: string; classifier: string; revision: number;
+  n_classes: number; n_examples: number; n_inbox: number; counts: Record<string, number>; created: string;
+  last_evaluation: { at: string; revision: number | null; method: string | null; accuracy: number | null } | null;
+  warnings: string[];
 }
 export interface ClassInfo { name: string; description: string; count: number }
 export interface Example {
@@ -114,6 +116,7 @@ export const api = {
   undo: (n: string) => req<TaskDetail>("POST", `${t(n)}/undo`),
   redo: (n: string) => req<TaskDetail>("POST", `${t(n)}/redo`),
   rename: (n: string, name: string) => req<TaskDetail>("POST", `${t(n)}/rename`, { name }),
+  duplicate: (n: string, name: string, examples: boolean) => req<TaskDetail>("POST", `${t(n)}/duplicate`, { name, examples }),
   exportUrl: (n: string) => `${t(n)}/export`,
   importTask: (file: File, name?: string) => {
     const fd = new FormData();

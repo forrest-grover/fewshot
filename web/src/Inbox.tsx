@@ -3,6 +3,7 @@ import { api, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
 import { pct } from "./format";
 import { useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
+import Lightbox from "./Lightbox";
 import { DropZone } from "./ui";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
@@ -24,6 +25,7 @@ export default function Inbox({ task, setTask, run }: Props) {
   const [minConf, setMinConf] = useState(0.9);
   const [shown, setShown] = useState(PAGE);
   const [busy, setBusy] = useState(false);
+  const [viewing, setViewing] = useState<number | null>(null); // index into the list, full size
   const cards = useRef(new Map<string, HTMLElement>());
 
   // Suggestions depend on the task's examples and settings: reload whenever it changes.
@@ -96,6 +98,26 @@ export default function Inbox({ task, setTask, run }: Props) {
       <DropZone disabled={busy} onFiles={(fs) => { void upload(fs); }}>
         {busy ? "Working…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
       </DropZone>
+      {viewing !== null && list.length > 0 && (
+        <Lightbox
+          items={list.map((i) => ({
+            url: api.imageUrl(task.name, i.id, 1024), title: i.source || i.id.slice(0, 12),
+            details: [i.prediction ? `Suggestion: ${suggested(i) ?? `unknown (closest ${i.prediction.top_label})`}, ${pct(i.prediction.confidence)}` : ""].filter(Boolean),
+          }))}
+          index={Math.min(viewing, list.length - 1)} onIndex={setViewing} onClose={() => { setViewing(null); }}
+          onKey={(e, k) => {
+            const item = list[k];
+            const s = suggested(item);
+            if (e.key === "Enter" && s) { void label({ [item.id]: s }); return true; }
+            if (/^[1-9]$/.test(e.key)) {
+              const c = task.classes[Number(e.key) - 1] as TaskDetail["classes"][number] | undefined;
+              if (c) void label({ [item.id]: c.name });
+              return true;
+            }
+            if (e.key === "Delete" || e.key === "Backspace") { void dismiss([item.id]); return true; }
+            return false;
+          }} />
+      )}
       {task.inbox_count === 0 ? (
         <p className="hint">
           The inbox holds images that aren't labelled yet. Add a batch, then label them from the model's suggestions: the
@@ -161,7 +183,8 @@ export default function Inbox({ task, setTask, run }: Props) {
                         });
                       }} />
                   </label>
-                  <img className="inbox-img" src={api.imageUrl(task.name, i.id, THUMB_SIZE)} alt={i.source || i.id} loading={n < 12 ? "eager" : "lazy"} />
+                  <img className="inbox-img zoomable" src={api.imageUrl(task.name, i.id, THUMB_SIZE)} alt={i.source || i.id}
+                    loading={n < 12 ? "eager" : "lazy"} onDoubleClick={() => { setViewing(n); }} title="Double-click to view full size" />
                   <div className="inbox-body">
                     {p ? (
                       <span className={s ? "" : "unknown"}>

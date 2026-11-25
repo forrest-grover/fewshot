@@ -4,6 +4,7 @@ import { api, type ModelInfo, type TaskDetail } from "./api";
 interface Props {
   task: TaskDetail; models: ModelInfo | null; setTask: (t: TaskDetail) => void;
   run: <T>(p: Promise<T>) => Promise<T | undefined>; onDeleted: () => void; onRenamed: (t: TaskDetail) => void;
+  onDuplicated: (t: TaskDetail) => void;
 }
 
 const PARAMS: Record<string, { key: string; label: string; help: string; def: number }[]> = {
@@ -28,7 +29,7 @@ function parseNumber(s: string): number | null {
 
 const optional = (v: number | null) => (v == null ? "" : String(v));
 
-export default function Settings({ task, models, setTask, run, onDeleted, onRenamed }: Props) {
+export default function Settings({ task, models, setTask, run, onDeleted, onRenamed, onDuplicated }: Props) {
   const [embedder, setEmbedder] = useState(task.embedder);
   const [classifier, setClassifier] = useState(task.classifier);
   // Inputs keep exactly what was typed; it is parsed and checked on save.
@@ -39,6 +40,8 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
   const [flip, setFlip] = useState(task.flip);
   const [temperature, setTemperature] = useState(optional(task.temperature));
   const [newName, setNewName] = useState(task.name);
+  const [copyName, setCopyName] = useState(`${task.name}-copy`);
+  const [copyExamples, setCopyExamples] = useState(true);
   const [saving, setSaving] = useState(false);
 
   // Reset the form whenever the saved task changes (another task, or a new revision after a save).
@@ -182,6 +185,21 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
         </label>
         <button type="submit" className="secondary" disabled={!newName.trim() || newName.trim() === task.name}>Rename</button>
       </form>
+      <form className="row" onSubmit={(e) => {
+        e.preventDefault();
+        void run(api.duplicate(task.name, copyName.trim(), copyExamples)).then((t) => { if (t) onDuplicated(t); });
+      }}>
+        <label className="grow">
+          <span>Copy as</span>
+          <input value={copyName} onChange={(e) => { setCopyName(e.target.value); }} pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" required />
+        </label>
+        <label className="check inline">
+          <input type="checkbox" checked={copyExamples} onChange={(e) => { setCopyExamples(e.target.checked); }} />
+          <span>with examples</span>
+        </label>
+        <button type="submit" className="secondary" disabled={!copyName.trim()}>Duplicate</button>
+      </form>
+      <p className="muted">A copy is a safe place to try another embedder or classifier; images are shared, not stored twice.</p>
       <div className="row">
         <a className="button secondary" href={api.exportUrl(task.name)} download={`${task.name}.zip`}>Export as zip</a>
         <span className="muted">Settings, classes, labels and images, for backup or to import into another workspace.</span>
