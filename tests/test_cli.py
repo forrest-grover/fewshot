@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -192,7 +193,7 @@ def test_config_and_create_validate_embedders(run, root, task):
     assert load(root).config.embedder == "fake:color"
     assert not (root / "tasks" / "new").exists()
     r = run("config", task, "--reject-below", "0.5", "--clear-reject")
-    assert r.exit_code == 1
+    assert r.exit_code == 2  # a usage error
     assert "not both" in r.output
 
 
@@ -208,7 +209,7 @@ def test_config_and_create_validate_embedders(run, root, task):
 def test_config_errors(run, root, task, args, message):
     """Invalid settings and malformed --param values fail without changing the task."""
     r = run("config", task, *args)
-    assert r.exit_code == 1
+    assert r.exit_code == (2 if message.startswith("Bad --param") else 1)  # 2: a usage error
     assert message in r.output
     assert load(root).config.classifier == "gda"
 
@@ -487,57 +488,49 @@ def test_bench_default_embedder_and_errors(run, bench_data, monkeypatch):
     assert "Not a directory" in r.output
 
 
-def test_serve(monkeypatch, tmp_path):
-    """`serve` starts uvicorn with the given host/port and exports --root as FEWSHOT_HOME."""
+def served(monkeypatch, *args):
+    """Run `fewshot serve ARGS` with uvicorn stubbed out; returns (result, the server, uvicorn's options)."""
     calls = []
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls.append((app, kw)))
-    monkeypatch.delenv("FEWSHOT_HOME", raising=False)
-    runner = CliRunner()
+    r = CliRunner().invoke(cli.app, ["serve", *args])
+    assert r.exit_code == 0, r.output
+    app, kw = calls[-1]
+    return PlainResult(r), app.state.server, kw
 
-    assert runner.invoke(cli.app, ["serve", "--port", "9001"]).exit_code == 0
-    assert calls[-1] == ("fewshot.api:app", {"host": "127.0.0.1", "port": 9001})
-    assert "FEWSHOT_HOME" not in os.environ
 
-    monkeypatch.setenv("FEWSHOT_HOME", "")  # let monkeypatch restore the variable after the test
-    assert runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--root", str(tmp_path)]).exit_code == 0
-    assert calls[-1] == ("fewshot.api:app", {"host": "0.0.0.0", "port": 8000})
-    assert os.environ["FEWSHOT_HOME"] == str(tmp_path)
+def test_serve(monkeypatch, tmp_path):
+    """`serve` starts uvicorn with an app for its settings, on the given host/port and --root."""
+    _, srv, kw = served(monkeypatch, "--port", "9001")
+    assert kw == {"host": "127.0.0.1", "port": 9001, "proxy_headers": True, "forwarded_allow_ips": "127.0.0.1"}
+    assert srv.ws.root == Path(os.environ["FEWSHOT_HOME"]).resolve()
+    _, srv, kw = served(monkeypatch, "--host", "0.0.0.0", "--root", str(tmp_path), "--forwarded-allow-ips", "10.0.0.2")
+    assert (kw["host"], kw["port"], kw["forwarded_allow_ips"]) == ("0.0.0.0", 8000, "10.0.0.2")
+    assert srv.ws.root == tmp_path.resolve()
 
 
 def test_serve_settings(monkeypatch):
-    """serve passes its options to the API through the environment, and warns when an open
-    address has no token."""
-    monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
-    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM"):
-        monkeypatch.setenv(k, "")  # let monkeypatch restore them after the test
-    monkeypatch.delenv("FEWSHOT_TOKEN")
-    runner = CliRunner()
-    r = runner.invoke(cli.app, ["serve"])
-    settings = ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM")
-    assert [os.environ[k] for k in settings] == ["", "", "1"]
+    """serve passes its options to the server's settings, and warns when an open address has no token."""
+    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM", "FEWSHOT_ALLOWED_HOSTS"):
+        monkeypatch.delenv(k, raising=False)
+    r, srv, _ = served(monkeypatch)
+    assert (srv.settings.token, srv.settings.allow_any_model, srv.settings.warm) == (None, False, True)
     assert "Warning" not in r.output
-    r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--no-warm", "--allow-any-model"])
-    assert "Warning: serving on 0.0.0.0 without --token" in ANSI.sub("", r.output)
-    assert (os.environ["FEWSHOT_ALLOW_ANY_MODEL"], os.environ["FEWSHOT_WARM"]) == ("1", "")
-    monkeypatch.delenv("FEWSHOT_ALLOWED_HOSTS", raising=False)
-    r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--token", "t0k"])
+    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--no-warm", "--allow-any-model")
+    assert "Warning: serving on 0.0.0.0 without --token" in r.output
+    assert (srv.settings.allow_any_model, srv.settings.warm) == (True, False)
+    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--token", "t0k")
     assert "Warning" not in r.output
-    assert os.environ["FEWSHOT_TOKEN"] == "t0k"
-    names = os.environ["FEWSHOT_ALLOWED_HOSTS"].split(",")  # local names and this machine's, never any
-    assert names[:3] == ["localhost", "127.0.0.1", "::1"]
-    assert socket.gethostname().lower() in names
+    assert srv.settings.token == "t0k"
+    names = srv.settings.allowed_hosts  # local names and this machine's, never any
+    assert {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()} <= names
     assert "*" not in names
     assert "Answering requests by IP address or for: localhost" in r.output
-    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allowed-host", "*"])
-    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "*"
-    monkeypatch.delenv("FEWSHOT_ALLOWED_HOSTS")
-    runner.invoke(cli.app, ["serve"])
-    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "localhost,127.0.0.1,::1"
+    assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "*")[1].settings.allowed_hosts == {"*"}
+    assert served(monkeypatch)[1].settings.allowed_hosts == {"localhost", "127.0.0.1", "::1"}
     monkeypatch.setenv("FEWSHOT_ALLOWED_HOSTS", " box.lan, ,10.0.0.5")  # as in docker-compose.yml
-    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0"])
-    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "box.lan,10.0.0.5"
-    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allowed-host", "a.lan"])  # the option wins
-    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "a.lan"
+    assert served(monkeypatch, "--host", "0.0.0.0")[1].settings.allowed_hosts == {"box.lan", "10.0.0.5"}
+    # The option wins.
+    assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "a.lan")[1].settings.allowed_hosts == {"a.lan"}
 
 
 def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):

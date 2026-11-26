@@ -2,7 +2,6 @@
 host names, unchecked thresholds, unfitted model weights and overconfident calibration."""
 
 import http.server
-import importlib
 import io
 import socket
 import threading
@@ -11,15 +10,13 @@ import zipfile
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
 
-import fewshot.api
 from fewshot import evaluate as ev
 from fewshot import fetch, images, pipeline
 from fewshot.archive import export_task, import_task
 from fewshot.guard import host_allowed
-from tests.conftest import png
+from tests.conftest import api_client, png
 
 RED = (220, 30, 30)
 
@@ -150,11 +147,9 @@ def test_host_allowed():
     assert host_allowed("anything", {"*"})
 
 
-def test_allowed_host_entries_may_have_ports(tmp_path, monkeypatch):
+def test_allowed_host_entries_may_have_ports(tmp_path):
     """An entry written with a port matches its name; the health check by IP always works."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    monkeypatch.setenv("FEWSHOT_ALLOWED_HOSTS", "box.lan:8443")
-    c = TestClient(importlib.reload(fewshot.api).app)
+    c = api_client(tmp_path, allowed_hosts=frozenset({"box.lan:8443"}))
     assert c.get("/api/health", headers={"Host": "box.lan:8443"}).status_code == 200
     assert c.get("/healthz", headers={"Host": "127.0.0.1:8000"}).status_code == 200
     assert c.get("/api/health", headers={"Host": "other.lan"}).status_code == 400

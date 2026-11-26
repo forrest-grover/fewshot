@@ -1,20 +1,17 @@
 """Predicting at an earlier revision, streaming predict output, and `fewshot watch`."""
 
 import csv
-import importlib
 import io
 import json
 import shutil
 
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import fewshot.api
 from fewshot import cli
 from fewshot.cli_common import images_in
 from fewshot.store import Workspace
-from tests.conftest import png
+from tests.conftest import api_client, png
 from tests.test_cli import PlainResult
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
@@ -256,11 +253,9 @@ def test_watch_needs_a_folder(run, task, tmp_path):
 
 
 # ---- API -------------------------------------------------------------------
-def test_api_predict_at_a_revision(tmp_path, monkeypatch):
+def test_api_predict_at_a_revision(tmp_path):
     """?revision= predicts with a kept version, 404 for one that isn't kept; predictions carry it."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    importlib.reload(fewshot.api)
-    client = TestClient(fewshot.api.app)
+    client = api_client(tmp_path)
     client.post("/api/tasks", json={"name": "c", "embedder": "fake:color"})
     for label, rgb in (("red", RED), ("blue", BLUE)):
         files = [("files", (f"{label}{i}.png", png(rgb, noise=15, seed=i), "image/png")) for i in range(2)]

@@ -1,7 +1,6 @@
 """Server operations: health, token auth, request size limit, model allowlist, warm-up and jobs."""
 
 import asyncio
-import importlib
 import threading
 import time
 
@@ -9,27 +8,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 import fewshot.api
+import fewshot.auth
+import fewshot.evaluate
 import fewshot.guard
+import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
-from tests.conftest import png
+from tests.conftest import api_client, png, set_settings
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
-def _reload(tmp_path, monkeypatch, **env):
-    """The API module reloaded with FEWSHOT_HOME in tmp_path and the given environment."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM", "FEWSHOT_MAX_REQUEST_MB"):
-        monkeypatch.delenv(k, raising=False)
-    for k, v in env.items():
-        monkeypatch.setenv(k, v)
-    return importlib.reload(fewshot.api)
-
-
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
-    """A TestClient on a freshly loaded API with default settings."""
-    return TestClient(_reload(tmp_path, monkeypatch).app)
+def client_fixture(tmp_path):
+    """A TestClient on a new server with default settings."""
+    return api_client(tmp_path)
 
 
 def _task(client, name="c", n=3):
@@ -45,7 +37,7 @@ def _wait(client, jid, timeout=10.0):
     deadline = time.time() + timeout
     while True:
         job = client.get(f"/api/jobs/{jid}").json()
-        if job["status"] != "running" or time.time() > deadline:
+        if job["status"] not in {"running", "cancelling"} or time.time() > deadline:
             return job
         time.sleep(0.02)
 
@@ -63,9 +55,9 @@ def test_health(client):
 
 
 # ---- auth ---------------------------------------------------------------
-def test_token_auth(tmp_path, monkeypatch):
+def test_token_auth(tmp_path):
     """With a token set, /api needs it as a Bearer header or the login cookie."""
-    client = TestClient(_reload(tmp_path, monkeypatch, FEWSHOT_TOKEN="s3cret").app)
+    client = api_client(tmp_path, token="s3cret")
     assert client.get("/api/tasks").status_code == 401
     assert client.get("/api/tasks").headers["www-authenticate"] == "Bearer"
     assert client.get("/api/tasks", headers={"Authorization": "Bearer nope"}).status_code == 401
@@ -92,9 +84,9 @@ def test_login_without_token_configured(client):
 
 
 # ---- request size -------------------------------------------------------
-def test_request_size_limit_by_content_length(tmp_path, monkeypatch):
+def test_request_size_limit_by_content_length(tmp_path):
     """A body over FEWSHOT_MAX_REQUEST_MB is refused with 413 before it is read."""
-    client = TestClient(_reload(tmp_path, monkeypatch, FEWSHOT_MAX_REQUEST_MB="0.5").app)
+    client = api_client(tmp_path, max_request_mb=0.5)
     _task(client, n=1)  # small requests still work
     big = [("files", ("x.png", b"x" * 600_000, "image/png"))]
     r = client.post("/api/tasks/c/examples", data={"label": "red"}, files=big)
@@ -169,15 +161,15 @@ def test_only_known_models_by_default(client, monkeypatch):
     preset = PRESETS[2].spec
     assert client.post("/api/tasks", json={"name": "p", "embedder": preset}).status_code == 201
     assert client.post("/api/tasks", json={"name": "f", "embedder": "fake:color"}).status_code == 201  # registered
-    fewshot.api.ws.create("cli", embedder="timm:some_model")  # e.g. made with the CLI
+    client.srv.ws.create("cli", embedder="timm:some_model")  # e.g. made with the CLI
     assert client.patch("/api/tasks/f", json={"embedder": "timm:some_model"}).status_code == 200
     assert loads == [preset, "fake:color", "timm:some_model"]  # allowed specs are still loaded to check them
-    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)
+    set_settings(monkeypatch, client, allow_any_model=True)
     assert client.post("/api/tasks", json={"name": "y", "embedder": "timm:other"}).status_code == 201
 
 
 # ---- warm-up ------------------------------------------------------------
-def test_warm_models(client, monkeypatch):  # pylint: disable=unused-argument  # loads a fresh API
+def test_warm_models(client, monkeypatch):
     """Warm-up loads the most used embedders (default spec with no tasks), skipping failures."""
     loaded = []
 
@@ -187,23 +179,23 @@ def test_warm_models(client, monkeypatch):  # pylint: disable=unused-argument  #
         loaded.append(spec)
 
     monkeypatch.setattr(fewshot.api, "get_embedder", fake_get)
-    assert fewshot.api.warm_models() == [DEFAULT_SPEC]
-    ws = fewshot.api.ws
+    assert client.srv.warm_models() == [DEFAULT_SPEC]
+    ws = client.srv.ws
     ws.create("a", embedder="fake:color")
     ws.create("b", embedder="fake:color")
     ws.create("c", embedder="bad:x")
     ws.create("d", embedder="other:y")
     monkeypatch.setenv("FEWSHOT_MAX_MODELS", "2")
-    assert fewshot.api.warm_models() == ["fake:color"]  # bad:x is second most used, and fails
+    assert client.srv.warm_models() == ["fake:color"]  # bad:x is second most used, and fails
     assert loaded == [DEFAULT_SPEC, "fake:color"]
 
 
 def test_warm_at_startup(tmp_path, monkeypatch):
-    """With FEWSHOT_WARM=1, starting the app warms models in a background thread."""
-    api = _reload(tmp_path, monkeypatch, FEWSHOT_WARM="1")
+    """With warm-up on, starting the app warms models in a background thread."""
+    client = api_client(tmp_path, warm=True)
     done = threading.Event()
-    monkeypatch.setattr(api, "warm_models", done.set)
-    with TestClient(api.app):
+    monkeypatch.setattr(client.srv, "warm_models", done.set)
+    with client:
         assert done.wait(5)
 
 
@@ -239,7 +231,7 @@ def test_job_internal_error_and_cancel(client, monkeypatch):
     def broken(*_args, **_kw):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(fewshot.api, "evaluate_task", broken)
+    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", broken)
     job = _wait(client, client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"])
     assert (job["status"], job["error"]) == ("failed", "Internal error; see the server log")
 
@@ -251,7 +243,7 @@ def test_job_internal_error_and_cancel(client, monkeypatch):
             started.set()
             time.sleep(0.01)
 
-    monkeypatch.setattr(fewshot.api, "evaluate_task", slow)
+    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
     jid = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
     assert started.wait(5)
     assert client.get("/api/health").json()["jobs_running"] == 1
@@ -264,7 +256,7 @@ def test_job_internal_error_and_cancel(client, monkeypatch):
 def test_old_jobs_are_forgotten(client, monkeypatch):
     """Only the most recent `kept` finished jobs are remembered."""
     task = _task(client, n=1)
-    monkeypatch.setattr(fewshot.api.jobs, "kept", 2)
+    monkeypatch.setattr(client.srv.jobs, "kept", 2)
     ids = []
     for _ in range(3):
         ids.append(client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"])
@@ -273,9 +265,9 @@ def test_old_jobs_are_forgotten(client, monkeypatch):
     assert all(client.get(f"/api/jobs/{j}").status_code == 200 for j in ids[1:])
 
 
-def test_no_warm_by_default(client):  # pylint: disable=unused-argument  # loads a fresh API
-    """Without FEWSHOT_WARM, startup loads nothing in the background."""
-    with TestClient(fewshot.api.app):
+def test_no_warm_when_off(client):
+    """With warm-up off, startup loads nothing in the background."""
+    with client:
         assert not any(t.name == "fewshot-warm" for t in threading.enumerate())
 
 
@@ -304,9 +296,9 @@ def test_request_size_limit_cuts_off_the_app():
 def test_url_fetches_have_a_budget(client, monkeypatch):
     """URLs share a time and size budget per request; what doesn't fit is reported per URL."""
     task = _task(client, n=1)
-    monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
-    monkeypatch.setattr(fewshot.api, "fetch_url", lambda url, max_bytes, timeout=20.0, public_only=False: png(RED))
-    monkeypatch.setattr(fewshot.api, "MAX_REQUEST_BYTES", len(png(RED)) + 1)
+    set_settings(monkeypatch, client, allow_urls=True)
+    monkeypatch.setattr(fewshot.services, "fetch_url", lambda url, max_bytes, timeout=20.0, public_only=False: png(RED))
+    set_settings(monkeypatch, client, max_request_mb=(len(png(RED)) + 1) / 2**20)
     preds = client.post(f"/api/tasks/{task}/predict/urls", json={"urls": ["http://h/a.png", "http://h/b.png"]}).json()
     assert sorted(p["error"] is None for p in preds) == [False, True]
     assert any("exceed the" in (p["error"] or "") for p in preds)
@@ -324,7 +316,7 @@ def test_jobs_are_capped_and_shared(client, monkeypatch):
         progress("evaluating", 0, 1)
         release.wait(5)
 
-    monkeypatch.setattr(fewshot.api, "evaluate_task", slow)
+    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
     monkeypatch.setattr(fewshot.api, "MAX_JOBS", 1)
     first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()
     assert client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"] == first["id"]  # shared
@@ -343,7 +335,7 @@ def test_a_cancelled_evaluation_is_not_shared(client, monkeypatch):
         release.wait(5)
         progress("evaluating", 0, 1)  # raises Cancelled
 
-    monkeypatch.setattr(fewshot.api, "evaluate_task", slow)
+    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
     first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
     assert client.delete(f"/api/jobs/{first}").status_code == 200
     second = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
@@ -355,42 +347,42 @@ def test_a_cancelled_evaluation_is_not_shared(client, monkeypatch):
 
 def test_login_is_rate_limited_and_secure_over_https(tmp_path, monkeypatch):
     """Too many wrong tokens get 429 for a while; over HTTPS the cookie is Secure."""
-    api = _reload(tmp_path, monkeypatch, FEWSHOT_TOKEN="s3cret")
-    monkeypatch.setattr(api, "LOGIN_FAILURES", 2)
-    c = TestClient(api.app)
+    monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
+    c = api_client(tmp_path, token="s3cret")
     assert c.post("/api/login", json={"token": "a"}).status_code == 401
     assert c.post("/api/login", json={"token": "b"}).status_code == 401
     r = c.post("/api/login", json={"token": "s3cret"})
     assert (r.status_code, r.json()["detail"]) == (429, "Too many wrong tokens; try again in a minute")
-    monkeypatch.setattr(api, "LOGIN_WINDOW", 0.0)  # the window has passed
+    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)  # the window has passed
     r = c.post("/api/login", json={"token": "s3cret"})
     assert r.status_code == 204
     assert "secure" not in r.headers["set-cookie"].lower()
-    https = TestClient(api.app, base_url="https://testserver")
+    https = TestClient(c.app, base_url="https://testserver")
     assert "secure" in https.post("/api/login", json={"token": "s3cret"}).headers["set-cookie"].lower()
 
 
 def test_wrong_tokens_on_any_request_count_towards_the_limit(tmp_path, monkeypatch):
-    """Guessing with Bearer tokens or cookies is limited like /api/login (no token at all isn't a
-    guess), and the limit then covers login too."""
-    api = _reload(tmp_path, monkeypatch, FEWSHOT_TOKEN="s3cret")
-    monkeypatch.setattr(api, "LOGIN_FAILURES", 2)
-    c = TestClient(api.app)
+    """Guessing with Bearer tokens is limited like /api/login (no token at all isn't a guess, and
+    a session cookie can't be guessed), and the limit then covers login too."""
+    api = fewshot.api
+    monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
+    c = api_client(tmp_path, token="s3cret")
     for _ in range(3):
         assert c.get("/api/tasks").status_code == 401
+        assert c.get("/api/tasks", headers={"Cookie": f"{api.SESSION_COOKIE}=b"}).status_code == 401
     assert c.get("/api/tasks", headers={"Authorization": "Bearer a"}).status_code == 401
-    assert c.get("/api/tasks", headers={"Cookie": f"{api.AUTH_COOKIE}=b"}).status_code == 401
+    assert c.get("/api/tasks", headers={"Authorization": "Bearer b"}).status_code == 401
     r = c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"})
     assert (r.status_code, r.json()["detail"]) == (429, api.TOO_MANY_TOKENS)
     assert c.post("/api/login", json={"token": "s3cret"}).status_code == 429
-    monkeypatch.setattr(api, "LOGIN_WINDOW", 0.0)
+    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)
     assert c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"}).status_code == 200
 
 
 def test_export_headers_and_import_with_another_embedder(client):
     """The export says its size and how many examples were left out; import can switch embedder."""
     task = _task(client, n=1)
-    t = fewshot.api.ws.get(task)
+    t = client.srv.ws.get(task)
     (t.path / t.config.examples[0].file).unlink()
     r = client.get(f"/api/tasks/{task}/export")
     assert r.headers["content-length"] == str(len(r.content))

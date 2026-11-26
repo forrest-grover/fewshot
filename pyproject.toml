@@ -20,6 +20,7 @@ dependencies = [
     "python-multipart",
     "typer",
     "pydantic>=2",
+    "rich",  # progress bars in the CLI
 ]
 
 [project.optional-dependencies]
@@ -27,7 +28,7 @@ dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint", "ruff", "mypy"]
 siglip = ["transformers"]  # tokenizer of the SigLIP 2 preset
 
 [project.scripts]
-fewshot = "fewshot.cli:app"
+fewshot = "fewshot.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["fewshot*"]

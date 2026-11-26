@@ -1,16 +1,14 @@
 """Recorded evaluations, warnings for the dashboard, and duplicating tasks."""
 
-import importlib
 
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import fewshot.api
 import fewshot.store
 from fewshot import cli
 from fewshot.store import Workspace
-from tests.conftest import png
+from tests.conftest import api_client, png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
@@ -98,9 +96,8 @@ def test_failed_duplicate_leaves_nothing(ws, monkeypatch):
 
 def test_api(tmp_path, monkeypatch):
     """Evaluations are recorded (sync and as a job) and duplicate works over the API."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    api = importlib.reload(fewshot.api)
-    client = TestClient(api.app)
+    client = api_client(tmp_path)
+    api = client.srv
     _task(api.ws)
     client.post("/api/tasks/t/evaluate")
     s = client.get("/api/tasks").json()[0]

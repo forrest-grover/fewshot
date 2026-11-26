@@ -1,25 +1,23 @@
 """Bounded memory for many images, streamed CLI input, transparent images, the job limit under
 concurrency, and quotes in uploaded file names."""
 
-import importlib
 import io
 import json
 import threading
 import time
+import uuid
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
 from typer.testing import CliRunner
 
-import fewshot.api
 from fewshot import classifiers, cli, pipeline
 from fewshot.classifiers import ClassData, make_classifier
 from fewshot.images import load_image, to_rgb
 from fewshot.jobs import Job, Jobs, TooManyJobs
 from fewshot.store import Workspace
-from tests.conftest import png
+from tests.conftest import api_client, png
 from tests.test_cli import PlainResult
 from tests.test_consistency import _task
 
@@ -151,7 +149,8 @@ def test_job_limit_is_checked_with_the_start():
 
     def start():
         try:
-            started.append(jobs.start(Job(task="t", kind="k"), lambda _p: gate.wait(5), limit=3))
+            job = Job(task="t", kind="k", key=uuid.uuid4().hex)  # different work, not shared
+            started.append(jobs.start(job, lambda _p: gate.wait(5), limit=3))
         except TooManyJobs:
             refused.append(1)
 
@@ -168,12 +167,10 @@ def test_job_limit_is_checked_with_the_start():
     assert jobs.start(Job(task="t", kind="k"), lambda _p: None, limit=3).status in {"running", "done"}
 
 
-def test_quotes_in_uploaded_file_names(tmp_path, monkeypatch):
+def test_quotes_in_uploaded_file_names(tmp_path):
     """A '"' that a browser sent as %22 comes back as a quote."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    api = importlib.reload(fewshot.api)
-    _task(api.ws)
-    c = TestClient(api.app)
+    c = api_client(tmp_path)
+    _task(c.srv.ws)
     r = c.post("/api/tasks/t/predict", files=[("files", ('say "cheese".png', png(RED, seed=3), "image/png"))])
     assert r.json()[0]["file"] == 'say "cheese".png'
 

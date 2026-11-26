@@ -3,7 +3,6 @@
 import csv
 import io
 import json
-import os
 import sys
 
 import pytest
@@ -12,7 +11,7 @@ from typer.testing import CliRunner
 from fewshot import cli, cli_common
 from fewshot.store import Workspace
 from tests.conftest import png
-from tests.test_cli import ANSI, PlainResult
+from tests.test_cli import ANSI, PlainResult, served
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
@@ -66,7 +65,7 @@ def test_config_zero_shot_threshold_and_flip(run, task):
     r = run("config", task, "--clear-reject-zero-shot", "--no-flip")
     assert "reject_below_zero_shot: None   flip: False" in r.output
     r = run("config", task, "--clear-reject-zero-shot", "--reject-below-zero-shot", "0.2")
-    assert r.exit_code == 1
+    assert r.exit_code == 2  # a usage error
     assert "either --reject-below-zero-shot or --clear-reject-zero-shot" in r.output
     run("class", "describe", task, "a {} thing\nthe {}")
     assert '"a red thing" | "the red"' in run("show", task).output
@@ -111,7 +110,7 @@ def test_example_commands(run, task, root):
     assert run("example", "relabel", task, " ", ids[0][:8]).exit_code == 1
     assert run("example", "tag", task, ids[0][:8], ids[1][:8], "--add", "hard").output.strip() == "Tagged 2 examples"
     assert run("example", "tag", task, ids[1][:8], "--remove", "hard", "--add", "x").exit_code == 0
-    assert run("example", "tag", task, ids[0][:8]).exit_code == 1
+    assert run("example", "tag", task, ids[0][:8]).exit_code == 2  # a usage error
     assert run("example", "tag", task, ids[0][:8], "--add", "a,b").exit_code == 1
     assert run("example", "note", task, ids[0][:8], "too dark").output.strip() == "Note saved"
     assert run("example", "note", task, ids[0][:8], "x" * 3000).exit_code == 1
@@ -191,15 +190,8 @@ def test_progress_bar_on_a_terminal(monkeypatch, capsys):
 
 
 def test_serve_allow_urls(monkeypatch):
-    """serve --allow-urls sets FEWSHOT_ALLOW_URLS for the API."""
-    seen: dict[str, str] = {}
-    import uvicorn  # pylint: disable=import-outside-toplevel
-
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: seen.update(os.environ))
-    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM", "FEWSHOT_ALLOW_URLS"):
-        monkeypatch.setenv(k, "")
-    CliRunner().invoke(cli.app, ["serve", "--allow-urls"])
-    assert seen["FEWSHOT_ALLOW_URLS"] == "1"
+    """serve --allow-urls lets the server fetch URLs."""
+    assert served(monkeypatch, "--allow-urls")[1].settings.allow_urls
 
 
 def test_cache_prune_removes_unused_images(run, task, root):
@@ -238,24 +230,21 @@ def test_more_cli_options(run, task, tmp_path, root):
 
 
 def test_serve_size_limits(monkeypatch):
-    """serve passes its upload and request size limits to the API."""
-    import uvicorn  # pylint: disable=import-outside-toplevel
-
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
-    CliRunner().invoke(cli.app, ["serve", "--max-upload-mb", "5", "--max-request-mb", "100.5"])
-    assert (os.environ["FEWSHOT_MAX_UPLOAD_MB"], os.environ["FEWSHOT_MAX_REQUEST_MB"]) == ("5", "100.5")
+    """serve passes its upload and request size limits to the server."""
+    srv = served(monkeypatch, "--max-upload-mb", "5", "--max-request-mb", "100.5")[1]
+    assert (srv.settings.max_upload_mb, srv.settings.max_request_mb) == (5, 100.5)
+    r = CliRunner().invoke(cli.app, ["serve", "--max-upload-mb", "-1"])
+    assert r.exit_code == 2  # refused as a usage error, before anything starts
 
 
 def test_serve_keeps_settings_from_the_environment(monkeypatch):
     """Settings already in the environment (as in a container) stand unless an option is given."""
-    import uvicorn  # pylint: disable=import-outside-toplevel
-
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
     env = {"FEWSHOT_ALLOW_URLS": "1", "FEWSHOT_ALLOW_ANY_MODEL": "1", "FEWSHOT_WARM": "0",
            "FEWSHOT_MAX_UPLOAD_MB": "5", "FEWSHOT_MAX_REQUEST_MB": "7"}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    assert CliRunner().invoke(cli.app, ["serve"]).exit_code == 0
-    assert {k: os.environ[k] for k in env} == {**env, "FEWSHOT_WARM": ""}  # the API's "off"
-    assert CliRunner().invoke(cli.app, ["serve", "--warm", "--max-upload-mb", "9"]).exit_code == 0
-    assert (os.environ["FEWSHOT_WARM"], os.environ["FEWSHOT_MAX_UPLOAD_MB"]) == ("1", "9")
+    st = served(monkeypatch)[1].settings
+    assert (st.allow_urls, st.allow_any_model, st.warm) == (True, True, False)
+    assert (st.max_upload_mb, st.max_request_mb) == (5, 7)
+    st = served(monkeypatch, "--warm", "--max-upload-mb", "9")[1].settings
+    assert (st.warm, st.max_upload_mb) == (True, 9)

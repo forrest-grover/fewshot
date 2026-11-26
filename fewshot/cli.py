@@ -15,50 +15,25 @@ from typing import TYPE_CHECKING, Any
 
 import typer
 
-from .cli_common import (
-    JSON_OPT,
-    ROOT_OPT,
-    Source,
-)
-from .cli_common import (
-    add_files as _add_files,
-)
-from .cli_common import (
-    echo_json as _echo_json,
-)
-from .cli_common import (
-    error_text as _error_text,
-)
-from .cli_common import (
-    expand as _expand,
-)
-from .cli_common import (
-    fail as _fail,
-)
-from .cli_common import (
-    get_task as _task,
-)
-from .cli_common import (
-    images_in as _images_in,
-)
-from .cli_common import (
-    make_pipeline as _pipe,
-)
-from .cli_common import (
-    progress as _progress,
-)
-from .cli_common import (
-    read_source as _read,
-)
-from .cli_common import (
-    workspace as _ws,
-)
-from .cli_common import (
-    write_csv as _write_csv,
-)
+from . import services
+from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source
+from .cli_common import add_files as _add_files
+from .cli_common import echo_json as _echo_json
+from .cli_common import error_text as _error_text
+from .cli_common import expand as _expand
+from .cli_common import fail as _fail
+from .cli_common import get_task as _task
+from .cli_common import images_in as _images_in
+from .cli_common import make_pipeline as _pipe
+from .cli_common import progress as _progress
+from .cli_common import read_source as _read
+from .cli_common import usage as _usage
+from .cli_common import workspace as _ws
+from .cli_common import write_csv as _write_csv
 from .cli_data import ex_app, inbox_app
-from .embedders import DEFAULT_SPEC, PRESETS, check_embedder, spec_supports_text
+from .embedders import DEFAULT_SPEC, PRESETS, spec_supports_text
 from .fetch import is_url
+from .folders import class_folders
 from .store import Workspace
 from .text import check_class_name
 
@@ -73,11 +48,15 @@ app.add_typer(cache_app, name="cache")
 app.add_typer(ex_app, name="example")
 app.add_typer(inbox_app, name="inbox")
 
-def _check_embedder(spec: str) -> None:
+def main() -> None:
+    """Entry point of the ``fewshot`` command: the CLI, with file system errors (an unreadable
+    workspace, a full disk) reported as an error message rather than a traceback."""
     try:
-        check_embedder(spec)
-    except ValueError as e:
-        _fail(str(e))
+        app()
+    except OSError as e:
+        where = f"{e.filename}: " if e.filename else ""
+        typer.secho(f"Error: {where}{e.strerror or e}", fg="red", err=True)
+        sys.exit(FAILED)
 
 
 @app.command()
@@ -98,12 +77,8 @@ def create(
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Create a task."""
-    kw = {"classifier": classifier}
-    if embedder is not None:
-        _check_embedder(embedder)
-        kw["embedder"] = embedder
     try:
-        t = _ws(root).create(name, **kw)
+        t = services.create_task(_ws(root, create=True), name, embedder, classifier)
     except ValueError as e:
         _fail(str(e))
     typer.echo(f"Created task {t.name} at {t.path}")
@@ -146,8 +121,8 @@ def show(name: str, as_json: bool = JSON_OPT, root: Path | None = ROOT_OPT) -> N
         typer.echo(f"  {cd.name:24} {counts.get(cd.name, 0):5}{thr}{desc.rstrip()}")
 
 
-def _parse_params(param: list[str], base: dict[str, Any]) -> dict[str, Any]:
-    params = dict(base)
+def _parse_params(param: list[str]) -> dict[str, Any]:
+    params = {}
     for p in param:
         k, sep, v = p.partition("=")
         try:
@@ -155,7 +130,7 @@ def _parse_params(param: list[str], base: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("expected KEY=VALUE")
             params[k] = json.loads(v)
         except ValueError as e:
-            _fail(f"Bad --param {p!r}: {e}")
+            _usage(f"Bad --param {p!r}: {e}")
     return params
 
 
@@ -179,34 +154,22 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     temperature: float | None = typer.Option(None, help="Confidence calibration (see `fewshot eval`); 1 = none"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Change task settings; switching classifier resets its params unless --param is given."""
+    """Change task settings; --param sets classifier params on top of the current ones, and switching
+    classifier starts its params afresh (then --param sets some)."""
     t = _task(root, name)
     if clear_reject and reject_below is not None:
-        _fail("Give either --reject-below or --clear-reject, not both")
+        _usage("Give either --reject-below or --clear-reject, not both")
     if clear_reject_zero_shot and reject_below_zero_shot is not None:
-        _fail("Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both")
-    kw: dict[str, Any] = {}
-    if embedder is not None and embedder != t.config.embedder:
-        _check_embedder(embedder)
-        kw["embedder"] = embedder
-    if classifier and classifier != t.config.classifier:
-        kw["classifier"] = classifier
-        kw["classifier_params"] = {}
-    if param:
-        kw["classifier_params"] = _parse_params(param, kw.get("classifier_params", t.config.classifier_params))
-    if text_weight is not None:
-        kw["text_weight"] = text_weight
-    if reject_below is not None:
-        kw["reject_below"] = reject_below
-    if clear_reject:
-        kw["reject_below"] = None
-    if reject_below_zero_shot is not None or clear_reject_zero_shot:
-        kw["reject_below_zero_shot"] = reject_below_zero_shot
-    kw.update({k: v for k, v in (("flip", flip), ("names_as_text", names)) if v is not None})
-    if temperature is not None:
-        kw["temperature"] = None if temperature == 1 else temperature
+        _usage("Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both")
+    values = {"embedder": embedder, "classifier": classifier or None, "text_weight": text_weight,
+              "reject_below": reject_below, "reject_below_zero_shot": reject_below_zero_shot, "flip": flip,
+              "names_as_text": names, "temperature": temperature}
+    flags = {"reject_below": ("--clear-reject", clear_reject),
+             "reject_below_zero_shot": ("--clear-reject-zero-shot", clear_reject_zero_shot)}
+    clear = {k: flag for k, (flag, on) in flags.items() if on}
     try:
-        _say_cleared(name, t.update_settings(**kw))
+        _say_cleared(name, services.change_settings(t, {k: v for k, v in values.items() if v is not None}, clear,
+                                                     _parse_params(param)))
     except ValueError as e:
         _fail(str(e))
     show(name, False, root)
@@ -313,9 +276,7 @@ def import_task(
     if not file.is_file():
         _fail(f"No such file: {file}")
     try:
-        if embedder:
-            _check_embedder(embedder)
-        t = read_export(_ws(root), file, name, embedder=embedder)
+        t = read_export(_ws(root, create=True), file, name, embedder=embedder or None)
     except ValueError as e:
         _fail(str(e))
     typer.echo(f"Imported task {t.name} ({len(t.config.examples)} examples)")
@@ -325,7 +286,8 @@ def import_task(
 def class_add(
     name: str,
     label: str,
-    description: str = typer.Option("", "--desc", help="Text prompt, e.g. 'a photo of a cracked weld'"),
+    description: str | None = typer.Option(None, "--desc", help="Text prompt, e.g. 'a photo of a cracked weld' "
+                                                                "[default: keep an existing class's]"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Add a class, or set an existing class's description."""
@@ -362,7 +324,7 @@ def class_threshold(
 ) -> None:
     """Set a class's own reject threshold, overriding the task's (see `eval` for suggestions)."""
     if (value is None) == (not clear):
-        _fail("Give either a threshold or --clear")
+        _usage("Give either a threshold or --clear")
     try:
         _task(root, name).set_class_thresholds({label: value})
     except KeyError as e:
@@ -400,13 +362,14 @@ def import_dir(
     shots: int | None = typer.Option(None, min=1, help="Take at most this many images per class"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Import FOLDER/<class>/<image> into a task; exits 1 if no image could be imported."""
+    """Import FOLDER/<class>/<image> into a task (hidden and system folders such as __MACOSX are
+    skipped); exits 1 if no image could be imported."""
     t = _task(root, name)
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
     n = 0
-    for d in sorted(p for p in folder.iterdir() if p.is_dir()):
-        n += _add_files(t, d.name, _images_in(d, recursive=False)[:shots])
+    for label, files in class_folders(folder, shots).items():
+        n += _add_files(t, label, files)
     typer.echo(f"Imported {n} images into {name}")
     if n == 0:
         _fail(f"No images were imported; expected {folder}/<class>/<image>")
@@ -434,9 +397,9 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     list can be piped through. A path in it that can't be read gets an error row."""
     t = _task(root, name)
     if sum((as_json, as_jsonl, as_csv)) > 1:
-        _fail("Give at most one of --json, --jsonl and --csv")
+        _usage("Give at most one of --json, --jsonl and --csv")
     if not paths and from_file is None:
-        _fail("Give images to classify, or --from-file")
+        _usage("Give images to classify, or --from-file")
     named = _expand(paths) if paths else []
     fmt = "json" if as_json else "jsonl" if as_jsonl else "csv" if as_csv else "text"
     try:
@@ -450,13 +413,11 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     sources = itertools.chain(named, _listed(from_file) if from_file is not None else [])
     with _progress("Classifying") as update:
         while part := list(itertools.islice(sources, PREDICT_CHUNK)):
-            images, fetch_errors = _download(part)
             try:
-                preds = pipe.predict(t, images, top_k=top if fmt in {"json", "jsonl"} else None, evidence=evidence,
-                                     cfg=cfg)
+                preds = services.predict(pipe, t, _loaded(part), top_k=top if fmt in {"json", "jsonl"} else None,
+                                         evidence=evidence, cfg=cfg)
             except ValueError as e:
                 _fail(str(e))
-            preds = _with_fetch_errors(preds, fetch_errors)
             failed += sum(p.error is not None for p in preds)
             if fmt == "json":
                 files += part
@@ -515,9 +476,9 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     from .evaluate import compare_embedders  # pylint: disable=import-outside-toplevel  # torch-backed
 
     t = _task(root, name)
-    specs = [t.config.embedder, *embedder, *([p.spec for p in PRESETS] if presets else [])]
-    if len(set(specs)) < 2:
-        _fail("Give another --embedder to compare with, or --presets")
+    specs = services.check_specs([t.config.embedder, *embedder, *([p.spec for p in PRESETS] if presets else [])])
+    if len(specs) < 2:
+        _usage("Give another --embedder to compare with, or --presets")
     try:
         with _progress("Comparing") as update:
             r = compare_embedders(_pipe(_ws(root)), t, specs, folds,
@@ -542,7 +503,7 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
 
 
 @app.command()
-def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
+def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     folder: Path = typer.Argument(..., help="Folder new images arrive in"),
     out: Path = typer.Option(..., help="Where images go: OUT/<class>/, OUT/_unknown/ (rejected or not confident "
@@ -566,14 +527,17 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     pipe = _pipe(ws)
     last: dict[Path, int] = {}  # files seen in the last look, and their sizes
     done: set[Path] = set()  # with --copy, files already copied
+    retry = Backoff(interval)
     try:
         while True:
             sizes = _sizes(folder)
-            ready = [f for f, n in sizes.items() if f not in done and n > 0 and (once or last.get(f) == n)]
+            ready = [f for f, n in sizes.items() if f not in done and n > 0 and (once or last.get(f) == n)
+                     and not retry.waiting(f)]
             last, done = sizes, done & sizes.keys()  # forget files that went away
+            retry.keep(sizes.keys())
             try:
                 done |= _sort_files(ws, pipe, name, ready, out, copy, min_confidence,
-                                    settle=0 if once else WATCH_SETTLE) if ready else set()
+                                    settle=0 if once else WATCH_SETTLE, retry=retry) if ready else set()
             except ValueError as e:  # the task can't predict yet (no examples): wait for some
                 if once:
                     _fail(str(e))
@@ -586,6 +550,36 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 
 
 WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
+WATCH_MAX_BACKOFF = 300.0  # longest wait before trying again to move a file that couldn't be moved
+
+
+class Backoff:
+    """When to try again to move files whose move failed: after ``interval`` seconds, then twice
+    as long after each further failure, up to ``WATCH_MAX_BACKOFF``."""
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self._failed: dict[Path, tuple[int, float]] = {}  # file -> (failures, when to try next)
+
+    def failed(self, f: Path) -> float:
+        """Note that moving ``f`` failed again; returns the seconds until it is tried again."""
+        n = self._failed.get(f, (0, 0.0))[0] + 1
+        wait: float = min(self.interval * 2.0 ** (n - 1), WATCH_MAX_BACKOFF)
+        self._failed[f] = (n, time.monotonic() + wait)
+        return wait
+
+    def succeeded(self, f: Path) -> None:
+        """Forget ``f``'s failures."""
+        self._failed.pop(f, None)
+
+    def waiting(self, f: Path) -> bool:
+        """Whether ``f`` failed lately and isn't due to be tried again yet."""
+        return f in self._failed and time.monotonic() < self._failed[f][1]
+
+    def keep(self, files: Iterable[Path]) -> None:
+        """Forget the files not among ``files`` (gone from the folder)."""
+        present = set(files)
+        self._failed = {f: v for f, v in self._failed.items() if f in present}
 
 
 def _sizes(folder: Path) -> dict[Path, int]:
@@ -599,12 +593,13 @@ def _sizes(folder: Path) -> dict[Path, int]:
     return out
 
 
-def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out: Path,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                copy: bool, min_confidence: float | None, settle: float = 0) -> set[Path]:
+def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out: Path,  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+                copy: bool, min_confidence: float | None, settle: float, retry: Backoff) -> set[Path]:
     """Classify ``files`` with the task's current version and move (or copy) each into its folder
     under ``out``, appending a JSON line per file to ``out/predictions.jsonl``. Returns the files
     handled. An unreadable file changed less than ``settle`` seconds ago may still be arriving and
-    is left for next time. Raises ``ValueError`` if the task can't predict yet (no examples)."""
+    is left for next time; a file that can't be moved is noted in ``retry``, to wait before trying
+    again. Raises ``ValueError`` if the task can't predict yet (no examples)."""
     try:
         preds = pipe.predict(ws.get(name), files)
     except KeyError:
@@ -618,8 +613,9 @@ def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out
                     continue
                 dest = _place(f, out / _folder_for(p, min_confidence), copy)
             except OSError as e:  # removed meanwhile, or the destination can't be written
-                typer.secho(f"{f.name}: {e}", fg="yellow", err=True)
+                typer.secho(f"{f.name}: {e}; trying again in {retry.failed(f):g} s", fg="yellow", err=True)
                 continue
+            retry.succeeded(f)
             handled.add(f)
             log.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "file": str(f), "to": str(dest),
                                   "task": name, **p.to_dict()}) + "\n")
@@ -651,13 +647,6 @@ def _free_name(path: Path) -> Path:
     return candidate
 
 
-def _with_fetch_errors(preds: list[Prediction], errors: dict[int, str]) -> list[Prediction]:
-    """``preds`` with the URLs that couldn't be downloaded failed with the real reason."""
-    from .pipeline import Prediction  # pylint: disable=import-outside-toplevel,redefined-outer-name  # torch-backed
-
-    return [Prediction.failed(errors[i]) if i in errors else p for i, p in enumerate(preds)]
-
-
 def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, top: int, header: bool = True) -> None:
     """Print predictions as JSON, JSON lines, CSV (with a ``header`` row) or text."""
     if fmt == "json":
@@ -675,18 +664,17 @@ def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, 
         _print_predictions(files, preds, top)
 
 
-def _download(files: list[Source]) -> tuple[list[bytes | Path], dict[int, str]]:
-    """Files as they are and URLs downloaded; a URL that can't be fetched becomes empty bytes, with
-    its error by position in the second result."""
-    images: list[bytes | Path] = []
-    errors: dict[int, str] = {}
-    for i, f in enumerate(files):
-        try:
-            images.append(f if isinstance(f, Path) else _read(f))
-        except ValueError as e:
-            images.append(b"")
-            errors[i] = str(e)
-    return images, errors
+def _loaded(files: list[Source]) -> list[services.Blob]:
+    """Files as they are (the pipeline reads them a few at a time) and URLs downloaded; a URL that
+    can't be fetched carries its error."""
+    return [services.Blob(str(f), f) if isinstance(f, Path) else _fetched(f) for f in files]
+
+
+def _fetched(url: str) -> services.Blob:
+    try:
+        return services.Blob(url, _read(url))
+    except ValueError as e:
+        return services.Blob(url, None, str(e))
 
 
 def _print_predictions(files: list[Source], preds: list[Prediction], top: int) -> None:
@@ -745,25 +733,19 @@ def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-argument
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Cross-validate a task on its own examples."""
-    # evaluate imports the torch-backed pipeline; importing it lazily keeps `fewshot --help` fast.
-    from .evaluate import evaluate_task  # pylint: disable=import-outside-toplevel
-
+    if as_json and as_csv:
+        _usage("Give at most one of --json and --csv")
     t = _task(root, name)
     try:
         with _progress("Evaluating") as update:
-            r = evaluate_task(_pipe(_ws(root)), t, folds, progress=lambda _stage, done, total: update(done, total))
+            r = services.evaluate(_pipe(_ws(root)), t, folds, lambda _stage, done, total: update(done, total),
+                                  apply_class_thresholds)
     except ValueError as e:
         _fail(str(e))
+    except KeyError as e:  # a class was renamed or deleted meanwhile
+        _fail(f"Thresholds not set: {e.args[0]}")
     if apply_class_thresholds and r["suggested_class_thresholds"]:
-        current = r["revision"] == t.config.revision
-        try:
-            t.set_class_thresholds(r["suggested_class_thresholds"])
-        except KeyError as e:  # a class was renamed or deleted meanwhile
-            _fail(f"Thresholds not set: {e.args[0]}")
         typer.echo(f"Set the thresholds of {len(r['suggested_class_thresholds'])} classes", err=True)
-        if current:  # thresholds don't change what evaluation measures, so the result still holds
-            r = {**r, "revision": t.config.revision}
-    t.record_evaluation(r)
     if as_json:
         _echo_json(r)
     elif as_csv:
@@ -847,11 +829,12 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 
 
 @app.command()
-def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
+def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     host: str = "127.0.0.1",
     port: int = 8000,
     token: str | None = typer.Option(None, envvar="FEWSHOT_TOKEN", show_envvar=True,
-                                     help="Require this token for the API and UI"),
+                                     help="Require this token for the API and UI (prefer setting FEWSHOT_TOKEN: "
+                                          "an option is visible to other users in the process list)"),
     allow_any_model: bool = typer.Option(False, "--allow-any-model", envvar="FEWSHOT_ALLOW_ANY_MODEL",
                                          show_envvar=True,
                                          help="Let API callers load any embedder spec, not just presets"),
@@ -860,43 +843,46 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     allow_urls: bool = typer.Option(False, "--allow-urls", envvar="FEWSHOT_ALLOW_URLS", show_envvar=True,
                                     help="Let API callers send image URLs for the server to download "
                                          "(public addresses only)"),
-    max_upload_mb: float = typer.Option(50, envvar="FEWSHOT_MAX_UPLOAD_MB", show_envvar=True,
+    max_upload_mb: float = typer.Option(50, min=0.001, envvar="FEWSHOT_MAX_UPLOAD_MB", show_envvar=True,
                                         help="Largest image accepted per upload"),
-    max_request_mb: float = typer.Option(1024, envvar="FEWSHOT_MAX_REQUEST_MB", show_envvar=True,
-                                         help="Largest request body accepted"),
+    max_request_mb: float = typer.Option(1024, min=0.001, envvar="FEWSHOT_MAX_REQUEST_MB", show_envvar=True,
+                                         help="Largest upload request accepted (other request bodies: 1 MB)"),
     allowed_host: list[str] = typer.Option(
         [], "--allowed-host", help="Host name clients use to reach the server; others are refused (IP addresses "
                                    "always work). Repeatable; '*' allows any. [default: $FEWSHOT_ALLOWED_HOSTS "
                                    "(comma-separated), else localhost, plus this machine's names when not serving "
                                    "locally]"),
+    forwarded_allow_ips: str = typer.Option(
+        "127.0.0.1", envvar="FEWSHOT_FORWARDED_ALLOW_IPS", show_envvar=True,
+        help="Comma-separated addresses of reverse proxies whose X-Forwarded-For/-Proto headers are trusted "
+             "('*': any), so limits on wrong tokens apply per client, not to the proxy"),
+    workers: int = typer.Option(4, min=1, max=256, envvar="FEWSHOT_WORKERS", show_envvar=True,
+                                help="Threads for heavy work (predicting, evaluating, uploads)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Run the REST API and web UI."""
-    # uvicorn is only needed here; importing it lazily keeps other commands fast.
+    # uvicorn and the API are only needed here; importing them lazily keeps other commands fast.
     import uvicorn  # pylint: disable=import-outside-toplevel
 
-    if root:
-        os.environ["FEWSHOT_HOME"] = str(root)
-    local = host in {"127.0.0.1", "localhost", "::1"}
+    from .api import create_app  # pylint: disable=import-outside-toplevel
+    from .server_settings import LOCAL_HOSTS, ServerSettings  # pylint: disable=import-outside-toplevel
+
+    local = host in LOCAL_HOSTS
     from_env = [h.strip() for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
-    hosts = allowed_host or from_env or ["localhost", "127.0.0.1", "::1"]
+    hosts = allowed_host or from_env or list(LOCAL_HOSTS)
     if not (allowed_host or from_env or local):
         hosts += sorted({socket.gethostname().lower(), socket.getfqdn().lower()} - {""})
-    # fewshot.api reads its settings from the environment when uvicorn imports it.
-    settings = {
-        "FEWSHOT_TOKEN": token or "", "FEWSHOT_ALLOW_ANY_MODEL": "1" if allow_any_model else "",
-        "FEWSHOT_WARM": "1" if warm else "", "FEWSHOT_ALLOW_URLS": "1" if allow_urls else "",
-        "FEWSHOT_ALLOWED_HOSTS": ",".join(hosts),
-        "FEWSHOT_MAX_UPLOAD_MB": f"{max_upload_mb:g}", "FEWSHOT_MAX_REQUEST_MB": f"{max_request_mb:g}",
-    }
-    os.environ.update(settings)
+    settings = ServerSettings(home=root, token=token, allow_any_model=allow_any_model, warm=warm,
+                              allow_urls=allow_urls, allowed_hosts=frozenset(hosts), max_upload_mb=max_upload_mb,
+                              max_request_mb=max_request_mb, forwarded_allow_ips=forwarded_allow_ips, workers=workers)
     if not token and not local:
         typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
                     "change every task.", fg="yellow", err=True)
     if not local and "*" not in hosts:
         typer.echo(f"Answering requests by IP address or for: {', '.join(hosts)}. Reaching it by another name "
                    "needs --allowed-host NAME.", err=True)
-    uvicorn.run("fewshot.api:app", host=host, port=port)
+    uvicorn.run(create_app(settings, _ws(root, create=True)), host=host, port=port, proxy_headers=True,
+                forwarded_allow_ips=settings.forwarded_allow_ips)
 
 
 @cache_app.command("info")
@@ -914,33 +900,27 @@ def cache_info(root: Path | None = ROOT_OPT) -> None:
 @cache_app.command("prune")
 def cache_prune(
     dry_run: bool = typer.Option(False, "--dry-run", help="Only report how many vectors would go"),
+    vacuum: bool = typer.Option(False, "--vacuum", help="Shrink the cache file afterwards (slow for a large cache)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Delete cached image vectors that no task's examples use (e.g. deleted examples, bench datasets),
     and stored images no task links to any more.
 
     Text vectors are kept. Refuses to run if a task can't be read, since its examples would be lost.
+    The space freed is reused by the cache; --vacuum gives it back to the disk, which rewrites the
+    whole file and keeps other processes from writing to the cache meanwhile.
     """
-    from .cache import EmbeddingCache  # pylint: disable=import-outside-toplevel  # keeps --help fast
+    from .cache import prune_unused  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
     ws = _ws(root)
-    tasks = ws.list_tasks()
-    folders = [p for p in ws.task_folders() if (p / "task.json").exists()]
-    if len(tasks) < len(folders):
-        unreadable = sorted({p.name for p in folders} - {t.config.name for t in tasks})
-        _fail(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
-    from .pipeline import FLIP_KEY  # pylint: disable=import-outside-toplevel  # keeps --help fast
-
-    # Images undo or redo may bring back keep their vectors too.
-    ids = {e.id for t in tasks for e in [*t.config.examples, *t.config.inbox]}
-    ids |= {f.split("/", 1)[1].rsplit(".", 1)[0] for t in tasks for f in t.kept_files()}
-    keep = {k for i in ids for k in (i, i + FLIP_KEY)}
-    cache = EmbeddingCache(ws.cache_path)
-    n = cache.prune(keep, dry_run=dry_run)
+    try:
+        n, blobs = prune_unused(ws, dry_run=dry_run, vacuum=vacuum)
+    except ValueError as e:
+        _fail(str(e))
     typer.echo(f"{'Would delete' if dry_run else 'Deleted'} {n} cached image vectors; "
                f"{_mb(ws.cache_path.stat().st_size)} on disk")
     if not dry_run:
-        typer.echo(f"Deleted {ws.gc_blobs()} stored images no task uses")
+        typer.echo(f"Deleted {blobs} stored images no task uses")
 
 
 @app.command()
@@ -959,4 +939,4 @@ def _mb(n: int) -> str:
 
 
 if __name__ == "__main__":
-    app()
+    main()

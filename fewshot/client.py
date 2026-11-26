@@ -8,31 +8,57 @@
         print(p["file"], p["label"], p["confidence"])
 
 Images are file paths or ``(filename, bytes)`` pairs. Every method returns the API's JSON; an error
-response raises ``ApiError`` with the HTTP status and the server's ``detail``. Many images are sent
-``BATCH`` per request (the server takes at most 1000 files per request), reading only one batch of
-files at a time; the results are combined.
+response raises ``ApiError`` with the HTTP status and the server's ``detail``, and so does a failed
+connection (status 0). Many images are sent in batches of at most ``BATCH`` images (the server
+takes at most 1000 files per request) and at most half the server's request size limit, reading
+only one batch of files at a time; the results are combined.
+
+The methods cover the common work (tasks, adding images, the inbox, predicting, evaluating);
+``request`` reaches every other endpoint (see the server's /docs).
 """
 
 from __future__ import annotations
 
-import itertools
+import http.client
 import json
 import mimetypes
+import time
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 Image = str | Path | tuple[str, bytes]
-BATCH = 256  # images per upload request
+BATCH = 256  # images per upload request, at most
+BATCH_BYTES = 256 * 1024 * 1024  # bytes per upload request, at most, if the server doesn't say its limit
 
 
-def _batches(images: Iterable[Image]) -> Iterator[list[Image]]:
-    it = iter(images)
-    while batch := list(itertools.islice(it, BATCH)):
+def _size(img: Image) -> int:
+    """How many bytes ``img`` will add to a request (0 for a file that can't be read: it fails when sent)."""
+    if isinstance(img, tuple):
+        return len(img[1])
+    try:
+        return Path(img).stat().st_size
+    except OSError:
+        return 0
+
+
+def _batches(images: Iterable[Image], max_bytes: int) -> Iterator[list[Image]]:
+    """``images`` in lists of at most ``BATCH`` images and ``max_bytes`` (an image larger than that
+    goes alone, for the server to judge)."""
+    batch: list[Image] = []
+    size = 0
+    for img in images:
+        n = _size(img)
+        if batch and (len(batch) >= BATCH or size + n > max_bytes):
+            yield batch
+            batch, size = [], 0
+        batch.append(img)
+        size += n
+    if batch:
         yield batch
 
 
@@ -52,9 +78,10 @@ class Client:
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self._batch_bytes: int | None = None  # half the server's request limit, once asked
 
     # ---- transport -----------------------------------------------------
-    def request(  # pylint: disable=too-many-arguments  # keyword-only body options
+    def request(  # pylint: disable=too-many-arguments,too-many-locals  # keyword-only body options
             self, method: str, path: str, *, params: dict[str, Any] | None = None, json_body: Any = None,
             fields: dict[str, str] | None = None, files: Sequence[Image] = ()) -> Any:
         """Send a request to ``path`` (under ``/api``) and return the decoded JSON (None if empty).
@@ -79,7 +106,19 @@ class Client:
                 body = r.read()
         except HTTPError as e:
             raise _api_error(e) from None
+        except (URLError, OSError, http.client.HTTPException) as e:
+            reason = getattr(e, "reason", None) or e
+            hint = " (the request may be larger than the server accepts)" if data and len(data) > 1024 * 1024 else ""
+            raise ApiError(0, f"Connection to {self.url} failed: {reason}{hint}") from None
         return json.loads(body) if body else None
+
+    def batch_bytes(self) -> int:
+        """The most bytes of images sent per request: half the server's request size limit (as its
+        health check reports it), or ``BATCH_BYTES`` if it doesn't say."""
+        if self._batch_bytes is None:
+            limit = self.health().get("max_request_bytes")
+            self._batch_bytes = limit // 2 if isinstance(limit, int) and limit > 0 else BATCH_BYTES
+        return self._batch_bytes
 
     # ---- tasks ---------------------------------------------------------
     def health(self) -> dict[str, Any]:
@@ -120,7 +159,7 @@ class Client:
         batch was refused, the first refusal is raised."""
         out: dict[str, Any] = {"added": [], "errors": [], "task": None}
         refused: ApiError | None = None
-        for batch in _batches(images):
+        for batch in _batches(images, self.batch_bytes()):
             try:
                 r = self.request("POST", path, fields=fields, files=batch)
             except ApiError as e:
@@ -152,13 +191,22 @@ class Client:
         """
         params = {"top_k": top_k, "evidence": evidence or None, "revision": revision}
         out: list[dict[str, Any]] = []
-        for batch in _batches(images):
+        for batch in _batches(images, self.batch_bytes()):
             out += self.request("POST", f"/tasks/{_seg(task)}/predict", params=params, files=batch)
         return out
 
-    def evaluate(self, task: str) -> dict[str, Any]:
-        """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...)."""
-        return self.request("POST", f"/tasks/{_seg(task)}/evaluate")  # type: ignore[no-any-return]
+    def evaluate(self, task: str, folds: int | None = None, poll: float = 1.0) -> dict[str, Any]:
+        """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...).
+
+        Runs as a background job on the server, polled every ``poll`` seconds, so a long evaluation
+        isn't cut off by the request timeout. A failed or cancelled job raises ``ApiError``."""
+        job = self.request("POST", f"/tasks/{_seg(task)}/evaluate/jobs", params={"folds": folds})
+        while job["status"] in {"running", "cancelling"}:
+            time.sleep(poll)
+            job = self.request("GET", f"/jobs/{_seg(job['id'])}")
+        if job["status"] != "done":
+            raise ApiError(409 if job["status"] == "cancelled" else 400, job["error"] or f"Evaluation {job['status']}")
+        return job["result"]  # type: ignore[no-any-return]
 
 
 def _api_error(e: HTTPError) -> ApiError:

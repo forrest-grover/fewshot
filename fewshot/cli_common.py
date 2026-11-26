@@ -12,8 +12,10 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 import typer
 
+from . import services
 from .fetch import fetch_url, is_url
-from .images import IMAGE_EXTS
+from .folders import image_files
+from .services import Added, Blob
 from .store import Task, Workspace
 
 if TYPE_CHECKING:
@@ -25,10 +27,20 @@ JSON_OPT = typer.Option(False, "--json", help="Print JSON")
 ROOT_OPT = typer.Option(None, "--root", envvar="FEWSHOT_HOME", help="Workspace directory [default: ./fewshot_data]")
 
 
-def fail(msg: str) -> NoReturn:
-    """Print ``msg`` as an error and exit with status 1."""
+# Exit statuses: 1 when the command failed (or failed for some of its inputs), 2 for a usage error
+# (options that don't go together, missing arguments), as for the usage errors Typer reports itself.
+FAILED, USAGE = 1, 2
+
+
+def fail(msg: str, code: int = FAILED) -> NoReturn:
+    """Print ``msg`` as an error and exit with status ``code`` (1: the command failed)."""
     typer.secho(f"Error: {msg}", fg="red", err=True)
-    raise typer.Exit(1)
+    raise typer.Exit(code)
+
+
+def usage(msg: str) -> NoReturn:
+    """Print ``msg`` as an error and exit with status 2: the command was called wrongly."""
+    fail(msg, USAGE)
 
 
 def error_text(e: Exception) -> str:
@@ -36,9 +48,11 @@ def error_text(e: Exception) -> str:
     return str(e.args[0]) if isinstance(e, KeyError) and e.args else str(e)
 
 
-def workspace(root: Path | None) -> Workspace:
-    """The workspace at ``root`` (default from FEWSHOT_HOME or ./fewshot_data)."""
-    return Workspace(root)
+def workspace(root: Path | None, create: bool = False) -> Workspace:
+    """The workspace at ``root`` (default from FEWSHOT_HOME or ./fewshot_data). Unless ``create``
+    (for commands that make tasks), a missing one isn't made: it reads as empty, so a mistyped
+    --root doesn't leave a new folder behind."""
+    return Workspace(root, create=create)
 
 
 def get_task(root: Path | None, name: str) -> Task:
@@ -60,9 +74,9 @@ Source = Path | str  # an image file, or an http(s) URL
 
 
 def images_in(folder: Path, recursive: bool = True) -> list[Path]:
-    """Image files under ``folder``, sorted; folders and broken links with image names are left out."""
-    found = folder.rglob("*") if recursive else folder.iterdir()
-    return sorted(f for f in found if f.suffix.lower() in IMAGE_EXTS and f.is_file())
+    """Image files under ``folder``, sorted; hidden and system files and folders, folders and broken
+    links with image names are left out."""
+    return image_files(folder, recursive)
 
 
 def expand(paths: list[str]) -> list[Source]:
@@ -109,39 +123,30 @@ def progress(what: str) -> Iterator[Callable[[int, int], None]]:
         yield lambda done, total: shown.update(tid, completed=done, total=total)
 
 
-def read_all(files: Sequence[Source], update: Callable[[int, int], None],
-             read: list[Source]) -> Iterator[tuple[Source, bytes]]:
-    """``(file, bytes)`` of each file or URL, skipping (with a message) those that can't be read;
-    the ones read are also appended to ``read``."""
+def blobs(files: Sequence[Source], update: Callable[[int, int], None]) -> Iterator[Blob]:
+    """Each file or URL read (lazily, as it is needed), named by its path or URL, or why it can't
+    be read; ``update`` counts them."""
     for i, f in enumerate(files):
         update(i, len(files))
         try:
-            data = read_source(f)
+            yield Blob(str(f), read_source(f), source=source_name(f))
         except ValueError as e:
-            typer.secho(f"skip {f}: {e}", fg="yellow", err=True)
-            continue
-        read.append(f)
-        yield f, data
+            yield Blob(str(f), None, str(e))
 
 
-def report_skipped(read: list[Source], results: Sequence[object]) -> int:
-    """Print the files a store call refused (results that are ValueErrors); returns how many weren't."""
-    n = 0
-    for f, r in zip(read, results, strict=True):
-        if isinstance(r, ValueError):
-            typer.secho(f"skip {f}: {r}", fg="yellow", err=True)
-        else:
-            n += 1
-    return n
+def report_skipped(result: Added) -> int:
+    """Print each image an add left out and why; returns how many were added."""
+    for f, why in result.errors:
+        typer.secho(f"skip {f}: {why}", fg="yellow", err=True)
+    return len(result.added)
 
 
 def add_files(task: Task, label: str, files: Sequence[Source]) -> int:
     """Add ``files`` (paths or URLs) as examples of ``label``, skipping unreadable images; returns
     how many were added."""
-    read: list[Source] = []  # the files actually read, in step with add_examples' results
     with progress(f"Adding to {label}") as update:
-        results = task.add_examples((data, label, source_name(f)) for f, data in read_all(files, update, read))
-    return report_skipped(read, results)
+        return report_skipped(services.add_examples(task, label, blobs(files, update)))
+
 
 
 def echo_json(obj: Any) -> None:
@@ -150,8 +155,9 @@ def echo_json(obj: Any) -> None:
 
 
 def write_csv(header: list[str], rows: list[list[Any]], with_header: bool = True) -> None:
-    """Print ``rows`` as CSV, after ``header`` unless ``with_header`` is False."""
+    """Print ``rows`` as CSV, after ``header`` unless ``with_header`` is False; booleans are
+    written ``true``/``false``, as in JSON."""
     w = csv.writer(sys.stdout, lineterminator="\n")
     if with_header:
         w.writerow(header)
-    w.writerows(rows)
+    w.writerows([str(v).lower() if isinstance(v, bool) else v for v in row] for row in rows)

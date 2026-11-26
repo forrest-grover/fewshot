@@ -28,20 +28,23 @@ class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job'
     task: str
     kind: str
     revision: int = 0  # of the task when the job started
+    key: str = ""  # with task, kind and revision, what makes two jobs the same work (see ``Jobs.start``)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    status: str = "running"  # running | done | failed | cancelled
+    status: str = "running"  # running | cancelling | done | failed | cancelled
     stage: str = "starting"
     done: int = 0
     total: int = 0
     result: Any = None
     error: str | None = None
+    expired: bool = False  # finished long enough ago that its result is no longer kept
     finished: float | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
+    _state: threading.Lock = field(default_factory=threading.Lock, repr=False)  # status changes
 
     def to_dict(self) -> dict[str, Any]:
         """JSON view of the job."""
         return {k: getattr(self, k) for k in ("id", "task", "kind", "status", "stage", "done", "total", "result",
-                                              "error")}
+                                              "error", "expired")}
 
     def progress(self, stage: str, done: int, total: int) -> None:
         """Progress callback for the work; raises ``Cancelled`` once cancellation was asked for."""
@@ -49,43 +52,73 @@ class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job'
             raise Cancelled
         self.stage, self.done, self.total = stage, done, total
 
+    def request_cancel(self) -> None:
+        """Ask the job to stop at its next progress step; until then its status is "cancelling"."""
+        with self._state:
+            self.cancel.set()
+            if self.status == "running":
+                self.status = "cancelling"
+
+    def end(self, status: str, error: str | None = None) -> None:
+        """Record how the job ended."""
+        with self._state:
+            self.status, self.error, self.finished = status, error, time.time()
+
 
 class Jobs:
-    """The jobs of this process, keeping the ``kept`` most recently finished ones for polling."""
+    """The jobs of this process, keeping the ``kept`` most recently finished ones for polling, and
+    the results of only the ``kept_results`` most recent (a report can be large)."""
 
-    def __init__(self, kept: int = 100) -> None:
+    def __init__(self, kept: int = 100, kept_results: int = 10) -> None:
         self.kept = kept
+        self.kept_results = kept_results
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
 
     def start(self, job: Job, work: Callable[[Callable[[str, int, int], None]], Any], limit: int | None = None) -> Job:
-        """Run ``work(progress)`` in a thread; its return value becomes ``job.result``, unless
-        ``limit`` jobs are running already: then raise ``TooManyJobs`` (checked and started under
-        one lock, so concurrent starts can't pass the limit together). A
-        ``ValueError`` or ``KeyError`` fails the job with its message; anything else with
+        """Run ``work(progress)`` in a thread; its return value becomes ``job.result``.
+
+        If the same work (task, kind, revision and key) is already running and not being
+        cancelled, that job is returned instead and nothing starts. Otherwise, if ``limit`` jobs
+        are running already (cancelling ones don't count), raises ``TooManyJobs``. Both are
+        decided under one lock, so concurrent starts can't pass the limit or duplicate a job.
+        A ``ValueError`` or ``KeyError`` fails the job with its message; anything else with
         "Internal error" (details go to the log only: they can hold server paths)."""
         def run() -> None:
             try:
                 job.result = work(job.progress)
-                job.status = "done"
+                job.end("done")
             except Cancelled:
-                job.status = "cancelled"
+                job.end("cancelled")
             except (ValueError, KeyError) as e:
-                job.status, job.error = "failed", str(e.args[0]) if e.args else str(e)
+                job.end("failed", str(e.args[0]) if e.args else str(e))
             except Exception:  # pylint: disable=broad-exception-caught  # reported to the poller
                 log.exception("Job %s failed", job.id)
-                job.status, job.error = "failed", "Internal error; see the server log"
-            job.finished = time.time()
+                job.end("failed", "Internal error; see the server log")
+            with self._lock:
+                self._forget_old()
 
+        same = (job.task, job.kind, job.revision, job.key)
         with self._lock:
+            for j in self._jobs.values():
+                if j.status == "running" and (j.task, j.kind, j.revision, j.key) == same:
+                    return j
             if limit is not None and sum(j.status == "running" for j in self._jobs.values()) >= limit:
                 raise TooManyJobs
-            finished = sorted((j for j in self._jobs.values() if j.finished), key=lambda j: j.finished or 0)
-            for old in finished[: max(0, len(finished) - self.kept + 1)]:
-                del self._jobs[old.id]
             self._jobs[job.id] = job
+            self._forget_old()
         threading.Thread(target=run, name=f"fewshot-job-{job.id[:8]}", daemon=True).start()
         return job
+
+    def _forget_old(self) -> None:
+        """Forget finished jobs beyond ``kept`` and drop results beyond ``kept_results``. Call with
+        the lock held."""
+        finished = sorted((j for j in self._jobs.values() if j.finished), key=lambda j: j.finished or 0)
+        for old in finished[: max(0, len(finished) - self.kept)]:
+            del self._jobs[old.id]
+        for old in finished[: max(0, len(finished) - self.kept_results)]:
+            if old.result is not None:
+                old.result, old.expired = None, True
 
     def get(self, jid: str) -> Job | None:
         """The job with id ``jid``, if it is still remembered."""
@@ -93,6 +126,6 @@ class Jobs:
             return self._jobs.get(jid)
 
     def running(self) -> list[Job]:
-        """Jobs not finished yet."""
+        """Jobs running and not asked to stop."""
         with self._lock:
             return [j for j in self._jobs.values() if j.status == "running"]

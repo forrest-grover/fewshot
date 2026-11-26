@@ -1,19 +1,16 @@
 """Per-class reject thresholds: storing them, predicting with them, suggesting them, and the API and CLI."""
 
-import importlib
 import json
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import fewshot.api
 from fewshot import cli
 from fewshot.evaluate import evaluate_task
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
-from tests.conftest import png
+from tests.conftest import api_client, png
 from tests.test_cli import PlainResult
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
@@ -118,12 +115,11 @@ def test_evaluation_suggests_class_thresholds(ws):
 
 # ---- API ------------------------------------------------------------------------
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
+def client_fixture(tmp_path):
     """A TestClient on a fresh API, with task 't'."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    api = importlib.reload(fewshot.api)
-    _task(api.ws, n=5)
-    return TestClient(api.app)
+    c = api_client(tmp_path)
+    _task(c.srv.ws, n=5)
+    return c
 
 
 def test_api_class_thresholds(client):
@@ -192,7 +188,7 @@ def test_cli_eval_apply_with_a_class_gone(run, monkeypatch):
 
 def test_cli_config_says_what_switching_embedder_cleared(run, monkeypatch):
     """`config --embedder` reports the thresholds it cleared, and how to get them back."""
-    monkeypatch.setattr("fewshot.cli.check_embedder", lambda spec: None)
+    monkeypatch.setattr("fewshot.services.check_embedder", lambda spec: None)
     run("class", "threshold", "t", "red", "0.8")
     r = run("config", "t", "--embedder", "fake:other")
     assert "Cleared class thresholds: fitted to the previous settings (`fewshot undo t` restores them)" in r.output

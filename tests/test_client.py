@@ -1,6 +1,5 @@
 """fewshot.client against a real server, and the API's operation ids."""
 
-import importlib
 import socket
 import threading
 import time
@@ -9,23 +8,21 @@ import pytest
 import uvicorn
 
 import fewshot.api
-from fewshot.client import ApiError, Client
+from fewshot.api import create_app
+from fewshot.client import BATCH_BYTES, ApiError, Client, _batches
+from fewshot.server_settings import ServerSettings
 from tests.conftest import png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
-@pytest.fixture(name="server")
-def server_fixture(tmp_path, monkeypatch):
+def _serve(tmp_path, **settings):
     """The API served by uvicorn on a free local port, with token 'secret'; yields its URL."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    monkeypatch.setenv("FEWSHOT_TOKEN", "secret")
-    monkeypatch.setenv("FEWSHOT_WARM", "0")
-    api = importlib.reload(fewshot.api)
+    app = create_app(ServerSettings(home=tmp_path / "ws", token="secret", warm=False, **settings))
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    srv = uvicorn.Server(uvicorn.Config(api.app, host="127.0.0.1", port=port, log_level="warning"))
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=srv.run, daemon=True)
     thread.start()
     deadline = time.time() + 10
@@ -34,6 +31,18 @@ def server_fixture(tmp_path, monkeypatch):
     yield f"http://127.0.0.1:{port}/"
     srv.should_exit = True
     thread.join(10)
+
+
+@pytest.fixture(name="server")
+def server_fixture(tmp_path):
+    """A server with token 'secret'; yields its URL."""
+    yield from _serve(tmp_path)
+
+
+@pytest.fixture(name="small_server")
+def small_server_fixture(tmp_path):
+    """A server taking requests of at most 64 KB; yields its URL."""
+    yield from _serve(tmp_path, max_request_mb=1 / 16)
 
 
 def test_client_round_trip(server, tmp_path):
@@ -127,3 +136,69 @@ def test_a_refused_batch_doesnt_lose_the_others(server, monkeypatch):
     with pytest.raises(ApiError) as e:
         fs.add_examples("nope", "red", bad)
     assert e.value.status == 404
+
+
+def test_uploads_are_batched_by_size(small_server, monkeypatch):
+    """Images are sent in batches of at most half the server's request limit, so many large
+    images don't make one request the server refuses."""
+    fs = Client(small_server, token="secret")
+    assert fs.batch_bytes() == 32 * 1024
+    fs.create_task("t", embedder="fake:color")
+    images = [(f"{i}.png", png(RED, size=64, noise=40, seed=i)) for i in range(8)]
+    assert 8 * len(images[0][1]) > 64 * 1024  # all at once would be refused
+    sent = []
+    real = Client.request
+
+    def spy(self, method, path, **kw):
+        sent.append(len(kw.get("files", ())))
+        return real(self, method, path, **kw)
+
+    monkeypatch.setattr(Client, "request", spy)
+    assert len(fs.add_examples("t", "red", images)["added"]) == 8
+    assert len([n for n in sent if n]) > 1
+    assert len(fs.predict("t", images)) == 8
+
+
+def test_batches_without_a_limit_from_the_server(monkeypatch, tmp_path):
+    """An older server that doesn't report its limit gets BATCH_BYTES per request; a file that
+    can't be read counts as empty here, and fails when it is sent."""
+    monkeypatch.setattr(Client, "health", lambda self: {"status": "ok"})
+    assert Client().batch_bytes() == BATCH_BYTES
+    big = ("big.png", b"x" * 10)
+    assert [len(b) for b in _batches([big, big, big], max_bytes=15)] == [1, 1, 1]
+    assert [len(b) for b in _batches([tmp_path / "missing.png"] * 3, max_bytes=15)] == [3]
+
+
+def test_connection_failures_raise_api_error():
+    """A refused or reset connection raises ApiError (status 0), like an error response."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with pytest.raises(ApiError, match=r"Connection to .* failed") as e:
+        Client(f"http://127.0.0.1:{port}", timeout=5).health()
+    assert e.value.status == 0
+
+
+def test_a_reset_upload_hints_at_the_size_limit(monkeypatch):
+    """A connection dropped during a large upload (as a server refusing it does) says so."""
+    def reset(*_a, **_k):
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+    monkeypatch.setattr("fewshot.client.urlopen", reset)
+    monkeypatch.setattr(Client, "batch_bytes", lambda self: 10**9)
+    with pytest.raises(ApiError, match="larger than the server accepts"):
+        Client().predict("t", [("a.png", b"x" * (2 * 1024 * 1024))])
+
+
+def test_evaluate_runs_as_a_job(server, monkeypatch):
+    """evaluate polls a background job; a failed or cancelled one raises ApiError."""
+    fs = Client(server, token="secret")
+    fs.create_task("empty", embedder="fake:color")
+    with pytest.raises(ApiError, match="no examples") as e:
+        fs.evaluate("empty", poll=0.01)
+    assert e.value.status == 400
+    replies = iter([{"id": "j", "status": "running"}, {"id": "j", "status": "cancelled", "error": None}])
+    monkeypatch.setattr(Client, "request", lambda self, method, path, **kw: next(replies))
+    with pytest.raises(ApiError, match="Evaluation cancelled") as e:
+        fs.evaluate("empty", poll=0)
+    assert e.value.status == 409

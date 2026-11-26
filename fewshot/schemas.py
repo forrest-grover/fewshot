@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .models import MAX_NOTE
+from .text import MAX_DESCRIPTION
 
 MAX_URLS = 100  # per request
 
@@ -19,6 +20,8 @@ class Health(BaseModel):
     models_loaded: list[str]
     jobs_running: int
     url_fetch: bool  # whether the .../urls endpoints are enabled
+    max_request_bytes: int  # largest upload request accepted (fewshot.client batches below it)
+    max_upload_bytes: int  # largest image accepted
 
 
 class EmbedderOut(BaseModel):
@@ -285,12 +288,13 @@ class JobOut(BaseModel):
     id: str
     task: str
     kind: str
-    status: str  # running | done | failed | cancelled
+    status: str  # running | cancelling | done | failed | cancelled
     stage: str
     done: int
     total: int
     result: EvalReport | CompareReport | None
     error: str | None
+    expired: bool = False  # finished long enough ago that ``result`` is no longer kept
 
 
 # ---- request bodies -----------------------------------------------------
@@ -346,23 +350,23 @@ class Duplicate(_Body):
 
 
 class ClassBody(_Body):
-    """Body of POST .../classes."""
+    """Body of POST .../classes. A description holds at most ``MAX_PROMPTS`` prompts (lines)."""
 
     name: str
-    description: str | None = None
+    description: str | None = Field(None, max_length=MAX_DESCRIPTION)
 
 
 class ClassPatch(_Body):
     """Body of PATCH .../classes/{label}: rename and/or set the description."""
 
     name: str | None = None
-    description: str | None = None
+    description: str | None = Field(None, max_length=MAX_DESCRIPTION)
 
 
 class Describe(_Body):
     """Body of POST .../describe."""
 
-    template: str = "a photo of a {}"
+    template: str = Field("a photo of a {}", max_length=MAX_DESCRIPTION)
     overwrite: bool = False
 
 
@@ -410,6 +414,13 @@ class InboxLabels(_Body):
     """Body of POST .../inbox/accept: the class for each inbox image to label."""
 
     labels: dict[str, str] = Field(min_length=1)
+
+
+class AcceptConfident(_Body):
+    """Body of POST .../inbox/accept-confident."""
+
+    min_confidence: float = Field(ge=0, le=1)
+    ids: list[str] | None = None  # only these inbox images (default: all)
 
 
 class Compare(_Body):

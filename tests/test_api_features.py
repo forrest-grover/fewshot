@@ -1,27 +1,23 @@
 """API endpoints for undo, rename, export/import, example pages, tags, URLs, duplicates and top_k."""
 
-import importlib
 import io
 import zipfile
 
 import pytest
-from fastapi.testclient import TestClient
 
 import fewshot.api
 import fewshot.embedders
+import fewshot.services
 import fewshot.store
-from tests.conftest import png
+from tests.conftest import api_client, png, set_settings
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
-    """A TestClient on a freshly loaded API whose workspace lives in tmp_path."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    monkeypatch.delenv("FEWSHOT_ALLOW_URLS", raising=False)
-    importlib.reload(fewshot.api)
-    return TestClient(fewshot.api.app)
+def client_fixture(tmp_path):
+    """A TestClient on a new server whose workspace lives in tmp_path."""
+    return api_client(tmp_path)
 
 
 @pytest.fixture(name="task")
@@ -77,7 +73,7 @@ def test_rename_race(client, task, monkeypatch):
     def gone(*_args):
         raise KeyError("No task 'c'")
 
-    monkeypatch.setattr(fewshot.api.ws, "rename", gone)
+    monkeypatch.setattr(client.srv.ws, "rename", gone)
     assert client.post(f"/api/tasks/{task}/rename", json={"name": "d"}).status_code == 404
 
 
@@ -177,7 +173,7 @@ def test_duplicates_with_bad_embeddings(client, task, monkeypatch):
     def broken(*_args):
         raise ValueError("Embedder 'fake:color' returned NaN or infinite values")
 
-    monkeypatch.setattr(fewshot.api.pipe, "near_duplicates", broken)
+    monkeypatch.setattr(client.srv.pipe, "near_duplicates", broken)
     assert client.get(f"/api/tasks/{task}/duplicates").status_code == 400
 
 
@@ -191,7 +187,7 @@ def test_urls_need_the_server_option(client, task):
 
 def test_urls(client, task, monkeypatch):
     """With URLs allowed, images are downloaded (public only) to predict or add; failures are per URL."""
-    monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
+    set_settings(monkeypatch, client, allow_urls=True)
     fetched = []
 
     def fake_fetch(url, max_bytes, timeout=20.0, public_only=False):
@@ -201,7 +197,7 @@ def test_urls(client, task, monkeypatch):
             raise ValueError(f"Could not fetch {url}: HTTP 404 Not Found")
         return png(BLUE, seed=len(fetched))
 
-    monkeypatch.setattr(fewshot.api, "fetch_url", fake_fetch)
+    monkeypatch.setattr(fewshot.services, "fetch_url", fake_fetch)
     preds = client.post(f"/api/tasks/{task}/predict/urls",
                         json={"urls": ["http://h/b.png", "http://h/bad.png"]}).json()
     assert [(p["file"], p["label"]) for p in preds] == [("http://h/b.png", "blue"), ("http://h/bad.png", None)]
@@ -233,7 +229,7 @@ def test_model_that_cannot_load_is_a_400(client, task, monkeypatch):
     def offline(spec):
         raise RuntimeError("couldn't reach huggingface.co")
 
-    t = fewshot.api.ws.get(task)
+    t = client.srv.ws.get(task)
     t.update_settings(embedder="timm:gone")
     monkeypatch.setattr(fewshot.embedders, "_build", offline)
     files = [("files", ("q.png", png(RED), "image/png"))]
@@ -243,17 +239,15 @@ def test_model_that_cannot_load_is_a_400(client, task, monkeypatch):
         assert r.json()["detail"] == "Could not load embedder 'timm:gone': couldn't reach huggingface.co"
 
 
-def test_streamed_body_over_the_limit_is_413(tmp_path, monkeypatch):
+def test_streamed_body_over_the_limit_is_413(tmp_path):
     """A body without Content-Length that grows past the limit is refused with 413, not 400."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    monkeypatch.setenv("FEWSHOT_MAX_REQUEST_MB", "0.01")
-    c = TestClient(importlib.reload(fewshot.api).app)
+    c = api_client(tmp_path, max_request_mb=0.01)
 
     def chunks():
         for _ in range(20):
             yield b" " * 1024
 
-    r = c.post("/api/tasks", content=chunks(), headers={"Content-Type": "application/json"})
+    r = c.post("/api/tasks/import", content=chunks(), headers={"Content-Type": "multipart/form-data; boundary=x"})
     assert r.status_code == 413
     assert r.json()["detail"] == "Request is larger than the 0.01 MB limit"
 
@@ -275,9 +269,9 @@ def test_patch_checks_everything_before_changing_anything(client, task):
 
 def test_urls_check_the_label_before_downloading(client, task, monkeypatch):
     """A bad label is refused before any URL is fetched."""
-    monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
+    set_settings(monkeypatch, client, allow_urls=True)
     fetched = []
-    monkeypatch.setattr(fewshot.api, "fetch_url", lambda url, *a, **k: fetched.append(url))
+    monkeypatch.setattr(fewshot.services, "fetch_url", lambda url, *a, **k: fetched.append(url))
     for label in ("  ", "a/b"):
         r = client.post(f"/api/tasks/{task}/examples/urls", json={"label": label, "urls": ["http://h/x.png"] * 5})
         assert r.status_code == 400

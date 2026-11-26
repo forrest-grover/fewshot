@@ -4,6 +4,9 @@ from __future__ import annotations
 
 MAX_CLASS_NAME = 200
 MAX_TAG = 50
+# A description's prompts are each embedded (and averaged): cap how many, and how long.
+MAX_DESCRIPTION = 10_000  # characters
+MAX_PROMPTS = 64  # non-blank lines
 
 
 def check_class_name(name: str) -> str:
@@ -50,8 +53,20 @@ def fill_template(template: str, name: str) -> str:
     return template.replace("{}", name.replace("_", " "))
 
 
+def check_description(description: str) -> str:
+    """Return ``description``; raise ``ValueError`` if it is longer than ``MAX_DESCRIPTION``
+    characters or holds more than ``MAX_PROMPTS`` prompts (each is a text embedding to compute)."""
+    if len(description) > MAX_DESCRIPTION:
+        raise ValueError(f"Description is longer than {MAX_DESCRIPTION} characters")
+    if len(prompts(description)) > MAX_PROMPTS:
+        raise ValueError(f"Description has more than {MAX_PROMPTS} prompts (non-blank lines)")
+    return description
+
+
 def check_template(template: str) -> None:
-    """Raise ``ValueError`` unless every non-blank line of ``template`` contains ``{}``."""
+    """Raise ``ValueError`` unless every non-blank line of ``template`` contains ``{}``, or if it
+    is too long for a description (see ``check_description``)."""
+    check_description(template)
     lines = prompts(template)
     if not lines or any("{}" not in line for line in lines):
         raise ValueError("Template must contain '{}' (on every line, for several prompts)")
