@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint", "ruff", "mypy"]
+dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint", "ruff", "mypy", "packaging"]  # packaging: scripts/freeze_constraints.py
 siglip = ["transformers"]  # tokenizer of the SigLIP 2 preset
 
 [project.scripts]
