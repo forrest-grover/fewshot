@@ -927,7 +927,8 @@ def start_evaluation(srv: Srv, name: str, folds: int | None = None) -> dict[str,
     t = srv.task(name)
     if folds is not None and folds < 2:
         raise HTTPException(400, f"folds must be at least 2, got {folds}")
-    job = Job(task=name, kind="evaluate" if folds is None else f"evaluate:{folds}", revision=t.config.revision)
+    job = Job(task=name, kind="evaluate" if folds is None else f"evaluate:{folds}", revision=t.config.revision,
+              uid=t.config.uid)
     return _start(srv, job, lambda progress: services.evaluate(srv.pipe, t, folds, progress))
 
 
@@ -952,7 +953,8 @@ def start_comparison(srv: Srv, name: str, body: Compare) -> dict[str, Any]:
         raise HTTPException(400, "Task has no examples to evaluate")
     for s in specs:
         srv.allowed_embedder(s)  # loaded by the job: a model that fails is reported in its result
-    job = Job(task=name, kind="compare", revision=t.config.revision, key=f"{body.folds}:" + "\n".join(specs))
+    job = Job(task=name, kind="compare", revision=t.config.revision, uid=t.config.uid,
+              key=f"{body.folds}:" + "\n".join(specs))
     return _start(srv, job, lambda progress: compare_embedders(srv.pipe, t, specs, body.folds, progress=progress))
 
 

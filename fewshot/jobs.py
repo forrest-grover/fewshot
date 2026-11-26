@@ -28,7 +28,8 @@ class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job'
     task: str
     kind: str
     revision: int = 0  # of the task when the job started
-    key: str = ""  # with task, kind and revision, what makes two jobs the same work (see ``Jobs.start``)
+    uid: str = ""  # the task's uid: a task deleted or renamed and re-created under its name has another
+    key: str = ""  # with uid, kind and revision, what makes two jobs the same work (see ``Jobs.start``)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = "running"  # running | cancelling | done | failed | cancelled
     stage: str = "starting"
@@ -78,7 +79,7 @@ class Jobs:
     def start(self, job: Job, work: Callable[[Callable[[str, int, int], None]], Any], limit: int | None = None) -> Job:
         """Run ``work(progress)`` in a thread; its return value becomes ``job.result``.
 
-        If the same work (task, kind, revision and key) is already running and not being
+        If the same work (the same task, by uid, and kind, revision and key) is already running and not being
         cancelled, that job is returned instead and nothing starts. Otherwise, if ``limit`` jobs
         are running already (cancelling ones don't count), raises ``TooManyJobs``. Both are
         decided under one lock, so concurrent starts can't pass the limit or duplicate a job.
@@ -98,10 +99,10 @@ class Jobs:
             with self._lock:
                 self._forget_old()
 
-        same = (job.task, job.kind, job.revision, job.key)
+        same = (job.uid or job.task, job.kind, job.revision, job.key)
         with self._lock:
             for j in self._jobs.values():
-                if j.status == "running" and (j.task, j.kind, j.revision, j.key) == same:
+                if j.status == "running" and (j.uid or j.task, j.kind, j.revision, j.key) == same:
                     return j
             if limit is not None and sum(j.status == "running" for j in self._jobs.values()) >= limit:
                 raise TooManyJobs
