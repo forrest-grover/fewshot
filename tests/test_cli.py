@@ -1,5 +1,6 @@
 """Tests for the ``fewshot`` command-line interface."""
 
+import contextlib
 import csv
 import io
 import json
@@ -12,7 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from fewshot import cache as cache_module
-from fewshot import cli, embedders
+from fewshot import cli, cli_common, embedders
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, served, two_each, write_images
@@ -722,6 +723,17 @@ def test_usage_errors_exit_2(run, task):
     assert r.exit_code == 2
     assert "at most one" in r.output
     assert run("class", "threshold", task, "red").exit_code == 2
+
+
+def test_csv_cells_that_look_like_formulas_stay_text(run, task, tmp_path):
+    """A CSV cell a spreadsheet would run as a formula gets a leading '; plain numbers don't."""
+    for name in ("=1+1.png", "@SUM(A1).png"):
+        (tmp_path / name).write_bytes(png(RED, seed=3))
+    with contextlib.chdir(tmp_path):  # so the file names are the cells' start
+        rows = list(csv.reader(io.StringIO(run("predict", task, "=1+1.png", "@SUM(A1).png", "--csv").output)))
+    assert [r[0] for r in rows[1:]] == ["'=1+1.png", "'@SUM(A1).png"]
+    assert [cli_common.csv_cell(v) for v in ("-0.1235", "-1e-5", "-x", "+1", "\tx", "a=b", -2, True)] == [
+        "-0.1235", "-1e-5", "'-x", "'+1", "'\tx", "a=b", -2, "true"]
 
 
 def test_csv_booleans_are_lowercase(run, task, tmp_path):

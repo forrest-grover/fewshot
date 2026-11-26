@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import json
+import re
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
@@ -159,10 +160,25 @@ def echo_json(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2))
 
 
+PLAIN_NUMBER = re.compile(r"-?\d+(\.\d+)?(e[-+]?\d+)?", re.IGNORECASE)  # read as that number
+
+
+def csv_cell(v: Any) -> Any:
+    """One CSV cell, by the rule the web UI's CSV export follows: booleans as ``true``/``false``,
+    as in JSON, and text a spreadsheet would read as a formula (starting with = + - @, tab or
+    carriage return, as a file or class name might) with a leading ' so it stays text; a plain
+    negative number is left as it is, so it stays a number."""
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, str) and v[:1] in {"=", "+", "-", "@", "\t", "\r"} and not PLAIN_NUMBER.fullmatch(v):
+        return "'" + v
+    return v
+
+
 def write_csv(header: list[str], rows: list[list[Any]], with_header: bool = True) -> None:
-    """Print ``rows`` as CSV, after ``header`` unless ``with_header`` is False; booleans are
-    written ``true``/``false``, as in JSON."""
+    """Print ``rows`` as CSV, after ``header`` unless ``with_header`` is False; see ``csv_cell``
+    for how cells are written."""
     w = csv.writer(sys.stdout, lineterminator="\n")
     if with_header:
         w.writerow(header)
-    w.writerows([str(v).lower() if isinstance(v, bool) else v for v in row] for row in rows)
+    w.writerows([csv_cell(v) for v in row] for row in rows)
