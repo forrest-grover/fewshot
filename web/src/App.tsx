@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, AUTH_EVENT, HttpError, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
-import type { CompareRun } from "./Compare";
-import Evaluate, { type EvalRun } from "./Evaluate";
+import { api, AUTH_EVENT, HttpError, type CompareReport, type EvalReport, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
+import Evaluate from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { Gate, Latest, stepToast, taskUndoKey, typingAt, usePredictResults } from "./hooks";
+import { Gate, Latest, stepToast, taskUndoKey, typingAt, useByTask, usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
-import { ErrorBox } from "./ui";
+import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
+import { ErrorBox, JobPoller } from "./ui";
 
 const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -45,10 +45,12 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
   const [help, setHelp] = useState(false); // the keyboard shortcuts
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
-  // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
+  // Prediction results live here so they survive switching tabs (they reset per task).
   const predictState = usePredictResults(route.task);
-  const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
-  const [compareRun, setCompareRun] = useState<CompareRun | null>(null);
+  // Each task's last evaluation and comparison, and their running jobs, which are polled here
+  // until they end, whatever is open, so a run can still be followed or cancelled after leaving it.
+  const evals = useByTask<EvalRun>();
+  const compares = useByTask<CompareRun>();
 
   const taskLoads = useRef(new Latest()).current;
   /** Fetch the open task again, e.g. after it was changed elsewhere (the CLI, another tab); a
@@ -126,8 +128,6 @@ export default function App() {
     currentTask.current = route.task;
     setMenuOpen(false);
     setToast(null);
-    setEvalRun((s) => (s?.task === route.task ? s : null)); // kept when this is the task's new name
-    setCompareRun((s) => (s?.task === route.task ? s : null));
     setError(null);
     setTask(null);
     setLoadFailed(false);
@@ -150,6 +150,9 @@ export default function App() {
   useEffect(() => {
     if (task && listedRevision !== null && (listedRevision > task.revision || listedRevision === -1)) reloadTask();
   }, [listedRevision, task?.revision, reloadTask]); // eslint-disable-line react-hooks/exhaustive-deps -- only on these changes
+
+  /** A background job of task ``name`` failed: say so if that task is open. */
+  const jobFailed = (name: string, message: string) => { if (currentTask.current === name) setError(message); };
 
   /** Show a task returned by a mutation, unless it is for another task or older than what is shown. */
   const updateTask = (t: TaskDetail) => {
@@ -265,16 +268,17 @@ export default function App() {
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
               {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} />}
               {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
-              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun}
-                models={models} compare={compareRun} setCompare={setCompareRun} />}
+              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run}
+                state={evals.map[task.name] ?? null} setState={evals.setFor(task.name)}
+                models={models} compare={compares.map[task.name] ?? null} setCompare={compares.setFor(task.name)} />}
               {route.tab === "settings" && (
-                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }}
+                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { evals.setFor(task.name)(null); compares.setFor(task.name)(null); void refreshTasks(); go(null); }}
                   onDuplicated={(t) => { void refreshTasks(); go(t.name); }}
                   onRenamed={(t) => {
                     // Results move with the task to its new name.
                     predictState.rename(t.name);
-                    setEvalRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
-                    setCompareRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
+                    evals.rename(task.name, t.name);
+                    compares.rename(task.name, t.name);
                     void refreshTasks();
                     go(t.name, "settings");
                   }} />
@@ -283,6 +287,16 @@ export default function App() {
           </>
         )}
       </main>
+      {Object.entries(evals.map).map(([name, r]) => r?.job && (
+        <JobPoller<EvalReport> key={r.job.id} id={r.job.id}
+          onJob={(j) => { evals.setFor(name)((s) => evalAfter(s, j)); if (j.status === "failed") jobFailed(name, `Evaluation failed: ${j.error ?? "unknown error"}`); }}
+          onError={(e) => { const id = r.job?.id ?? ""; evals.setFor(name)((s) => jobLost(s, id)); jobFailed(name, e.message); }} />
+      ))}
+      {Object.entries(compares.map).map(([name, r]) => r?.job && (
+        <JobPoller<CompareReport> key={r.job.id} id={r.job.id}
+          onJob={(j) => { compares.setFor(name)((s) => compareAfter(s, j)); if (j.status === "failed") jobFailed(name, `Comparison failed: ${j.error ?? "unknown error"}`); }}
+          onError={(e) => { const id = r.job?.id ?? ""; compares.setFor(name)((s) => jobLost(s, id)); jobFailed(name, e.message); }} />
+      ))}
       {help && <Shortcuts onClose={() => { setHelp(false); }} />}
       {toast && (
         <div className="toast" role="status" key={toast.key}>

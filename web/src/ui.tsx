@@ -1,5 +1,6 @@
 import { useRef, useState, type ReactNode } from "react";
-import { filesFromDrop, isImage } from "./hooks";
+import type { Job } from "./api";
+import { filesFromDrop, isImage, usePollJob } from "./hooks";
 
 export function DropZone(props: {
   onFiles: (files: File[]) => void;
@@ -57,6 +58,12 @@ export function Bar({ value, label, strong }: { value: number; label: string; st
       <span className="bar-value">{(value * 100).toFixed(1)}%</span>
     </div>
   );
+}
+
+/** Polls job ``id`` while mounted (see usePollJob); renders nothing. */
+export function JobPoller<T>({ id, onJob, onError }: { id: string; onJob: (j: Job<T>) => void; onError: (e: Error) => void }) {
+  usePollJob<T>(id, onJob, onError);
+  return null;
 }
 
 export function ErrorBox({ error, onClose }: { error: string | null; onClose: () => void }) {

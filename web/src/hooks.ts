@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, HttpError, type Job, type Prediction, type TaskDetail } from "./api";
 
 const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
@@ -53,6 +53,28 @@ export function stepToast(which: "undo" | "redo", t: TaskDetail, fallback: strin
     text: `${which === "undo" ? "Undid" : "Redid"} ${what}`,
     then: which === "undo" ? (t.can_redo ? "redo" as const : null) : (t.can_undo ? "undo" as const : null),
   };
+}
+
+/** A state setter for one task's value in ``useByTask``. */
+export type SetFor<V> = (f: V | null | ((v: V | null) => V | null)) => void;
+
+/** A value per task (e.g. its last evaluation and the job computing the next), kept by the App so
+ * it survives switching tabs and tasks. ``setFor(name)`` is a state setter for one task's value;
+ * setting null forgets it. */
+export function useByTask<V>() {
+  const [map, setMap] = useState<Partial<Record<string, V>>>({});
+  const setFor = useCallback((task: string): SetFor<V> => (f) => {
+    setMap((m) => {
+      const cur = m[task] ?? null;
+      const next = typeof f === "function" ? (f as (v: V | null) => V | null)(cur) : f;
+      return next === cur ? m : { ...m, [task]: next ?? undefined };
+    });
+  }, []);
+  /** Move a task's value to its new name. */
+  const rename = useCallback((from: string, to: string) => {
+    setMap((m) => (m[from] === undefined ? m : { ...m, [from]: undefined, [to]: m[from] }));
+  }, []);
+  return { map, setFor, rename };
 }
 
 /** Orders overlapping requests for the same thing: ``begin`` returns a check that is true only
