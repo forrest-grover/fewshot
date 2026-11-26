@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier, temper, top_k
+from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, log_clamped, make_classifier, temper, top_k
 from .images import IMAGE_EXTS
 from .pipeline import Pipeline, new_classifier
 from .store import Task, TaskConfig
@@ -254,7 +254,9 @@ def _fit_temperature(P: np.ndarray, t: np.ndarray) -> float:
     Y[np.arange(len(t)), t] = 1.0 - eps
     with np.errstate(divide="ignore"):
         logs = [np.log(np.clip(temper(P, float(T)), 1e-12, 1)) for T in TEMPERATURES]
-    return float(TEMPERATURES[int(np.argmin([-(Y * lg).sum() for lg in logs]))])
+    best = int(np.argmin([-(Y * lg).sum() for lg in logs]))
+    log_clamped("temperature", TEMPERATURES, best)
+    return float(TEMPERATURES[best])
 
 
 def _cross_fitted(P: np.ndarray, t: np.ndarray) -> np.ndarray:

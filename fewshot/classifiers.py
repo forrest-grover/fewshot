@@ -29,6 +29,7 @@ vector *is* the text mean, so the shift erases every class difference.
 from __future__ import annotations
 
 import inspect
+import logging
 import math
 import numbers
 from collections.abc import Callable
@@ -41,6 +42,7 @@ import numpy.typing as npt
 from .embedders import Vectors
 
 CLIP_LOGIT_SCALE = 100.0
+log = logging.getLogger(__name__)
 
 Labels = npt.NDArray[np.int_]  # class indices
 Scores = npt.NDArray[np.floating[Any]]  # log-probabilities, probabilities or similarities
@@ -503,27 +505,39 @@ def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: 
     zt, loo, y = zt[keep], loo[keep], y[keep]
     if len(y) < 2:
         return prior * rel, 1.0
-    chosen = _least_nll([zt + a * rel * loo for a in GDA_ALPHAS], GDA_ALPHAS, y)
+    chosen = _least_nll([zt + a * rel * loo for a in GDA_ALPHAS], GDA_ALPHAS, y, what="image-term weight")
     pull = 1.0 / (1.0 + (k - 1) / 2)  # all prior at 1 image per class, less with more
     weight = float(np.exp((1 - pull) * np.log(chosen) + pull * np.log(prior))) * rel
     fused = text_weight * zt + weight * exact()[keep]
     scales = np.geomspace(0.1, 10, 41)
-    return weight, _least_nll([s * fused for s in scales], scales, y)
+    return weight, _least_nll([s * fused for s in scales], scales, y, what="fused logit scale")
 
 
-def _least_nll(logits: list[Scores], values: Scores, y: Labels, smooth: bool = False) -> float:
+def _least_nll(logits: list[Scores], values: Scores, y: Labels, smooth: bool = False,
+               what: str = "value") -> float:
     """The value whose logits give the true classes ``y`` the least mean cross-entropy. With
     ``smooth``, against targets smoothed by 1/(n+2) (as for a task's temperature): examples that
     all came out right don't prove the scores are never wrong, and fitting them as certain would
-    push the scale, and every confidence, to the limit."""
+    push the scale, and every confidence, to the limit. A choice at either end of the grid may be
+    clamped; it is logged at debug level as ``what``."""
     rows = np.arange(len(y))
-    if not smooth:
-        return float(values[int(np.argmin([-_log_softmax(z)[rows, y].mean() for z in logits]))])
-    eps = 1.0 / (len(y) + 2)
-    C = logits[0].shape[1]
-    Y = np.full(logits[0].shape, eps / max(C - 1, 1))  # (one class: nothing to spread it over)
-    Y[rows, y] = 1.0 - eps
-    return float(values[int(np.argmin([-(Y * _log_softmax(z)).sum(1).mean() for z in logits]))])
+    if smooth:
+        eps = 1.0 / (len(y) + 2)
+        C = logits[0].shape[1]
+        Y = np.full(logits[0].shape, eps / max(C - 1, 1))  # (one class: nothing to spread it over)
+        Y[rows, y] = 1.0 - eps
+        best = int(np.argmin([-(Y * _log_softmax(z)).sum(1).mean() for z in logits]))
+    else:
+        best = int(np.argmin([-_log_softmax(z)[rows, y].mean() for z in logits]))
+    log_clamped(what, values, best)
+    return float(values[best])
+
+
+def log_clamped(what: str, grid: Scores, best: int) -> None:
+    """Log at debug level when a grid search chose an end of its grid ``grid``: the best value may
+    lie beyond it."""
+    if best in (0, len(grid) - 1):
+        log.debug("%s chose %g, the %s end of its grid", what, float(grid[best]), "low" if best == 0 else "high")
 
 
 def _shared_precision(Z: Scores, y: Labels, mu: Scores, n: Scores, m: int  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -631,7 +645,7 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
             return default
         L, t = L[ok], self.y[ok]
         base = 10.0 / max(float(L.std()), 1e-12)
-        fitted = _least_nll([a * base * L for a in GDA_ALPHAS], GDA_ALPHAS, t, smooth=True) * base
+        fitted = _least_nll([a * base * L for a in GDA_ALPHAS], GDA_ALPHAS, t, smooth=True, what="score scale") * base
         # Examples of a single class can't show how often the others are mistaken for it, so then
         # the fit only caps the default.
         return fitted if len(set(t.tolist())) > 1 else min(fitted, default)

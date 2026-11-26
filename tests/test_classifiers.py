@@ -449,3 +449,24 @@ def test_gda_text_weight_scales_the_prior(monkeypatch):
     tiny, none = GDAClassifier(text_weight=1e-6).fit(data), GDAClassifier(text_weight=0.0).fit(data)
     Q = data.X + 0.1
     assert (tiny.predict(Q)[0].argmax(1) == none.predict(Q)[0].argmax(1)).all()
+
+
+def test_grid_searches_log_when_they_hit_an_end(caplog):
+    """A grid search that chooses an end of its grid (where the best value may lie beyond it) says
+    so at debug level; one that chooses inside it doesn't. So do evaluation's temperatures."""
+    import fewshot.evaluate as ev  # pylint: disable=import-outside-toplevel
+
+    caplog.set_level("DEBUG", logger="fewshot")
+    y = np.array([0, 1])
+    sure = np.array([[1.0, -1.0], [-1.0, 1.0]])
+    grid = np.array([0.5, 1.0, 2.0])
+    assert classifiers._least_nll([g * sure for g in grid], grid, y, what="probe") == 2.0  # pylint: disable=protected-access
+    assert "probe chose 2, the high end of its grid" in caplog.text
+    caplog.clear()
+    assert classifiers._least_nll([g * sure for g in (0.5, 5, 10)], grid, y, smooth=True) == 0.5  # pylint: disable=protected-access
+    assert "value chose 0.5, the low end of its grid" in caplog.text
+    caplog.clear()
+    assert classifiers._least_nll([sure * 0, sure, sure * 0], grid, y) == 1.0  # pylint: disable=protected-access
+    assert not caplog.text
+    ev._fit_temperature(np.array([[0.501, 0.499], [0.499, 0.501]] * 50), np.array([0, 1] * 50))  # pylint: disable=protected-access
+    assert "temperature chose" in caplog.text
