@@ -84,6 +84,31 @@ def dir_lock(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def claim_dir(path: Path) -> Iterator[bool]:
+    """Try to take ``dir_lock`` on folder ``path`` without waiting; yields whether this caller now
+    holds it on the folder still at ``path`` (False if another process holds it, or the folder is
+    gone or was replaced meanwhile). Without ``fcntl`` it yields True and locks nothing."""
+    if fcntl is None:  # pragma: no cover  # Windows
+        yield True
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            st, now = os.fstat(fd), os.stat(path)
+            held = (st.st_dev, st.st_ino) == (now.st_dev, now.st_ino)
+        except OSError:  # BlockingIOError: someone else holds it; FileNotFoundError: gone since
+            held = False
+        yield held
+    finally:
+        os.close(fd)
+
+
 def dir_locked(path: Path) -> bool:
     """Whether some process (this one included) holds ``dir_lock`` on folder ``path``."""
     if fcntl is None:  # pragma: no cover  # Windows

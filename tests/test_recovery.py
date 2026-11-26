@@ -1,5 +1,6 @@
 """Crash safety and clean-up: interrupted renames, creates and deletes, failed adds, and gc."""
 
+import fcntl
 import os
 import shutil
 import time
@@ -7,7 +8,7 @@ import time
 import pytest
 from typer.testing import CliRunner
 
-from fewshot import archive, cli, history, store
+from fewshot import archive, cli, fsutil, history, store
 from fewshot.store import Workspace
 from tests.conftest import GREEN, RED, png, red_task
 
@@ -111,3 +112,47 @@ def test_abandoned_folder_vanishing(tmp_path):
     """A folder that disappears while being checked is not abandoned."""
     assert not store._abandoned(tmp_path / "gone")  # pylint: disable=protected-access
     assert archive.MAX_IMPORT_TOTAL > 0
+
+
+def test_gc_never_deletes_a_folder_taken_back_meanwhile(ws, monkeypatch):
+    """A leftover folder judged abandoned may be taken back (its name reused by a create) before
+    gc removes it: gc judges it again under its lock, so the new task survives."""
+    leftover = ws.root / "tasks" / "pets"
+    leftover.mkdir()
+    _age(leftover)
+    real = store._abandoned  # pylint: disable=protected-access
+
+    def racing(p, **kw):
+        found = real(p, **kw)
+        if found and p == leftover and not kw:  # gc's first look: another process creates "pets"
+            monkeypatch.setattr(store, "_abandoned", real)
+            Workspace(ws.root).create("pets").upsert_class("cat")
+        return found
+
+    monkeypatch.setattr(store, "_abandoned", racing)
+    assert ws.gc()["folders"] == 0
+    assert Workspace(ws.root).get("pets").class_names() == ["cat"]
+    assert not [p for p in (ws.root / "tasks").iterdir() if p.name.startswith(".")]
+
+
+def test_claim_dir(tmp_path, monkeypatch):
+    """``claim_dir`` holds a folder's lock only if nobody else does and the folder is still there."""
+    p = tmp_path / "f"
+    with fsutil.claim_dir(p) as held:
+        assert not held  # missing
+    p.mkdir()
+    with fsutil.dir_lock(p), fsutil.claim_dir(p) as held:
+        assert not held  # a builder holds it
+    with fsutil.claim_dir(p) as held:
+        assert held
+        assert fsutil.dir_locked(p)
+    real = fcntl.flock
+
+    def replaced(fd, op):  # the folder is replaced by another just after it was opened
+        p.rename(tmp_path / "old")
+        p.mkdir()
+        real(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", replaced)
+    with fsutil.claim_dir(p) as held:
+        assert not held

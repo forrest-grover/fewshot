@@ -51,6 +51,7 @@ from . import blobs as _blobs
 from .classifiers import CLASSIFIERS
 from .folders import class_folders, read_or_empty
 from .fsutil import FileStamp, os_reason
+from .fsutil import claim_dir as _claim_dir
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import dir_locked as _dir_locked
 from .fsutil import file_lock as _file_lock
@@ -843,9 +844,8 @@ class Workspace:
         try:
             p.mkdir()  # atomic: of two concurrent creates, exactly one succeeds
         except FileExistsError:
-            if not _abandoned(p):
+            if not _reclaim(p):  # unless left by a crash: then take the name back
                 raise ValueError(f"Task {name!r} already exists") from None
-            shutil.rmtree(p, ignore_errors=True)  # left by a crash: take the name back
             return self._reserve_again(name)
         return p
 
@@ -864,8 +864,7 @@ class Workspace:
         out = {"folders": 0, "images": 0, "blobs": 0}
         for p in (self.root / "tasks").iterdir():
             hidden = p.name.startswith((".tmp-", ".trash-"))
-            if p.is_dir() and (hidden or not (p / "task.json").exists()) and _abandoned(p):
-                shutil.rmtree(p, ignore_errors=True)
+            if p.is_dir() and (hidden or not (p / "task.json").exists()) and _reclaim(p):
                 out["folders"] += 1
         for t in self.list_tasks():
             with contextlib.suppress(KeyError):  # deleted by another process meanwhile
@@ -950,16 +949,37 @@ class Workspace:
         return self.root / "cache.sqlite"
 
 
-def _abandoned(folder: Path) -> bool:
+def _abandoned(folder: Path, locked: bool = False) -> bool:
     """Whether ``folder`` is a leftover of a crash: no task.json (or hidden), untouched for
     ``STALE_SECONDS`` (so it isn't a folder just made, before its builder locked it) and not
-    locked by a create, duplicate or import still building it, however long that takes."""
+    locked by a create, duplicate or import still building it, however long that takes (unless
+    ``locked``: the caller holds that lock itself)."""
     try:
         age = datetime.now(UTC).timestamp() - folder.stat().st_mtime
     except FileNotFoundError:
         return False
     return (age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
-            and not _dir_locked(folder))
+            and (locked or not _dir_locked(folder)))
+
+
+def _reclaim(folder: Path) -> bool:
+    """Delete ``folder`` if it is a crash's leftover (see ``_abandoned``); returns whether it went.
+
+    Judged again while holding its lock (taken without waiting) and moved aside to a ``.trash-``
+    name before it is removed, so a folder that another process took back and started building
+    in meanwhile is never the one deleted."""
+    if not _abandoned(folder):
+        return False
+    with _claim_dir(folder) as held:
+        if not held or not _abandoned(folder, locked=True):
+            return False
+        trash = folder.parent / f".trash-{uuid.uuid4().hex}"
+        try:
+            os.rename(folder, trash)
+        except FileNotFoundError:  # pragma: no cover  # removed by a process not taking the lock
+            return False
+    shutil.rmtree(trash, ignore_errors=True)
+    return True
 
 
 _n = functools.partial(plural, what="example")  # "1 example", "3 examples"
