@@ -37,13 +37,29 @@ def host_allowed(host: str, allowed: set[str]) -> bool:
     return True
 
 
-def cross_site(request: Request) -> bool:
-    """Whether a request comes from a page on another site: its Origin isn't this server, or the
-    browser says so in Sec-Fetch-Site. Requests without either (curl, the CLI) are not."""
+def cross_site(request: Request) -> str | None:
+    """Why a request comes from a page on another site, or None if it doesn't: its Origin isn't
+    this server, or the browser says so in Sec-Fetch-Site. Requests without either (curl, the
+    CLI) are not.
+
+    The Origin's host may match the Host header or, behind a reverse proxy that rewrites Host
+    (nginx's default ``proxy_pass``), one in X-Forwarded-Host. Which proxy sent that needn't be
+    checked: a page on another site can't add X-Forwarded-Host to its request without a CORS
+    preflight, which this server never grants, and a client that isn't a browser can send any
+    Origin it likes anyway."""
     origin = request.headers.get("origin")
     if origin is not None:
-        return origin == "null" or origin.split("://", 1)[-1].lower() != request.headers.get("host", "").lower()
-    return request.headers.get("sec-fetch-site", "same-origin") not in {"same-origin", "none"}
+        host = request.headers.get("host", "")
+        forwarded = [h.strip() for h in request.headers.get("x-forwarded-host", "").split(",") if h.strip()]
+        if origin != "null" and origin.split("://", 1)[-1].lower() in {h.lower() for h in [host, *forwarded]}:
+            return None
+        names = f"Host {host!r}" + "".join(f" or X-Forwarded-Host {h!r}" for h in forwarded)
+        return (f"Cross-site request refused: its Origin {origin!r} doesn't match the {names}. Behind a reverse "
+                "proxy, pass the browser's Host header on (nginx: proxy_set_header Host $host).")
+    site = request.headers.get("sec-fetch-site", "same-origin")
+    if site in {"same-origin", "none"}:
+        return None
+    return f"Cross-site request refused: the browser sent it from another site (Sec-Fetch-Site: {site})"
 
 
 class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware is just __call__

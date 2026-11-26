@@ -245,7 +245,8 @@ def test_cross_site_writes_are_refused(tmp_path, monkeypatch):
     for headers in ({"Origin": "https://evil.example"}, {"Origin": "null"}, {"Origin": "http://localhost:9999"},
                     {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}):
         r = c.post("/api/tasks", json=body, headers=headers)
-        assert (r.status_code, r.json()["detail"]) == (403, "Cross-site requests are not allowed"), headers
+        assert r.status_code == 403, headers
+        assert r.json()["detail"].startswith("Cross-site request refused"), headers
     files = [("files", ("a.png", png(RED), "image/png"))]
     assert c.post("/api/tasks/t/examples", data={"label": "red"}, files=files,
                   headers={"Origin": "https://evil.example"}).status_code == 403
@@ -254,3 +255,25 @@ def test_cross_site_writes_are_refused(tmp_path, monkeypatch):
     assert c.post("/api/tasks", json={**body, "name": "u"}, headers=same).status_code == 201
     assert c.post("/api/tasks", json={**body, "name": "v"}).status_code == 201  # curl, the CLI
     assert c.get("/api/tasks", headers={"Origin": "https://evil.example"}).status_code == 200
+
+
+def test_cross_site_check_behind_a_proxy_that_rewrites_host(tmp_path, monkeypatch):
+    """Behind a proxy sending its own Host (nginx's default), the browser's Origin is compared
+    with X-Forwarded-Host too; a refusal says what was compared and how to fix the proxy."""
+    c = host_client(tmp_path, monkeypatch, hosts="*")
+    body = {"name": "t", "embedder": "fake:color"}
+    page = {"Host": "127.0.0.1:8000", "Origin": "https://fewshot.example.com", "Sec-Fetch-Site": "same-origin"}
+    r = c.post("/api/tasks", json=body, headers=page)
+    assert r.status_code == 403
+    assert r.json()["detail"] == ("Cross-site request refused: its Origin 'https://fewshot.example.com' doesn't "
+                                  "match the Host '127.0.0.1:8000'. Behind a reverse proxy, pass the browser's "
+                                  "Host header on (nginx: proxy_set_header Host $host).")
+    forwarded = {**page, "X-Forwarded-Host": "fewshot.example.com"}
+    assert c.post("/api/tasks", json=body, headers=forwarded).status_code == 201
+    evil = {**forwarded, "Origin": "https://evil.example"}
+    r = c.post("/api/tasks", json={**body, "name": "u"}, headers=evil)
+    assert r.status_code == 403
+    assert "Host '127.0.0.1:8000' or X-Forwarded-Host 'fewshot.example.com'" in r.json()["detail"]
+    r = c.post("/api/tasks", json={**body, "name": "u"}, headers={"Sec-Fetch-Site": "same-site"})
+    assert r.json()["detail"] == ("Cross-site request refused: the browser sent it from another site "
+                                  "(Sec-Fetch-Site: same-site)")

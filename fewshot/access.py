@@ -66,8 +66,8 @@ async def guard(request: Request, call_next: Any) -> Response:
     if not host_allowed(request.headers.get("host", ""), set(srv.settings.allowed_hosts)):
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path
-    if request.method not in SAFE_METHODS and path.startswith("/api/") and cross_site(request):
-        return JSONResponse({"detail": "Cross-site requests are not allowed"}, 403)
+    if request.method not in SAFE_METHODS and path.startswith("/api/") and (why := cross_site(request)):
+        return JSONResponse({"detail": why}, 403)
     if srv.sessions is not None:
         _note_untrusted_proxy(srv, request)
     if srv.sessions is not None and path.startswith("/api/") and path not in OPEN_PATHS:

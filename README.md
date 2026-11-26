@@ -160,6 +160,27 @@ docker run --gpus all -p 8000:8000 -e FEWSHOT_TOKEN -v fewshot-data:/data -v few
 
 Tasks, images and the embedding cache live in the `/data` volume and downloaded model weights in `/models`, so both survive rebuilds. `docker-compose.yml` publishes the port on 127.0.0.1 only, for a reverse proxy with HTTPS on the same machine (publish `8000:8000` to reach it from others); it trusts `X-Forwarded-For` from Docker's gateway addresses (`FEWSHOT_FORWARDED_ALLOW_IPS`, default `172.16.0.0/12` there), where such a proxy connects from, so limits on wrong tokens apply per client; set it to the proxy's own address if other containers can reach this one. Inside, the server listens on all interfaces, so set `FEWSHOT_TOKEN`, and set `FEWSHOT_ALLOWED_HOSTS` (comma-separated) to the host names clients use: by default the server answers requests by IP address and for localhost and the container's own name only. It runs as an unprivileged user and its health check polls `/healthz`; over HTTPS the login cookie is `Secure`.
 
+The reverse proxy must pass on the browser's `Host` header (or send it as `X-Forwarded-Host`): the server refuses writes whose `Origin` matches neither (403, naming both), and nginx's `proxy_pass` sends `Host: 127.0.0.1:8000` unless told otherwise. Add the public name to `FEWSHOT_ALLOWED_HOSTS` too. For nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name fewshot.example.com;
+    # ssl_certificate ...; ssl_certificate_key ...;
+    client_max_body_size 1024m;        # the server enforces its own limits (FEWSHOT_MAX_REQUEST_MB)
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_request_buffering off;   # stream uploads instead of spooling them first
+        proxy_read_timeout 600s;       # a large upload or evaluation can take minutes
+    }
+}
+```
+
+Caddy passes all of these on by default: `fewshot.example.com { reverse_proxy 127.0.0.1:8000 }`.
+
 ## Tests and checks
 
 `scripts/check.sh` runs everything CI runs (`.github/workflows/ci.yml`):
