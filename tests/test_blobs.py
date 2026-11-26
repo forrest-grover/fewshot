@@ -4,11 +4,15 @@ clean-up."""
 import os
 from pathlib import Path
 
+import pytest
+
 from fewshot import blobs as blobs_mod
 from fewshot import history, store
 from fewshot.fsutil import create_exclusive
 from fewshot.models import TaskConfig
 from tests.conftest import RED, png
+
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
 
 
 def test_images_are_stored_once_across_tasks(ws, monkeypatch):

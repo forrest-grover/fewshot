@@ -16,6 +16,8 @@ from fewshot.store import Workspace
 from fewshot.text import MAX_DESCRIPTION, MAX_PROMPTS, check_class_name, check_tag, check_template, prompts
 from tests.conftest import GREEN, RED, png, red_green_task, two_each
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 def jpeg(size=(4, 2), orientation=None, mode="RGB"):
     """JPEG bytes, optionally tagged with an EXIF orientation."""

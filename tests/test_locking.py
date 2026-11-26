@@ -25,6 +25,8 @@ from fewshot.fsutil import write_atomic
 from fewshot.store import Workspace
 from tests.conftest import RED, png
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 @pytest.fixture(name="pair")
 def pair_fixture(tmp_path):

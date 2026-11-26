@@ -13,6 +13,8 @@ from fewshot.fsutil import write_atomic
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, png, red_green_task, red_task, two_each
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 # ---- undo ---------------------------------------------------------------
 def test_undo_steps_back_through_changes(ws):

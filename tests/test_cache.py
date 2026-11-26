@@ -9,6 +9,8 @@ from fewshot.cache import EmbeddingCache, prune_unused
 from fewshot.store import Workspace
 from tests.conftest import two_each
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 def _rows(path):
     with sqlite3.connect(str(path)) as conn:

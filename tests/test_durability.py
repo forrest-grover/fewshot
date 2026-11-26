@@ -8,6 +8,8 @@ import pytest
 from fewshot import fsutil
 from tests.conftest import BLUE, RED, png
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 class DiskLog:
     """Records, in order, every ``os.fsync`` (by the inode of what was synced) and every

@@ -7,7 +7,8 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push replaces a branch's run; every run on main finishes (it publishes the badge).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -17,6 +18,7 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -79,6 +81,7 @@ jobs:
       always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
       && needs.python.result != 'skipped' && needs.python.result != 'cancelled'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
@@ -106,6 +109,7 @@ jobs:
   macos:
     # README promises that the store's flock-based locking and atomic saves work on macOS too.
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -117,15 +121,14 @@ jobs:
         run: |
           pip install --no-deps -c constraints.txt torch torchvision
           pip install -c constraints.txt -e ".[dev]"
-      - name: pytest (locking, transactions, history and the store)
+      - name: pytest -m posix_fs (locking, syncs, renames and hard links)
         env:
           FEWSHOT_DEVICE: cpu
-        run: >-
-          pytest -q tests/test_locking.py tests/test_transactions.py tests/test_history.py
-          tests/test_store.py tests/test_blobs.py tests/test_recovery.py tests/test_archive.py tests/test_cache.py
+        run: pytest -q -m posix_fs
 
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
@@ -148,6 +151,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: docker build

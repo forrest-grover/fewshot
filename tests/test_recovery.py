@@ -13,6 +13,8 @@ from fewshot import archive, cli, fsutil, history, store
 from fewshot.store import Workspace
 from tests.conftest import GREEN, RED, png, red_task
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 # ---- interrupted operations ----------------------------------------------
 def test_interrupted_rename_leaves_a_usable_task(ws):

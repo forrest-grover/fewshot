@@ -89,3 +89,21 @@ def test_tokens_in_workflows_and_docs_would_be_accepted():
              for m in re.findall(r"FEWSHOT_TOKEN=([^\s\"'$`)]+)", f.read_text())]
     for name, token in found:
         assert token_problem(token) is None, f"{name} sets FEWSHOT_TOKEN={token}, which the server refuses"
+
+
+# What a test module touching the store's file-system guarantees mentions.
+POSIX_FS = re.compile(r"\bfsutil\b|os\.fsync|os\.link|\bflock\b|\bfile_lock\b|\bdir_lock\b|st_nlink|multiprocessing"
+                      r"|os\.replace|os\.rename")
+
+
+def test_modules_testing_locks_syncs_and_links_run_on_macos():
+    """A test module using locks, fsync, atomic renames, hard links or other processes carries the
+    posix_fs marker, which the macOS CI job selects (instead of a list of files to keep up to date)."""
+    root = Path(__file__).resolve().parent
+    marked = {p.name for p in root.glob("test_*.py") if "pytestmark = pytest.mark.posix_fs" in p.read_text()}
+    touching = {p.name for p in root.glob("test_*.py")
+                if POSIX_FS.search(p.read_text()) and p.name != Path(__file__).name}
+    assert touching <= marked, sorted(touching - marked)
+    assert {"test_locking.py", "test_durability.py", "test_store.py"} <= marked
+    ci = (root.parent / ".github" / "workflows" / "ci.yml").read_text()
+    assert "pytest -q -m posix_fs" in ci

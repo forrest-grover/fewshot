@@ -13,6 +13,7 @@ permissions:
 jobs:
   latest-dependencies:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -37,6 +38,7 @@ jobs:
     # real, with the pinned dependencies and with the newest ones (an open_clip, timm or
     # transformers release that breaks loading a preset shows up here).
     runs-on: ubuntu-latest
+    timeout-minutes: 60 # a stalled model download would otherwise hold the runner for 6 hours
     strategy:
       fail-fast: false
       matrix:
@@ -59,8 +61,11 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-${{ hashFiles('fewshot/embedders.py') }}
-          restore-keys: hf-
+          # One cache per leg: both legs saving under one key would race, and only one would win.
+          key: hf-${{ matrix.deps }}-${{ hashFiles('fewshot/embedders.py') }}
+          restore-keys: |
+            hf-${{ matrix.deps }}-
+            hf-
       - name: pytest -m model (fails if the model tests were skipped)
         run: |
           set -o pipefail

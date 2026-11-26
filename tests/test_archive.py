@@ -18,6 +18,8 @@ from fewshot.store import Workspace
 from fewshot.text import MAX_PROMPTS
 from tests.conftest import BLUE, RED, host_client, png, red_blue_task, red_green_task, red_task, two_each, zip_of
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 # ---- export and import ---------------------------------------------------
 def _export(ws, name="t"):

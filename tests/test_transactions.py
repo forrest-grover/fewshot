@@ -12,6 +12,8 @@ from fewshot import fsutil, store
 from fewshot.store import Workspace
 from tests.conftest import BLUE, RED, png
 
+pytestmark = pytest.mark.posix_fs  # also run on macOS: see .github/workflows/ci.yml
+
 
 @pytest.fixture(name="task")
 def task_fixture(ws):

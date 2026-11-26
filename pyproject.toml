@@ -36,7 +36,10 @@ include = ["fewshot*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
-markers = ["model: loads a real model (downloads its weights); skipped unless FEWSHOT_TEST_MODELS=1"]
+markers = [
+    "model: loads a real model (downloads its weights); skipped unless FEWSHOT_TEST_MODELS=1",
+    "posix_fs: exercises file locks, fsync, atomic renames or hard links; CI also runs these on macOS",
+]
 
 [tool.coverage.run]
 source = ["fewshot"]
