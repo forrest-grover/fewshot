@@ -199,7 +199,7 @@ def prune_unused(ws: Workspace, dry_run: bool = False, vacuum: bool = False) -> 
     with contextlib.ExitStack() as locks:
         for t in list(tasks):
             try:
-                locks.enter_context(t._writing())  # pylint: disable=protected-access  # one consistent view of every task
+                locks.enter_context(t.locked())  # one consistent view of every task
             except KeyError:  # deleted meanwhile: its vectors needn't be kept
                 tasks.remove(t)
         ids = {e.id for t in tasks for e in [*t.config.examples, *t.config.inbox]}

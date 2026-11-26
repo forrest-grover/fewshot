@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib
 import os
 import tempfile
@@ -30,16 +31,25 @@ def stamp(st: os.stat_result) -> FileStamp:
 
 
 @contextlib.contextmanager
-def file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive lock on ``path`` (created if missing) across processes: ``flock`` on
-    Linux and macOS, ``msvcrt.locking`` on Windows.
+def file_lock(path: Path, shared: bool = False) -> Iterator[None]:
+    """Hold a lock on ``path`` (created if missing) across processes: ``flock`` on Linux and
+    macOS, ``msvcrt.locking`` (always exclusive) on Windows. An exclusive lock waits for every
+    other holder; a ``shared`` one only for exclusive holders, and needs no write access to an
+    existing ``path`` (where it can't be created either, as in a read-only folder, nobody can be
+    changing what it guards, and nothing is locked).
 
     Raises ``FileNotFoundError`` if the folder holding ``path`` is gone.
     """
     while True:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            _lock(fd)
+            fd = _open_lock(path, shared)
+        except PermissionError:
+            if not shared or path.exists():
+                raise
+            yield
+            return
+        try:
+            _lock(fd, shared)
             # If the task was deleted (and maybe recreated) while we waited, we hold a lock on a
             # file that is no longer at ``path``; start again on the current one.
             with contextlib.suppress(FileNotFoundError):
@@ -55,10 +65,22 @@ def file_lock(path: Path) -> Iterator[None]:
         os.close(fd)  # releases the lock
 
 
-def _lock(fd: int) -> None:
-    """Block until this process holds the exclusive lock on open file ``fd``."""
+def _open_lock(path: Path, shared: bool) -> int:
+    if shared:
+        with contextlib.suppress(FileNotFoundError):
+            return os.open(path, os.O_RDONLY)  # flock needs no write access
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        if e.errno == errno.EROFS:  # a read-only file system: as for a folder without write access
+            raise PermissionError(e.errno, e.strerror, e.filename) from e
+        raise
+
+
+def _lock(fd: int, shared: bool = False) -> None:
+    """Block until this process holds the lock (exclusive unless ``shared``) on open file ``fd``."""
     if fcntl is not None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         return
     while True:  # pragma: no cover  # Windows: LK_LOCK gives up after 10 one-second tries
         try:

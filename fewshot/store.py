@@ -127,6 +127,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         self._state = threading.Lock()  # held briefly to swap ``_published`` and ``_stamp`` together
         self._stamp = stamp  # of the task.json that ``_published`` matches
         self._depth = 0  # nesting of ``_writing`` in the thread holding ``_lock``
+        self._reader: int | None = None  # thread id of the ``locked`` read in progress, if any
         self._commits = 0  # saves that reached task.json, to tell a failed save from a later failure
         self._pending_ino: int | None = None  # inode of the task.json the save in progress wrote
         self._unsynced: set[Path] = set()  # folders with new image files not yet made durable
@@ -183,6 +184,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                 finally:
                     self._depth -= 1
                 return
+            if self._reader == threading.get_ident():  # its shared lock would block our exclusive one
+                raise RuntimeError(f"Can't change task {self.name!r} while reading it in Task.locked")
             with contextlib.ExitStack() as stack:
                 try:
                     stack.enter_context(_file_lock(self.path / ".lock"))
@@ -198,6 +201,28 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                     self._writer = None
                     self._draft = None
                     self._depth = 0
+
+    @contextlib.contextmanager
+    def locked(self) -> Iterator[TaskConfig]:
+        """Hold the task still while reading it: yields its latest saved version, and changes from
+        other threads and processes wait until the block ends (other readers don't). Needs only
+        read access to the task. Don't change the task inside the block (``RuntimeError``).
+        Raises ``KeyError`` if the task was deleted."""
+        with self._lock:
+            if self._depth:  # inside this thread's own change: already held still
+                yield self.config
+                return
+            with contextlib.ExitStack() as stack:
+                try:
+                    stack.enter_context(_file_lock(self.path / ".lock", shared=True))
+                    self.refresh()
+                except FileNotFoundError as e:  # deleted by another process
+                    raise KeyError(f"No task {self.name!r}") from e
+                self._reader = threading.get_ident()
+                try:
+                    yield self._published
+                finally:
+                    self._reader = None
 
     def _save(self, gone: Iterable[str] = (), record: bool = True, label: str = "", keep_redo: bool = False) -> None:
         """Bump the revision and write ``task.json`` atomically and durably. Call inside ``_writing``.

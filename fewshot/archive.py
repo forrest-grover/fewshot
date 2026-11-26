@@ -38,12 +38,12 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
     the number of examples written and of examples left out because their image file was
     missing. Raises ``KeyError`` if there is no such task.
 
-    The task is locked meanwhile, so another process can't rename or change it half-way; an image
-    file missing from the task (only if it was damaged) is left out with its example.
+    The task is locked meanwhile (``Task.locked``, which needs no write access), so another
+    process can't rename or change it half-way; an image file missing from the task (only if it
+    was damaged) is left out with its example.
     """
     t = ws.get(name)
-    with t._writing(), zipfile.ZipFile(out, "w") as z:  # pylint: disable=protected-access
-        cfg = t.config
+    with t.locked() as cfg, zipfile.ZipFile(out, "w") as z:
         kept: dict[str, list[Any]] = {"examples": [], "inbox": []}
         for field, items in (("examples", cfg.examples), ("inbox", cfg.inbox)):
             for e in items:
