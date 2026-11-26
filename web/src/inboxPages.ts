@@ -19,3 +19,15 @@ export async function fetchInbox(
   } while (items.length < Math.min(want, total));
   return { items, total };
 }
+
+/** Inbox images acted on (accepted or dismissed) but maybe still in the list as last fetched:
+ * each id with the task revision its change made, or null while that change is still being saved.
+ * They stay hidden until a list fetched at that revision or later arrives. */
+export type Gone = ReadonlyMap<string, number | null>;
+
+/** What of ``gone`` still needs hiding once a list fetched at revision ``rev`` arrives: changes
+ * still being saved, and saved ones the list may predate. One the list already reflects is
+ * forgotten, so the image shows again if an undo brings it back. */
+export function stillGone(gone: Gone, rev: number): Gone {
+  return new Map([...gone].filter(([, r]) => r === null || r > rev));
+}
