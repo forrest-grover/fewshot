@@ -10,8 +10,8 @@ import fewshot.access
 import fewshot.api
 import fewshot.auth
 import fewshot.guard
-from fewshot.auth import Sessions, WrongTokens
 from fewshot.access import NO_TOKEN, exposure_problem
+from fewshot.auth import Sessions, WrongTokens
 from fewshot.guard import host_allowed
 from tests.conftest import RED, api_client, api_task, host_client, png
 
@@ -353,12 +353,16 @@ def test_no_content_answers_have_no_content_type(tmp_path):
     sets its cookie."""
     c = api_client(tmp_path, token=TOKEN)
     r = c.post("/api/login", json={"token": TOKEN})
-    assert r.status_code == 204 and "content-type" not in r.headers and fewshot.access.SESSION_COOKIE in r.cookies
+    assert r.status_code == 204
+    assert "content-type" not in r.headers
+    assert fewshot.access.SESSION_COOKIE in r.cookies
     api_task(c, n=1)
     r = c.delete("/api/tasks/c")
-    assert r.status_code == 204 and "content-type" not in r.headers
+    assert r.status_code == 204
+    assert "content-type" not in r.headers
     r = c.post("/api/logout")
-    assert r.status_code == 204 and "content-type" not in r.headers
+    assert r.status_code == 204
+    assert "content-type" not in r.headers
 
 
 def test_schema_declares_the_access_errors(client):

@@ -55,7 +55,7 @@ from .images import thumbnail
 from .inbox import chunked
 from .jobs import Job, Jobs, TooManyJobs
 from .pipeline import Pipeline
-from .responses import Problem, json_response
+from .responses import ERRORS, UI_HEADERS, json_response
 from .schemas import (
     AcceptConfident,
     AddResult,
@@ -243,14 +243,6 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# What the access checks and body limits (``access``, ``guard``) answer on any route, for the schema.
-ERRORS: dict[int | str, dict[str, Any]] = {
-    401: {"model": Problem, "description": "Not signed in (a server with a token)"},
-    403: {"model": Problem, "description": "Cross-site request, or a server without a token reached from "
-                                           "another machine"},
-    413: {"model": Problem, "description": "Request body over its size limit"},
-    429: {"model": Problem, "description": "Too many wrong tokens from this address"},
-}
 router = APIRouter(responses=ERRORS)
 
 
@@ -578,11 +570,9 @@ def list_examples(srv: Srv, name: str, offset: int = Query(0, ge=0), limit: int 
 
 def _uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
     """The uploaded files, each read only when it is needed, so a big upload is never held in
-    memory whole; one over the upload limit carries an error instead of its bytes.
-
-    A file that can no longer be read (closed once the request was given up, as when the client
-    went away) stops the upload with a 400 and a log line: the batch being read isn't stored,
-    as it is stored only once read whole, while batches stored before it stay."""
+    memory whole; one over the upload limit carries an error instead of its bytes. A file that
+    can't be read any more (closed as the request was abandoned) stops the upload with a 400 and
+    a log line: the batch being read isn't stored, batches stored before it stay."""
     limit = srv.settings.max_upload_bytes
     for i, f in enumerate(files):
         # Browsers (and fewshot.client) send a '"' in a file name as %22, per the HTML standard;
@@ -592,8 +582,7 @@ def _uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
             data = f.file.read(limit + 1)
         except (ValueError, OSError) as e:  # ValueError: read of a closed file
             log.warning("Stopped an upload at file %d of %d (%s): it can't be read any more (%s), most likely as "
-                        "the client went away. Images of batches stored before it are kept.", i + 1, len(files),
-                        name, e)
+                        "the client went away; batches stored before it are kept", i + 1, len(files), name, e)
             raise HTTPException(400, f"The upload stopped at file {i + 1} of {len(files)} ({name}): it could no "
                                      "longer be read; images before it may have been stored") from None
         if len(data) > limit:
@@ -988,14 +977,6 @@ def cancel_job(srv: Srv, jid: str) -> Response:
 
 
 # ---- web UI -------------------------------------------------------------
-# The built UI loads only its own scripts and styles (no inline ones; React sets styles through
-# the DOM, which style-src allows), shows thumbnails from the API, and previews files picked for
-# prediction as blob: URLs. No other site may frame it (clickjacking).
-UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
-          "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
-UI_HEADERS = {"Content-Security-Policy": UI_CSP, "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff"}
-
-
 def mount_ui(application: FastAPI, dist: Path) -> None:
     """Serve the built single-page app in ``dist`` at / (no-op if it hasn't been built)."""
     if not dist.is_dir():

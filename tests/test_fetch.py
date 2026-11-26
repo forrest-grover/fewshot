@@ -62,7 +62,8 @@ def test_fetch_public_only(server, monkeypatch):
     with pytest.raises(ValueError, match="not a public address"):
         fetch.fetch_url(server + "/img", 10_000, public_only=True)
     real_check = fetch.check_public
-    monkeypatch.setattr(fetch, "check_public", lambda url, timeout=None: None if url.endswith("/redirect") else real_check(url, timeout))
+    monkeypatch.setattr(fetch, "check_public",
+                        lambda url, timeout=None: None if url.endswith("/redirect") else real_check(url, timeout))
     with pytest.raises(ValueError, match="not a public address"):
         fetch.fetch_url(server + "/redirect", 10_000, public_only=True)
 
@@ -320,7 +321,7 @@ def test_lookup_errors_reach_the_caller(monkeypatch):
         raise socket.gaierror(-2, "Name or service not known")
 
     monkeypatch.setattr(socket, "getaddrinfo", fail)
-    with pytest.raises(ValueError, match="Can't resolve nowhere.test: .*not known"):
+    with pytest.raises(ValueError, match=r"Can't resolve nowhere\.test: .*not known"):
         fetch.public_addresses("nowhere.test", 80, timeout=5)
 
 

@@ -1,4 +1,5 @@
-"""JSON responses built where they are made, not on the event loop.
+"""JSON responses built where they are made, not on the event loop; the errors every route may
+answer, and the headers of the UI's pages.
 
 FastAPI validates and serialises an endpoint's result against its ``response_model`` on the event
 loop, where a large task's response (10 MB for 50,000 examples) stalls every other request. The
@@ -61,3 +62,20 @@ def json_response(model: Any, content: Any, status: int = 200) -> Response:
     for 50,000 examples) would stall every other request; endpoints return this instead, and
     still declare ``response_model`` for the OpenAPI schema."""
     return Response(render(model, content), status, media_type="application/json")
+
+
+# What the access checks and body limits (``access``, ``guard``) answer on any route, for the schema.
+ERRORS: dict[int | str, dict[str, Any]] = {
+    401: {"model": Problem, "description": "Not signed in (a server with a token)"},
+    403: {"model": Problem, "description": "Cross-site request, or a server without a token reached from "
+                                           "another machine"},
+    413: {"model": Problem, "description": "Request body over its size limit"},
+    429: {"model": Problem, "description": "Too many wrong tokens from this address"},
+}
+
+# The built UI loads only its own scripts and styles (no inline ones; React sets styles through
+# the DOM, which style-src allows), shows thumbnails from the API, and previews files picked for
+# prediction as blob: URLs. No other site may frame it (clickjacking).
+UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
+          "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+UI_HEADERS = {"Content-Security-Policy": UI_CSP, "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff"}
