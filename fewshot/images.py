@@ -19,16 +19,25 @@ def image_id(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:32]
 
 
-def load_image(data: bytes, draft: int | None = None) -> Image.Image:
-    """Decode image bytes to an upright RGB image; raises ``ValueError`` if unreadable.
+VERIFY_SIDE = 2048  # JPEGs are checked decoded at about this size, so huge photos pass
+MAX_PIXELS = 50_000_000  # largest image decoded (after any JPEG draft scaling): about 150 MB as RGB
+
+
+def load_image(data: bytes, draft: int | None = None, max_side: int | None = None) -> Image.Image:
+    """Decode image bytes to an upright RGB image; raises ``ValueError`` if unreadable or over
+    ``MAX_PIXELS`` (a small file can hold a huge, highly compressible image).
 
     With ``draft``, a JPEG may be decoded at a reduced scale that is still at least ``draft``
-    pixels on each side (much faster for large photos); other formats decode in full.
+    pixels on each side (much faster for large photos); other formats decode in full. With
+    ``max_side``, the result is scaled down to fit in ``max_side`` x ``max_side``.
     """
     try:
         im = Image.open(io.BytesIO(data))
         if draft:
             im.draft("RGB", (draft, draft))
+        if im.width * im.height > MAX_PIXELS:
+            raise ValueError(f"Not a readable image: {im.width}x{im.height} is over the "
+                             f"{MAX_PIXELS / 1e6:g} megapixel limit")
         im.load()
     except UnidentifiedImageError as e:
         raise ValueError("Not a readable image: unrecognised file format") from e
@@ -36,7 +45,10 @@ def load_image(data: bytes, draft: int | None = None) -> Image.Image:
         raise ValueError(f"Not a readable image: {e}") from e
     except OSError as e:
         raise ValueError(f"Not a readable image: {e}") from e
-    return ImageOps.exif_transpose(im).convert("RGB")
+    out = ImageOps.exif_transpose(im).convert("RGB")
+    if max_side and max(out.size) > max_side:
+        out.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    return out
 
 
 def thumbnail(data: bytes, size: int) -> bytes:
@@ -51,7 +63,7 @@ def thumbnail(data: bytes, size: int) -> bytes:
 
 def image_ext(data: bytes) -> str:
     """File extension for image bytes from their actual format (e.g. "jpg", "png"), after decoding
-    them in full; raises ``ValueError`` if they aren't a readable image."""
-    load_image(data)
+    them (a JPEG at a reduced scale); raises ``ValueError`` if they aren't a readable image."""
+    load_image(data, draft=VERIFY_SIDE)
     fmt = (Image.open(io.BytesIO(data)).format or "png").lower()
     return {"jpeg": "jpg"}.get(fmt, fmt)

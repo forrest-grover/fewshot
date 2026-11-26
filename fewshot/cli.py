@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import sys
 import time
 from collections.abc import Iterator
@@ -774,9 +775,10 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     max_upload_mb: float = typer.Option(50, help="Largest image accepted per upload"),
     max_request_mb: float = typer.Option(1024, help="Largest request body accepted"),
     allowed_host: list[str] = typer.Option(
-        [], "--allowed-host", help="Host name clients use to reach the server; others are refused. Repeatable. "
-                                   "[default: $FEWSHOT_ALLOWED_HOSTS (comma-separated), else localhost names when "
-                                   "serving locally, else any]"),
+        [], "--allowed-host", help="Host name clients use to reach the server; others are refused (IP addresses "
+                                   "always work). Repeatable; '*' allows any. [default: $FEWSHOT_ALLOWED_HOSTS "
+                                   "(comma-separated), else localhost, plus this machine's names when not serving "
+                                   "locally]"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Run the REST API and web UI."""
@@ -787,7 +789,9 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
         os.environ["FEWSHOT_HOME"] = str(root)
     local = host in {"127.0.0.1", "localhost", "::1"}
     from_env = [h.strip() for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
-    hosts = allowed_host or from_env or (["localhost", "127.0.0.1", "::1"] if local else ["*"])
+    hosts = allowed_host or from_env or ["localhost", "127.0.0.1", "::1"]
+    if not (allowed_host or from_env or local):
+        hosts += sorted({socket.gethostname().lower(), socket.getfqdn().lower()} - {""})
     # fewshot.api reads its settings from the environment when uvicorn imports it.
     settings = {
         "FEWSHOT_TOKEN": token or "", "FEWSHOT_ALLOW_ANY_MODEL": "1" if allow_any_model else "",
@@ -799,6 +803,9 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     if not token and not local:
         typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
                     "change every task.", fg="yellow", err=True)
+    if not local and "*" not in hosts:
+        typer.echo(f"Answering requests by IP address or for: {', '.join(hosts)}. Reaching it by another name "
+                   "needs --allowed-host NAME.", err=True)
     uvicorn.run("fewshot.api:app", host=host, port=port)
 
 

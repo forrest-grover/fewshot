@@ -13,9 +13,9 @@ variables, read when this module is imported (``fewshot serve`` sets them from i
 ``FEWSHOT_WARM=1``
     At startup, load the models existing tasks use (in the background).
 ``FEWSHOT_ALLOWED_HOSTS``
-    Comma-separated host names the server answers to (``*``: any; default: localhost,
-    127.0.0.1 and ::1). A request with another Host header gets 400, which stops web pages
-    from reaching a local server through DNS rebinding. ``fewshot serve`` sets it from ``--host``.
+    Comma-separated host names the server answers to, besides IP addresses (``*``: any; default:
+    localhost). A request with another Host header gets 400, which stops web pages from reaching
+    the server through DNS rebinding. ``fewshot serve`` sets it from ``--host``.
 ``FEWSHOT_ALLOW_URLS=1``
     Accept image URLs (``.../predict/urls``, ``.../examples/urls``): the server downloads them,
     from public addresses only.
@@ -58,7 +58,7 @@ from .embedders import (
 )
 from .evaluate import compare_embedders, evaluate_task
 from .fetch import fetch_url
-from .guard import LimitBody, cross_site, host_name
+from .guard import LimitBody, cross_site, host_allowed, host_name
 from .images import thumbnail
 from .jobs import Job, Jobs
 from .pipeline import Pipeline, Prediction
@@ -106,7 +106,7 @@ URL_FETCH_WORKERS = 4  # URLs fetched at once
 MAX_JOBS = 4  # background jobs running at once
 LOGIN_FAILURES = 10  # wrong tokens per client within LOGIN_WINDOW before /api/login answers 429
 LOGIN_WINDOW = 60.0
-ALLOWED_HOSTS = {h.strip().strip("[]").lower()
+ALLOWED_HOSTS = {host_name(h)
                  for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "localhost,127.0.0.1,::1").split(",") if h.strip()}
 MAX_REQUEST_BYTES = int(float(os.environ.get("FEWSHOT_MAX_REQUEST_MB", "1024")) * 1024 * 1024)
 
@@ -159,7 +159,7 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 async def _guard(request: Request, call_next: Any) -> Response:
     """Refuse requests for another host name (DNS rebinding) and writes from other sites (CSRF),
     then check the token."""
-    if "*" not in ALLOWED_HOSTS and host_name(request.headers.get("host", "")) not in ALLOWED_HOSTS:
+    if not host_allowed(request.headers.get("host", ""), ALLOWED_HOSTS):
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path
     if request.method not in SAFE_METHODS and path.startswith("/api/") and cross_site(request):

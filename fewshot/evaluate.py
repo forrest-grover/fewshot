@@ -242,24 +242,48 @@ def _ece(conf: np.ndarray, correct: np.ndarray, bins: int = 10) -> tuple[float, 
 MIN_CALIBRATION = 50  # scored examples needed before a temperature is suggested (fewer: too noisy)
 
 
-def _nll(P: np.ndarray, t: np.ndarray, T: float) -> float:
-    return float(-np.log(np.clip(temper(P, T)[np.arange(len(t)), t], 1e-12, 1)).sum())
+TEMPERATURES = np.geomspace(0.01, 100, 81)  # the range a task's temperature may take
+
+
+def _fit_temperature(P: np.ndarray, t: np.ndarray) -> float:
+    """The grid temperature minimising cross-entropy against the true labels, smoothed by
+    1/(n+2): held-out predictions that were all right still don't prove the model is never wrong,
+    and fitting them as certain would push the temperature (and every confidence) to the limit."""
+    eps = 1.0 / (len(t) + 2)
+    Y = np.full(P.shape, eps / (P.shape[1] - 1))
+    Y[np.arange(len(t)), t] = 1.0 - eps
+    with np.errstate(divide="ignore"):
+        logs = [np.log(np.clip(temper(P, float(T)), 1e-12, 1)) for T in TEMPERATURES]
+    return float(TEMPERATURES[int(np.argmin([-(Y * lg).sum() for lg in logs]))])
+
+
+def _cross_fitted(P: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """``P`` with each half of its rows tempered by a temperature fitted on the other half."""
+    half = np.arange(len(t)) % 2 == 0
+    Q = np.empty_like(P)
+    for fit, score in ((half, ~half), (~half, half)):
+        Q[score] = temper(P[score], _fit_temperature(P[fit], t[fit]))
+    return Q
 
 
 def _calibration(h: HeldOut, truth: np.ndarray, current: float) -> dict[str, Any] | None:
     """A temperature that makes held-out confidence match held-out accuracy (fitted by maximum
     likelihood over a grid), with the calibration error before and after. ``None`` with too few
     scored examples or classes. The temperature is absolute: ``current`` times the one fitted
-    on top of the task's present setting."""
+    on top of the task's present setting, kept within the range settings allow.
+
+    The error "after" is cross-fitted: each half of the predictions is scored with a temperature
+    fitted on the other half, so it isn't flattered by fitting and scoring the same predictions."""
     rows = np.flatnonzero((h.pred >= 0) & (h.probs[np.arange(len(truth)), truth] > 0))
     if len(rows) < MIN_CALIBRATION or h.probs.shape[1] < 2:
         return None
     P, t = h.probs[rows], truth[rows]
-    best = float(min(np.geomspace(0.01, 100, 81), key=lambda T: _nll(P, t, float(T))))
+    best = _fit_temperature(P, t)
     correct = (P.argmax(1) == t).astype(float)
     ece, table = _ece(P.max(1), correct)
-    ece_after, table_after = _ece(temper(P, best).max(1), correct)
-    return {"temperature": round(current * best, 4), "ece": ece, "ece_calibrated": ece_after,
+    ece_after, table_after = _ece(_cross_fitted(P, t).max(1), correct)
+    absolute = min(max(current * best, float(TEMPERATURES[0])), float(TEMPERATURES[-1]))
+    return {"temperature": round(absolute, 4), "ece": ece, "ece_calibrated": ece_after,
             "reliability": table, "reliability_calibrated": table_after}
 
 

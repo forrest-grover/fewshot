@@ -230,6 +230,9 @@ def check_settings(cfg: TaskConfig) -> None:
         v = getattr(cfg, key)
         if v is not None and not -1.0 <= v <= 1.0:
             raise ValueError(f"{key} must be between -1 and 1, got {v}")
+    for c in cfg.classes:
+        if c.reject_below is not None and not -1.0 <= c.reject_below <= 1.0:
+            raise ValueError(f"The threshold of {c.name!r} must be between -1 and 1, got {c.reject_below}")
     if cfg.temperature is not None and not 0.01 <= cfg.temperature <= 100:
         raise ValueError(f"temperature must be between 0.01 and 100, got {cfg.temperature}")
     if "text_weight" in cfg.classifier_params:

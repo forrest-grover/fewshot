@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import socket
 
 import numpy as np
 import pytest
@@ -522,7 +523,13 @@ def test_serve_settings(monkeypatch):
     r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--token", "t0k"])
     assert "Warning" not in r.output
     assert os.environ["FEWSHOT_TOKEN"] == "t0k"
-    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "*"  # reached by any name on an open address
+    names = os.environ["FEWSHOT_ALLOWED_HOSTS"].split(",")  # local names and this machine's, never any
+    assert names[:3] == ["localhost", "127.0.0.1", "::1"]
+    assert socket.gethostname().lower() in names
+    assert "*" not in names
+    assert "Answering requests by IP address or for: localhost" in r.output
+    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allowed-host", "*"])
+    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "*"
     monkeypatch.delenv("FEWSHOT_ALLOWED_HOSTS")
     runner.invoke(cli.app, ["serve"])
     assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "localhost,127.0.0.1,::1"

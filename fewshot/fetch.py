@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -92,13 +93,31 @@ class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_PinnedHTTPS, req)
 
 
+class _HTTPRedirectOnly(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to http(s) URLs: urllib also follows ``ftp://``, whose connection
+    no address check covers."""
+
+    def redirect_request(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # urllib's signature
+            self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str,
+    ) -> urllib.request.Request | None:
+        if not is_url(newurl):
+            raise urllib.error.URLError(f"redirected to a URL that isn't http(s): {newurl[:200]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+CHUNK = 64 * 1024
+
+
 def fetch_url(url: str, max_bytes: int, timeout: float = 20.0, public_only: bool = False) -> bytes:
     """The body at ``url``; raises ``ValueError`` for a bad URL, an HTTP or network error, or a
-    body over ``max_bytes`` (read no further). With ``public_only``, every connection (redirects
-    too) goes to a public address, the very one that was checked, and no proxy is used."""
+    body over ``max_bytes`` (read no further). ``timeout`` bounds the whole download, not just
+    each read, so a server sending a byte at a time can't hold the caller. Redirects are followed
+    to http(s) URLs only. With ``public_only``, every connection (redirects too) goes to a public
+    address, the very one that was checked, and no proxy is used."""
     if not is_url(url):
         raise ValueError(f"Not an http(s) URL: {url}")
-    handlers: list[urllib.request.BaseHandler] = []
+    deadline = time.monotonic() + timeout
+    handlers: list[urllib.request.BaseHandler] = [_HTTPRedirectOnly()]
     if public_only:
         check_public(url)
         handlers += [urllib.request.ProxyHandler({}), _PublicHTTPHandler(), _PublicHTTPSHandler()]
@@ -106,7 +125,11 @@ def fetch_url(url: str, max_bytes: int, timeout: float = 20.0, public_only: bool
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with opener.open(req, timeout=timeout) as resp:
-            data: bytes = resp.read(max_bytes + 1)
+            data = bytearray()
+            while len(data) <= max_bytes and (chunk := resp.read1(CHUNK)):
+                data += chunk
+                if time.monotonic() > deadline:
+                    raise ValueError(f"Could not fetch {url}: took longer than {timeout:g} s")
     except urllib.error.HTTPError as e:
         raise ValueError(f"Could not fetch {url}: HTTP {e.code} {e.reason}") from None
     except (urllib.error.URLError, OSError) as e:
@@ -114,4 +137,4 @@ def fetch_url(url: str, max_bytes: int, timeout: float = 20.0, public_only: bool
         raise ValueError(f"Could not fetch {url}: {reason}") from None
     if len(data) > max_bytes:
         raise ValueError(f"{url} is larger than the {max_bytes / 1024 / 1024:g} MB limit")
-    return data
+    return bytes(data)

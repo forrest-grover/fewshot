@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -13,6 +15,19 @@ def host_name(host: str) -> str:
     if host.startswith("["):  # [::1]:8000
         return host[1 : host.find("]")] if "]" in host else host
     return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def host_allowed(host: str, allowed: set[str]) -> bool:
+    """Whether a request's Host header names this server: one of ``allowed`` (``*``: any), or an
+    IP address. DNS rebinding needs a host name the attacker controls, so an address is safe."""
+    name = host_name(host)
+    if "*" in allowed or name in allowed:
+        return True
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
 
 
 def cross_site(request: Request) -> bool:

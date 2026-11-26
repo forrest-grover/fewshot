@@ -421,9 +421,15 @@ def _decode(todo: list[tuple[int, str | None, ImageInput]], errors: dict[int, st
     return decoded
 
 
+EMBED_MAX_SIDE = 2048  # images are shrunk to this before embedding, so a batch stays small in memory
+
+
 def _to_pil(im: ImageInput) -> Image.Image:
     if isinstance(im, Image.Image):
-        return im.convert("RGB")
+        im = im.convert("RGB")
+        if max(im.size) > EMBED_MAX_SIDE:
+            im.thumbnail((EMBED_MAX_SIDE, EMBED_MAX_SIDE), Image.Resampling.LANCZOS)
+        return im
     if isinstance(im, (str, Path)):
         im = Path(im).read_bytes()
-    return load_image(im)
+    return load_image(im, draft=EMBED_MAX_SIDE, max_side=EMBED_MAX_SIDE)

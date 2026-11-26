@@ -241,7 +241,7 @@ def test_job_internal_error_and_cancel(client, monkeypatch):
 
     monkeypatch.setattr(fewshot.api, "evaluate_task", broken)
     job = _wait(client, client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"])
-    assert (job["status"], job["error"]) == ("failed", "Internal error: boom")
+    assert (job["status"], job["error"]) == ("failed", "Internal error; see the server log")
 
     started = threading.Event()
 

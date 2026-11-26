@@ -430,7 +430,10 @@ def _build(spec: str) -> Embedder:
         raise ValueError(f"Bad embedder spec {spec!r}; expected '<backend>:<model>'")
     if backend == "openclip":
         model, _, pretrained = rest.partition("@")
-        return OpenCLIPEmbedder(spec, model, pretrained or None)
+        if not pretrained:  # open_clip would quietly build the model with random weights
+            raise ValueError(f"{spec!r} names no pretrained weights; add them as 'openclip:{model}@<pretrained>' "
+                             "(open_clip.list_pretrained() lists them)")
+        return OpenCLIPEmbedder(spec, model, pretrained)
     if backend == "timm":
         return TimmEmbedder(spec, rest)
     raise ValueError(f"Unknown embedder backend {backend!r} (use 'openclip' or 'timm')")

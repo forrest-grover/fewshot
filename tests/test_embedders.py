@@ -409,16 +409,17 @@ def test_timm_on_cuda_moves_model_and_inputs_and_uses_fp16_autocast(calls, fake_
 
 @pytest.mark.usefixtures("fake_backends", "cpu")
 def test_get_embedder_builds_openclip_and_caches(calls):
-    """openclip specs build once per spec; the '@pretrained' part is optional."""
+    """openclip specs build once per spec; one without '@pretrained' (random weights) is refused."""
     emb = get_embedder("openclip:Tiny@weights")
     assert isinstance(emb, OpenCLIPEmbedder)
     assert calls["clip"] == [("Tiny", "weights", "cpu")]
     assert get_embedder("openclip:Tiny@weights") is emb
     assert len(calls["clip"]) == 1  # second call served from the cache
 
-    bare = get_embedder("openclip:Tiny")
-    assert bare is not emb
-    assert calls["clip"][-1] == ("Tiny", None, "cpu")  # no '@' means no pretrained tag
+    for bare in ("openclip:Tiny", "openclip:Tiny@"):
+        with pytest.raises(ValueError, match="names no pretrained weights"):
+            get_embedder(bare)
+    assert len(calls["clip"]) == 1
 
 
 @pytest.mark.usefixtures("fake_backends", "cpu")

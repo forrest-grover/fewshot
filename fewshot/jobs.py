@@ -57,7 +57,7 @@ class Jobs:
     def start(self, job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> Job:
         """Run ``work(progress)`` in a thread; its return value becomes ``job.result``. A
         ``ValueError`` or ``KeyError`` fails the job with its message; anything else with
-        "Internal error: ..."."""
+        "Internal error" (details go to the log only: they can hold server paths)."""
         def run() -> None:
             try:
                 job.result = work(job.progress)
@@ -66,9 +66,9 @@ class Jobs:
                 job.status = "cancelled"
             except (ValueError, KeyError) as e:
                 job.status, job.error = "failed", str(e.args[0]) if e.args else str(e)
-            except Exception as e:  # pylint: disable=broad-exception-caught  # reported to the poller
+            except Exception:  # pylint: disable=broad-exception-caught  # reported to the poller
                 log.exception("Job %s failed", job.id)
-                job.status, job.error = "failed", f"Internal error: {e}"
+                job.status, job.error = "failed", "Internal error; see the server log"
             job.finished = time.time()
 
         with self._lock:
