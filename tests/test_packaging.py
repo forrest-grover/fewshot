@@ -1,7 +1,10 @@
 """Packaging and deployment files: declared dependencies, docker-compose and the Dockerfile."""
 
 import os
+import re
 from pathlib import Path
+
+import pytest
 
 
 def test_rich_is_a_declared_dependency():
@@ -19,3 +22,24 @@ def test_compose_publishes_on_this_machine_and_images_are_pinned():
     assert 'ports: ["127.0.0.1:8000:8000"]' in compose
     bases = [line.split()[1] for line in (root / "Dockerfile").read_text().splitlines() if line.startswith("FROM ")]
     assert bases == ["node:22-bookworm-slim", "python:3.12-slim-bookworm"]
+
+
+def test_constraints_pin_every_dependency():
+    """constraints.txt pins each dependency pyproject.toml declares (extras too) to one exact version,
+    without local labels (so the CPU and CUDA builds of torch both match) or CUDA-only packages;
+    the Dockerfile installs with it."""
+    tomllib = pytest.importorskip("tomllib")
+    root = Path(__file__).resolve().parent.parent
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    declared = project["dependencies"] + [d for extra in project["optional-dependencies"].values() for d in extra]
+    pins = {}
+    for line in (root / "constraints.txt").read_text().splitlines():
+        if line and not line.startswith("#"):
+            name, version = line.split("==")
+            assert re.fullmatch(r"[0-9][0-9a-z.]*", version), line
+            pins[name] = version
+    assert not [n for n in pins if re.fullmatch(r"nvidia-.*|cuda-.*|triton", n)]
+    for dep in declared:
+        name = re.split(r"[\[<>=!~; ]", dep, maxsplit=1)[0]
+        assert re.sub(r"[-_.]+", "-", name).lower() in pins, dep
+    assert "-c constraints.txt" in (root / "Dockerfile").read_text()

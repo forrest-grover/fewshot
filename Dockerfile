@@ -13,13 +13,16 @@ FROM python:3.12-slim-bookworm
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
     FEWSHOT_HOME=/data HF_HOME=/models TORCH_HOME=/models
-RUN pip install torch torchvision --index-url "$TORCH_INDEX"
 WORKDIR /app
+# Exact versions from constraints.txt; torch without its dependencies from TORCH_INDEX (they, and a
+# GPU build's CUDA libraries, come from PyPI with the rest).
+COPY constraints.txt ./
+RUN pip install --no-deps -c constraints.txt torch torchvision --index-url "$TORCH_INDEX"
 COPY pyproject.toml README.md ./
 COPY fewshot/ fewshot/
 COPY --from=web /src/web/dist web/dist
 # Editable, so the server finds the built UI next to the package (web/dist).
-RUN pip install -e ".[siglip]" \
+RUN pip install -c constraints.txt -e ".[siglip]" \
     && useradd --uid 1000 --create-home fewshot \
     && mkdir -p /data /models && chown fewshot /data /models
 USER fewshot

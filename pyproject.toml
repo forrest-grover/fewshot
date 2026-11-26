@@ -10,8 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
     "torch",
     "torchvision",
-    "open_clip_torch",
-    "timm",
+    "open_clip_torch>=3.0",  # the PE Core presets
+    "timm>=1.0.17",  # what open_clip 3.0 needs
     "numpy",
     "pillow",
     "scikit-learn",
@@ -35,6 +35,8 @@ include = ["fewshot*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = ["model: loads a real model (downloads its weights); skipped unless FEWSHOT_TEST_MODELS=1"]
 
 [tool.coverage.run]
 source = ["fewshot"]
