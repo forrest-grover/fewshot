@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
 import { pct } from "./format";
+import { fetchInbox } from "./inboxPages";
 import { useShortcuts, type Uploads } from "./hooks";
 import { THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
@@ -27,7 +28,7 @@ const INBOX = "inbox";
 export default function Inbox({ task, setTask, run, uploads }: Props) {
   const [sort, setSort] = useState<InboxSort>("uncertain");
   // The images loaded so far (a page at a time, in the chosen order), of ``total`` waiting.
-  const [items, setItems] = useState<{ key: string; list: InboxEntry[]; total: number } | null>(null);
+  const [items, setItems] = useState<{ key: string; of: string; list: InboxEntry[]; total: number } | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const [current, setCurrent] = useState<string | null>(null);
@@ -42,13 +43,19 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
 
   // Suggestions depend on the task's examples and settings: reload whenever it changes.
   const key = `${task.name}\u0000${String(task.revision)}\u0000${sort}`;
+  const listId = `${task.name}\u0000${sort}`; // the same list, at any revision
+  // A reload after a change to the task fetches as many images as were loaded (with "Load more"),
+  // so they stay, and so does the highlight; another task or order starts from one page.
+  const loaded = useRef(items);
+  loaded.current = items;
   useEffect(() => {
     let live = true;
-    void run(api.inbox(task.name, sort, 0, INBOX_PAGE)).then((r) => {
-      if (live && r) { setItems({ key, list: r.items, total: r.total }); setGone(new Set()); }
+    const want = loaded.current?.of === listId ? loaded.current.list.length : 0;
+    void fetchInbox((offset, limit) => run(api.inbox(task.name, sort, offset, limit)), want, INBOX_PAGE).then((r) => {
+      if (live && r) { setItems({ key, of: listId, list: r.items, total: r.total }); setGone(new Set()); }
     });
     return () => { live = false; };
-  }, [key, task.name, sort, run]);
+  }, [key, listId, task.name, sort, run]);
   const list = (items?.list ?? []).filter((i) => !gone.has(i.id));
   const stale = items?.key !== key;
   const unloaded = items ? Math.max(0, items.total - items.list.length) : 0; // waiting beyond the pages loaded
