@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, AUTH_EVENT, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
+import { api, AUTH_EVENT, HttpError, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
 import type { CompareRun } from "./Compare";
 import Evaluate, { type EvalRun } from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { Gate, stepToast, taskUndoKey, typingAt, usePredictResults } from "./hooks";
+import { Gate, Latest, stepToast, taskUndoKey, typingAt, usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
@@ -50,21 +50,44 @@ export default function App() {
   const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
   const [compareRun, setCompareRun] = useState<CompareRun | null>(null);
 
+  const taskLoads = useRef(new Latest()).current;
+  /** Fetch the open task again, e.g. after it was changed elsewhere (the CLI, another tab); a
+   * response older than the task shown is ignored. If it is gone, say so. */
+  const reloadTask = useCallback(() => {
+    const name = currentTask.current;
+    if (!name) return;
+    const latest = taskLoads.begin();
+    api.task(name).then((t) => {
+      if (!latest() || currentTask.current !== name) return;
+      setTask((cur) => (cur && cur.name === t.name && cur.revision >= t.revision ? cur : t));
+    }, (e: unknown) => {
+      if (!latest() || currentTask.current !== name || !(e instanceof HttpError && e.status === 404)) return;
+      setTask(null);
+      setLoadFailed(true);
+      setError(e.message);
+    });
+  }, [taskLoads]);
+
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
     const from = currentTask.current;
     try {
       return await p;
     } catch (e) {
       // An error from a task the user has since left would only confuse the one now shown.
-      if (currentTask.current === from) setError(e instanceof Error ? e.message : String(e));
+      if (currentTask.current !== from) return undefined;
+      setError(e instanceof Error ? e.message : String(e));
+      // Refused (say, an example or class that is gone): the task may have changed elsewhere.
+      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) reloadTask();
       return undefined;
     }
-  }, []);
+  }, [reloadTask]);
 
-  const refreshTasks = useCallback(
-    () => run(api.tasks()).then((t) => { if (t) setTasks(t); }),
-    [run],
-  );
+  const taskLists = useRef(new Latest()).current;
+  const refreshTasks = useCallback(async () => {
+    const latest = taskLists.begin();
+    const t = await run(api.tasks());
+    if (t && latest()) setTasks(t); // not an older list that arrived after a newer one
+  }, [run, taskLists]);
 
   useEffect(() => {
     const auth = () => { setSignIn(true); };
@@ -109,17 +132,24 @@ export default function App() {
     setTask(null);
     setLoadFailed(false);
     if (!route.task) return;
-    let current = true; // false once the user opens another task: a late response must not show
+    const latest = taskLoads.begin(); // false once the user opens another task: a late response must not show
     api.task(route.task).then(
-      (t) => { if (current) setTask(t); },
+      (t) => { if (latest()) setTask(t); },
       (e: unknown) => {
-        if (!current) return;
+        if (!latest()) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoadFailed(true);
       },
     );
-    return () => { current = false; };
-  }, [route.task]);
+  }, [route.task, taskLoads]);
+
+  // The task list (fetched again whenever the window comes back, and after each change) shows
+  // the open task changed elsewhere, or gone: fetch it again.
+  const listed = tasks.find((s) => s.name === task?.name);
+  const listedRevision = tasks.length && task ? listed?.revision ?? -1 : null; // -1: not listed
+  useEffect(() => {
+    if (task && listedRevision !== null && (listedRevision > task.revision || listedRevision === -1)) reloadTask();
+  }, [listedRevision, task?.revision, reloadTask]); // eslint-disable-line react-hooks/exhaustive-deps -- only on these changes
 
   /** Show a task returned by a mutation, unless it is for another task or older than what is shown. */
   const updateTask = (t: TaskDetail) => {

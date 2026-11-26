@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { Gate, stepToast, taskUndoKey, typingAt } from "./hooks";
+import { Gate, Latest, stepToast, taskUndoKey, typingAt } from "./hooks";
 import { taskDetail } from "./test-data";
 
 /** A keydown dispatched at ``target`` (an element in the document); its ``target`` stays set. */
@@ -82,6 +82,17 @@ describe("Gate", () => {
     const gate = new Gate();
     await expect(gate.run(() => Promise.reject(new Error("x")))).rejects.toThrow("x");
     expect(await gate.run(() => Promise.resolve(1))).toBe(1);
+  });
+});
+
+describe("Latest", () => {
+  it("lets only the newest request through", () => {
+    const l = new Latest();
+    const first = l.begin();
+    expect(first()).toBe(true);
+    const second = l.begin();
+    expect(first()).toBe(false); // an older response arriving after a newer request began
+    expect(second()).toBe(true);
   });
 });
 

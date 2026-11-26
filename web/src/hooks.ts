@@ -55,6 +55,16 @@ export function stepToast(which: "undo" | "redo", t: TaskDetail, fallback: strin
   };
 }
 
+/** Orders overlapping requests for the same thing: ``begin`` returns a check that is true only
+ * while no later request has begun, so an older response arriving last can't overwrite a newer one. */
+export class Latest {
+  private seq = 0;
+  begin(): () => boolean {
+    const mine = ++this.seq;
+    return () => mine === this.seq;
+  }
+}
+
 /** Lets one async action run at a time: ``run`` ignores calls (resolving to undefined) while an
  * earlier one is still in flight, e.g. a held-down Ctrl+Z. */
 export class Gate {
