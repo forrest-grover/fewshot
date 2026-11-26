@@ -1,30 +1,25 @@
 """Security checks: host names, cross-site writes, image responses and task imports."""
 
-import importlib
 import io
 import json
 import zipfile
 
 import pytest
-from fastapi.testclient import TestClient
 
 import fewshot.api
 from fewshot import archive, models
 from fewshot.archive import import_task
 from fewshot.embedders import DEFAULT_SPEC
 from fewshot.images import image_id
-from tests.conftest import png
+from fewshot.server_settings import ServerSettings
+from tests.conftest import api_client, png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
-def _client(tmp_path, monkeypatch, hosts=None, base_url="http://testserver"):
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    if hosts is None:
-        monkeypatch.delenv("FEWSHOT_ALLOWED_HOSTS", raising=False)
-    else:
-        monkeypatch.setenv("FEWSHOT_ALLOWED_HOSTS", hosts)
-    return TestClient(importlib.reload(fewshot.api).app, base_url=base_url)
+def _client(tmp_path, monkeypatch, hosts=None, base_url="http://testserver"):  # pylint: disable=unused-argument
+    allowed = ServerSettings().allowed_hosts if hosts is None else frozenset(hosts.split(","))
+    return api_client(tmp_path, base_url=base_url, allowed_hosts=allowed)
 
 
 # ---- host names (DNS rebinding) -----------------------------------------
@@ -86,7 +81,7 @@ def test_images_are_served_only_as_images(tmp_path, monkeypatch):
     # A file named .html (as a crafted import used to allow) is not served as HTML.
     page = b"<script>alert(1)</script>"
     hid = image_id(page)
-    t = fewshot.api.ws.get("t")
+    t = c.srv.ws.get("t")
     (t.path / f"images/{hid}.html").write_bytes(page)
     with t._writing():  # pylint: disable=protected-access
         t.config.examples.append(models.Example(id=hid, label="red", file=f"images/{hid}.html"))

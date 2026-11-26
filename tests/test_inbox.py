@@ -1,19 +1,18 @@
 """The inbox: unlabelled images, the model's suggestions, accepting and dismissing them."""
 
-import importlib
 import io
 import json
 
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import fewshot.api
+import fewshot.services
 from fewshot import cli, cli_common
 from fewshot.archive import export_task, import_task
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
-from tests.conftest import png
+from tests.conftest import api_client, png, set_settings
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
@@ -105,10 +104,9 @@ def test_suggestions_and_their_order(ws):
 
 # ---- API ------------------------------------------------------------------
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
+def client_fixture(tmp_path):
     """A TestClient on a fresh API with task 't' (one red, one blue example)."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    c = TestClient(importlib.reload(fewshot.api).app)
+    c = api_client(tmp_path)
     c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
     for label, rgb in (("red", RED), ("blue", BLUE)):
         c.post("/api/tasks/t/examples", data={"label": label}, files=[("files", ("x.png", png(rgb), "image/png"))])
@@ -136,15 +134,15 @@ def test_api(client, monkeypatch):
     assert client.post("/api/tasks/t/inbox/dismiss", json={"ids": [ids[1]]}).json()["inbox_count"] == 1
     assert client.post("/api/tasks/t/inbox/dismiss", json={"ids": ["nope"]}).status_code == 404
 
-    monkeypatch.setattr(fewshot.api, "ALLOW_URLS", True)
-    monkeypatch.setattr(fewshot.api, "fetch_url", lambda url, *a, **k: png(BLUE, noise=10, seed=9))
+    set_settings(monkeypatch, client, allow_urls=True)
+    monkeypatch.setattr(fewshot.services, "fetch_url", lambda url, *a, **k: png(BLUE, noise=10, seed=9))
     r = client.post("/api/tasks/t/inbox/urls", json={"urls": ["http://h/b.png"]})
     assert r.json()["added"][0]["source"] == "http://h/b.png"
 
     def broken(*_args):
         raise ValueError("Could not load embedder")
 
-    monkeypatch.setattr(fewshot.api.pipe, "inbox_suggestions", broken)
+    monkeypatch.setattr(client.srv.pipe, "inbox_suggestions", broken)
     assert client.get("/api/tasks/t/inbox").status_code == 400
 
 

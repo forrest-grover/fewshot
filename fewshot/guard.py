@@ -40,24 +40,29 @@ def cross_site(request: Request) -> bool:
 
 
 class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware is just __call__
-    """Refuse (413) request bodies over ``limit`` bytes, by Content-Length or while streaming, so an
-    oversized upload isn't spooled to disk first.
+    """Refuse (413) request bodies over ``limit`` bytes (``other_limit`` for bodies that aren't
+    multipart uploads, such as JSON), by Content-Length or while streaming, so an oversized
+    upload isn't spooled to disk or parsed first.
 
     A streamed body that passes the limit gets the 413 at once (if no response has started), and
     the app is told the client went away; whatever it then sends is dropped. Raising from the
     body stream instead would reach FastAPI as a body-parsing error, which it reports as 400.
     """
 
-    def __init__(self, inner: ASGIApp, limit: int) -> None:
-        self.inner, self.limit = inner, limit
+    def __init__(self, inner: ASGIApp, limit: int, other_limit: int | None = None) -> None:
+        self.inner, self.upload_limit = inner, limit
+        self.other_limit = limit if other_limit is None else other_limit
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.inner(scope, receive, send)
             return
-        length = dict(scope["headers"]).get(b"content-length")
-        if length is not None and length.isdigit() and int(length) > self.limit:
-            await self._refuse(scope, receive, send)
+        headers = dict(scope["headers"])
+        upload = headers.get(b"content-type", b"").lower().startswith(b"multipart/form-data")
+        limit = self.upload_limit if upload else self.other_limit
+        length = headers.get(b"content-length")
+        if length is not None and length.isdigit() and int(length) > limit:
+            await self._refuse(limit, scope, receive, send)
             return
         seen = 0
         started = refused = False
@@ -68,12 +73,12 @@ class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware
                 return {"type": "http.disconnect"}
             msg = await receive()
             seen += len(msg.get("body", b""))
-            if seen <= self.limit:
+            if seen <= limit:
                 return msg
             refused = True
             if not started:  # too late for a 413 once a response has begun: just stop
                 started = True
-                await self._refuse(scope, receive, send)
+                await self._refuse(limit, scope, receive, send)
             return {"type": "http.disconnect"}
 
         async def tracked(msg: Message) -> None:
@@ -89,6 +94,7 @@ class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware
             if not refused:
                 raise
 
-    async def _refuse(self, scope: Scope, receive: Receive, send: Send) -> None:
-        mb = self.limit / 1024 / 1024
+    @staticmethod
+    async def _refuse(limit: int, scope: Scope, receive: Receive, send: Send) -> None:
+        mb = limit / 1024 / 1024
         await JSONResponse({"detail": f"Request is larger than the {mb:.3g} MB limit"}, 413)(scope, receive, send)

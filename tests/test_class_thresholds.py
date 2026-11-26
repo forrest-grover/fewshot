@@ -1,19 +1,16 @@
 """Per-class reject thresholds: storing them, predicting with them, suggesting them, and the API and CLI."""
 
-import importlib
 import json
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import fewshot.api
 from fewshot import cli
 from fewshot.evaluate import evaluate_task
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
-from tests.conftest import png
+from tests.conftest import api_client, png
 from tests.test_cli import PlainResult
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
@@ -118,12 +115,11 @@ def test_evaluation_suggests_class_thresholds(ws):
 
 # ---- API ------------------------------------------------------------------------
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
+def client_fixture(tmp_path):
     """A TestClient on a fresh API, with task 't'."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    api = importlib.reload(fewshot.api)
-    _task(api.ws, n=5)
-    return TestClient(api.app)
+    c = api_client(tmp_path)
+    _task(c.srv.ws, n=5)
+    return c
 
 
 def test_api_class_thresholds(client):

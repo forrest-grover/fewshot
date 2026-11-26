@@ -1,20 +1,17 @@
 """Evidence (nearest labelled examples) and confidence calibration."""
 
-import importlib
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-import fewshot.api
 import fewshot.evaluate as ev
 from fewshot import cli
 from fewshot.classifiers import ClassData, make_classifier, temper
 from fewshot.evaluate import evaluate_task
 from fewshot.models import TaskConfig
 from fewshot.pipeline import Pipeline
-from tests.conftest import png
+from tests.conftest import api_client, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
 
@@ -128,10 +125,9 @@ def test_fast_leave_one_out_is_tempered_like_refitting():
 
 # ---- API and CLI --------------------------------------------------------
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
+def client_fixture(tmp_path):
     """A TestClient on a fresh API, with task 'c' (one red and one blue example)."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    c = TestClient(importlib.reload(fewshot.api).app)
+    c = api_client(tmp_path)
     c.post("/api/tasks", json={"name": "c", "embedder": "fake:color"})
     for label, rgb in (("red", RED), ("blue", BLUE)):
         c.post("/api/tasks/c/examples", data={"label": label}, files=[("files", ("x.png", png(rgb), "image/png"))])

@@ -778,8 +778,7 @@ class Workspace:
     """A folder of tasks plus the shared embedding cache."""
 
     def __init__(self, root: Path | str | None = None, create: bool = True) -> None:
-        """The workspace in ``root`` (default ``default_root()``), made if missing unless ``create``
-        is False (then a missing one has no tasks)."""
+        """The workspace in ``root`` (default ``default_root()``), made if missing and ``create``."""
         self.root = Path(root).resolve() if root else default_root()
         if create:
             (self.root / "tasks").mkdir(parents=True, exist_ok=True)

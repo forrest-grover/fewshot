@@ -20,6 +20,8 @@ class Health(BaseModel):
     models_loaded: list[str]
     jobs_running: int
     url_fetch: bool  # whether the .../urls endpoints are enabled
+    max_request_bytes: int  # largest upload request accepted (fewshot.client batches below it)
+    max_upload_bytes: int  # largest image accepted
 
 
 class EmbedderOut(BaseModel):
@@ -286,12 +288,13 @@ class JobOut(BaseModel):
     id: str
     task: str
     kind: str
-    status: str  # running | done | failed | cancelled
+    status: str  # running | cancelling | done | failed | cancelled
     stage: str
     done: int
     total: int
     result: EvalReport | CompareReport | None
     error: str | None
+    expired: bool = False  # finished long enough ago that ``result`` is no longer kept
 
 
 # ---- request bodies -----------------------------------------------------
@@ -411,6 +414,13 @@ class InboxLabels(_Body):
     """Body of POST .../inbox/accept: the class for each inbox image to label."""
 
     labels: dict[str, str] = Field(min_length=1)
+
+
+class AcceptConfident(_Body):
+    """Body of POST .../inbox/accept-confident."""
+
+    min_confidence: float = Field(ge=0, le=1)
+    ids: list[str] | None = None  # only these inbox images (default: all)
 
 
 class Compare(_Body):

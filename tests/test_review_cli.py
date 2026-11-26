@@ -287,8 +287,8 @@ def test_change_settings_checks_clears_and_embedders(ws):
     t = _two(ws)
     t.update_settings(reject_below=0.5)
     with pytest.raises(ValueError, match="not both"):
-        services.change_settings(t, {"reject_below": 0.4}, ["reject_below"])
-    services.change_settings(t, {}, ["reject_below"])
+        services.change_settings(t, {"reject_below": 0.4}, {"reject_below": "clear_reject"})
+    services.change_settings(t, {}, {"reject_below": "clear_reject"})
     assert t.config.reject_below is None
     checked: list[str] = []
     services.change_settings(t, {"embedder": "fake:color"}, embedder_ok=checked.append)

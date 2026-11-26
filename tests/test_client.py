@@ -1,6 +1,5 @@
 """fewshot.client against a real server, and the API's operation ids."""
 
-import importlib
 import socket
 import threading
 import time
@@ -9,23 +8,22 @@ import pytest
 import uvicorn
 
 import fewshot.api
+from fewshot.api import create_app
 from fewshot.client import ApiError, Client
+from fewshot.server_settings import ServerSettings
 from tests.conftest import png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
 @pytest.fixture(name="server")
-def server_fixture(tmp_path, monkeypatch):
+def server_fixture(tmp_path):
     """The API served by uvicorn on a free local port, with token 'secret'; yields its URL."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    monkeypatch.setenv("FEWSHOT_TOKEN", "secret")
-    monkeypatch.setenv("FEWSHOT_WARM", "0")
-    api = importlib.reload(fewshot.api)
+    app = create_app(ServerSettings(home=tmp_path / "ws", token="secret", warm=False))
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    srv = uvicorn.Server(uvicorn.Config(api.app, host="127.0.0.1", port=port, log_level="warning"))
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=srv.run, daemon=True)
     thread.start()
     deadline = time.time() + 10

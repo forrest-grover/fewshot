@@ -53,20 +53,21 @@ def create_task(ws: Workspace, name: str, embedder: str | None = None, classifie
     return ws.create(name, **kw)
 
 
-def change_settings(task: Task, values: dict[str, Any], clear: Iterable[str] = (),  # pylint: disable=too-many-arguments
+def change_settings(task: Task, values: dict[str, Any], clear: dict[str, str] | None = None,  # pylint: disable=too-many-arguments
                     merge_params: dict[str, Any] | None = None, *, embedder_ok: SpecCheck | None = None
                     ) -> list[str]:
-    """Change ``task``'s settings: ``values`` are set, the settings named in ``clear`` (say,
-    ``reject_below``) unset, and ``merge_params`` set on top of the classifier's params (see
-    ``Task.update_settings`` for the rules). A new embedder is checked with ``embedder_ok`` (default
+    """Change ``task``'s settings: ``values`` are set, the settings in ``clear`` unset (it maps
+    each to what the caller calls clearing it, such as ``{"reject_below": "clear_reject"}``), and
+    ``merge_params`` set on top of the classifier's params (see ``Task.update_settings`` for the
+    rules). A new embedder is checked with ``embedder_ok`` (default
     ``check_embedder``).
     Returns the fitted settings the change cleared.
 
     Raises ``ValueError`` for a setting both given and cleared, or a bad value."""
     kw = dict(values)
-    for key in clear:
+    for key, flag in (clear or {}).items():
         if kw.get(key) is not None:
-            raise ValueError(f"Give either {key} or clear it, not both")
+            raise ValueError(f"Give either {key} or {flag}, not both")
         kw[key] = None
     if "embedder" in kw:
         if kw["embedder"] == task.config.embedder:

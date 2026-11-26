@@ -164,7 +164,9 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     values = {"embedder": embedder, "classifier": classifier or None, "text_weight": text_weight,
               "reject_below": reject_below, "reject_below_zero_shot": reject_below_zero_shot, "flip": flip,
               "names_as_text": names, "temperature": temperature}
-    clear = [k for k, on in (("reject_below", clear_reject), ("reject_below_zero_shot", clear_reject_zero_shot)) if on]
+    flags = {"reject_below": ("--clear-reject", clear_reject),
+             "reject_below_zero_shot": ("--clear-reject-zero-shot", clear_reject_zero_shot)}
+    clear = {k: flag for k, (flag, on) in flags.items() if on}
     try:
         _say_cleared(name, services.change_settings(t, {k: v for k, v in values.items() if v is not None}, clear,
                                                      _parse_params(param)))
@@ -827,11 +829,12 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 
 
 @app.command()
-def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
+def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     host: str = "127.0.0.1",
     port: int = 8000,
     token: str | None = typer.Option(None, envvar="FEWSHOT_TOKEN", show_envvar=True,
-                                     help="Require this token for the API and UI"),
+                                     help="Require this token for the API and UI (prefer setting FEWSHOT_TOKEN: "
+                                          "an option is visible to other users in the process list)"),
     allow_any_model: bool = typer.Option(False, "--allow-any-model", envvar="FEWSHOT_ALLOW_ANY_MODEL",
                                          show_envvar=True,
                                          help="Let API callers load any embedder spec, not just presets"),
@@ -840,43 +843,46 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     allow_urls: bool = typer.Option(False, "--allow-urls", envvar="FEWSHOT_ALLOW_URLS", show_envvar=True,
                                     help="Let API callers send image URLs for the server to download "
                                          "(public addresses only)"),
-    max_upload_mb: float = typer.Option(50, envvar="FEWSHOT_MAX_UPLOAD_MB", show_envvar=True,
+    max_upload_mb: float = typer.Option(50, min=0.001, envvar="FEWSHOT_MAX_UPLOAD_MB", show_envvar=True,
                                         help="Largest image accepted per upload"),
-    max_request_mb: float = typer.Option(1024, envvar="FEWSHOT_MAX_REQUEST_MB", show_envvar=True,
-                                         help="Largest request body accepted"),
+    max_request_mb: float = typer.Option(1024, min=0.001, envvar="FEWSHOT_MAX_REQUEST_MB", show_envvar=True,
+                                         help="Largest upload request accepted (other request bodies: 1 MB)"),
     allowed_host: list[str] = typer.Option(
         [], "--allowed-host", help="Host name clients use to reach the server; others are refused (IP addresses "
                                    "always work). Repeatable; '*' allows any. [default: $FEWSHOT_ALLOWED_HOSTS "
                                    "(comma-separated), else localhost, plus this machine's names when not serving "
                                    "locally]"),
+    forwarded_allow_ips: str = typer.Option(
+        "127.0.0.1", envvar="FEWSHOT_FORWARDED_ALLOW_IPS", show_envvar=True,
+        help="Comma-separated addresses of reverse proxies whose X-Forwarded-For/-Proto headers are trusted "
+             "('*': any), so limits on wrong tokens apply per client, not to the proxy"),
+    workers: int = typer.Option(4, min=1, max=256, envvar="FEWSHOT_WORKERS", show_envvar=True,
+                                help="Threads for heavy work (predicting, evaluating, uploads)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Run the REST API and web UI."""
-    # uvicorn is only needed here; importing it lazily keeps other commands fast.
+    # uvicorn and the API are only needed here; importing them lazily keeps other commands fast.
     import uvicorn  # pylint: disable=import-outside-toplevel
 
-    if root:
-        os.environ["FEWSHOT_HOME"] = str(root)
-    local = host in {"127.0.0.1", "localhost", "::1"}
+    from .api import create_app  # pylint: disable=import-outside-toplevel
+    from .server_settings import LOCAL_HOSTS, ServerSettings  # pylint: disable=import-outside-toplevel
+
+    local = host in LOCAL_HOSTS
     from_env = [h.strip() for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
-    hosts = allowed_host or from_env or ["localhost", "127.0.0.1", "::1"]
+    hosts = allowed_host or from_env or list(LOCAL_HOSTS)
     if not (allowed_host or from_env or local):
         hosts += sorted({socket.gethostname().lower(), socket.getfqdn().lower()} - {""})
-    # fewshot.api reads its settings from the environment when uvicorn imports it.
-    settings = {
-        "FEWSHOT_TOKEN": token or "", "FEWSHOT_ALLOW_ANY_MODEL": "1" if allow_any_model else "",
-        "FEWSHOT_WARM": "1" if warm else "", "FEWSHOT_ALLOW_URLS": "1" if allow_urls else "",
-        "FEWSHOT_ALLOWED_HOSTS": ",".join(hosts),
-        "FEWSHOT_MAX_UPLOAD_MB": f"{max_upload_mb:g}", "FEWSHOT_MAX_REQUEST_MB": f"{max_request_mb:g}",
-    }
-    os.environ.update(settings)
+    settings = ServerSettings(home=root, token=token, allow_any_model=allow_any_model, warm=warm,
+                              allow_urls=allow_urls, allowed_hosts=frozenset(hosts), max_upload_mb=max_upload_mb,
+                              max_request_mb=max_request_mb, forwarded_allow_ips=forwarded_allow_ips, workers=workers)
     if not token and not local:
         typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
                     "change every task.", fg="yellow", err=True)
     if not local and "*" not in hosts:
         typer.echo(f"Answering requests by IP address or for: {', '.join(hosts)}. Reaching it by another name "
                    "needs --allowed-host NAME.", err=True)
-    uvicorn.run("fewshot.api:app", host=host, port=port)
+    uvicorn.run(create_app(settings, _ws(root, create=True)), host=host, port=port, proxy_headers=True,
+                forwarded_allow_ips=settings.forwarded_allow_ips)
 
 
 @cache_app.command("info")

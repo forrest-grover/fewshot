@@ -1,25 +1,21 @@
 """Tests for the REST API (fewshot.api) using the fake colour embedder."""
 
-import importlib
 import io
 
 import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
 
 import fewshot.api
 import fewshot.history
-from tests.conftest import png
+from tests.conftest import api_client, png, set_settings
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
 @pytest.fixture(name="client")
-def client_fixture(tmp_path, monkeypatch):
-    """A TestClient on a freshly loaded API whose workspace lives in tmp_path."""
-    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
-    importlib.reload(fewshot.api)
-    return TestClient(fewshot.api.app)
+def client_fixture(tmp_path):
+    """A TestClient on a new server whose workspace lives in tmp_path."""
+    return api_client(tmp_path)
 
 
 def _upload(client, task, label, rgb, seeds=range(3)):
@@ -90,7 +86,7 @@ def test_create_task_default_embedder_and_bad_name(client):
     """Default embedder is used when omitted; invalid names/classifiers are 400."""
     r = client.post("/api/tasks", json={"name": "plain"})
     assert r.status_code == 201
-    assert r.json()["embedder"] == fewshot.api.ws.get("plain").config.embedder
+    assert r.json()["embedder"] == client.srv.ws.get("plain").config.embedder
     assert r.json()["classes"] == []
     assert r.json()["examples"] == []
     r = client.post("/api/tasks", json={"name": "bad/name", "embedder": "fake:color"})
@@ -104,7 +100,7 @@ def test_create_task_default_embedder_and_bad_name(client):
 
 def test_create_task_bad_embedder(client, monkeypatch):
     """An unloadable embedder spec is rejected before the task is created."""
-    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)  # these specs aren't presets
+    set_settings(monkeypatch, client, allow_any_model=True)  # these specs aren't presets
     r = client.post("/api/tasks", json={"name": "x", "embedder": "bogus:x"})
     assert r.status_code == 400
     assert r.json()["detail"].startswith("Could not load embedder 'bogus:x': Unknown embedder backend")
@@ -116,7 +112,7 @@ def test_create_task_bad_embedder(client, monkeypatch):
 
 def test_check_embedder_trims_model_list(client, monkeypatch):
     """open_clip's long 'Available:' list is cut from the error message."""
-    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)  # these specs aren't presets
+    set_settings(monkeypatch, client, allow_any_model=True)  # these specs aren't presets
     def boom(spec):
         raise RuntimeError(f"Model {spec} not found. Available: " + ", ".join(["m"] * 500))
 
@@ -128,7 +124,7 @@ def test_check_embedder_trims_model_list(client, monkeypatch):
 
 def test_update_task_settings(client, task, monkeypatch, request):
     """PATCH settings: classifier params reset, clear_reject, embedder validation."""
-    monkeypatch.setattr(fewshot.api, "ALLOW_ANY_MODEL", True)  # these specs aren't presets
+    set_settings(monkeypatch, client, allow_any_model=True)  # these specs aren't presets
     t = client.patch(f"/api/tasks/{task}", json={"classifier": "knn", "classifier_params": {"k": 3}}).json()
     assert t["classifier"] == "knn"
     assert t["classifier_params"] == {"k": 3}
@@ -454,7 +450,7 @@ def test_settings_bodies_are_strict(client, task):
 
 def test_uploads_over_the_size_limit_are_refused(client, task, monkeypatch):
     """Files over the limit are reported per file and never fully read."""
-    monkeypatch.setattr(fewshot.api, "MAX_UPLOAD_BYTES", 100)
+    set_settings(monkeypatch, client, max_upload_mb=(100) / 2**20)
     big = png(RED, size=64, noise=50)
     assert len(big) > 100
     files = [("files", ("big.png", big, "image/png")), ("files", ("small.png", png(RED, size=2), "image/png"))]
