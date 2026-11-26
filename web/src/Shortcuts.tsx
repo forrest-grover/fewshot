@@ -40,11 +40,18 @@ const KEYS: [string, [string, string][]][] = [
 export default function Shortcuts({ onClose }: { onClose: () => void }) {
   const box = useRef<HTMLDivElement>(null);
   useFocusTrap(box);
+  const opener = useRef(document.activeElement); // read on the first render, before autoFocus moves it
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
-    const on = (e: KeyboardEvent) => { if (e.key === "Escape" || e.key === "?") { e.preventDefault(); e.stopPropagation(); onClose(); } };
+    const prev = opener.current;
+    const on = (e: KeyboardEvent) => { if (e.key === "Escape" || e.key === "?") { e.preventDefault(); e.stopPropagation(); close.current(); } };
     window.addEventListener("keydown", on, true);
-    return () => { window.removeEventListener("keydown", on, true); };
-  }, [onClose]);
+    return () => {
+      window.removeEventListener("keydown", on, true);
+      if (prev instanceof HTMLElement) prev.focus(); // back to the opener
+    };
+  }, []);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div ref={box} className="modal shortcuts" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">

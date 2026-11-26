@@ -161,11 +161,13 @@ export default function Examples({ task, setTask, run }: Props) {
     },
   });
 
+  const nFolded = task.classes.filter((c) => folded.has(c.name)).length; // ``folded`` may name deleted classes
   const editedIds = editing ? ("one" in editing ? [editing.one.id] : editing.ids) : [];
   const editedTags = [...new Set(task.examples.filter((e) => editedIds.includes(e.id)).flatMap((e) => e.tags))];
 
   const viewed = viewer ? viewer.ids.map((id) => byId.get(id)).filter((e): e is Example => e !== undefined) : [];
   const shownEx = viewer ? (viewed[Math.min(viewer.index, viewed.length - 1)] as Example | undefined) : undefined;
+  if (viewer && viewed.length === 0) setViewer(null); // emptied: don't reopen when its examples come back (undo)
 
   return (
     <div className="examples">
@@ -270,11 +272,11 @@ export default function Examples({ task, setTask, run }: Props) {
           </label>
           {task.classes.length > 1 && (
             <button className="ghost small" onClick={() => {
-              const all = folded.size < task.classes.length;
+              const all = nFolded < task.classes.length;
               const next = new Set(all ? task.classes.map((c) => c.name) : []);
               saveFolded(task.name, next);
               setFolded(next);
-            }}>{folded.size < task.classes.length ? "Collapse all" : "Expand all"}</button>
+            }}>{nFolded < task.classes.length ? "Collapse all" : "Expand all"}</button>
           )}
         </div>
       )}

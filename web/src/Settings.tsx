@@ -175,7 +175,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
         <small className="muted check-help">Often a little more accurate when left and right don't matter (most photos). Embedding takes twice as long.</small>
       </label>
 
-      {task.supports_text && (
+      {supportsText && (
         <label className="check">
           <input type="checkbox" checked={names} onChange={(e) => { setNames(e.target.checked); }} />
           <span>Use class names as descriptions</span>

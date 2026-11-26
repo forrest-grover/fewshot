@@ -49,13 +49,15 @@ export function useFocusTrap(root: React.RefObject<HTMLElement | null>) {
   }, [root]);
 }
 
-/** Controls whose own keys (Enter, Space, arrows) must keep working. */
-const CONTROL = "button, a[href], summary, [role=tab], [role=button], [role=option], [role=menuitem]";
+/** Controls whose own keys (Enter, Space, arrows) must keep working. A checkbox only takes Enter and Space. */
+const CONTROL = "button, a[href], summary, input[type=radio], [role=tab], [role=button], [role=option], [role=menuitem]";
 const CONTROL_KEYS = new Set(["Enter", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
 
-/** True when a focused button, link or tab should handle ``e`` itself. */
+/** True when a focused button, link, checkbox or tab should handle ``e`` itself. */
 function forControl(e: KeyboardEvent): boolean {
-  return CONTROL_KEYS.has(e.key) && e.target instanceof Element && !!e.target.closest(CONTROL);
+  if (!(e.target instanceof Element)) return false;
+  return (CONTROL_KEYS.has(e.key) && !!e.target.closest(CONTROL))
+    || ((e.key === "Enter" || e.key === " ") && e.target.matches("input[type=checkbox]"));
 }
 
 /** Call ``onKey`` for key presses without Ctrl/Alt/Meta that aren't typed into a form field, nor
@@ -107,7 +109,7 @@ export interface Item {
 export interface Results {
   task: string;
   items: Item[];
-  busy: boolean;
+  batch: number | null; // the classification in progress, if any (it lands here even if the task is renamed meanwhile)
   current: number | null; // key of the result that keyboard shortcuts act on
 }
 
@@ -115,7 +117,7 @@ export interface Results {
  * another task is opened (not when ``rename`` moved them to the task's new name) and when the App
  * unmounts. */
 export function usePredictResults(task: string | null) {
-  const [results, setResults] = useState<Results>({ task: task ?? "", items: [], busy: false, current: null });
+  const [results, setResults] = useState<Results>({ task: task ?? "", items: [], batch: null, current: null });
   const urls = useRef(new Set<string>()); // preview object URLs still in use
   const name = task ?? "";
   const renamed = useRef<{ from: string; to: string } | null>(null);
@@ -126,7 +128,7 @@ export function usePredictResults(task: string | null) {
   const moving = renamed.current?.from === name && renamed.current.to === results.task;
   if (results.task !== name && !moving) { // another task: adjust during render, as React recommends
     revoke(urls.current);
-    setResults({ task: name, items: [], busy: false, current: null });
+    setResults({ task: name, items: [], batch: null, current: null });
   }
   useEffect(() => {
     const live = urls.current;

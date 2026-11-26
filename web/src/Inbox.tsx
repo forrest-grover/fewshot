@@ -27,30 +27,44 @@ export default function Inbox({ task, setTask, run }: Props) {
   const [shown, setShown] = useState(PAGE);
   const [busy, setBusy] = useState(false);
   const [viewing, setViewing] = useState<number | null>(null); // index into the list, full size
+  const [gone, setGone] = useState<ReadonlySet<string>>(new Set()); // accepted or dismissed, until the list reloads
   const cards = useRef(new Map<string, HTMLElement>());
 
   // Suggestions depend on the task's examples and settings: reload whenever it changes.
   const key = `${task.name}\u0000${String(task.revision)}\u0000${sort}`;
   useEffect(() => {
     let live = true;
-    void run(api.inbox(task.name, sort)).then((r) => { if (live && r) setItems({ key, list: r.items }); });
+    void run(api.inbox(task.name, sort)).then((r) => {
+      if (live && r) { setItems({ key, list: r.items }); setGone(new Set()); }
+    });
     return () => { live = false; };
   }, [key, task.name, sort, run]);
-  const list = items?.list ?? [];
+  const list = (items?.list ?? []).filter((i) => !gone.has(i.id));
   const stale = items?.key !== key;
+  const locked = busy || stale; // a change is being saved, or the list is reloading after one
+  if (viewing !== null && list.length === 0) setViewing(null); // emptied: don't reopen when the list refills
 
-  const save = async (p: Promise<TaskDetail>) => {
+  const cur = list.find((i) => i.id === current) ?? list.find((i) => !picked.has(i.id)) ?? null;
+  /** Save a change to inbox images ``ids``: they leave the list at once (and come back if it
+   * fails), and the highlight moves on to the image after the highlighted one if it was among them. */
+  const save = async (ids: string[], p: Promise<TaskDetail>) => {
+    const rest = list.filter((i) => !ids.includes(i.id));
+    if (cur && ids.includes(cur.id)) {
+      const next = rest[Math.min(list.indexOf(cur), rest.length - 1)] as InboxEntry | undefined;
+      setCurrent(next?.id ?? null);
+    }
+    setGone((g) => new Set([...g, ...ids]));
     setBusy(true);
     const t = await run(p);
     setBusy(false);
     if (t) { setTask(t); setPicked(new Set()); }
+    else setGone((g) => new Set([...g].filter((id) => !ids.includes(id))));
   };
-  const label = (labels: Record<string, string>) => save(api.acceptInbox(task.name, labels));
-  const dismiss = (ids: string[]) => save(api.dismissInbox(task.name, ids));
+  const label = (labels: Record<string, string>) => save(Object.keys(labels), api.acceptInbox(task.name, labels));
+  const dismiss = (ids: string[]) => save(ids, api.dismissInbox(task.name, ids));
   const suggested = (i: InboxEntry) => (i.prediction && !i.prediction.rejected && i.prediction.label ? i.prediction.label : null);
   const sure = list.filter((i) => suggested(i) && (i.prediction?.confidence ?? 0) >= minConf);
   const selection = list.filter((i) => picked.has(i.id));
-  const cur = list.find((i) => i.id === current) ?? list.find((i) => !picked.has(i.id)) ?? null;
 
   const upload = async (files: File[]) => {
     setBusy(true);
@@ -67,22 +81,29 @@ export default function Inbox({ task, setTask, run }: Props) {
 
   // Keys for the highlighted image: Enter accepts the suggestion, 1-9 label it, Delete dismisses, arrows move.
   useShortcuts((e) => {
-    if (!cur || busy) return;
+    if (!cur) return;
     const at = list.indexOf(cur);
     let move = 0;
+    const act = (done: () => void) => {
+      e.preventDefault();
+      if (locked) return; // the last change is still being saved: don't act on a stale list
+      done();
+      // The image leaves the list and the highlight moves to the next one (see ``save``): focus it.
+      const rest = list.filter((i) => i !== cur);
+      const next = rest[Math.min(at, rest.length - 1)] as InboxEntry | undefined;
+      if (next) requestAnimationFrame(() => { cards.current.get(next.id)?.focus(); });
+    };
     if (e.key === "Enter") {
       const s = suggested(cur);
-      if (!s) return;
-      void label({ [cur.id]: s });
-      move = 1;
+      if (s) act(() => { void label({ [cur.id]: s }); });
+      return;
     } else if (/^[1-9]$/.test(e.key)) {
       const c = task.classes[Number(e.key) - 1] as TaskDetail["classes"][number] | undefined;
-      if (!c) return;
-      void label({ [cur.id]: c.name });
-      move = 1;
+      if (c) act(() => { void label({ [cur.id]: c.name }); });
+      return;
     } else if (e.key === "Delete" || e.key === "Backspace") {
-      void dismiss([cur.id]);
-      move = 1;
+      act(() => { void dismiss([cur.id]); });
+      return;
     } else if (e.key === " ") {
       e.preventDefault();
       setViewing(at);
@@ -117,15 +138,16 @@ export default function Inbox({ task, setTask, run }: Props) {
           }))}
           index={Math.min(viewing, list.length - 1)} onIndex={setViewing} onClose={() => { setViewing(null); }}
           onKey={(e, k) => {
+            // A labelled or dismissed image leaves the list, so the viewer moves on to the next one.
             const item = list[k];
             const s = suggested(item);
-            if (e.key === "Enter" && s) { void label({ [item.id]: s }); return true; }
+            if (e.key === "Enter" && s) { if (!locked) void label({ [item.id]: s }); return true; }
             if (/^[1-9]$/.test(e.key)) {
               const c = task.classes[Number(e.key) - 1] as TaskDetail["classes"][number] | undefined;
-              if (c) void label({ [item.id]: c.name });
+              if (c && !locked) void label({ [item.id]: c.name });
               return true;
             }
-            if (e.key === "Delete" || e.key === "Backspace") { void dismiss([item.id]); return true; }
+            if (e.key === "Delete" || e.key === "Backspace") { if (!locked) void dismiss([item.id]); return true; }
             return false;
           }} />
       )}
@@ -149,7 +171,7 @@ export default function Inbox({ task, setTask, run }: Props) {
               <input type="number" min={0} max={1} step={0.05} value={minConfText} className="threshold-input"
                 onChange={(e) => { setMinConfText(e.target.value); }} />
             </label>
-            <button disabled={busy || stale || sure.length === 0}
+            <button disabled={locked || sure.length === 0}
               onClick={() => { void label(Object.fromEntries(sure.map((i) => [i.id, suggested(i) ?? ""]))); }}>
               Accept {sure.length} suggestion{sure.length === 1 ? "" : "s"}
             </button>
@@ -162,17 +184,17 @@ export default function Inbox({ task, setTask, run }: Props) {
           {selection.length > 0 && (
             <div className="bulk-bar" role="toolbar" aria-label="Selected inbox images">
               <strong>{selection.length} selected</strong>
-              <button className="small" disabled={busy || !selection.some(suggested)}
+              <button className="small" disabled={locked || !selection.some(suggested)}
                 onClick={() => { void label(Object.fromEntries(selection.filter(suggested).map((i) => [i.id, suggested(i) ?? ""]))); }}>
                 Accept suggestions
               </button>
-              <select value="" aria-label="Label selected as" onChange={(e) => {
+              <select value="" aria-label="Label selected as" disabled={locked} onChange={(e) => {
                 if (e.target.value) void label(Object.fromEntries(selection.map((i) => [i.id, e.target.value])));
               }}>
                 <option value="">Label as…</option>
                 {task.classes.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
               </select>
-              <button className="small danger" onClick={() => { void dismiss(selection.map((i) => i.id)); }}>Dismiss</button>
+              <button className="small danger" disabled={locked} onClick={() => { void dismiss(selection.map((i) => i.id)); }}>Dismiss</button>
               <button className="ghost small" onClick={() => { setPicked(new Set()); }}>Clear selection</button>
             </div>
           )}
@@ -203,13 +225,13 @@ export default function Inbox({ task, setTask, run }: Props) {
                       </span>
                     ) : <span className="muted">No classes yet</span>}
                     <div className="row">
-                      {s && <button className="small" disabled={busy} onClick={(e) => { e.stopPropagation(); void label({ [i.id]: s }); }}>✓ {s}</button>}
-                      <select className="small" value="" disabled={busy} aria-label="Label as"
+                      {s && <button className="small" disabled={locked} onClick={(e) => { e.stopPropagation(); void label({ [i.id]: s }); }}>✓ {s}</button>}
+                      <select className="small" value="" disabled={locked} aria-label="Label as"
                         onChange={(e) => { if (e.target.value) void label({ [i.id]: e.target.value }); }}>
                         <option value="">Label as…</option>
                         {task.classes.map((c, k) => <option key={c.name} value={c.name}>{k < 9 ? `${String(k + 1)} · ` : ""}{c.name}</option>)}
                       </select>
-                      <button className="ghost small danger" aria-label="Dismiss" title="Dismiss (Delete)" disabled={busy}
+                      <button className="ghost small danger" aria-label="Dismiss" title="Dismiss (Delete)" disabled={locked}
                         onClick={(e) => { e.stopPropagation(); void dismiss([i.id]); }}>×</button>
                     </div>
                   </div>

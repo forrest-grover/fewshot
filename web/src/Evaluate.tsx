@@ -1,4 +1,4 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { api, type DuplicatePair, type EvalReport, type Job, type ModelInfo, type TaskDetail } from "./api";
 import Compare, { type CompareRun } from "./Compare";
 import { downloadCsv } from "./csv";
@@ -12,7 +12,7 @@ import Threshold from "./Threshold";
 export interface EvalRun {
   task: string;
   report: EvalReport | null; rev: number | null; // the report shown, and the task revision it is of
-  job: Job<EvalReport> | null; jobRev: number | null; // a run in progress, and the revision it started from
+  job: Job<EvalReport> | null; // a run in progress
 }
 
 interface Props {
@@ -33,14 +33,26 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
   const [dupes, setDupes] = useState<{ task: string; pairs: DuplicatePair[] } | null>(null);
   const [finding, setFinding] = useState(false);
   const [viewing, setViewing] = useState<number | null>(null); // index into the listed examples, full size
+  // The task this view shows, or null once it is gone: read by responses that arrive later.
+  const shown = useRef<string | null>(task.name);
+  useEffect(() => {
+    shown.current = task.name;
+    return () => { shown.current = null; };
+  }, [task.name]);
   const update = (p: Partial<EvalRun>) => {
-    // A run that finishes after the user opened another task is dropped.
-    setState((s) => (s && s.task !== task.name ? s : { task: task.name, report: null, rev: null, job: null, jobRev: null, ...s, ...p }));
+    const name = task.name;
+    setState((s) => {
+      if (s?.task === name) return { ...s, ...p };
+      // A response that arrives after the user opened another task is dropped; while this task is
+      // shown, it replaces whatever another task left.
+      if (shown.current !== name) return s;
+      return { task: name, report: null, rev: null, job: null, ...p };
+    });
   };
 
   const go = async () => {
     const j = await run(api.startEvaluation(task.name));
-    if (j) update({ job: j, jobRev: task.revision });
+    if (j) update({ job: j });
   };
   // Poll the running job until it ends. Leaving the tab stops polling; coming back resumes it.
   const jobId = job?.id;
@@ -50,7 +62,8 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
       if (j.status === "running") return { ...s, job: j };
       // Only a finished run replaces the report (and its revision): a cancelled or failed one
       // leaves the old report, still marked as out of date if the task changed.
-      return j.status === "done" ? { ...s, job: null, report: j.result, rev: s.jobRev } : { ...s, job: null };
+      // The report says which revision it evaluated (the task may have changed while it ran).
+      return j.status === "done" ? { ...s, job: null, report: j.result, rev: j.result?.revision ?? null } : { ...s, job: null };
     });
     if (j.status === "failed") void run(Promise.reject(new Error(`Evaluation failed: ${j.error ?? "unknown error"}`)));
   }, (e) => {

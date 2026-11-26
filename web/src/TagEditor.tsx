@@ -26,12 +26,21 @@ export default function TagEditor({ title, allTags, tags, note, onSave, onClose 
   useFocusTrap(form);
   const id = useId();
 
+  const close = useRef(onClose);
+  close.current = onClose;
+
+  // Once, on opening (the parent passes a new ``onClose`` on each render, which mustn't pull the
+  // focus back here): focus the tag input; on closing, give the focus back to the opener.
   useEffect(() => {
+    const prev = document.activeElement;
     input.current?.focus();
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); close.current(); } };
     window.addEventListener("keydown", esc, true);
-    return () => { window.removeEventListener("keydown", esc, true); };
-  }, [onClose]);
+    return () => {
+      window.removeEventListener("keydown", esc, true);
+      if (prev instanceof HTMLElement) prev.focus();
+    };
+  }, []);
 
   const add = (raw: string) => {
     const words = raw.split(",").map((w) => w.trim()).filter(Boolean);

@@ -14,7 +14,8 @@ interface Props {
 /** Histogram of held-out similarities, correct and wrong predictions stacked, with the current and
  * suggested reject thresholds marked. Clicking a bar picks its lower edge as a threshold to apply. */
 export default function Threshold({ predictions, current, suggested, onSet }: Props) {
-  const [picked, setPicked] = useState<number | null>(null);
+  // The threshold typed or picked from a bar, as typed (so the field can be cleared); null: the suggestion.
+  const [text, setText] = useState<string | null>(null);
   const [hover, setHover] = useState<number | null>(null);
   if (predictions.length === 0) return null;
 
@@ -34,6 +35,7 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
   const y = (n: number) => PAD.t + plotH - (n / top) * plotH;
   const bw = plotW / BINS;
 
+  const picked = text === null ? null : text.trim() === "" ? NaN : Number(text); // NaN: empty or not a number
   const value = picked ?? suggested;
   const below = (ok: boolean) => predictions.filter((p) => p.correct === ok && value !== null && p.similarity < value).length;
   const nCorrect = predictions.filter((p) => p.correct).length;
@@ -68,9 +70,9 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
                 onKeyDown={(e) => {
                   if (e.key !== "Enter" && e.key !== " ") return;
                   e.preventDefault();
-                  setPicked(Number(b.from.toFixed(3)));
+                  setText(String(Number(b.from.toFixed(3))));
                 }}
-                onClick={() => { setPicked(Number(b.from.toFixed(3))); }}>
+                onClick={() => { setText(String(Number(b.from.toFixed(3)))); }}>
                 <rect className="hit" x={PAD.l + i * bw} y={PAD.t} width={bw} height={plotH} />
                 {b.correct > 0 && <rect className="correct" x={bx} y={y(b.correct)} width={w} height={Math.max(1, hc)} rx={2} />}
                 {b.wrong > 0 && <rect className="wrong" x={bx} y={y(b.correct + b.wrong)} width={w} height={Math.max(1, hw - (b.correct ? 2 : 0))} rx={2} />}
@@ -79,7 +81,7 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
           })}
           {current !== null && <line className="mark" x1={x(current)} x2={x(current)} y1={PAD.t} y2={PAD.t + plotH} />}
           {suggested !== null && <line className="mark dashed" x1={x(suggested)} x2={x(suggested)} y1={PAD.t} y2={PAD.t + plotH} />}
-          {picked !== null && <line className="mark picked" x1={x(picked)} x2={x(picked)} y1={PAD.t} y2={PAD.t + plotH} />}
+          {picked !== null && Number.isFinite(picked) && <line className="mark picked" x1={x(picked)} x2={x(picked)} y1={PAD.t} y2={PAD.t + plotH} />}
         </svg>
         {hover !== null && (
           <div className="tooltip" style={{ left: `${String((x(bins[hover].from + step / 2) / W) * 100)}%` }}>
@@ -93,8 +95,8 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
         <label className="inline">
           <span>Threshold</span>
           <input type="number" min={-1} max={1} step={0.001} className="threshold-input"
-            value={value === null ? "" : String(value)} placeholder="pick a bar"
-            onChange={(e) => { setPicked(e.target.value === "" ? null : Number(e.target.value)); }} />
+            value={text ?? (suggested === null ? "" : String(suggested))} placeholder="pick a bar"
+            onChange={(e) => { setText(e.target.value); }} />
         </label>
         {value !== null && Number.isFinite(value) && (
           <span>

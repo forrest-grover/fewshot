@@ -21,10 +21,22 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
   const [urlText, setUrlText] = useState("");
   const { setResults, urls } = state;
   // Results for another task (e.g. a classify that finished after switching) are never shown.
-  const results = state.results.task === task.name ? state.results : { items: [], busy: false, current: null };
-  const { items, busy } = results;
+  const results = state.results.task === task.name ? state.results : { items: [], batch: null, current: null };
+  const { items } = results;
+  const busy = results.batch !== null;
   const update = (f: (r: Results) => Results) => {
     setResults((r) => (r.task === task.name ? f(r) : r));
+  };
+  /** Start a classification; its results go to ``finish`` with the token returned. */
+  const begin = () => {
+    const batch = nextKey++;
+    update((r) => ({ ...r, batch }));
+    return batch;
+  };
+  /** Change the results a classification started on, unless another task was opened since (which
+   * drops them). They may have moved to the task's new name: a rename keeps ``batch``. */
+  const finish = (batch: number, f: (r: Results) => Results) => {
+    setResults((r) => (r.batch === batch ? f(r) : r));
   };
   const cardRefs = useRef(new Map<number, HTMLElement>());
   // "Added" only while that example is still in the task, so an undone add can be made again.
@@ -32,14 +44,14 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
   const actionable = (it: Item) => !it.pred.error && !addedAs(it);
   const current = items.find((it) => it.key === results.current && actionable(it)) ?? items.find(actionable);
 
-  const show = (added: Item[]) => {
-    update((r) => ({ ...r, items: [...added, ...r.items], current: null }));
+  const show = (batch: number, added: Item[]) => {
+    finish(batch, (r) => ({ ...r, items: [...added, ...r.items], current: null }));
     // Focus the new top result, so Enter and the number keys act on it rather than on the drop zone.
     const top = added[0].key;
     requestAnimationFrame(() => { cardRefs.current.get(top)?.focus(); });
   };
   const classify = async (originals: File[]) => {
-    update((r) => ({ ...r, busy: true }));
+    const batch = begin();
     try {
       const files = await shrinkImages(originals);
       const preds = await run(api.predict(task.name, files));
@@ -48,24 +60,24 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
           key: nextKey++, name: originals[i].name, file: f, url: URL.createObjectURL(f), pred: preds[i],
         }));
         added.forEach((it) => urls.current.add(it.url));
-        show(added);
+        show(batch, added);
       }
     } finally {
-      update((r) => ({ ...r, busy: false }));
+      finish(batch, (r) => ({ ...r, batch: null }));
     }
   };
   const classifyUrls = async () => {
     const list = urlsIn(urlText);
     if (!list.length) return;
-    update((r) => ({ ...r, busy: true }));
+    const batch = begin();
     try {
       const preds = await run(api.predictUrls(task.name, list));
       if (preds) {
         setUrlText("");
-        show(list.map((u, i) => ({ key: nextKey++, name: u, url: u, pred: preds[i] })));
+        show(batch, list.map((u, i) => ({ key: nextKey++, name: u, url: u, pred: preds[i] })));
       }
     } finally {
-      update((r) => ({ ...r, busy: false }));
+      finish(batch, (r) => ({ ...r, batch: null }));
     }
   };
   const exportCsv = () => {
@@ -78,8 +90,9 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     ]);
   };
 
+  // By key, which is unique across tasks: this reaches the item even if the task was renamed meanwhile.
   const patch = (key: number, p: Partial<Item>) => {
-    update((r) => ({ ...r, items: r.items.map((it) => (it.key === key ? { ...it, ...p } : it)) }));
+    setResults((r) => ({ ...r, items: r.items.map((it) => (it.key === key ? { ...it, ...p } : it)) }));
   };
   const addAs = async (it: Item, label: string) => {
     if (it.adding || addedAs(it)) return;
