@@ -114,6 +114,24 @@ def test_watch_once_sorts_and_logs(run, task, tmp_path):
     assert all(x["task"] == task and "revision" in x for x in log)
 
 
+@pytest.mark.parametrize(("label", "folder"), [
+    ("_unknown", "_class__unknown"), ("_error", "_class__error"), ("predictions.jsonl", "_class_predictions.jsonl"),
+    ("_class_x", "_class__class_x"), ("_other", "_other"),
+])
+def test_watch_keeps_classes_apart_from_its_own_folders(run, root, tmp_path, label, folder):
+    """A class named like watch's own outputs (_unknown, _error, predictions.jsonl) gets a folder
+    of its own, and the log stays a file."""
+    Workspace(root).create("c", embedder="fake:color").add_examples(
+        [(png(RED, noise=15, seed=i), label, "") for i in range(2)] + [(png(BLUE, noise=15), "blue", "")])
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "r.png").write_bytes(png(RED, seed=9))
+    r = run("watch", "c", inbox, "--out", out, "--once")
+    assert r.exit_code == 0, r.output
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*.png")] == [f"{folder}/r.png"]
+    assert (out / "predictions.jsonl").is_file()
+
+
 def test_watch_copy_min_confidence_and_free_names(run, task, tmp_path):
     """--copy leaves the originals; below --min-confidence goes to _unknown; names are never overwritten."""
     inbox, out = tmp_path / "in", tmp_path / "out"

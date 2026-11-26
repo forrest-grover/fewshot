@@ -623,7 +623,8 @@ def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.B
         raise _bad(e) from e
     if not r.added:
         raise HTTPException(400, "No images added: " + "; ".join(f"{f}: {why}" for f, why in r.errors))
-    return {"added": [e.model_dump() for e in r.added], "errors": _errors(r), "task": _detail(t)}
+    return {"added": [e.model_dump() for e in r.added], "errors": _errors(r), "task": _detail(t),
+            "moved": [{"id": e.id, "previous_label": was} for e, was in r.moved]}
 
 
 @router.post("/api/tasks/{name}/examples", status_code=201, response_model=AddResult)

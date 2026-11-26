@@ -6,7 +6,6 @@ import itertools
 import json
 import os
 import shutil
-import socket
 import sys
 import time
 from collections.abc import Iterable, Iterator
@@ -16,7 +15,18 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from . import services
-from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source
+from .cli_common import (
+    CLASSIFIER_LIST,
+    FAILED,
+    JSON_OPT,
+    MAX_DOWNLOAD,
+    ROOT_OPT,
+    ClassifierName,
+    Source,
+    classifier_names,
+    command_group,
+    report_skipped,
+)
 from .cli_common import add_files as _add_files
 from .cli_common import echo_json as _echo_json
 from .cli_common import error_text as _error_text
@@ -26,27 +36,27 @@ from .cli_common import get_task as _task
 from .cli_common import images_in as _images_in
 from .cli_common import make_pipeline as _pipe
 from .cli_common import progress as _progress
-from .cli_common import read_source as _read
 from .cli_common import usage as _usage
 from .cli_common import workspace as _ws
 from .cli_common import write_csv as _write_csv
 from .cli_data import ex_app, inbox_app
+from .cli_serve import serve
 from .embedders import DEFAULT_SPEC, PRESETS, spec_supports_text
 from .fetch import is_url
-from .folders import class_folders
 from .store import Workspace
 from .text import check_class_name
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline, Prediction
 
-app = typer.Typer(help="Embedding-based few-shot image classification.", no_args_is_help=True)
-cls_app = typer.Typer(help="Manage a task's classes.", no_args_is_help=True)
+app = command_group("Embedding-based few-shot image classification.")
+cls_app = command_group("Manage a task's classes.")
 app.add_typer(cls_app, name="class")
-cache_app = typer.Typer(help="Inspect and prune the embedding cache.", no_args_is_help=True)
+cache_app = command_group("Inspect and prune the embedding cache.")
 app.add_typer(cache_app, name="cache")
 app.add_typer(ex_app, name="example")
 app.add_typer(inbox_app, name="inbox")
+app.command()(serve)
 
 def main() -> None:
     """Entry point of the ``fewshot`` command: the CLI, with file system errors (an unreadable
@@ -73,7 +83,7 @@ def models(as_json: bool = JSON_OPT) -> None:
 def create(
     name: str,
     embedder: str | None = typer.Option(None, help="Embedder spec; see `fewshot models`"),
-    classifier: str = typer.Option("gda", help="gda | prototype | knn | logreg"),
+    classifier: ClassifierName = "gda",
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Create a task."""
@@ -138,7 +148,7 @@ def _parse_params(param: list[str]) -> dict[str, Any]:
 def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     embedder: str | None = None,
-    classifier: str | None = None,
+    classifier: ClassifierName | None = None,
     param: list[str] = typer.Option([], help="Classifier param KEY=VALUE (e.g. k=3, scale=20). Repeatable."),
     text_weight: float | None = None,
     reject_below: float | None = typer.Option(None, help="Similarity threshold (-1 to 1) for 'unknown'"),
@@ -157,22 +167,24 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     """Change task settings; --param sets classifier params on top of the current ones, and switching
     classifier starts its params afresh (then --param sets some)."""
     t = _task(root, name)
-    if clear_reject and reject_below is not None:
-        _usage("Give either --reject-below or --clear-reject, not both")
-    if clear_reject_zero_shot and reject_below_zero_shot is not None:
-        _usage("Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both")
     values = {"embedder": embedder, "classifier": classifier or None, "text_weight": text_weight,
               "reject_below": reject_below, "reject_below_zero_shot": reject_below_zero_shot, "flip": flip,
               "names_as_text": names, "temperature": temperature}
-    flags = {"reject_below": ("--clear-reject", clear_reject),
-             "reject_below_zero_shot": ("--clear-reject-zero-shot", clear_reject_zero_shot)}
-    clear = {k: flag for k, (flag, on) in flags.items() if on}
+    clears = {"reject_below": clear_reject, "reject_below_zero_shot": clear_reject_zero_shot}
+    change = services.SettingsChange({k: v for k, v in values.items() if v is not None},
+                                     frozenset(k for k, on in clears.items() if on), _parse_params(param))
     try:
-        _say_cleared(name, services.change_settings(t, {k: v for k, v in values.items() if v is not None}, clear,
-                                                     _parse_params(param)))
+        _say_cleared(name, services.apply_settings(t, change))
+    except services.SettingConflict as e:
+        set_flag, clear_flag = _CONFIG_FLAGS[e.setting]
+        _usage(f"Give either {set_flag} or {clear_flag}, not both")
     except ValueError as e:
         _fail(str(e))
     show(name, False, root)
+
+
+_CONFIG_FLAGS = {"reject_below": ("--reject-below", "--clear-reject"),  # setting: (its option, clearing it)
+                 "reject_below_zero_shot": ("--reject-below-zero-shot", "--clear-reject-zero-shot")}
 
 
 def _say_cleared(name: str, cleared: list[str]) -> None:
@@ -188,7 +200,10 @@ def delete(name: str, yes: bool = typer.Option(False, "--yes", "-y"), root: Path
     _task(root, name)
     if not yes:
         typer.confirm(f"Delete task {name} and all its images?", abort=True)
-    _ws(root).delete(name)
+    try:
+        _ws(root).delete(name)
+    except KeyError as e:  # deleted by someone else meanwhile
+        _fail(_error_text(e))
     typer.echo(f"Deleted task {name}")
 
 
@@ -293,8 +308,8 @@ def class_add(
     """Add a class, or set an existing class's description."""
     try:
         _task(root, name).upsert_class(label, description)
-    except ValueError as e:
-        _fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        _fail(_error_text(e))
 
 
 @cls_app.command("describe")
@@ -308,8 +323,8 @@ def class_describe(
     """Fill class descriptions from a template, e.g. 'a photo of a {}, a type of pet'."""
     try:
         n = _task(root, name).describe_classes(template, overwrite)
-    except ValueError as e:
-        _fail(str(e))
+    except (KeyError, ValueError) as e:
+        _fail(_error_text(e))
     typer.echo(f"Set {n} descriptions")
 
 
@@ -329,6 +344,18 @@ def class_threshold(
         _task(root, name).set_class_thresholds({label: value})
     except KeyError as e:
         _fail(_error_text(e))
+
+
+@cls_app.command("rename")
+def class_rename(name: str, label: str, new_label: str, root: Path | None = ROOT_OPT) -> None:
+    """Rename a class, relabelling its examples (one undo step)."""
+    t = _task(root, name)
+    n = sum(e.label == label for e in t.config.examples)
+    try:
+        t.rename_class(label, new_label)
+    except (KeyError, ValueError) as e:
+        _fail(_error_text(e))
+    typer.echo(f"Renamed class {label} to {new_label.strip()} ({n} examples)")
 
 
 @cls_app.command("rm")
@@ -363,13 +390,12 @@ def import_dir(
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Import FOLDER/<class>/<image> into a task (hidden and system folders such as __MACOSX are
-    skipped); exits 1 if no image could be imported."""
+    skipped), as one undo step; exits 1 if no image could be imported."""
     t = _task(root, name)
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
-    n = 0
-    for label, files in class_folders(folder, shots).items():
-        n += _add_files(t, label, files)
+    with _progress("Importing") as update:
+        n = report_skipped(services.import_folder(t, folder, shots, update))
     typer.echo(f"Imported {n} images into {name}")
     if n == 0:
         _fail(f"No images were imported; expected {folder}/<class>/<image>")
@@ -378,7 +404,9 @@ def import_dir(
 PREDICT_CHUNK = 256  # images classified (and printed) at a time
 
 
-@app.command()
+@app.command(help=f"""Classify images (files, directories or http(s) URLs), {PREDICT_CHUNK} at a time: text, CSV
+    and JSON lines are printed as each batch finishes, and --from-file is read as it arrives, so a
+    long list can be piped through. A path in it that can't be read gets an error row.""")
 def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     paths: list[str] = typer.Argument(None, help="Image files, directories or http(s) URLs"),
@@ -392,9 +420,7 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     revision: int | None = typer.Option(None, help="Use this earlier version of the task (one kept for undo)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Classify images (files, directories or http(s) URLs), PREDICT_CHUNK at a time: text, CSV and
-    JSON lines are printed as each batch finishes, and --from-file is read as it arrives, so a long
-    list can be piped through. A path in it that can't be read gets an error row."""
+    """Classify images; the help text is in the decorator, to name PREDICT_CHUNK's value."""
     t = _task(root, name)
     if sum((as_json, as_jsonl, as_csv)) > 1:
         _usage("Give at most one of --json, --jsonl and --csv")
@@ -502,24 +528,30 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         typer.echo(f"To switch: fewshot config {name} --embedder {r['best']}")
 
 
-@app.command()
+WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
+WATCH_MAX_BACKOFF = 300.0  # longest wait before trying again to move a file that couldn't be moved
+
+
+@app.command(help=f"""Classify images as they arrive in FOLDER and sort them into OUT, logging each to
+    OUT/predictions.jsonl.
+
+    A file is handled once its size has stayed the same for one interval (so half-copied files
+    wait); one that can't be read yet is retried until it is {WATCH_SETTLE:g} seconds old, then goes to
+    _error. The task is re-read every time, so labelling more examples improves the sorting as it
+    runs.""")
 def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     folder: Path = typer.Argument(..., help="Folder new images arrive in"),
     out: Path = typer.Option(..., help="Where images go: OUT/<class>/, OUT/_unknown/ (rejected or not confident "
-                                       "enough) or OUT/_error/"),
+                                       "enough) or OUT/_error/ (a class named _unknown, _error or "
+                                       "predictions.jsonl goes to OUT/_class_<name>/)"),
     copy: bool = typer.Option(False, "--copy", help="Copy instead of moving (then each file is handled once per run)"),
     min_confidence: float | None = typer.Option(None, min=0, max=1, help="Below this, an image goes to _unknown"),
     interval: float = typer.Option(2.0, min=0.1, help="Seconds between looks at the folder"),
     once: bool = typer.Option(False, "--once", help="Handle what is there now and stop"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Classify images as they arrive in FOLDER and sort them into OUT, logging each to OUT/predictions.jsonl.
-
-    A file is handled once its size has stayed the same for one interval (so half-copied files wait);
-    one that can't be read yet is retried until it is WATCH_SETTLE seconds old, then goes to _error.
-    The task is re-read every time, so labelling more examples improves the sorting as it runs.
-    """
+    """Sort arriving images; the help text is in the decorator, to name WATCH_SETTLE's value."""
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
     ws = _ws(root)
@@ -547,10 +579,6 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
             time.sleep(interval)
     except KeyboardInterrupt:
         typer.echo("Stopped")
-
-
-WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
-WATCH_MAX_BACKOFF = 300.0  # longest wait before trying again to move a file that couldn't be moved
 
 
 class Backoff:
@@ -623,10 +651,20 @@ def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out
     return handled
 
 
+WATCH_RESERVED = {"_unknown", "_error", "predictions.jsonl"}  # watch's own names in OUT
+CLASS_PREFIX = "_class_"  # put before a class name that would be one of them
+
+
 def _folder_for(p: Prediction, min_confidence: float | None) -> str:
-    """The folder under OUT a prediction sends its image to."""
+    """The folder under OUT a prediction sends its image to: its class's, except that a class
+    named like one of watch's own (or like such a folder, starting with CLASS_PREFIX) goes to
+    CLASS_PREFIX + its name, so no class shares a folder with another or with watch's own."""
     unsure = p.rejected or (min_confidence is not None and p.confidence < min_confidence)
-    return "_error" if p.error else "_unknown" if unsure or not p.label else p.label
+    if p.error:
+        return "_error"
+    if unsure or not p.label:
+        return "_unknown"
+    return CLASS_PREFIX + p.label if p.label in WATCH_RESERVED or p.label.startswith(CLASS_PREFIX) else p.label
 
 
 def _place(f: Path, folder: Path, copy: bool) -> Path:
@@ -665,16 +703,11 @@ def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, 
 
 
 def _loaded(files: list[Source]) -> list[services.Blob]:
-    """Files as they are (the pipeline reads them a few at a time) and URLs downloaded; a URL that
-    can't be fetched carries its error."""
-    return [services.Blob(str(f), f) if isinstance(f, Path) else _fetched(f) for f in files]
-
-
-def _fetched(url: str) -> services.Blob:
-    try:
-        return services.Blob(url, _read(url))
-    except ValueError as e:
-        return services.Blob(url, None, str(e))
+    """Files as they are (the pipeline reads them a few at a time) and URLs downloaded, several at
+    a time; a URL that can't be fetched carries its error."""
+    urls = [f for f in files if isinstance(f, str)]
+    fetched = iter(services.fetch_urls(urls, MAX_DOWNLOAD) if urls else [])
+    return [services.Blob(str(f), f) if isinstance(f, Path) else next(fetched) for f in files]
 
 
 def _print_predictions(files: list[Source], preds: list[Prediction], top: int) -> None:
@@ -806,8 +839,9 @@ def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | Non
 @app.command()
 def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     folder: Path,
-    embedder: list[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
-    classifier: list[str] = typer.Option(["gda"], help="Classifier(s) to compare"),
+    embedder: list[str] = typer.Option(None, help=f"Embedder spec(s) to compare [default: {DEFAULT_SPEC}]"),
+    classifier: list[str] = typer.Option(["gda"], callback=classifier_names,
+                                         help=f"Classifier(s) to compare: {CLASSIFIER_LIST}"),
     way: int = typer.Option(5, min=0, help="Classes per episode; 0 for every class with enough images"),
     shot: list[int] = typer.Option([1, 5], min=0, help="Shot count(s)"),
     query: int = typer.Option(15, min=1),
@@ -828,73 +862,15 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
         typer.echo(_bench_one(pipe, folder, run, opts))
 
 
-@app.command()
-def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    token: str | None = typer.Option(None, envvar="FEWSHOT_TOKEN", show_envvar=True,
-                                     help="Require this token for the API and UI (prefer setting FEWSHOT_TOKEN: "
-                                          "an option is visible to other users in the process list)"),
-    allow_any_model: bool = typer.Option(False, "--allow-any-model", envvar="FEWSHOT_ALLOW_ANY_MODEL",
-                                         show_envvar=True,
-                                         help="Let API callers load any embedder spec, not just presets"),
-    warm: bool = typer.Option(True, "--warm/--no-warm", envvar="FEWSHOT_WARM", show_envvar=True,
-                              help="Load the models tasks use at startup"),
-    allow_urls: bool = typer.Option(False, "--allow-urls", envvar="FEWSHOT_ALLOW_URLS", show_envvar=True,
-                                    help="Let API callers send image URLs for the server to download "
-                                         "(public addresses only)"),
-    max_upload_mb: float = typer.Option(50, min=0.001, envvar="FEWSHOT_MAX_UPLOAD_MB", show_envvar=True,
-                                        help="Largest image accepted per upload"),
-    max_request_mb: float = typer.Option(1024, min=0.001, envvar="FEWSHOT_MAX_REQUEST_MB", show_envvar=True,
-                                         help="Largest upload request accepted (other request bodies: 1 MB)"),
-    allowed_host: list[str] = typer.Option(
-        [], "--allowed-host", help="Host name clients use to reach the server; others are refused (IP addresses "
-                                   "always work). Repeatable; '*' allows any. [default: $FEWSHOT_ALLOWED_HOSTS "
-                                   "(comma-separated), else localhost, plus this machine's names when not serving "
-                                   "locally]"),
-    forwarded_allow_ips: str = typer.Option(
-        "127.0.0.1", envvar="FEWSHOT_FORWARDED_ALLOW_IPS", show_envvar=True,
-        help="Comma-separated addresses of reverse proxies whose X-Forwarded-For/-Proto headers are trusted "
-             "('*': any), so limits on wrong tokens apply per client, not to the proxy"),
-    workers: int = typer.Option(4, min=1, max=256, envvar="FEWSHOT_WORKERS", show_envvar=True,
-                                help="Threads for heavy work (predicting, evaluating, uploads)"),
-    root: Path | None = ROOT_OPT,
-) -> None:
-    """Run the REST API and web UI."""
-    # uvicorn and the API are only needed here; importing them lazily keeps other commands fast.
-    import uvicorn  # pylint: disable=import-outside-toplevel
-
-    from .api import create_app  # pylint: disable=import-outside-toplevel
-    from .server_settings import LOCAL_HOSTS, ServerSettings  # pylint: disable=import-outside-toplevel
-
-    local = host in LOCAL_HOSTS
-    from_env = [h.strip() for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
-    hosts = allowed_host or from_env or list(LOCAL_HOSTS)
-    if not (allowed_host or from_env or local):
-        hosts += sorted({socket.gethostname().lower(), socket.getfqdn().lower()} - {""})
-    try:
-        settings = ServerSettings(home=root, token=token, allow_any_model=allow_any_model, warm=warm,
-                                  allow_urls=allow_urls, allowed_hosts=frozenset(hosts), max_upload_mb=max_upload_mb,
-                                  max_request_mb=max_request_mb, forwarded_allow_ips=forwarded_allow_ips,
-                                  workers=workers)
-    except ValueError as e:  # a token too weak; the other options are checked by their types
-        _fail(f"{e} (--token / FEWSHOT_TOKEN)")
-    if not token and not local:
-        typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
-                    "change every task.", fg="yellow", err=True)
-    if not local and "*" not in hosts:
-        typer.echo(f"Answering requests by IP address or for: {', '.join(hosts)}. Reaching it by another name "
-                   "needs --allowed-host NAME.", err=True)
-    uvicorn.run(create_app(settings, _ws(root, create=True)), host=host, port=port, proxy_headers=True,
-                forwarded_allow_ips=settings.forwarded_allow_ips)
-
-
 @cache_app.command("info")
 def cache_info(root: Path | None = ROOT_OPT) -> None:
     """Show the cache file's size and how many vectors each model has cached."""
     from .cache import EmbeddingCache  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
     ws = _ws(root)
+    if not ws.cache_path.is_file():  # opening it would make it (and the workspace)
+        typer.echo(f"No cache at {ws.cache_path}")
+        return
     cache = EmbeddingCache(ws.cache_path)
     typer.echo(f"{ws.cache_path}: {_mb(ws.cache_path.stat().st_size)}")
     for ns, n, size in cache.stats():
@@ -917,6 +893,9 @@ def cache_prune(
     from .cache import prune_unused  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
     ws = _ws(root)
+    if not ws.cache_path.is_file() and (dry_run or not ws.root.is_dir()):  # a look shouldn't make one
+        typer.echo(f"No cache at {ws.cache_path}: nothing to prune")
+        return
     try:
         n, blobs = prune_unused(ws, dry_run=dry_run, vacuum=vacuum)
     except ValueError as e:

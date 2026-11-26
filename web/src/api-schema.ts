@@ -744,13 +744,16 @@ export interface components {
         };
         /**
          * AddResult
-         * @description POST .../examples.
+         * @description POST .../examples. ``added`` is every example the request stored, including those that were
+         *     in another class before and are listed again in ``moved``.
          */
         AddResult: {
             /** Added */
             added: components["schemas"]["ExampleOut"][];
             /** Errors */
             errors: components["schemas"]["FileError"][];
+            /** Moved */
+            moved: components["schemas"]["MovedExample"][];
             task: components["schemas"]["TaskDetail"];
         };
         /** Body_add_examples */
@@ -1295,6 +1298,16 @@ export interface components {
             classifiers: string[];
             /** Embedders */
             embedders: components["schemas"]["EmbedderOut"][];
+        };
+        /**
+         * MovedExample
+         * @description An image added as an example that was already an example of another class: adding it moved it.
+         */
+        MovedExample: {
+            /** Id */
+            id: string;
+            /** Previous Label */
+            previous_label: string;
         };
         /**
          * PredictionOut

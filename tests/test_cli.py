@@ -1,19 +1,25 @@
 """Tests for the ``fewshot`` command-line interface."""
 
+import contextlib
 import csv
 import io
 import json
 import os
+import shutil
 import socket
 from pathlib import Path
+from typing import get_args
 
 import numpy as np
 import pytest
 from typer.testing import CliRunner
 
 from fewshot import cache as cache_module
-from fewshot import cli, embedders
+from fewshot import cli, cli_common, embedders
+from fewshot.classifiers import CLASSIFIERS
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
+from fewshot.images import image_id
+from fewshot.server_settings import ServerSettings, served_host
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, served, two_each, write_images
 
@@ -42,6 +48,36 @@ def task_fixture(run, photos):
 def load(root, name="colors"):
     """Read a task fresh from disk."""
     return Workspace(root).get(name)
+
+
+@pytest.mark.parametrize(("command", "shown"), [
+    (["import-task"], "[default: the exported name]"),
+    (["eval"], "[default: leave-one-out up to 100"),
+    (["compare"], "[default: as for eval]"),
+    (["class", "add"], "[default: keep an existing class's]"),
+    (["bench"], f"[default: {embedders.DEFAULT_SPEC}]"),
+    (["serve"], "[default: $FEWSHOT_ALLOWED_HOSTS"),
+    (["list"], "[default: ./fewshot_data]"),
+    (["predict"], f"{cli.PREDICT_CHUNK} at a time"),
+    (["watch"], f"until it is {cli.WATCH_SETTLE:g} seconds old"),
+])
+def test_help_shows_text_in_brackets_and_values(command, shown):
+    """Help prints hand-written [default: ...] text (Rich markup would drop it) and the values of
+    constants it mentions, not their names."""
+    r = CliRunner().invoke(cli.app, [*command, "--help"], env={"COLUMNS": "1000"})
+    assert r.exit_code == 0
+    assert shown in " ".join(r.output.split())
+
+
+def test_choices_are_usage_errors(run):
+    """An unknown classifier or inbox order is a usage error (2) naming the choices, which are the
+    library's own."""
+    assert sorted(CLASSIFIERS) == list(get_args(cli_common.ClassifierName))
+    for args in (["create", "x", "--classifier", "bogus"], ["inbox", "ls", "x", "--sort", "bogus"],
+                 ["bench", ".", "--classifier", "gda", "--classifier", "bogus"]):
+        r = run(*args)
+        assert r.exit_code == 2
+        assert "'bogus' is not one of" in r.output
 
 
 def test_models_lists_presets():
@@ -85,13 +121,14 @@ def test_create_list_show(run, root):
 @pytest.mark.parametrize(("args", "message"), [
     (["pets"], "already exists"),
     (["bad name!"], "Task names use"),
-    (["other", "--classifier", "nope"], "Unknown classifier"),
+    (["other", "--classifier", "nope"], "'nope' is not one of"),
 ])
 def test_create_errors(run, args, message):
-    """`create` rejects duplicates, bad names and unknown classifiers with exit code 1."""
+    """`create` rejects duplicates and bad names with exit code 1, unknown classifiers as a usage
+    error (2)."""
     run("create", "pets", "--embedder", "fake:color")
     r = run("create", *args)
-    assert r.exit_code == 1
+    assert r.exit_code == (2 if "--classifier" in args else 1)
     assert message in r.output
 
 
@@ -153,11 +190,17 @@ def test_config_and_create_validate_embedders(run, root, task):
     assert not (root / "tasks" / "new").exists()
     r = run("config", task, "--reject-below", "0.5", "--clear-reject")
     assert r.exit_code == 2  # a usage error
-    assert "not both" in r.output
+    assert "Give either --reject-below or --clear-reject, not both" in r.output
+    r = run("config", task, "--reject-below-zero-shot", "0.2", "--clear-reject-zero-shot")
+    assert r.exit_code == 2
+    assert "Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both" in r.output
+    r = run("config", task, "--text-weight", "-5")
+    assert r.exit_code == 1
+    assert "Error: text_weight must be between 0 and 100, got -5" in r.output
 
 
 @pytest.mark.parametrize(("args", "message"), [
-    (["--classifier", "nope"], "Unknown classifier"),
+    (["--classifier", "nope"], "'nope' is not one of 'gda', 'knn', 'logreg', 'prototype'"),
     (["--param", "k"], "Bad --param 'k'"),
     (["--param", "=3"], "Bad --param '=3'"),
     (["--param", "k=three"], "Bad --param 'k=three'"),
@@ -168,9 +211,34 @@ def test_config_and_create_validate_embedders(run, root, task):
 def test_config_errors(run, root, task, args, message):
     """Invalid settings and malformed --param values fail without changing the task."""
     r = run("config", task, *args)
-    assert r.exit_code == (2 if message.startswith("Bad --param") else 1)  # 2: a usage error
+    assert r.exit_code == (2 if message.startswith(("Bad --param", "'nope'")) else 1)  # 2: a usage error
     assert message in r.output
     assert load(root).config.classifier == "gda"
+
+
+def test_a_task_deleted_meanwhile_is_an_error_not_a_traceback(run, root, task, photos, monkeypatch):
+    """A task another process deletes between looking it up and changing it gives an error."""
+    real_get = Workspace.get
+
+    def get_then_lose(ws, name):
+        t = real_get(ws, name)
+        shutil.rmtree(t.path)
+        return t
+
+    eid = load(root).config.examples[0].id
+    waiting = png((90, 90, 90))
+    monkeypatch.setattr(Workspace, "get", get_then_lose)
+    for args in (["delete", task, "--yes"], ["example", "rm", task, eid], ["example", "relabel", task, "x", eid],
+                 ["example", "tag", task, eid, "--add", "x"], ["example", "note", task, eid, "n"],
+                 ["inbox", "dismiss", task, image_id(waiting)], ["class", "add", task, "x"],
+                 ["class", "describe", task]):
+        if not (root / "tasks" / task).exists():  # back again, to be lost once more
+            t = Workspace(root).create(task, embedder="fake:color")
+            t.add_examples_from_dir(photos)
+            t.add_to_inbox([(waiting, "w.png")])
+        r = run(*args)
+        assert r.exit_code == 1, (args, r.output)
+        assert "Error:" in r.output, args
 
 
 def test_delete(run, root, task):
@@ -188,6 +256,21 @@ def test_delete(run, root, task):
     run("create", "again", "--embedder", "fake:color")
     assert run("delete", "again", "-y").exit_code == 0
     assert run("list").output == ""
+
+
+def test_class_rename(run, root, task):
+    """`class rename` renames a class and relabels its examples, in one undo step."""
+    r = run("class", "rename", task, "red", "crimson")
+    assert r.exit_code == 0
+    assert "Renamed class red to crimson (4 examples)" in r.output
+    assert load(root).summary()["counts"] == {"blue": 4, "crimson": 4, "green": 4}
+    for args, message in ((["nope", "x"], "No class 'nope'"), (["blue", "green"], "Class 'green' already exists"),
+                          (["blue", "a/b"], "can't be '.' or '..'"), (["blue", "blue"], "already exists")):
+        r = run("class", "rename", task, *args)
+        assert r.exit_code == 1
+        assert message in r.output
+    run("undo", task)
+    assert "red" in load(root).class_names()
 
 
 def test_class_commands(run, root, task):
@@ -248,6 +331,35 @@ def test_add(run, root, tmp_path):
     assert r.exit_code == 1
     assert "No such file or directory" in r.output
     assert len(load(root).config.examples) == 3
+
+
+def test_add_says_how_many_moved(run, root, task, photos):
+    """Adding images that are examples of another class says they moved, and from where."""
+    r = run("add", task, "green", photos / "red" / "0.png", photos / "red" / "1.png", photos / "blue" / "20.png")
+    assert r.exit_code == 0
+    assert "3 of them moved from other classes (1 from blue, 2 from red)" in r.output
+    assert load(root).summary()["counts"] == {"blue": 3, "green": 7, "red": 2}
+    assert "moved" not in run("add", task, "green", photos / "green").output
+
+
+def test_import_is_one_undo_step(run, root, tmp_path):
+    """Importing a folder of more classes than undo keeps versions is still one undo step, which
+    leaves the earlier history alone; images that can't be added are reported by path."""
+    folder = tmp_path / "many"
+    for i in range(25):
+        (folder / f"c{i:02}").mkdir(parents=True)
+        (folder / f"c{i:02}" / "a.png").write_bytes(png((i * 10, 0, 0)))
+    (folder / "c00" / "bad.png").write_bytes(b"junk")
+    run("create", "many", "--embedder", "fake:color")
+    run("class", "add", "many", "first")
+    r = run("import", "many", folder)
+    assert r.exit_code == 0
+    assert "Imported 25 images" in r.output
+    assert f"skip {folder / 'c00' / 'bad.png'}" in r.output
+    assert len(load(root, "many").config.examples) == 25
+    assert run("undo", "many").exit_code == 0
+    t = load(root, "many")
+    assert (len(t.config.examples), t.class_names()) == (0, ["first"])
 
 
 def test_import(run, root, photos):
@@ -452,7 +564,8 @@ def test_serve(monkeypatch, tmp_path):
     _, srv, kw = served(monkeypatch, "--port", "9001")
     assert kw == {"host": "127.0.0.1", "port": 9001, "proxy_headers": True, "forwarded_allow_ips": "127.0.0.1"}
     assert srv.ws.root == Path(os.environ["FEWSHOT_HOME"]).resolve()
-    _, srv, kw = served(monkeypatch, "--host", "0.0.0.0", "--root", str(tmp_path), "--forwarded-allow-ips", "10.0.0.2")
+    _, srv, kw = served(monkeypatch, "--host", "0.0.0.0", "--root", str(tmp_path), "--forwarded-allow-ips", "10.0.0.2",
+                         "--no-token")
     assert (kw["host"], kw["port"], kw["forwarded_allow_ips"]) == ("0.0.0.0", 8000, "10.0.0.2")
     assert srv.ws.root == tmp_path.resolve()
 
@@ -464,8 +577,14 @@ def test_serve_settings(monkeypatch):
     r, srv, _ = served(monkeypatch)
     assert (srv.settings.token, srv.settings.allow_any_model, srv.settings.warm) == (None, False, True)
     assert "Warning" not in r.output
-    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--no-warm", "--allow-any-model")
-    assert "Warning: serving on 0.0.0.0 without --token" in r.output
+    monkeypatch.setattr("uvicorn.run", lambda *a, **kw: pytest.fail("started"))
+    r = CliRunner().invoke(cli.app, ["serve", "--host", "0.0.0.0"])
+    assert r.exit_code == 1
+    assert "This server has no token" in r.output
+    assert "(--token, --no-token)" in r.output
+    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--no-warm", "--allow-any-model", "--no-token")
+    assert "Warning: serving on 0.0.0.0 without a token" in r.output
+    assert srv.allow_no_token
     assert (srv.settings.allow_any_model, srv.settings.warm) == (True, False)
     r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--token", "t0ken-for-the-cli")
     assert "Warning" not in r.output
@@ -474,9 +593,11 @@ def test_serve_settings(monkeypatch):
     assert {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()} <= names
     assert "*" not in names
     assert "Answering requests by IP address or for: localhost" in r.output
-    assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "*")[1].settings.allowed_hosts == {"*"}
+    anyhost = served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "*", "--no-token")[1]
+    assert anyhost.settings.allowed_hosts == {"*"}
     assert served(monkeypatch)[1].settings.allowed_hosts == {"localhost", "127.0.0.1", "::1"}
     monkeypatch.setenv("FEWSHOT_ALLOWED_HOSTS", " box.lan, ,10.0.0.5")  # as in docker-compose.yml
+    monkeypatch.setenv("FEWSHOT_ALLOW_NO_TOKEN", "1")  # the variable says so too
     assert served(monkeypatch, "--host", "0.0.0.0")[1].settings.allowed_hosts == {"box.lan", "10.0.0.5"}
     # The option wins.
     assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "a.lan")[1].settings.allowed_hosts == {"a.lan"}
@@ -488,8 +609,60 @@ def test_serve_refuses_a_weak_token(monkeypatch):
     monkeypatch.setenv("FEWSHOT_TOKEN", "hunter2")
     r = CliRunner().invoke(cli.app, ["serve"])
     assert r.exit_code == 1
-    assert "The token is too weak to be safe: it has 7 characters" in r.output
-    assert "(--token / FEWSHOT_TOKEN)" in r.output
+    assert "FEWSHOT_TOKEN is too weak to be safe: it has 7 characters" in r.output
+    r = CliRunner().invoke(cli.app, ["serve", "--token", "s3cret"])
+    assert r.exit_code == 1
+    assert "The token is too weak to be safe: it has 6 characters" in r.output
+    assert "(--token)" in r.output
+
+
+@pytest.mark.parametrize("env", [
+    {"FEWSHOT_WARM": ""}, {"FEWSHOT_WARM": "off"}, {"FEWSHOT_ALLOW_URLS": "y"}, {"FEWSHOT_ALLOW_ANY_MODEL": "yes"},
+    {"FEWSHOT_WORKERS": "0"}, {"FEWSHOT_MAX_UPLOAD_MB": "2"}, {"FEWSHOT_FORWARDED_ALLOW_IPS": "10.0.0.9"},
+    {"FEWSHOT_ALLOWED_HOSTS": "box.lan"},
+])
+def test_serve_reads_the_environment_as_the_server_does(monkeypatch, env):
+    """`serve` without options gets the settings ServerSettings.from_env makes of the same
+    environment, or refuses with the same error."""
+    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM", "FEWSHOT_ALLOWED_HOSTS"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    if env == {"FEWSHOT_WORKERS": "0"}:
+        with pytest.raises(ValueError, match="FEWSHOT_WORKERS must be a whole number") as refused:
+            ServerSettings.from_env()
+        monkeypatch.setattr("uvicorn.run", lambda *a, **kw: pytest.fail("started"))
+        r = CliRunner().invoke(cli.app, ["serve"])
+        assert r.exit_code == 1
+        assert str(refused.value) in " ".join(r.output.split())
+        return
+    expected = ServerSettings.from_env()
+    _, srv, kw = served(monkeypatch)
+    assert srv.settings == expected
+    assert kw["forwarded_allow_ips"] == expected.forwarded_allow_ips
+
+
+def test_serve_options_win_over_the_environment(monkeypatch):
+    """An option replaces its variable, which then isn't read at all (so a bad one doesn't matter)."""
+    monkeypatch.setenv("FEWSHOT_WARM", "maybe")
+    monkeypatch.setenv("FEWSHOT_TOKEN", "weak")
+    monkeypatch.setenv("FEWSHOT_WORKERS", "2")
+    monkeypatch.setenv("FEWSHOT_ALLOW_URLS", "1")
+    _, srv, _ = served(monkeypatch, "--no-warm", "--token", "a-good-long-t0ken", "--no-urls")
+    assert (srv.settings.warm, srv.settings.token, srv.settings.workers, srv.settings.allow_urls) == (
+        False, "a-good-long-t0ken", 2, False)
+
+
+def test_uvicorn_listening_beyond_localhost_answers_to_the_machine_names():
+    """Run by uvicorn on a non-local address, the app allows the machine's names as serve does."""
+    name = socket.gethostname().lower()
+    assert served_host(["/x/bin/uvicorn", "fewshot.api:app", "--host", "0.0.0.0"], {}) == "0.0.0.0"
+    assert served_host(["/x/site-packages/uvicorn/__main__.py", "fewshot.api:app", "--host=::"], {}) == "::"
+    assert served_host(["/x/bin/uvicorn", "fewshot.api:app"], {"UVICORN_HOST": "10.1.1.1"}) == "10.1.1.1"
+    assert served_host(["pytest", "--host", "0.0.0.0"], {}) == "127.0.0.1"
+    assert name in ServerSettings.from_env({}, host="0.0.0.0").allowed_hosts
+    assert ServerSettings.from_env({}, host="localhost").allowed_hosts == {"localhost", "127.0.0.1", "::1"}
+    assert ServerSettings.from_env({"UVICORN_HOST": "0.0.0.0"}).allowed_hosts >= {name}
 
 
 def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):
@@ -569,6 +742,21 @@ def test_bench_way_one_is_an_error(run, bench_data):
     """One class per episode is meaningless (0 means every class)."""
     r = run("bench", bench_data, "--embedder", "fake:color", "--way", "1")
     assert (r.exit_code, "way must be at least 2, or 0 for every class" in r.output) == (1, True)
+
+
+@pytest.mark.usefixtures("task")
+def test_cache_commands_that_only_look_make_nothing(run, root):
+    """cache info and prune --dry-run report a missing cache without making it, or a workspace;
+    a real prune of a workspace without a cache makes nothing either."""
+    missing = root.parent / "nows"
+    for args in (["info"], ["prune", "--dry-run"], ["prune"]):
+        r = CliRunner().invoke(cli.app, ["cache", *args, "--root", str(missing)])
+        assert r.exit_code == 0
+        assert "No cache at" in r.output
+    assert not missing.exists()
+    assert "No cache at" in run("cache", "info").output
+    assert "nothing to prune" in run("cache", "prune", "--dry-run").output
+    assert not (root / "cache.sqlite").exists()
 
 
 def test_cache_info_and_prune(run, root, task):
@@ -693,6 +881,17 @@ def test_usage_errors_exit_2(run, task):
     assert r.exit_code == 2
     assert "at most one" in r.output
     assert run("class", "threshold", task, "red").exit_code == 2
+
+
+def test_csv_cells_that_look_like_formulas_stay_text(run, task, tmp_path):
+    """A CSV cell a spreadsheet would run as a formula gets a leading '; plain numbers don't."""
+    for name in ("=1+1.png", "@SUM(A1).png"):
+        (tmp_path / name).write_bytes(png(RED, seed=3))
+    with contextlib.chdir(tmp_path):  # so the file names are the cells' start
+        rows = list(csv.reader(io.StringIO(run("predict", task, "=1+1.png", "@SUM(A1).png", "--csv").output)))
+    assert [r[0] for r in rows[1:]] == ["'=1+1.png", "'@SUM(A1).png"]
+    assert [cli_common.csv_cell(v) for v in ("-0.1235", "-1e-5", "-x", "+1", "\tx", "a=b", -2, True)] == [
+        "-0.1235", "-1e-5", "'-x", "'+1", "'\tx", "a=b", -2, "true"]
 
 
 def test_csv_booleans_are_lowercase(run, task, tmp_path):

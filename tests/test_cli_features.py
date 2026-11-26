@@ -8,7 +8,7 @@ import sys
 import pytest
 from typer.testing import CliRunner
 
-from fewshot import cli, cli_common
+from fewshot import cli, cli_common, services
 from fewshot.store import Workspace
 from tests.conftest import ANSI, BLUE, RED, png, served
 
@@ -116,21 +116,31 @@ def test_dupes(run, task):
 def test_predict_csv_json_and_urls(run, task, tmp_path, monkeypatch):
     """predict reads URLs, prints CSV, and limits JSON scores to --top."""
 
-    def fake_fetch(url, max_bytes):
+    def fake_fetch(url, max_bytes, **_):
         assert max_bytes == cli_common.MAX_DOWNLOAD
         if "bad" in url:
             raise ValueError(f"Could not fetch {url}: HTTP 404 Not Found")
         return png(BLUE, seed=7)
 
-    monkeypatch.setattr(cli_common, "fetch_url", fake_fetch)
+    batches = []
+
+    def fetch_urls(urls, max_bytes, **kw):
+        batches.append(list(urls))
+        return real_fetch_urls(urls, max_bytes, **kw)
+
+    real_fetch_urls = services.fetch_urls
+    monkeypatch.setattr(cli_common, "fetch_url", fake_fetch)  # add reads them one by one
+    monkeypatch.setattr(services, "fetch_url", fake_fetch)
+    monkeypatch.setattr(services, "fetch_urls", fetch_urls)
     q = tmp_path / "q.png"
     q.write_bytes(png(RED, seed=8))
     r = run("predict", task, q, "http://h/b.png", "--csv")
     rows = list(csv.DictReader(io.StringIO(r.output)))
     assert [(row["label"], row["labels"]) for row in rows] == [("red", "red"), ("blue", "blue")]
     assert rows[0]["file"] == str(q)
-    r = run("predict", task, "http://h/bad.png", q)
+    r = run("predict", task, "http://h/bad.png", q, "http://h/c.png")
     assert r.exit_code == 1
+    assert batches[-1] == ["http://h/bad.png", "http://h/c.png"]  # predict fetches a batch's URLs together
     assert "http://h/bad.png: error: Could not fetch http://h/bad.png: HTTP 404" in r.output
     data = json.loads(run("predict", task, "http://h/bad.png", "--json").stdout)
     assert data[0]["error"] == "Could not fetch http://h/bad.png: HTTP 404 Not Found"  # the real reason

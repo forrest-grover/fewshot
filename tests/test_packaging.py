@@ -1,7 +1,10 @@
 """Packaging and deployment files: declared dependencies, docker-compose and the Dockerfile."""
 
+import ast
+import importlib.metadata
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +15,23 @@ def test_rich_is_a_declared_dependency():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as f:
         assert '"rich"' in f.read()
+
+
+def test_scripts_import_only_declared_packages():
+    """What scripts/ import is the standard library or a declared dependency (the dev extra counts)."""
+    tomllib = pytest.importorskip("tomllib")
+    root = Path(__file__).resolve().parent.parent
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    declared = {re.sub(r"[-_.]+", "-", re.split(r"[\[<>=!~; ]", d, maxsplit=1)[0]).lower()
+                for d in project["dependencies"] + project["optional-dependencies"]["dev"]}
+    providers = importlib.metadata.packages_distributions()
+    for script in (root / "scripts").glob("*.py"):
+        for node in ast.walk(ast.parse(script.read_text())):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else (
+                [node.module] if isinstance(node, ast.ImportFrom) and node.module and not node.level else [])
+            for top in {n.split(".")[0] for n in names} - set(sys.stdlib_module_names) - {"fewshot"}:
+                dists = {re.sub(r"[-_.]+", "-", d).lower() for d in providers.get(top, [top])}
+                assert dists & declared, f"{script.name} imports {top}, which pyproject.toml doesn't declare"
 
 
 def test_compose_publishes_on_this_machine_and_images_are_pinned():

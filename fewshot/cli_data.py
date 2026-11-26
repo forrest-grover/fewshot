@@ -10,7 +10,9 @@ from . import services
 from .cli_common import (
     JSON_OPT,
     ROOT_OPT,
+    InboxSort,
     blobs,
+    command_group,
     echo_json,
     error_text,
     expand,
@@ -24,10 +26,10 @@ from .cli_common import (
 )
 from .store import Task
 
-ex_app = typer.Typer(help="List, move, tag and delete a task's examples (ids may be shortened to a unique "
-                          "prefix of 4+ characters).", no_args_is_help=True)
-inbox_app = typer.Typer(help="Unlabelled images waiting to be labelled, with the model's suggestions (ids may be "
-                             "shortened to a unique prefix of 4+ characters).", no_args_is_help=True)
+ex_app = command_group("List, move, tag and delete a task's examples (ids may be shortened to a unique "
+                       "prefix of 4+ characters).")
+inbox_app = command_group("Unlabelled images waiting to be labelled, with the model's suggestions (ids may be "
+                          "shortened to a unique prefix of 4+ characters).")
 
 
 # ---- examples -------------------------------------------------------------
@@ -61,7 +63,10 @@ def example_ls(
 def example_rm(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
     """Delete examples (undo brings them back)."""
     t = get_task(root, name)
-    n = t.delete_examples(_ids(t, ids))
+    try:
+        n = t.delete_examples(_ids(t, ids))
+    except KeyError as e:  # the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Deleted {n} examples")
 
 
@@ -71,8 +76,8 @@ def example_relabel(name: str, label: str, ids: list[str], root: Path | None = R
     t = get_task(root, name)
     try:
         n = t.relabel_many(_ids(t, ids), label)
-    except ValueError as e:
-        fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Moved {n} examples to {label}")
 
 
@@ -90,8 +95,8 @@ def example_tag(
     t = get_task(root, name)
     try:
         n = t.annotate(_ids(t, ids), add_tags=add_tag, remove_tags=remove_tag)
-    except ValueError as e:
-        fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Tagged {n} examples")
 
 
@@ -101,8 +106,8 @@ def example_note(name: str, example_id: str, note: str, root: Path | None = ROOT
     t = get_task(root, name)
     try:
         t.annotate(_ids(t, [example_id]), note=note)
-    except ValueError as e:
-        fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo("Note saved")
 
 
@@ -122,17 +127,15 @@ def inbox_add(name: str, paths: list[str], root: Path | None = ROOT_OPT) -> None
 @inbox_app.command("ls")
 def inbox_ls(
     name: str,
-    sort: str = typer.Option("uncertain", help="uncertain (most useful to label first) | confident | novel | added"),
+    sort: InboxSort = typer.Option("uncertain", help="uncertain: most useful to label first; confident; novel: "
+                                                     "unlike any example; added: in the order added"),
     limit: int = typer.Option(50, min=1, help="Show at most this many"),
     as_json: bool = JSON_OPT,
     root: Path | None = ROOT_OPT,
 ) -> None:
     """List inbox images with the model's suggestion, in the order to label them."""
     t = get_task(root, name)
-    try:
-        items = make_pipeline(workspace(root)).inbox_suggestions(t, sort)[:limit]
-    except ValueError as e:
-        fail(str(e))
+    items = make_pipeline(workspace(root)).inbox_suggestions(t, sort)[:limit]
     if as_json:
         echo_json(items)
         return
@@ -178,5 +181,8 @@ def inbox_accept(
 def inbox_dismiss(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
     """Remove images from the inbox without labelling them (undo brings them back)."""
     t = get_task(root, name)
-    n = t.dismiss(_ids(t, ids, inbox=True))
+    try:
+        n = t.dismiss(_ids(t, ids, inbox=True))
+    except KeyError as e:  # the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Dismissed {n} images; {len(t.config.inbox)} left")

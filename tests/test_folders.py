@@ -2,8 +2,9 @@
 
 import pytest
 
+from fewshot import services
 from fewshot.folders import class_folders, image_files, read_or_empty
-from tests.conftest import BLUE, RED, png, write_images
+from tests.conftest import BLUE, RED, png, two_each, write_images
 
 
 def _messy(folder):
@@ -49,3 +50,19 @@ def test_add_examples_from_dir_reports_an_unreadable_file(ws, tmp_path):
 def test_an_unreadable_file_reads_as_empty(tmp_path):
     """A file that can't be read gives no bytes (and so an unreadable image), not an exception."""
     assert read_or_empty(tmp_path) == b""  # a folder
+
+
+def test_import_folder_reports_images_left_out_and_moved(ws, tmp_path):
+    """services.import_folder adds each class folder's images under its name, in one undo step,
+    and reports by path the images it couldn't add and those it moved from another class."""
+    t = two_each(ws)
+    (tmp_path / "blue").mkdir()
+    (tmp_path / "blue" / "r0.png").write_bytes(png(RED, noise=10, seed=0))  # now red: moves
+    (tmp_path / "blue" / "bad.png").write_bytes(b"junk")
+    write_images(tmp_path / "green", BLUE, 2, start=50)
+    before = t.config.revision
+    r = services.import_folder(t, tmp_path)
+    assert len(r.added) == 3
+    assert [(ex.label, was) for ex, was in r.moved] == [("blue", "red")]
+    assert [f for f, _ in r.errors] == [str(tmp_path / "blue" / "bad.png")]
+    assert t.config.revision == before + 1
