@@ -268,3 +268,47 @@ def test_undo_interrupted_after_commit_stays_redoable(task, monkeypatch):
     monkeypatch.undo()
     assert [e.label for e in task.config.examples] == ["red"]
     assert task.redo_label() == "add 1 example to blue"
+
+
+def _interrupt_after_commit(real: Any) -> Any:
+    """``os.replace`` that commits task.json and is then interrupted before returning control."""
+    def replace(src: Any, dst: Any, **kw: Any) -> None:
+        real(src, dst, **kw)
+        if str(dst).endswith("task.json"):
+            raise KeyboardInterrupt
+    return replace
+
+
+def test_interrupt_right_after_the_replace_keeps_the_change(task, monkeypatch):
+    """Ctrl+C landing just after task.json was replaced, before the save recorded it, still
+    counts as committed: the images it names stay and memory shows the change."""
+    monkeypatch.setattr(os, "replace", _interrupt_after_commit(os.replace))
+    with pytest.raises(KeyboardInterrupt):
+        task.add_example(png(BLUE, noise=15, seed=2), "blue")
+    monkeypatch.undo()
+    saved = Workspace(task.path.parent.parent).get("t").config
+    assert [e.label for e in saved.examples] == ["red", "blue"]
+    assert all((task.path / e.file).exists() for e in saved.examples)
+    assert task.config.revision == saved.revision
+
+
+def test_undo_interrupted_right_after_the_replace_stays_redoable(task, monkeypatch):
+    """The same window during an undo keeps its redo step."""
+    task.add_example(png(BLUE, noise=15, seed=2), "blue")
+    monkeypatch.setattr(os, "replace", _interrupt_after_commit(os.replace))
+    with pytest.raises(KeyboardInterrupt):
+        task.undo()
+    monkeypatch.undo()
+    assert [e.label for e in task.config.examples] == ["red"]
+    assert task.redo_label() == "add 1 example to blue"
+
+
+def test_gc_skips_a_task_deleted_meanwhile(ws, monkeypatch):
+    """A task another process deletes while gc runs is skipped, and the rest is still cleaned."""
+    ws.create("a")
+    b = ws.create("b")
+    listed = ws.list_tasks()
+    Workspace(ws.root).delete("b")
+    monkeypatch.setattr(ws, "list_tasks", lambda: listed)
+    assert b not in Workspace(ws.root).list_tasks()
+    assert ws.gc()["folders"] == 0

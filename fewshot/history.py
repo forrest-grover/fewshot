@@ -37,6 +37,9 @@ class TaskHistory:
     config: TaskConfig
     _commits: int
 
+    def _committed_since(self, commits: int) -> bool:  # pragma: no cover  # Task's
+        raise NotImplementedError
+
     def _writing(self) -> contextlib.AbstractContextManager[None]:  # pragma: no cover  # Task's
         raise NotImplementedError
 
@@ -222,7 +225,7 @@ class TaskHistory:
             try:
                 self._restore(old)
             except BaseException:
-                if self._commits == commits:  # nothing was undone: nothing to redo
+                if not self._committed_since(commits):  # nothing was undone: nothing to redo
                     for f in redo:
                         f.unlink(missing_ok=True)
                 raise

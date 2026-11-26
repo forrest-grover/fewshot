@@ -47,10 +47,10 @@ from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
+from . import blobs as _blobs
 from .classifiers import CLASSIFIERS
 from .folders import class_folders, read_or_empty
 from .fsutil import FileStamp, os_reason
-from .fsutil import create_exclusive as _create_exclusive
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import dir_locked as _dir_locked
 from .fsutil import file_lock as _file_lock
@@ -125,6 +125,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         self._stamp = stamp  # of the task.json that ``_published`` matches
         self._depth = 0  # nesting of ``_writing`` in the thread holding ``_lock``
         self._commits = 0  # saves that reached task.json, to tell a failed save from a later failure
+        self._pending_ino: int | None = None  # inode of the task.json the save in progress wrote
         self._unsynced: set[Path] = set()  # folders with new image files not yet made durable
 
     # ---- persistence -------------------------------------------------
@@ -212,9 +213,11 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         cfg.revision += 1
         made: list[Path] = []
         stale_redo: Path | None = None
+        self._pending_ino = None
         fd, tmp = tempfile.mkstemp(dir=self.path, prefix=".task.json.", suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
+                self._pending_ino = os.fstat(f.fileno()).st_ino
                 f.write(cfg.model_dump_json(indent=2).encode())
                 f.flush()
                 os.fsync(f.fileno())
@@ -228,6 +231,9 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                 stale_redo = self._set_redo_aside()
             os.replace(tmp, self.path / "task.json")
         except BaseException:
+            if self._landed():  # interrupted just after the commit: the change stands
+                self._publish(cfg)
+                raise
             cfg.revision = old_rev
             for leftover in [Path(tmp), *made]:  # a version that never got replaced is no step to undo
                 with contextlib.suppress(OSError):
@@ -238,6 +244,19 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             raise
         self._publish(cfg)
         self._after_commit(stale_redo, record)
+
+    def _landed(self) -> bool:
+        """Whether task.json is the file the last ``_save`` wrote: its commit happened, even if an
+        interrupt arrived before the save could record it. Decided from the disk, since a
+        signal can land between any two bytecodes."""
+        try:
+            return self._pending_ino is not None and os.stat(self.path / "task.json").st_ino == self._pending_ino
+        except OSError:
+            return False
+
+    def _committed_since(self, commits: int) -> bool:
+        """Whether a save committed since ``_commits`` was ``commits``."""
+        return self._commits != commits or self._landed()
 
     def _publish(self, cfg: TaskConfig) -> None:
         """Make ``cfg``, just written to task.json, what other threads see."""
@@ -265,55 +284,15 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             except Exception:  # pylint: disable=broad-exception-caught  # the change is saved regardless
                 log.exception("%s: the change was saved, but failed to %s", self.path, what)
 
-    # ---- image files -------------------------------------------------
+    # ---- image files (shared through the workspace's store: see blobs.py) ----
     def _blob(self, file: str) -> Path | None:
-        """The shared-store file for ``images/<name>``, or None without a store."""
-        name = file.rsplit("/", 1)[-1]
-        # Ids from before 128-bit ids are too short to rule out a crafted collision, which in a
-        # shared store would let one task's image stand in for another's: those stay task-local.
-        if self.blobs is None or len(name.split(".", 1)[0]) != 32:
-            return None
-        return self.blobs / name[:2] / name
+        return _blobs.blob_path(self.blobs, file)
 
     def _store_image(self, file: str, data: bytes) -> bool:
-        """Write ``data`` (whose id the name of ``file`` carries) as the task's ``file``: a hard link
-        to the workspace's copy, made if needed, or a plain copy where links aren't possible.
-        Returns whether this call created the file (False if it was there already)."""
-        dest = self.path / file
-        dest.parent.mkdir(exist_ok=True)
-        if _intact(dest, data):  # kept for undo, or re-added: same content, since the name is its hash
-            return False
-        dest.unlink(missing_ok=True)  # cut short by a power cut: store it again
-        self._unsynced.add(dest.parent)
-        blob = self._blob(file)
-        if blob is not None:
-            made = False
-            try:
-                blob.parent.mkdir(parents=True, exist_ok=True)
-                made = _create_exclusive(blob, data)
-                if not made and not _intact(blob, data):  # a damaged copy must not spread to this task
-                    _write_atomic(blob, data)
-                    made = True
-                if made:
-                    self._unsynced.add(blob.parent)
-                os.link(blob, dest)
-                return True
-            except FileExistsError:  # another writer stored this file in this task first
-                return False
-            except OSError:  # no hard links here, or the blob vanished under us: copy instead
-                if made:  # a blob nothing can link to would only waste space
-                    blob.unlink(missing_ok=True)
-        _write_atomic(dest, data)
-        return True
+        return _blobs.store_image(self.path, file, data, self.blobs, self._unsynced)
 
     def _drop_file(self, file: str) -> None:
-        """Delete a task image file, and the shared copy once no task links to it."""
-        (self.path / file).unlink(missing_ok=True)
-        blob = self._blob(file)
-        if blob is not None:
-            with contextlib.suppress(FileNotFoundError):
-                if blob.stat().st_nlink == 1:
-                    blob.unlink()
+        _blobs.drop_file(self.path, file, self.blobs)
 
     @classmethod
     def new(cls, path: Path, config: TaskConfig, blobs: Path | None = None) -> Task:
@@ -336,10 +315,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             _fsync_dir(self.path.parent)
             shutil.rmtree(trash)
             for f in files:  # the shared copies no other task links to
-                blob = self._blob(f)
-                with contextlib.suppress(FileNotFoundError):
-                    if blob is not None and blob.stat().st_nlink == 1:
-                        blob.unlink()
+                _blobs.release(self._blob(f))
 
     # ---- settings ----------------------------------------------------
     def update_settings(self, merge_params: dict[str, Any] | None = None, **kw: Any) -> list[str]:
@@ -561,7 +537,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         try:
             self._save(record=record, label=label)
         except BaseException:
-            if self._commits == commits:  # not committed: no version names them
+            if not self._committed_since(commits):  # no version names them
                 for f in created:
                     self._drop_file(f)
             raise
@@ -889,7 +865,8 @@ class Workspace:
                 shutil.rmtree(p, ignore_errors=True)
                 out["folders"] += 1
         for t in self.list_tasks():
-            out["images"] += t._drop_unused_images()  # pylint: disable=protected-access
+            with contextlib.suppress(KeyError):  # deleted by another process meanwhile
+                out["images"] += t._drop_unused_images()  # pylint: disable=protected-access
         out["blobs"] = self.gc_blobs()
         return out
 
@@ -953,13 +930,7 @@ class Workspace:
 
     def gc_blobs(self) -> int:
         """Delete shared image copies that no task links to any more; returns how many."""
-        n = 0
-        for f in self.blobs.glob("*/*") if self.blobs.is_dir() else []:
-            with contextlib.suppress(FileNotFoundError):
-                if f.is_file() and f.stat().st_nlink == 1:
-                    f.unlink()
-                    n += 1
-        return n
+        return _blobs.gc_blobs(self.blobs)
 
     def delete(self, name: str) -> None:
         """Delete a task folder and everything in it; raises ``KeyError`` if it is already gone."""
@@ -986,15 +957,6 @@ def _abandoned(folder: Path) -> bool:
         return False
     return (age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
             and not _dir_locked(folder))
-
-
-def _intact(path: Path, data: bytes) -> bool:
-    """Whether the stored file ``path``, named by the hash of ``data``, exists whole. Its size is
-    enough to check: only a power cut can leave it different, and that leaves it short."""
-    try:
-        return path.stat().st_size == len(data)
-    except FileNotFoundError:
-        return False
 
 
 _n = functools.partial(plural, what="example")  # "1 example", "3 examples"

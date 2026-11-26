@@ -141,14 +141,22 @@ def prune_unused(ws: Workspace, dry_run: bool = False, vacuum: bool = False) -> 
     Every task is locked while the vectors to keep are worked out and the others deleted, so an
     image added meanwhile can't lose its vector. Raises ``ValueError`` if a task can't be read,
     since its vectors would be lost."""
-    tasks = ws.list_tasks()
-    unreadable = sorted({p.name for p in ws.task_folders() if (p / "task.json").exists()} - {t.name for t in tasks})
+    tasks, unreadable = [], []
+    for p in ws.task_folders():  # one listing, so a task made meanwhile isn't taken for unreadable
+        try:
+            tasks.append(ws.get(p.name))
+        except KeyError:
+            if (p / "task.json").exists():
+                unreadable.append(p.name)
     if unreadable:
         raise ValueError(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
     cache = EmbeddingCache(ws.cache_path)
     with contextlib.ExitStack() as locks:
-        for t in tasks:
-            locks.enter_context(t._writing())  # pylint: disable=protected-access  # one consistent view of every task
+        for t in list(tasks):
+            try:
+                locks.enter_context(t._writing())  # pylint: disable=protected-access  # one consistent view of every task
+            except KeyError:  # deleted meanwhile: its vectors needn't be kept
+                tasks.remove(t)
         ids = {e.id for t in tasks for e in [*t.config.examples, *t.config.inbox]}
         ids |= {f.split("/", 1)[1].rsplit(".", 1)[0] for t in tasks for f in t.kept_files()}
         n = cache.prune({k for i in ids for k in (i, i + FLIP_KEY)}, dry_run=dry_run)

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from fewshot.cache import EmbeddingCache, prune_unused
+from fewshot.store import Workspace
 from tests.conftest import two_each
 
 
@@ -150,3 +151,20 @@ def test_prune_cache_vacuums_only_when_asked(ws, monkeypatch):
     assert prune_unused(ws, vacuum=True) == (1, 0)
     with sqlite3.connect(ws.cache_path) as db:
         assert db.execute("SELECT COUNT(*) FROM emb WHERE key='gone'").fetchone() == (0,)
+
+
+def test_prune_skips_a_task_deleted_meanwhile(ws, monkeypatch):
+    """A task deleted between listing and locking is left out, not reported as an error."""
+    ws.create("a")
+    ws.create("b")
+    (ws.root / "tasks" / "empty").mkdir()  # a folder without task.json is no task, not unreadable
+    real = ws.get
+
+    def get_then_delete(name):
+        t = real(name)
+        if name == "b":
+            Workspace(ws.root).delete("b")  # another process, just after this one read it
+        return t
+
+    monkeypatch.setattr(ws, "get", get_then_delete)
+    assert prune_unused(ws) == (0, 0)
