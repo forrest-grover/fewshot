@@ -403,9 +403,9 @@ def test_added_images_are_handed_over_lazily(client, monkeypatch):
     kinds = []
     real = Task.add_examples
 
-    def spy(self, items, chunk=256):
+    def spy(self, items, chunk=256, **kw):
         kinds.append(isinstance(items, list))
-        return real(self, items, chunk)
+        return real(self, items, chunk, **kw)
 
     monkeypatch.setattr(Task, "add_examples", spy)
     assert client.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(3)).status_code == 201

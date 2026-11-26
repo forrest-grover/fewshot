@@ -5,6 +5,7 @@ per change."""
 import pytest
 
 from fewshot import history
+from fewshot.fsutil import write_atomic
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, png, red_green_task, red_task, two_each
 
@@ -277,3 +278,109 @@ def test_damaged_version_is_skipped_by_undo(ws):
         t.undo()
     t.undo()
     assert t.class_names() == ["red"]
+
+
+# ---- undo groups ----------------------------------------------------------
+def _items(rgb, label, n, seed=0):
+    return [(png(rgb, noise=30, seed=seed + i), label, f"{label}{seed + i}.png") for i in range(n)]
+
+
+def test_an_undo_group_is_one_undo_step(ws):
+    """Consecutive adds with the same undo group are one undo step, described as a whole; a
+    later add in another group, or after any other change, is a step of its own."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 2), undo_group="drop")
+    t.add_examples(_items(BLUE, "blue", 3), undo_group="drop")
+    assert t.undo_label() == "add 5 examples to red, blue"
+    t.add_examples(_items(GREEN, "green", 1), undo_group="other")
+    assert t.undo_label() == "add 1 example to green"
+    t.add_examples(_items(RED, "red", 1, seed=10), undo_group="drop")  # that group was ended
+    assert t.undo_label() == "add 1 example to red"
+    t.undo()
+    t.undo()
+    assert t.undo_label() == "add 5 examples to red, blue"
+    t.undo()
+    assert not t.config.examples
+    assert not t.can_undo()
+
+
+def test_any_other_change_ends_an_undo_group(ws):
+    """A change in between (even one not kept for undo, like a rename) ends the group, and so
+    does undoing its step."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 1), undo_group="g")
+    t.upsert_class("blue")
+    t.add_examples(_items(RED, "red", 1, seed=1), undo_group="g")
+    assert t.undo_label() == "add 1 example to red"
+    t = ws.rename("t", "u")
+    t.add_examples(_items(RED, "red", 1, seed=2), undo_group="g")
+    assert t.undo_label() == "add 1 example to red"
+    t.undo()
+    t.add_examples(_items(RED, "red", 1, seed=3), undo_group="g")
+    assert t.undo_label() == "add 1 example to red"
+    assert len(history.TaskHistory._history(t)) == 4  # pylint: disable=protected-access
+
+
+def test_an_undo_group_works_across_processes(ws):
+    """The group is noted on disk with its step, so another process's add (here: another
+    Workspace on the same folder) joins it."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 2), undo_group="drop")
+    other = Workspace(ws.root).get("t")
+    other.add_examples(_items(BLUE, "blue", 2), undo_group="drop")
+    assert other.undo_label() == t.undo_label() == "add 4 examples to red, blue"
+    t.undo()
+    assert not t.config.examples
+
+
+def test_one_call_is_one_step_described_whole(ws):
+    """The chunks of one call are one undo step, labelled with everything the call added."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 3) + _items(BLUE, "blue", 2), chunk=2)
+    assert t.undo_label() == "add 5 examples to red, blue"
+    t.add_to_inbox([(png(GREEN, noise=30, seed=i), f"g{i}.png") for i in range(3)], chunk=2)
+    assert t.undo_label() == "add 3 images to the inbox"
+    t.undo()
+    assert t.undo_label() == "add 5 examples to red, blue"
+
+
+def test_inbox_uploads_group_too_but_not_with_examples(ws):
+    """Inbox adds group like examples; an inbox add and an example add with the same group id
+    stay two steps."""
+    t = ws.create("t", embedder="fake:color")
+    for i in range(2):
+        t.add_to_inbox([(png(GREEN, noise=30, seed=10 * i + j), f"g{j}.png") for j in range(2)], undo_group="d")
+    assert t.undo_label() == "add 4 images to the inbox"
+    t.add_examples(_items(RED, "red", 1), undo_group="d")
+    t.undo()
+    assert t.undo_label() == "add 4 images to the inbox"
+    t.undo()
+    assert not t.config.inbox
+
+
+def test_a_damaged_or_unwritable_group_note_just_ends_the_group(ws, monkeypatch, caplog):
+    """A group note that can't be read starts a new step; one that can't be written is logged,
+    and the change stands. A step pruned at once gets no note."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 1), undo_group="g")
+    note = history.TaskHistory._history(t)[-1][1].with_suffix(".group")  # pylint: disable=protected-access
+    for bad in ("junk", '{"group": "g"}'):
+        note.write_text(bad)
+        t.add_examples(_items(RED, "red", 1, seed=len(bad)), undo_group="g")
+        assert t.undo_label() == "add 1 example to red"
+        note = history.TaskHistory._history(t)[-1][1].with_suffix(".group")  # pylint: disable=protected-access
+    real = write_atomic
+
+    def failing(path, data):
+        if path.suffix == ".group":
+            raise OSError("disk full")
+        real(path, data)
+
+    monkeypatch.setattr(history, "_write_atomic", failing)
+    t.add_examples(_items(BLUE, "blue", 1), undo_group="h")
+    assert "its undo group was not noted" in caplog.text
+    assert t.undo_label() == "add 1 example to blue"
+    monkeypatch.setattr(history, "_write_atomic", real)
+    monkeypatch.setattr(history, "HISTORY_KEPT", 0)
+    t.add_examples(_items(GREEN, "green", 1), undo_group="i")
+    assert not list((t.path / "history").glob("*.group"))

@@ -759,11 +759,21 @@ export interface components {
             files: string[];
             /** Label */
             label: string;
+            /**
+             * Undo Group
+             * @description Any id the client chooses for one upload it sends in several requests: consecutive uploads to the task with the same id, with no other change in between, are one undo step
+             */
+            undo_group?: string | null;
         };
         /** Body_add_to_inbox */
         Body_add_to_inbox: {
             /** Files */
             files: string[];
+            /**
+             * Undo Group
+             * @description Any id the client chooses for one upload it sends in several requests: consecutive uploads to the task with the same id, with no other change in between, are one undo step
+             */
+            undo_group?: string | null;
         };
         /** Body_import_task */
         Body_import_task: {

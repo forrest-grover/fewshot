@@ -154,17 +154,21 @@ def _bytes(data: bytes | Path | None) -> bytes:
     return read_or_empty(data) if isinstance(data, Path) else data or b""
 
 
-def add_examples(task: Task, label: str, blobs: Iterable[Blob]) -> Added:
-    """Add the readable ``blobs`` as examples of ``label``, one undo step for all of them;
-    ``ValueError`` for a bad label. Images that can't be added are reported, not raised."""
+def add_examples(task: Task, label: str, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:
+    """Add the readable ``blobs`` as examples of ``label``, one undo step for all of them (and for
+    the calls just before with the same ``undo_group``: see ``Task.add_examples``); ``ValueError``
+    for a bad label. Images that can't be added are reported, not raised."""
     label = check_class_name(label)
-    return _added(task.add_examples, blobs, lambda b: (_bytes(b.data), label, b.source or b.name))
+    return _added(lambda items: task.add_examples(items, undo_group=undo_group), blobs,
+                  lambda b: (_bytes(b.data), label, b.source or b.name))
 
 
-def add_to_inbox(task: Task, blobs: Iterable[Blob]) -> Added:
-    """Put the readable ``blobs`` in the task's inbox, one undo step for all of them. Images that
-    can't be added (unreadable, or labelled already) are reported, not raised."""
-    return _added(task.add_to_inbox, blobs, lambda b: (_bytes(b.data), b.source or b.name))
+def add_to_inbox(task: Task, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:
+    """Put the readable ``blobs`` in the task's inbox, one undo step for all of them (and for the
+    calls just before with the same ``undo_group``). Images that can't be added (unreadable, or
+    labelled already) are reported, not raised."""
+    return _added(lambda items: task.add_to_inbox(items, undo_group=undo_group), blobs,
+                  lambda b: (_bytes(b.data), b.source or b.name))
 
 
 # ---- predictions and evaluation ---------------------------------------------

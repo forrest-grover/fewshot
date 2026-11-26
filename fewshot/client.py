@@ -154,11 +154,12 @@ class Client:
         return self._upload(f"/tasks/{_seg(task)}/inbox", images, {})
 
     def _upload(self, path: str, images: Iterable[Image], fields: dict[str, str]) -> dict[str, Any]:
-        """POST ``images`` a batch at a time; ``added`` and ``errors`` are combined, ``task`` is the
-        last. A batch refused with 400 (nothing in it added) adds its reason to ``errors``; if every
-        batch was refused, the first refusal is raised."""
+        """POST ``images`` a batch at a time, all one undo step; ``added`` and ``errors`` are
+        combined, ``task`` is the last. A batch refused with 400 (nothing in it added) adds its
+        reason to ``errors``; if every batch was refused, the first refusal is raised."""
         out: dict[str, Any] = {"added": [], "errors": [], "task": None}
         refused: ApiError | None = None
+        fields = {**fields, "undo_group": uuid.uuid4().hex}  # the batches are one undo step
         for batch in _batches(images, self.batch_bytes()):
             try:
                 r = self.request("POST", path, fields=fields, files=batch)

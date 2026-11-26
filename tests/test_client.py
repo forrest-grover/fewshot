@@ -152,8 +152,10 @@ def test_uploads_are_batched_by_size(small_server, monkeypatch):
         return real(self, method, path, **kw)
 
     monkeypatch.setattr(Client, "request", spy)
-    assert len(fs.add_examples("t", "red", images)["added"]) == 8
+    r = fs.add_examples("t", "red", images)
+    assert len(r["added"]) == 8
     assert len([n for n in sent if n]) > 1
+    assert r["task"]["undo_label"] == "add 8 examples to red"  # the batches are one undo step
     assert len(fs.predict("t", images)) == 8
 
 

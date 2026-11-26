@@ -582,16 +582,21 @@ def _downloads(srv: Server, urls: list[str]) -> list[services.Blob]:
                                max_total=srv.settings.max_request_bytes, workers=URL_FETCH_WORKERS)
 
 
+UNDO_GROUP = Form(None, max_length=64, description=(
+    "Any id the client chooses for one upload it sends in several requests: consecutive uploads "
+    "to the task with the same id, with no other change in between, are one undo step"))
+
+
 def _errors(r: services.Added) -> list[dict[str, str]]:
     return [{"file": f, "error": why} for f, why in r.errors]
 
 
-def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.Blob] | list[services.Blob]
-                  ) -> dict[str, Any]:
+def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.Blob] | list[services.Blob],
+                  undo_group: str | None = None) -> dict[str, Any]:
     """Add the readable ``blobs`` as examples of ``label``; 400 if none could be added."""
     t = srv.task(name)
     try:
-        r = services.add_examples(t, label, blobs)
+        r = services.add_examples(t, label, blobs, undo_group)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -602,13 +607,14 @@ def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.B
 
 
 @router.post("/api/tasks/{name}/examples", status_code=201, response_model=AddResult)
-async def add_examples(srv: Srv, name: str, label: str = Form(...), files: list[UploadFile] = File(...)
-                       ) -> Response:
+async def add_examples(srv: Srv, name: str, label: str = Form(...), files: list[UploadFile] = File(...),
+                       undo_group: str | None = UNDO_GROUP) -> Response:
     """Upload images as examples of ``label``; unreadable files are reported in ``errors``.
 
     Returns 400 when the label is blank or no file could be added.
     """
-    return await srv.render(AddResult, _add_examples, srv, name, label, _uploads(srv, files), status=201)
+    return await srv.render(AddResult, _add_examples, srv, name, label, _uploads(srv, files), undo_group or None,
+                            status=201)
 
 
 def _add_examples_by_url(srv: Server, name: str, body: LabelledUrls) -> dict[str, Any]:
@@ -712,11 +718,12 @@ async def example_image(srv: Srv, name: str, eid: str,
 
 
 # ---- inbox --------------------------------------------------------------
-def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[services.Blob]) -> dict[str, Any]:
+def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[services.Blob],
+               undo_group: str | None = None) -> dict[str, Any]:
     """Put the readable ``blobs`` in the inbox; 400 if none could be added."""
     t = srv.task(name)
     try:
-        r = services.add_to_inbox(t, blobs)
+        r = services.add_to_inbox(t, blobs, undo_group)
     except KeyError as e:
         raise _missing(e) from e
     if not r.added:
@@ -726,9 +733,11 @@ def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[ser
 
 
 @router.post("/api/tasks/{name}/inbox", status_code=201, response_model=InboxAdded)
-async def add_to_inbox(srv: Srv, name: str, files: list[UploadFile] = File(...)) -> Response:
+async def add_to_inbox(srv: Srv, name: str, files: list[UploadFile] = File(...),
+                       undo_group: str | None = UNDO_GROUP) -> Response:
     """Upload unlabelled images to the task's inbox, to label later with the model's suggestions."""
-    return await srv.render(InboxAdded, _add_inbox, srv, name, _uploads(srv, files), status=201)
+    return await srv.render(InboxAdded, _add_inbox, srv, name, _uploads(srv, files), undo_group or None,
+                            status=201)
 
 
 def _add_inbox_by_url(srv: Server, name: str, urls: list[str]) -> dict[str, Any]:

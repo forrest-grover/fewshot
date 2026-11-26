@@ -9,7 +9,7 @@ import fewshot.api
 import fewshot.embedders
 import fewshot.services
 import fewshot.store
-from tests.conftest import BLUE, RED, api_client, png, set_settings
+from tests.conftest import BLUE, RED, api_client, png, query_files, set_settings
 
 
 @pytest.fixture(name="task")
@@ -293,3 +293,23 @@ def test_redo_of_a_task_deleted_meanwhile(client, task, monkeypatch):
 
     monkeypatch.setattr(fewshot.store.Task, "redo", gone)
     assert client.post(f"/api/tasks/{task}/redo").status_code == 404
+
+
+def test_uploads_with_an_undo_group_are_one_undo_step(client):
+    """A drop sent as several requests with one ``undo_group`` is one undo step, for examples
+    and for the inbox; the id is at most 64 characters."""
+    client.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
+    for label, rgb in (("red", RED), ("blue", (0, 0, 255))):
+        r = client.post("/api/tasks/t/examples", data={"label": label, "undo_group": "drop-1"},
+                        files=query_files(2, rgb=rgb))
+        assert r.status_code == 201
+    assert r.json()["task"]["undo_label"] == "add 4 examples to red, blue"
+    for i in range(2):
+        files = [("files", (f"g{i}{j}.png", png((0, 255, 0), noise=30, seed=10 * i + j), "image/png"))
+                 for j in range(2)]
+        r = client.post("/api/tasks/t/inbox", data={"undo_group": "drop-2"}, files=files)
+    assert r.json()["task"]["undo_label"] == "add 4 images to the inbox"
+    assert client.post("/api/tasks/t/undo").json()["inbox_count"] == 0
+    assert client.post("/api/tasks/t/undo").json()["examples"] == []
+    r = client.post("/api/tasks/t/examples", data={"label": "red", "undo_group": "x" * 65}, files=query_files(1))
+    assert r.status_code == 422
