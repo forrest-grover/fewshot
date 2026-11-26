@@ -357,9 +357,11 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     """Cross-validate the task's current settings (or ``cfg``, a variant of them) on its own
     labelled examples.
 
-    Defaults to leave-one-out for up to 300 examples with the prototype and kNN classifiers
-    (computed in closed form) or 100 with the others (one refit per example), then 10-fold up to
-    300 examples and 5-fold beyond. Every
+    Defaults to leave-one-out for up to 300 examples with the prototype and kNN classifiers or 100
+    with the others, then 10-fold up to 300 examples and 5-fold beyond. Leave-one-out refits once
+    per example, except that for prototype and kNN it is computed in closed form when no text can
+    play a part (see ``_text_unused``): with names-as-text on (the default) and a text-capable
+    embedder, each fold decides afresh whether the names are used, so those refit too. Every
     held-out example is predicted by a classifier that never saw it.
     ``progress(stage, done, total)`` is called with stage ``"embedding"`` (images) and then
     ``"evaluating"`` (folds); it may raise to cancel.

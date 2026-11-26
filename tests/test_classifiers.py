@@ -554,6 +554,14 @@ def test_top_k_breaks_ties_by_column():
     assert top_k(S, 5).tolist() == [[0, 1, 2, 3, 4]] * 3
 
 
+def test_top_k_refuses_nan():
+    """A NaN similarity (from an embedding that isn't finite) is a clear error, not a crash in
+    reshaping; -inf (an example kept out of its own vote) is fine."""
+    with pytest.raises(ValueError, match="NaN"):
+        top_k(np.array([[0.5, np.nan, 0.2, 0.1]]), 2)
+    assert top_k(np.array([[0.5, -np.inf, 0.2]]), 2).tolist() == [[0, 2]]
+
+
 @pytest.mark.parametrize("name", ["prototype", "knn", "logreg", "gda"])
 def test_queries_are_scored_in_blocks(monkeypatch, name):
     """Scoring queries a block at a time gives the same results as all at once; the block holds
