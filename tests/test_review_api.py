@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import anyio.to_thread
@@ -394,3 +395,13 @@ def test_empty_edits_change_nothing(client):
 def test_an_unreadable_file_reads_as_empty(tmp_path):
     """A file that can't be read gives no bytes (and so an unreadable image), not an exception."""
     assert read_or_empty(tmp_path) == b""  # a folder
+
+
+def test_compose_publishes_on_this_machine_and_images_are_pinned():
+    """docker-compose.yml publishes the port on 127.0.0.1 only (a reverse proxy faces the network),
+    and the Dockerfile's base images name their Debian release."""
+    root = Path(__file__).resolve().parent.parent
+    compose = (root / "docker-compose.yml").read_text()
+    assert 'ports: ["127.0.0.1:8000:8000"]' in compose
+    bases = [line.split()[1] for line in (root / "Dockerfile").read_text().splitlines() if line.startswith("FROM ")]
+    assert bases == ["node:22-bookworm-slim", "python:3.12-slim-bookworm"]

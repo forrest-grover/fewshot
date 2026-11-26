@@ -3,10 +3,15 @@ services:
   fewshot:
     build: .
     image: fewshot
-    ports: ["8000:8000"]
+    # Published on this machine only: put a reverse proxy with HTTPS in front of it. To reach it
+    # directly from other machines instead, publish "8000:8000" (with a strong FEWSHOT_TOKEN).
+    ports: ["127.0.0.1:8000:8000"]
     environment:
       FEWSHOT_TOKEN: ${FEWSHOT_TOKEN:?set FEWSHOT_TOKEN, e.g. FEWSHOT_TOKEN=$(openssl rand -hex 16)}
       # FEWSHOT_ALLOWED_HOSTS: fewshot.example.com   # the names clients use; IP addresses always work
+      # The proxy's address as the container sees it (Docker's gateway, e.g. 172.17.0.1), so that
+      # wrong tokens are limited per client rather than for everyone behind the proxy:
+      # FEWSHOT_FORWARDED_ALLOW_IPS: 172.17.0.1
     volumes:
       - fewshot-data:/data      # tasks, images and the embedding cache
       - fewshot-models:/models  # downloaded model weights
