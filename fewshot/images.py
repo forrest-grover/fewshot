@@ -81,6 +81,7 @@ def _keyed_out(im: Image.Image) -> np.ndarray | None:
     return hit.astype(np.uint8) * 255
 
 
+PNG_HEAD = 1 << 20  # bytes of a PNG file read for its sBIT chunk (which comes before the pixels)
 HIGH_DEPTH_MODES = {"I;16", "I;16B", "I;16L", "I;16N", "I", "F"}
 STRETCH_PERCENTILE = 99.9  # without a known white level, this percentile of the pixels is white
 STRETCH_SAMPLE = 1_000_000  # the percentile is taken over about this many evenly spaced pixels
@@ -91,9 +92,19 @@ def white_level(im: Image.Image, data: bytes | None = None) -> float | None:
     says: a TIFF's MaxSampleValue tag (which writers of 10- to 14-bit data stored in 16 bits may
     set), else its BitsPerSample if under 16; a PNG (``data``, the file's bytes) with an sBIT
     chunk, which Pillow doesn't read, says its samples were scaled to the full 16 bits, as the PNG
-    standard requires. None if the file doesn't say, or ``im`` isn't such an image."""
+    standard requires. None if the file doesn't say, or ``im`` isn't such an image.
+
+    Without ``data``, a PNG opened from a file has the start of that file read for the chunk; one
+    opened from bytes (the file is gone) is taken as saying nothing."""
     if im.mode not in HIGH_DEPTH_MODES or im.mode == "F":
         return None
+    name = getattr(im, "filename", None)
+    if data is None and im.format == "PNG" and isinstance(name, str) and name:
+        try:
+            with open(name, "rb") as f:
+                data = f.read(PNG_HEAD)
+        except OSError:
+            pass
     if data is not None and data.startswith(b"\x89PNG\r\n\x1a\n"):
         return 65535.0 if _has_sbit(data) else None
     tags = getattr(im, "tag_v2", None)  # MaxSampleValue, BitsPerSample:

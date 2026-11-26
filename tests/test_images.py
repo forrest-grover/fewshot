@@ -135,6 +135,20 @@ def test_white_level_from_metadata():
     assert images.white_level(Image.fromarray(dark), b"\x89PNG\r\n\x1a\n") is None  # truncated
 
 
+def test_white_level_of_a_png_opened_from_a_file(tmp_path):
+    """A 16-bit PNG given as an opened PIL image keeps its sBIT chunk's white level if it was
+    opened from a file (whose start is read for it); from bytes, it is auto-exposed."""
+    data = _with_sbit(_saved(np.full((4, 4), 3000, np.uint16), "PNG"), 12)
+    (tmp_path / "a.png").write_bytes(data)
+    with Image.open(tmp_path / "a.png") as im:
+        assert images.white_level(im) == 65535.0
+    with Image.open(io.BytesIO(data)) as im:
+        assert images.white_level(im) is None
+    with Image.open(tmp_path / "a.png") as im:
+        (tmp_path / "a.png").unlink()
+        assert images.white_level(im) is None  # the file is gone
+
+
 def test_float_images():
     """Floats from 0 to 2 are the 0..1 range, overshoot clipped (not stretched); a constant one
     isn't black; others are scaled as integers are, or stretched if they go negative."""
