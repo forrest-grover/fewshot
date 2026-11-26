@@ -376,7 +376,12 @@ def test_healthz_answers_while_every_thread_is_busy(client, monkeypatch):
     """With Starlette's thread pool used up by slow requests, /healthz still answers."""
     entered, release = threading.Event(), threading.Event()
     real = Task.summary
-    monkeypatch.setattr(Task, "summary", lambda self: entered.set() or (release.wait(10) and real(self)))
+
+    def slow_summary(self):
+        entered.set()
+        return release.wait(10) and real(self)
+
+    monkeypatch.setattr(Task, "summary", slow_summary)
     with client:  # one event loop, whose thread limit is set to one
         client.portal.call(lambda: setattr(anyio.to_thread.current_default_thread_limiter(), "total_tokens", 1))
         stuck = threading.Thread(target=lambda: client.get("/api/tasks"))
