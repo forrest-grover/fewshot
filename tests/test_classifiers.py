@@ -767,3 +767,16 @@ def test_gda_prior_when_no_anchor_fits(monkeypatch):
     monkeypatch.setattr(classifiers, "_anchors_fit", lambda dist: np.zeros(len(dist), bool))
     GDAClassifier().fit(_noisy_task(0.1, C=24, k=6))
     assert (seen[-1] == 0).all()
+
+
+def test_gda_fused_scale_can_go_below_a_tenth():
+    """The fused logits' scale is chosen from a grid wide enough for scores far too confident at
+    scale 1 (EuroSAT at 8 images per class wanted 0.04; the grid used to stop at 0.1)."""
+    rng = np.random.default_rng(0)
+    n, C = 400, 5
+    y = rng.integers(0, C, n)
+    zt = 100 * rng.normal(size=(n, C))  # huge scores ...
+    zt[np.arange(n), y] += 60  # ... that are right only about half the time
+    loo = rng.normal(size=(n, C))
+    _, scale = classifiers._fusion(zt, loo, lambda: loo, y, 8.0, 1.0, np.ones(n, bool))  # pylint: disable=protected-access
+    assert scale < 0.05

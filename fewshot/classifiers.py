@@ -522,6 +522,12 @@ class LogRegClassifier(Classifier):
 
 
 GDA_ALPHAS = np.geomspace(0.01, 100, 41)  # image-term weights tried, relative to the text term
+# Scales tried for GDA's fused (text and image) logits. From 0.1 to 10, EuroSAT at 8 images per class
+# chose 0.1, the end, and was 96% confident at 90% accuracy (0.04 gives 89%). Unlike the image-only
+# scale, it is fitted without label smoothing: smoothing made confidence too low at every number of
+# images (benchmark ECE 5.7/4.0/2.8/2.6/1.9 -> 6.5/4.6/3.3/2.5/2.3 at 1-16; without, 5.7/4.0/3.0/2.2/1.9).
+FUSED_SCALES = np.geomspace(0.01, 100, 81)
+ONE_SHOT_SCALE = 15.0  # image-only scores' scale times D where the spread can't be measured (see ``_fit_image``)
 TEXT_PRIOR = 1.5  # multiplies the empirical-Bayes weight of a class's text in its mean
 PRIOR_TEST_LEVEL = 0.05  # the text pulls the means only if its anchors match them this unlikely by chance
 MEAN_TEST_CLASSES = 4  # with fewer described classes, the pull's test counts images instead of class means
@@ -584,7 +590,12 @@ class GDAClassifier(Classifier):
         loo = _GDALeaveOneOut(Z[:m], y[:m], mu, n, prec, downdate)
         if self.Pt is None or self.text_weight <= 0:
             self._set_means(loo.mu, prec)
-            self.weight = loo.scale(_fitted(self.W), _fitted(self.b), default=15.0 * nu)
+            # With 1 image per class nothing can be left out to fit the scale. The best one varies
+            # with the data, not with the number of classes: on the six benchmark datasets from 7
+            # (EuroSAT) to 23 (Flowers) whether 5, 10 or all classes, and nothing the images show
+            # predicts it. 15 is near the least cross-entropy over all of them (13: 0.931 nats vs
+            # 0.945) and has the least calibration error (ECE 11.4% vs 11.7% at 13, 12.5% at 12).
+            self.weight = loo.scale(_fitted(self.W), _fitted(self.b), default=ONE_SHOT_SCALE * nu)
         else:
             self._fit_with_text(X[:m], raw_mu, loo, nu)
 
@@ -713,8 +724,7 @@ def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: 
     pull = 1.0 / (1.0 + (k - 1) / 2)  # all prior at 1 image per class, less with more
     weight = float(np.exp((1 - pull) * np.log(chosen) + pull * np.log(prior))) * rel
     fused = text_weight * zt + weight * exact()[keep]
-    scales = np.geomspace(0.1, 10, 41)
-    return weight, least_nll(fused, scales, y, what="fused logit scale")
+    return weight, least_nll(fused, FUSED_SCALES, y, what="fused logit scale")
 
 
 def nll_grid(B: Scores, multipliers: Scores, y: Labels, A: Scores | None = None, *,  # pylint: disable=too-many-arguments,too-many-locals
