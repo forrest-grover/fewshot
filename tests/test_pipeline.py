@@ -8,10 +8,10 @@ import pytest
 from PIL import Image
 
 import fewshot.pipeline as pipeline_mod
-from fewshot.classifiers import KNNClassifier, binomial_tail
+from fewshot.classifiers import KNNClassifier, binomial_tail, names_match, with_names
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.images import image_id
-from fewshot.pipeline import Pipeline, Prediction, names_match
+from fewshot.pipeline import Pipeline, Prediction
 from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
@@ -159,8 +159,9 @@ def test_class_data_text_for_described_classes(ws, emb):
     d = pipe.class_data(t)
     assert sorted(d.text) == [2, 3]
     # descriptions first, then the undescribed classes' names (for the modality gap only)
-    assert emb.texts == ["something blue", "a green-ish purple", "red", "green"]
-    assert sorted(d.name_text) == [0, 1]
+    assert emb.texts == ["something blue", "a green-ish purple", "a photo of a red.", "a photo of a green."]
+    assert sorted(d.names) == [0, 1]
+    assert not d.use_names
     assert d.text[2].argmax() == 2
     assert d.text[3].argmax() == 1
 
@@ -173,13 +174,13 @@ def test_text_only_class_is_predicted(ws, emb):
     t.upsert_class("blue", "pure blue")
     preds = Pipeline(ws).predict(t, [png(BLUE, seed=3), png(RED, seed=3)])
     assert [p.label for p in preds] == ["blue", "red"]
-    assert emb.texts == ["pure blue", "red", "green"]
+    assert emb.texts == ["pure blue", "a photo of a red.", "a photo of a green."]
 
 
 def test_names_are_not_embedded_without_descriptions(ws, emb):
     """With names_as_text off, class names are only embedded when some class has a description."""
     t = make_task(ws, embedder=TEXT_SPEC, names_as_text=False)
-    assert not Pipeline(ws).class_data(t).name_text
+    assert not Pipeline(ws).class_data(t).names
     assert emb.texts == []
 
 
@@ -188,15 +189,27 @@ def test_names_as_text_when_they_match(ws, emb):
     the examples better than chance; names that don't are left out, as are classes without examples."""
     t = make_task(ws, embedder=TEXT_SPEC)
     t.upsert_class("yellow")  # no examples: not described by its name
-    d = Pipeline(ws).class_data(t)
-    assert sorted(d.text) == [0, 1, 2]
+    pipe = Pipeline(ws)
+    d = pipe.class_data(t)
+    assert d.use_names
+    assert not d.text
+    assert sorted(d.names) == [0, 1, 2]
     assert emb.texts == ["a photo of a red.", "a photo of a green.", "a photo of a blue."]
-    assert [int(d.text[i].argmax()) for i in range(3)] == [0, 1, 2]
+    assert sorted(with_names(d).text) == [0, 1, 2]
+    assert [int(with_names(d).text[i].argmax()) for i in range(3)] == [0, 1, 2]
+    assert pipe.fitted(t).names_used
     wrong = ws.create("wrong", embedder=TEXT_SPEC)  # every name points at another class's colour
     for label, rgb in [("green-a", RED), ("blue-b", GREEN), ("red-c", BLUE)]:
         for i in range(2):
             wrong.add_example(png(rgb, noise=15, seed=i), label)
-    assert not Pipeline(ws).class_data(wrong).text
+    d = pipe.class_data(wrong)
+    assert with_names(d) is d
+    assert not pipe.fitted(wrong).names_used
+    off = make_task(ws, "off", embedder=TEXT_SPEC, names_as_text=False)
+    off.upsert_class("red", "pure red")
+    d = pipe.class_data(off)
+    assert sorted(d.names) == [1, 2]  # for the modality gap only
+    assert with_names(d) is d
 
 
 def test_binomial_tail():
@@ -495,3 +508,30 @@ def test_embed_files_reads_each_file_once(ws, emb, tmp_path, monkeypatch):
     np.testing.assert_allclose(out, pipe.embed_images("fake:color", [(None, f) for f in files]))
     assert pipe.embed_files("fake:color", []).shape == (0, 0)
     assert emb.images == 10
+
+
+@pytest.mark.usefixtures("emb")
+def test_names_gate_is_decided_per_fold_without_the_held_out_example(ws, monkeypatch):
+    """Whether names are used as text is decided from each fold's training examples: here all 5
+    examples pass the test (0.52**5 < 0.05) but no 4 of them do (0.5**4), so no fold may use the
+    names, while a fit on every example does."""
+    import fewshot.evaluate as ev  # pylint: disable=import-outside-toplevel
+
+    t = ws.create("t", embedder=TEXT_SPEC)
+    for label, rgb, n in (("red", RED, 3), ("blue", BLUE, 2)):
+        for i in range(n):
+            t.add_example(png(rgb, noise=15, seed=i), label)
+    pipe = Pipeline(ws)
+    assert pipe.fitted(t).names_used
+    folds = []
+    real = pipeline_mod.new_classifier
+
+    def spy(cfg):
+        folds.append(real(cfg))
+        return folds[-1]
+
+    monkeypatch.setattr(ev, "new_classifier", spy)
+    report = ev.evaluate_task(pipe, t)
+    assert report["method"] == "leave-one-out"
+    assert len(folds) == 5
+    assert not any(c.names_used for c in folds)

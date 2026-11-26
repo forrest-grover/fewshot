@@ -470,3 +470,22 @@ def test_grid_searches_log_when_they_hit_an_end(caplog):
     assert not caplog.text
     ev._fit_temperature(np.array([[0.501, 0.499], [0.499, 0.501]] * 50), np.array([0, 1] * 50))  # pylint: disable=protected-access
     assert "temperature chose" in caplog.text
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_refitting_forgets_the_previous_fit(name):
+    """Fitting a classifier again (here without text, after a fit with it) gives what a fresh one
+    would: no fitted scale, text vectors or gap carry over."""
+    rng = np.random.default_rng(0)
+    X, y = noise(rng, 12, 8), np.arange(12) % 3
+    text = dict(enumerate(noise(rng, 3, 8)))
+    plain = ClassData(list("abc"), X, y)
+    Q = noise(rng, 5, 8)
+    clf = make_classifier(name).fit(ClassData(list("abc"), X, y, text))
+    assert clf.Pt is not None
+    clf.fit(plain)
+    fresh = make_classifier(name).fit(plain)
+    assert clf.Pt is None
+    assert clf.gap is None
+    assert clf.logit_scale == fresh.logit_scale
+    np.testing.assert_allclose(clf.predict(Q)[0], fresh.predict(Q)[0], rtol=1e-6)

@@ -21,13 +21,19 @@ members from outsiders (one-class or anomaly tasks, with a reject threshold).
 
 The gap is the mean of (text - image centroid) over the classes with images,
 taking each class's description, or else the embedding of its name
-(``ClassData.name_text``). Without names it falls back to the difference of the
+(``ClassData.names``). Without names it falls back to the difference of the
 modality means, which degenerates when only one class has text: that text
 vector *is* the text mean, so the shift erases every class difference.
+
+With ``ClassData.use_names``, the names of the classes with images but no description are
+also their text, if they classify the images better than chance would (``names_match``). That
+is decided in ``fit``, from the images it is given, so cross-validation decides it per fold
+without the held-out images.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import math
@@ -58,9 +64,11 @@ class ClassData:
     X: Vectors  # (n, d) image embeddings
     y: Labels  # (n,) int class indices into ``classes``
     text: dict[int, Vectors] = field(default_factory=dict)  # class index -> (d,) text embedding
-    # Class index -> (d,) embedding of the class name, for classes without ``text``. Only used to
-    # estimate the modality gap, never to score.
-    name_text: dict[int, Vectors] = field(default_factory=dict)
+    # Class index -> (d,) embedding of the class's name in a template ("a photo of a {}."), for
+    # classes without ``text``. They estimate the modality gap, and with ``use_names`` the names
+    # of the classes with images are their text if they pass ``names_match`` (see ``with_names``).
+    names: dict[int, Vectors] = field(default_factory=dict)
+    use_names: bool = False
 
     @property
     def dim(self) -> int:
@@ -102,10 +110,42 @@ def _fitted(value: _T | None) -> _T:
     return value
 
 
+NAME_TEST_LEVEL = 0.05  # names are used as text when matching the examples this well is unlikely by chance
+
+
+def names_match(guess: Labels, truth: Labels, named: npt.NDArray[np.bool_], texts: int) -> bool:
+    """Whether text guesses ``guess`` of every example's class ``truth`` hit it, among the examples
+    of the classes described by their names (``named``), more often than chance would (one-sided
+    binomial test at ``NAME_TEST_LEVEL``). Chance is the hit rate of guesses unrelated to the
+    images: one is class c as often as the guesses for all the examples are, so texts that send
+    every image to the largest class score no better than chance however unbalanced the classes
+    are. With every example in one class that rate can't show whether the text tells the class
+    apart, so chance is then one in the number of ``texts`` (classes with text)."""
+    rate = np.bincount(guess, minlength=int(max(guess.max(), truth.max())) + 1) / len(guess)
+    chance = 1.0 / texts if len(set(truth.tolist())) == 1 else float(rate[truth[named]].mean())
+    return binomial_tail(int((guess == truth)[named].sum()), int(named.sum()), chance) < NAME_TEST_LEVEL
+
+
+def with_names(data: ClassData) -> ClassData:
+    """``data`` with the names of its classes that have images but no text as their text, if
+    ``use_names`` is set and those names classify the images better than chance would (see
+    ``names_match``, guessing among every class with text or such a name): meaningless names
+    (codes, numbers) would only pull predictions off. Otherwise ``data`` itself."""
+    named = {i: v for i, v in data.names.items() if i not in data.text and (data.y == i).any()}
+    if not data.use_names or not named:
+        return data
+    candidates = sorted(set(data.text) | set(named))
+    T = np.stack([data.text[i] if i in data.text else named[i] for i in candidates])
+    guess = np.array(candidates)[(data.X @ T.T).argmax(1)]
+    if not names_match(guess, data.y, np.isin(data.y, list(named)), len(candidates)):
+        return data
+    return dataclasses.replace(data, text={**data.text, **named})
+
+
 def _modality_gap(data: ClassData) -> Vectors:
     """Estimated (text - image) offset; ``data`` has images and at least one text embedding."""
     with_images = sorted(set(data.y.tolist()))
-    sides = [(i, t) for i in with_images if (t := data.text.get(i, data.name_text.get(i))) is not None]
+    sides = [(i, t) for i in with_images if (t := data.text.get(i, data.names.get(i))) is not None]
     if len(sides) == len(with_images):
         gap: Vectors = np.mean([t - data.X[data.y == i].mean(0) for i, t in sides], axis=0).astype(np.float32)
         return gap
@@ -136,6 +176,12 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         self.gap: Vectors | None = None
         self._X: Vectors | None = None  # image-space support points (examples + text anchors)
         self._y: Labels | None = None  # class of each support point
+        self.names_used = False  # whether the last fit used class names as text (see ``with_names``)
+
+    def _reset(self) -> None:
+        """Forget a previous fit's state, so refitting the same object matches a fresh one."""
+        self.logit_scale, self.n_images, self.names_used = 1.0, 0, False
+        self.Pt = self.described = self.gap = self._X = self._y = None
 
     # Subclasses implement these on image-space data where every class has >= 1 point.
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
@@ -175,12 +221,15 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         missing = [c for i, c in enumerate(data.classes) if i not in with_images and i not in data.text]
         if missing:
             raise ValueError(f"Classes with no images and no text description: {missing}")
+        self._reset()
+        described = len(data.text)
+        data = with_names(data)
+        self.names_used = len(data.text) > described
         self.classes = list(data.classes)
         self.zero_shot = len(data.X) == 0
-        self.Pt = None
+        gap = None if self.zero_shot or not data.text else _modality_gap(data)
 
         if data.text and (self.zero_shot or self.text_weight > 0):
-            gap = None if self.zero_shot else _modality_gap(data)
             Pt = np.zeros((C, data.dim), np.float32)
             for i in range(C):
                 if i in data.text:
@@ -196,8 +245,7 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         X, y, w = data.X, data.y, np.ones(len(data.X), np.float32)
         text_only = [i for i in data.text if i not in with_images]
         if text_only:
-            gap = _modality_gap(data)
-            T = _unit(np.stack([data.text[i] - gap for i in text_only]))
+            T = _unit(np.stack([data.text[i] - _fitted(gap) for i in text_only]))
             X = np.concatenate([X, T])
             y = np.concatenate([y, text_only])
             w = np.concatenate([w, np.ones(len(T), np.float32)])

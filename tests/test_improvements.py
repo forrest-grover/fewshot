@@ -51,7 +51,7 @@ def test_model_is_held_between_batches(ws, monkeypatch):
     monkeypatch.setenv("FEWSHOT_MAX_MODELS", "1")
     evicted = []
 
-    def load_another(done, total):
+    def load_another(done, _total):
         assert emb.users == 0  # between batches: no embed call is running
         with embedders._load_lock:  # pylint: disable=protected-access
             embedders._loaded[f"m:other{done}"] = ColorEmbedder()  # pylint: disable=protected-access
@@ -221,7 +221,7 @@ def test_batch_size_changes_under_the_model_lock(monkeypatch):
     emb = Guarded()
     emb.armed = True
     emb.embed_images([Image.new("RGB", (2, 2))] * 8)
-    assert emb._full_batch == 4
+    assert emb._full_batch == 4  # pylint: disable=protected-access
     assert emb.batch_size == 4
 
 

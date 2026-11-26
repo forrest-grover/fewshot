@@ -53,7 +53,8 @@ class HeldOut:
 def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
     """Training ClassData restricted to rows ``train``, dropping classes left with
     neither images nor text. Returns it plus a map from subset class index to
-    original class index."""
+    original class index. Whether names are used as text is left to the fit, which
+    decides it from these rows only."""
     X, y = data.X[train], data.y[train]
     present = sorted(set(y.tolist()) | set(data.text))
     remap = {c: i for i, c in enumerate(present)}
@@ -62,7 +63,8 @@ def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
         X,
         np.array([remap[c] for c in y], int),
         {remap[c]: v for c, v in data.text.items()},
-        {remap[c]: v for c, v in data.name_text.items() if c in remap},
+        {remap[c]: v for c, v in data.names.items() if c in remap},
+        data.use_names,
     )
     return sub, np.array(present)
 
@@ -113,10 +115,10 @@ def _fold(data: ClassData, cfg: TaskConfig, test: np.ndarray, out: HeldOut) -> N
 
 
 def _text_unused(data: ClassData, cfg: TaskConfig) -> bool:
-    """Whether descriptions play no part in any leave-one-out fold: there are none, or their
-    weight is 0 and every class keeps an example when one is held out (a class left with only
-    its description would score through it)."""
-    if not data.text:
+    """Whether text plays no part in any leave-one-out fold: there are no descriptions and no
+    names that a fold might use as text, or the text's weight is 0 and every class keeps an
+    example when one is held out (a class left with only its description would score through it)."""
+    if not data.text and not (data.use_names and data.names):
         return True
     return cfg.text_weight == 0 and int(np.bincount(data.y, minlength=len(data.classes)).min()) >= 2
 
