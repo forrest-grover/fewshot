@@ -70,7 +70,9 @@ class Flaky(ColorEmbedder):
 
 
 @pytest.mark.parametrize("error", [torch.cuda.OutOfMemoryError("CUDA out of memory"),
-                                   RuntimeError("MPS backend out of memory")])
+                                   RuntimeError("MPS backend out of memory"),
+                                   RuntimeError("[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: "
+                                                "can't allocate memory: you tried to allocate 3221225472 bytes.")])
 def test_out_of_memory_halves_the_batch(error, monkeypatch):
     """On OOM the batch is split in halves and later batches stay smaller; results are unchanged."""
     freed = []

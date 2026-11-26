@@ -15,6 +15,7 @@ from fewshot.classifiers import (
     LogRegClassifier,
     PrototypeClassifier,
     make_classifier,
+    temper,
     top_k,
 )
 
@@ -231,6 +232,17 @@ def test_knn_low_similarities_still_decide():
     assert probs[0, 0] > 0.99
 
 
+def test_text_weight_errors_name_a_task_setting():
+    """text_weight is a task setting every classifier takes; its errors say so instead of calling
+    it the classifier's parameter. The classifier's own parameters are still named as such."""
+    with pytest.raises(ValueError, match=r"^task setting 'text_weight' must be >= 0.0 and <= 100, got -5$"):
+        make_classifier("gda", text_weight=-5)
+    with pytest.raises(ValueError, match=r"^task setting 'text_weight' must be a number"):
+        make_classifier("gda", text_weight="x")
+    with pytest.raises(ValueError, match=r"^knn parameter 'k' must be > 0"):
+        make_classifier("knn", k=0)
+
+
 @pytest.mark.parametrize(("name", "params", "message"), [
     ("nope", {}, "Unknown classifier 'nope'"),
     ("knn", {"bogus": 1}, "Unknown parameter 'bogus' for knn"),
@@ -432,13 +444,33 @@ def test_gda_prior_needs_text_that_matches_the_images(monkeypatch):
     seen = _prior_strengths(monkeypatch)
     data = _noisy_task(0.3)
     GDAClassifier().fit(data)
-    assert (seen[-1] > 0).all()
+    assert (seen[-1] > 0).mean() > 0.5  # (some classes' images are too noisy to show it)
     order = np.roll(np.arange(len(data.classes)), 1)
     GDAClassifier().fit(ClassData(data.classes, data.X, data.y, {i: data.text[int(j)] for i, j in enumerate(order)}))
     assert (seen[-1] == 0).all()
     # A single described class can't show it matches.
     GDAClassifier().fit(ClassData(data.classes, data.X, data.y, {0: data.text[0]}))
     assert (seen[-1] == 0).all()
+
+
+def test_gda_prior_is_decided_per_class(monkeypatch):
+    """Descriptions that don't match their images don't pull their class means, even when the
+    others' do (and so pass the test for the task as a whole)."""
+    seen = _prior_strengths(monkeypatch)
+    data = _noisy_task(0.1, C=24, k=6)
+    GDAClassifier().fit(data)
+    assert (seen[-1] > 0).all()
+    wrong = [0, 1, 2, 3]
+    text = {i: -t if i in wrong else t for i, t in data.text.items()}  # (pointing away from the images)
+    GDAClassifier().fit(ClassData(data.classes, data.X, data.y, text))
+    assert (seen[-1][wrong] == 0).all()
+    assert (np.delete(seen[-1], wrong) > 0).all()
+
+
+def test_anchors_fit_needs_enough_classes_to_rank():
+    """With fewer than ``MEAN_TEST_CLASSES`` described classes, every anchor pulls (the task-wide
+    test counts images instead)."""
+    assert classifiers._anchors_fit(np.array([[5.0, 0.0], [0.0, 5.0]])).all()  # pylint: disable=protected-access
 
 
 def test_gda_text_weight_scales_the_prior(monkeypatch):
@@ -462,16 +494,64 @@ def test_grid_searches_log_when_they_hit_an_end(caplog):
     y = np.array([0, 1])
     sure = np.array([[1.0, -1.0], [-1.0, 1.0]])
     grid = np.array([0.5, 1.0, 2.0])
-    assert classifiers._least_nll([g * sure for g in grid], grid, y, what="probe") == 2.0  # pylint: disable=protected-access
+    assert classifiers.least_nll(sure, grid, y, what="probe") == 2.0
     assert "probe chose 2, the high end of its grid" in caplog.text
     caplog.clear()
-    assert classifiers._least_nll([g * sure for g in (0.5, 5, 10)], grid, y, smooth=True) == 0.5  # pylint: disable=protected-access
+    assert classifiers.least_nll(sure, grid, y, smooth=True) == 0.5  # smoothed: best near 0.55
     assert "value chose 0.5, the low end of its grid" in caplog.text
     caplog.clear()
-    assert classifiers._least_nll([sure * 0, sure, sure * 0], grid, y) == 1.0  # pylint: disable=protected-access
+    assert classifiers.least_nll(sure, np.array([0.25, 0.55, 2.0]), y, smooth=True) == 0.55
     assert not caplog.text
     ev._fit_temperature(np.array([[0.501, 0.499], [0.499, 0.501]] * 50), np.array([0, 1] * 50))  # pylint: disable=protected-access
     assert "temperature chose" in caplog.text
+
+
+def _old_least_nll(logits, values, y, smooth=False):
+    """The grid search as it was, with every candidate's logits at once: the reference."""
+    rows = np.arange(len(y))
+    if smooth:
+        eps = 1.0 / (len(y) + 2)
+        Y = np.full(logits[0].shape, eps / max(logits[0].shape[1] - 1, 1))
+        Y[rows, y] = 1.0 - eps
+        nll = [-(Y * classifiers._log_softmax(z)).sum(1).mean() for z in logits]  # pylint: disable=protected-access
+    else:
+        nll = [-classifiers._log_softmax(z)[rows, y].mean() for z in logits]  # pylint: disable=protected-access
+    return np.array(nll), float(values[int(np.argmin(nll))])
+
+
+@pytest.mark.parametrize("smooth", [False, True])
+def test_grid_search_in_blocks_matches_all_at_once(monkeypatch, smooth):
+    """The grid search scores candidates block by block, a few rows at a time; it gives the same
+    cross-entropies and choices as scoring every candidate's logits at once."""
+    rng = np.random.default_rng(0)
+    n, C = 203, 7
+    A, B, y = rng.normal(size=(n, C)) * 3, rng.normal(size=(n, C)), rng.integers(0, C, n)
+    B[np.arange(n), y] += 1.0
+    grid = classifiers.GDA_ALPHAS
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 50)  # blocks of 7 rows
+    old, choice = _old_least_nll([A + a * 2.5 * B for a in grid], grid, y, smooth)
+    np.testing.assert_allclose(classifiers.nll_grid(B, grid * 2.5, y, A, smooth=smooth), old, rtol=1e-10)
+    assert classifiers.least_nll(B, grid, y, A, factor=2.5, smooth=smooth) == choice
+    old, choice = _old_least_nll([a * B for a in grid], grid, y, smooth)
+    assert classifiers.least_nll(B, grid, y, smooth=smooth) == choice
+
+
+def test_temperature_fit_matches_all_at_once(monkeypatch):
+    """Evaluation's temperature, fitted block by block, is the one the all-at-once search found,
+    with probabilities of 0 (classes a fold left out) floored as before."""
+    rng = np.random.default_rng(1)
+    n, C = 120, 5
+    P = classifiers._softmax(rng.normal(size=(n, C)) * 4)  # pylint: disable=protected-access
+    P[:10, 4] = 0.0
+    P /= P.sum(1, keepdims=True)
+    t = np.where(rng.random(n) < 0.7, P.argmax(1), rng.integers(0, 4, n))
+    eps = 1.0 / (n + 2)
+    Y = np.full(P.shape, eps / (C - 1))
+    Y[np.arange(n), t] = 1.0 - eps
+    with np.errstate(divide="ignore"):
+        old = [-(Y * np.log(np.clip(temper(P, float(T)), 1e-12, 1))).sum() for T in ev.TEMPERATURES]
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 20)
+    assert ev._fit_temperature(P, t) == float(ev.TEMPERATURES[int(np.argmin(old))])  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -603,3 +683,146 @@ def test_knn_compares_with_examples_once(monkeypatch):
     assert calls == [3]
     clf._image_logprobs(X)  # pylint: disable=protected-access  # without S, the hook computes it
     assert calls == [3, 3]
+
+
+def _named_task(real, C=30, k=2, seed=3):
+    """Images of ``C`` classes with a name each: classes ``real`` have names matching their
+    images (across a modality gap), the others random codes."""
+    rng = np.random.default_rng(seed)
+    centres = unit(rng.normal(size=(C, 32)))
+    gap = unit(rng.normal(size=32))
+    y = np.repeat(np.arange(C), k)
+    X = unit(centres[y] + 0.1 * rng.normal(size=(len(y), 32)))
+    codes = unit(gap + 0.4 * rng.normal(size=(C, 32)))
+    names = {i: unit(centres[i] + gap) if i in real else codes[i] for i in range(C)}
+    return ClassData([str(i) for i in range(C)], X, y, {}, names, True)
+
+
+def test_names_are_decided_per_class():
+    """A task mixing real names with codes uses the real ones as text and not (most of) the
+    codes, which would otherwise ride on the real ones passing the test for the task as a whole."""
+    real = set(range(10))
+    data = classifiers.with_names(_named_task(real))
+    assert real <= set(data.text)
+    assert len(set(data.text) - real) <= 3  # of 20 codes, a few rank their examples high by luck
+    every = classifiers.with_names(_named_task(set(range(30))))
+    assert set(every.text) == set(range(30))
+    assert classifiers.with_names(_named_task(set())).text == {}
+
+
+def test_own_rank_compares_with_the_other_classes_examples():
+    """How a class's examples rank by similarity to its text, against the other classes' examples:
+    a text every image is near (column 2) only passes for the classes its examples rank high in."""
+    S = np.array([[0.9, 0.1, 0.0], [0.1, 0.9, 0.0], [0.0, 0.1, 0.30], [0.0, 0.0, 0.31],
+                  [0.0, 0.0, 0.32], [0.0, 0.0, 0.1]])
+    y = np.array([0, 1, 2, 3, 4, 5])
+    assert classifiers.own_rank(S, y, np.array([0, 1, 5])) == pytest.approx([0.0, 0.0, 0.6])
+    assert classifiers.own_rank(S[:1], y[:1], np.array([0])) == pytest.approx([0.0])  # nothing to rank against
+
+
+def test_meaningless_chance_adapts_to_the_task():
+    """A middling p-value counts as meaningless where most names are codes, not where all are real."""
+    real = np.full(40, 0.01)
+    assert (classifiers.meaningless_chance(np.append(real, 0.3), 1e-3) < 0.5).all()
+    mixed = np.append(np.linspace(0.02, 1, 40), [0.01] * 5)
+    chance = classifiers.meaningless_chance(np.append(mixed, 0.3), 1e-3)
+    assert chance[-1] > 0.5
+    assert chance[-2] < chance[-1]
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_stand_in_text_scores_match_real_texts(name):
+    """An image-only class's text score (against its centroid moved across the gap) is mapped to
+    real texts' scale: the map that makes the described classes' own stand-ins score the other
+    classes' examples with their texts' mean and spread. Predictions use the mapped scores."""
+    data = _noisy_task(0.3, C=12)
+    text = {i: unit(t + 0.5) for i, t in data.text.items() if i >= 3}  # classes 0-2 without text
+    data = ClassData(data.classes, data.X, data.y, text)
+    clf = make_classifier(name).fit(data)
+    assert clf.gap is not None
+    assert clf.Pt is not None
+    assert clf.text_a is not None
+    assert clf.text_b is not None
+    a, b = classifiers._stand_in_scale(data, clf.gap)  # pylint: disable=protected-access
+    assert a != pytest.approx(1.0)
+    assert clf.text_a.tolist() == [a] * 3 + [1.0] * 9
+    assert clf.text_b.tolist() == [b] * 3 + [0.0] * 9
+    P = unit(np.stack([data.X[data.y == i].mean(0) for i in range(3, 12)]) + clf.gap)
+    other = data.y[:, None] != np.arange(3, 12)[None, :]
+    T = np.stack([text[i] for i in range(3, 12)])
+    mapped, real = a * (data.X @ P.T)[other] + b, (data.X @ T.T)[other]
+    assert mapped.mean() == pytest.approx(real.mean(), abs=1e-5)
+    assert mapped.std() == pytest.approx(real.std(), rel=1e-4)
+    z = clf._text_logits(data.X)  # pylint: disable=protected-access
+    np.testing.assert_allclose(z[:, :3], 100 * (a * (data.X @ clf.Pt[:3].T) + b), rtol=1e-4, atol=1e-3)
+
+
+def test_stand_in_scale_needs_enough_pairs():
+    """Too few (text, other example) pairs to measure a spread leave the scores as they are."""
+    data, gap = text_task()
+    assert classifiers._stand_in_scale(data, gap) == (1.0, 0.0)  # pylint: disable=protected-access
+    assert classifiers._stand_in_scale(ClassData(data.classes, data.X, data.y, {}), gap) == (1.0, 0.0)  # pylint: disable=protected-access
+
+
+def test_stand_in_scale_without_spread():
+    """Stand-ins that score every other example alike (identical images) leave the scores as they are."""
+    X = np.repeat(unit(np.eye(4)[:3]), 8, axis=0)
+    y = np.repeat(np.arange(3), 8)
+    data = ClassData(["a", "b", "c"], X, y, {0: unit([1, 0, 0, 1]), 1: unit([0, 1, 0, 1])})
+    assert classifiers._stand_in_scale(data, np.zeros(4, np.float32)) == (1.0, 0.0)  # pylint: disable=protected-access
+
+
+def test_gda_prior_when_no_anchor_fits(monkeypatch):
+    """Text that passes the task-wide test but fits no class's mean pulls none."""
+    seen = _prior_strengths(monkeypatch)
+    monkeypatch.setattr(classifiers, "_anchors_fit", lambda dist: np.zeros(len(dist), bool))
+    GDAClassifier().fit(_noisy_task(0.1, C=24, k=6))
+    assert (seen[-1] == 0).all()
+
+
+def test_gda_fused_scale_can_go_below_a_tenth():
+    """The fused logits' scale is chosen from a grid wide enough for scores far too confident at
+    scale 1 (EuroSAT at 8 images per class wanted 0.04; the grid used to stop at 0.1)."""
+    rng = np.random.default_rng(0)
+    n, C = 400, 5
+    y = rng.integers(0, C, n)
+    zt = 100 * rng.normal(size=(n, C))  # huge scores ...
+    zt[np.arange(n), y] += 60  # ... that are right only about half the time
+    loo = rng.normal(size=(n, C))
+    _, scale = classifiers._fusion(zt, loo, lambda: loo, y, 8.0, 1.0, np.ones(n, bool))  # pylint: disable=protected-access
+    assert scale < 0.05
+
+
+def test_knn_casts_its_examples_once(monkeypatch):
+    """kNN keeps a float64 copy of its examples from the fit, instead of casting them again for
+    every block of queries (which made 1000 queries against 100k examples take 8 s, not 2)."""
+    rng = np.random.default_rng(0)
+    X = unit(rng.normal(size=(30, 8)))
+    clf = make_classifier("knn").fit(ClassData(["a", "b", "c"], X, np.arange(30) % 3))
+    seen = []
+    real = classifiers.knn_similarity
+
+    def spy(Q, S):
+        seen.append(S.dtype)
+        return real(Q, S)
+    monkeypatch.setattr(classifiers, "knn_similarity", spy)
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 60)  # blocks of 2 queries
+    probs, _ = clf.predict(X[:6])
+    assert seen == [np.float64] * 3
+    np.testing.assert_array_equal(probs.argmax(1), np.arange(6) % 3)
+
+
+@pytest.mark.parametrize("name", ["knn", "logreg", "gda"])
+def test_class_similarity_with_classes_in_any_order(name):
+    """Each class's similarity is that of its nearest support point however the examples (and the
+    text-only classes' anchors after them) are ordered."""
+    rng = np.random.default_rng(1)
+    X = unit(rng.normal(size=(40, 6)))
+    y = rng.permutation(np.arange(40) % 4)
+    text = {4: unit(rng.normal(size=6))}
+    clf = make_classifier(name).fit(ClassData(list("abcde"), X, y, text))
+    Q = unit(rng.normal(size=(5, 6)))
+    assert clf._X is not None  # pylint: disable=protected-access
+    S = Q @ clf._X.T  # pylint: disable=protected-access
+    expected = np.stack([S[:, clf._y == c].max(1) for c in range(5)], axis=1)  # pylint: disable=protected-access
+    np.testing.assert_allclose(clf.class_similarity(Q), expected, atol=1e-6)

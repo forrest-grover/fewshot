@@ -124,11 +124,12 @@ def _autocast(device: str) -> AbstractContextManager[Any]:
 
 
 def _is_oom(e: BaseException) -> bool:
-    """Whether ``e`` is the GPU running out of memory (CUDA's own error, or MPS's RuntimeError)."""
+    """Whether ``e`` is the device running out of memory: CUDA's own error, or a RuntimeError
+    from MPS ("out of memory") or the CPU's allocator ("can't allocate memory")."""
     import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
     return isinstance(e, torch.cuda.OutOfMemoryError) or (
-        isinstance(e, RuntimeError) and "out of memory" in str(e).lower())
+        isinstance(e, RuntimeError) and any(m in str(e).lower() for m in ("out of memory", "can't allocate memory")))
 
 
 def _l2(x: torch.Tensor) -> Vectors:
@@ -387,6 +388,13 @@ def cache_namespace(spec: str) -> str:
     replaced under the same spec, so its namespace adds its ``cache_version`` or, by default, a
     fingerprint of its output on a fixed image: a new model never gets the old one's vectors, and
     the same model gets them back in a later process.
+
+    Neither names the library versions or the device. A change to how images are turned into
+    pixels is marked per image instead (see ``images.conversion_key``), re-embedding only the
+    images it changes. Half precision on CUDA and full precision on the CPU agree to a cosine of
+    0.99996 or more (PE Core B/16, 96 DTD images; similarities differ by at most 0.002), so they
+    share vectors; versioning the namespace by device or by open_clip and timm releases would
+    re-embed every image after each switch or upgrade for differences no prediction shows.
     """
     with _load_lock:
         emb = _loaded.get(spec) if spec in _registered else None

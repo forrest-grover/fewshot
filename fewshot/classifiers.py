@@ -26,9 +26,10 @@ modality means, which degenerates when only one class has text: that text
 vector *is* the text mean, so the shift erases every class difference.
 
 With ``ClassData.use_names``, the names of the classes with images but no description are
-also their text, if they classify the images better than chance would (``names_match``). That
-is decided in ``fit``, from the images it is given, so cross-validation decides it per fold
-without the held-out images.
+also their text, if they classify the images better than chance would (``names_match``) and,
+name by name, match their own class's images (``with_names``). That is decided in ``fit``,
+from the images it is given, so cross-validation decides it per fold without the held-out
+images.
 """
 
 from __future__ import annotations
@@ -124,20 +125,107 @@ def names_match(guess: Labels, truth: Labels, named: npt.NDArray[np.bool_], text
     return binomial_tail(int((guess == truth)[named].sum()), int(named.sum()), chance) < NAME_TEST_LEVEL
 
 
+NAME_FDR = 0.2  # a name is used if the chance that it is meaningless is below this (see ``meaningless_chance``)
+ANCHOR_FDR = 0.5  # the same for a description's pull on its class mean (see ``_anchors_fit``)
+NAME_SEEN_RANK = 0.5  # ... or it is some own example's best text, and its examples rank in this top share
+NULL_ROWS = 4096  # at most this many examples are the other classes' side of ``own_rank``
+
+
+def own_rank(S: Scores, y: Labels, cols: Labels) -> Scores:
+    """For each class ``c`` = ``cols[j]``: how its examples rank by their similarity ``S[:, j]``
+    to its text against the other classes' examples, as the mean share of the others scoring at
+    least as high (0: its own examples are the most similar). A text unrelated to the images
+    gives about 0.5 whatever the text, since every class's examples are compared with the same
+    text: one that every image is similar to (a sink) doesn't pass for matching. Ranked against
+    an even subsample of at most ``NULL_ROWS`` examples, so its cost doesn't grow with the
+    square of the examples. 0 for a class with no other examples to compare with."""
+    null = np.unique(np.linspace(0, len(y) - 1, min(len(y), NULL_ROWS)).astype(int))
+    out = np.zeros(len(cols))
+    for j, c in enumerate(cols):
+        own, others = S[y == c, j], np.sort(S[null[y[null] != c], j])
+        if len(others) and len(own):
+            out[j] = float((len(others) - np.searchsorted(others, own, "left")).mean()) / len(others)
+    return out
+
+
+_BUM_SHAPES = np.geomspace(0.01, 1, 60)
+_BUM_MIX = np.linspace(0, 1, 101)
+
+
+def meaningless_chance(p: Scores, floor: float) -> Scores:
+    """For p-values ``p`` (at least ``floor``) of names tested one by one, each one's chance of
+    being meaningless (its local false discovery rate) under a beta-uniform mixture fitted by
+    maximum likelihood (Pounds and Morris, 2003): density ``m + (1 - m) a p^(a-1)``, uniform for
+    meaningless names and piled up near 0 for real ones. Unlike a fixed level, it adapts to the
+    task: where nearly all names are real, a weak one is kept; where most are codes, a code
+    that ranks its examples high by luck is not."""
+    p = np.clip(p, floor, 1.0)
+    a, mix = _BUM_SHAPES[:, None, None], _BUM_MIX[None, :, None]
+    ll = np.log(mix + (1 - mix) * a * p[None, None, :] ** (a - 1)).sum(2)
+    best = int(np.argmax(ll))
+    a0, m0 = float(_BUM_SHAPES[best // ll.shape[1]]), float(_BUM_MIX[best % ll.shape[1]])
+    out: Scores = (m0 + (1 - m0) * a0) / (m0 + (1 - m0) * a0 * p ** (a0 - 1))
+    return out
+
+
 def with_names(data: ClassData) -> ClassData:
     """``data`` with the names of its classes that have images but no text as their text, if
-    ``use_names`` is set and those names classify the images better than chance would (see
-    ``names_match``, guessing among every class with text or such a name): meaningless names
-    (codes, numbers) would only pull predictions off. Otherwise ``data`` itself."""
+    ``use_names`` is set and they match the examples: meaningless names (codes, numbers) would
+    only pull predictions off. The names together must classify the images better than chance
+    would (see ``names_match``, guessing among every class with text or such a name), and then
+    each is tested on its own, since a task can mix names with codes and real names passing the
+    first test would otherwise carry the codes with them (on Food-101 with a fifth of the
+    classes named, the coded classes fell from 72% to 23% at 2 images per class). A name is
+    kept if its examples rank high by their similarity to it (``own_rank``, a p-value) and so
+    its chance of being meaningless is below ``NAME_FDR`` (``meaningless_chance``), or if it is
+    the best text of one of its own examples and they rank in the top ``NAME_SEEN_RANK``: a
+    weak but real name (DTD's textures at 1 image each) then still counts. On the six benchmark
+    datasets with a share of the names replaced by codes, the coded classes lose 2 points on
+    average instead of 30, and all-real names lose under half a point.
+    Otherwise ``data`` itself."""
     named = {i: v for i, v in data.names.items() if i not in data.text and (data.y == i).any()}
     if not data.use_names or not named:
         return data
     candidates = sorted(set(data.text) | set(named))
     T = np.stack([data.text[i] if i in data.text else named[i] for i in candidates])
-    guess = np.array(candidates)[(data.X @ T.T).argmax(1)]
+    S = data.X @ T.T
+    guess = np.array(candidates)[S.argmax(1)]
     if not names_match(guess, data.y, np.isin(data.y, list(named)), len(candidates)):
         return data
-    return dataclasses.replace(data, text={**data.text, **named})
+    cols = [j for j, i in enumerate(candidates) if i in named]
+    cls = np.array(candidates)[cols]
+    rank = own_rank(S[:, cols], data.y, cls)
+    seen = np.array([bool((guess[data.y == c] == c).any()) for c in cls])
+    ok = (meaningless_chance(rank, 0.5 / len(data.y)) < NAME_FDR) | (seen & (rank <= NAME_SEEN_RANK))
+    keep = {int(c): named[int(c)] for c in cls[ok]}
+    return dataclasses.replace(data, text={**data.text, **keep}) if keep else data
+
+
+STAND_IN_PAIRS = 20  # (text, other class's example) pairs needed to map stand-in text scores
+
+
+def _stand_in_scale(data: ClassData, gap: Vectors) -> tuple[float, float]:
+    """(a, b) mapping an image-only class's text score, its similarity ``s`` to its image centroid
+    moved across the gap, to ``a * s + b`` on the scale of real texts' scores. That similarity is
+    spread more widely than a text's (on PE Core about 0.07 against 0.04 between an image and
+    another class), so without the mapping every class without text drew images away from the
+    described ones: on FGVC Aircraft with 8% of the classes undescribed they took 45% of the
+    predictions. Fitted on the classes with both images and text, matching the mean and spread
+    of their stand-ins' scores to their texts' over the other classes' examples. (1, 0) with
+    fewer than ``STAND_IN_PAIRS`` such (text, example) pairs, too few to measure a spread."""
+    both = [i for i in sorted(set(data.y.tolist())) if i in data.text]
+    if not both:
+        return 1.0, 0.0
+    T = np.stack([data.text[i] for i in both])
+    P = _unit(np.stack([data.X[data.y == i].mean(0) for i in both]) + gap)
+    other = data.y[:, None] != np.array(both)[None, :]
+    if other.sum() < STAND_IN_PAIRS:
+        return 1.0, 0.0
+    st, sp = (data.X @ T.T)[other].astype(np.float64), (data.X @ P.T)[other].astype(np.float64)
+    if float(sp.std()) <= 1e-9:
+        return 1.0, 0.0
+    a = float(st.std()) / float(sp.std())
+    return a, float(st.mean()) - a * float(sp.mean())
 
 
 def _modality_gap(data: ClassData) -> Vectors:
@@ -171,15 +259,23 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         # Whether each class has its own text (the others' ``Pt`` rows are image centroids moved
         # across the gap ``gap``), when ``Pt`` is set.
         self.described: npt.NDArray[np.bool_] | None = None
+        # The text scores of the classes without text, mapped as ``a * cos + b`` (see
+        # ``_stand_in_scale``); 1 and 0 for the described classes.
+        self.text_a: Scores | None = None
+        self.text_b: Scores | None = None
         self.gap: Vectors | None = None
         self._X: Vectors | None = None  # image-space support points (examples + text anchors)
         self._y: Labels | None = None  # class of each support point
+        # The support points in class order, and where each class's run starts (see
+        # ``_class_similarity_image``).
+        self._by_class: tuple[Labels, Labels] | None = None
         self.names_used = False  # whether the last fit used class names as text (see ``with_names``)
 
     def _reset(self) -> None:
         """Forget a previous fit's state, so refitting the same object matches a fresh one."""
         self.logit_scale, self.n_images, self.names_used = 1.0, 0, False
-        self.Pt = self.described = self.gap = self._X = self._y = None
+        self.Pt = self.described = self.gap = self._X = self._y = self.text_a = self.text_b = None
+        self._by_class = None
 
     # Subclasses implement these on image-space data where every class has >= 1 point.
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
@@ -196,10 +292,12 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         return Q @ _fitted(self._X).T
 
     def _class_similarity_image(self, Q: Vectors, S: Scores | None = None) -> Scores:
-        """(m, C) cosine similarity of each query to each class's nearest support point."""
+        """(m, C) cosine similarity of each query to each class's nearest support point: the
+        maximum over each class's run of columns, with the columns in class order."""
         S = self._support_similarity(Q) if S is None else S
-        y = _fitted(self._y)
-        return np.stack([S[:, y == c].max(axis=1) for c in range(len(self.classes))], axis=1)
+        order, starts = _fitted(self._by_class)
+        out: Scores = np.maximum.reduceat(S[:, order], starts, axis=1)
+        return out
 
     def class_similarity(self, Q: Vectors, S: Scores | None = None) -> Scores:
         """(m, C) similarity of each query to each class: to its nearest example (its prototype, for
@@ -228,15 +326,7 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         gap = None if self.zero_shot or not data.text else _modality_gap(data)
 
         if data.text and (self.zero_shot or self.text_weight > 0):
-            Pt = np.zeros((C, data.dim), np.float32)
-            for i in range(C):
-                if i in data.text:
-                    Pt[i] = data.text[i]
-                else:  # image-only class: centroid moved into text space
-                    Pt[i] = _unit(data.X[data.y == i].mean(0) + _fitted(gap))
-            self.Pt = _unit(Pt)
-            self.described = np.array([i in data.text for i in range(C)])
-            self.gap = gap
+            self._fit_text_side(data, gap)
         if self.zero_shot:
             return self
 
@@ -248,9 +338,31 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
             y = np.concatenate([y, text_only])
             w = np.concatenate([w, np.ones(len(T), np.float32)])
         self._X, self._y = X, y
+        order = np.argsort(y, kind="stable")  # every class has a support point, so no run is empty
+        self._by_class = order, np.searchsorted(y[order], np.arange(C))
         self.n_images = len(data.X)
         self._fit_image(X, y, w)
         return self
+
+    def _text_logits(self, Q: Vectors) -> Scores:
+        """(m, C) text scores at CLIP's scale, the classes without text mapped to match the others."""
+        out: Scores = CLIP_LOGIT_SCALE * (_fitted(self.text_a) * (Q @ _fitted(self.Pt).T) + _fitted(self.text_b))
+        return out
+
+    def _fit_text_side(self, data: ClassData, gap: Vectors | None) -> None:
+        """Each class's text-side vector, an image-only class's being its centroid moved into text
+        space, and the map of those classes' scores onto the texts' (see ``_stand_in_scale``)."""
+        C = len(data.classes)
+        Pt = np.zeros((C, data.dim), np.float32)
+        for i in range(C):
+            Pt[i] = data.text[i] if i in data.text else _unit(data.X[data.y == i].mean(0) + _fitted(gap))
+        self.Pt = _unit(Pt)
+        described = np.array([i in data.text for i in range(C)])
+        self.described, self.gap = described, gap
+        self.text_a, self.text_b = np.ones(C), np.zeros(C)
+        if not described.all():
+            a, b = _stand_in_scale(data, _fitted(gap))
+            self.text_a[~described], self.text_b[~described] = a, b
 
     def nearest(self, Q: Vectors, k: int) -> tuple[npt.NDArray[np.int_], Scores]:
         """The ``k`` example images most similar to each query, as (row indices into the fitted
@@ -303,7 +415,7 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         else:
             logits = self._image_logprobs(Q, S)
             if self.Pt is not None and self.text_weight > 0:
-                logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
+                logits = logits + self.text_weight * self._text_logits(Q)
             probs = _softmax(self.logit_scale * logits)
         probs = temper(probs, self.temperature)
         return probs, per_class[np.arange(len(Q)), probs.argmax(axis=1)], per_class
@@ -345,12 +457,14 @@ class KNNClassifier(Classifier):
         self.k, self.scale = k, scale
         self.y: Labels | None = None
         self.w: Vectors | None = None
+        self._support64: npt.NDArray[np.float64] | None = None
 
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         self.y, self.w = y, w
+        self._support64 = X.astype(np.float64)  # cast once, not for every block of queries
 
     def _support_similarity(self, Q: Vectors) -> Scores:
-        return knn_similarity(Q, _fitted(self._X))
+        return knn_similarity(Q, _fitted(self._support64))
 
     def _image_logprobs(self, Q: Vectors, S: Scores | None = None) -> Scores:
         S = self._support_similarity(Q) if S is None else S
@@ -372,7 +486,7 @@ def knn_similarity(Q: npt.NDArray[np.floating[Any]], X: npt.NDArray[np.floating[
     in float64 and rounded to float32. In float32, BLAS rounds a product differently depending on
     where its column falls in the matrix, so exact duplicates could score 1.0 and 0.99999994 and
     which of them is among the k nearest would depend on what else is in the matrix."""
-    out: Scores = (Q.astype(np.float64) @ X.astype(np.float64).T).astype(np.float32)
+    out: Scores = (np.asarray(Q, np.float64) @ np.asarray(X, np.float64).T).astype(np.float32)
     return out
 
 
@@ -418,6 +532,12 @@ class LogRegClassifier(Classifier):
 
 
 GDA_ALPHAS = np.geomspace(0.01, 100, 41)  # image-term weights tried, relative to the text term
+# Scales tried for GDA's fused (text and image) logits. From 0.1 to 10, EuroSAT at 8 images per class
+# chose 0.1, the end, and was 96% confident at 90% accuracy (0.04 gives 89%). Unlike the image-only
+# scale, it is fitted without label smoothing: smoothing made confidence too low at every number of
+# images (benchmark ECE 5.7/4.0/2.8/2.6/1.9 -> 6.5/4.6/3.3/2.5/2.3 at 1-16; without, 5.7/4.0/3.0/2.2/1.9).
+FUSED_SCALES = np.geomspace(0.01, 100, 81)
+ONE_SHOT_SCALE = 15.0  # image-only scores' scale times D where the spread can't be measured (see ``_fit_image``)
 TEXT_PRIOR = 1.5  # multiplies the empirical-Bayes weight of a class's text in its mean
 PRIOR_TEST_LEVEL = 0.05  # the text pulls the means only if its anchors match them this unlikely by chance
 MEAN_TEST_CLASSES = 4  # with fewer described classes, the pull's test counts images instead of class means
@@ -480,7 +600,12 @@ class GDAClassifier(Classifier):
         loo = _GDALeaveOneOut(Z[:m], y[:m], mu, n, prec, downdate)
         if self.Pt is None or self.text_weight <= 0:
             self._set_means(loo.mu, prec)
-            self.weight = loo.scale(_fitted(self.W), _fitted(self.b), default=15.0 * nu)
+            # With 1 image per class nothing can be left out to fit the scale. The best one varies
+            # with the data, not with the number of classes: on the six benchmark datasets from 7
+            # (EuroSAT) to 23 (Flowers) whether 5, 10 or all classes, and nothing the images show
+            # predicts it. 15 is near the least cross-entropy over all of them (13: 0.931 nats vs
+            # 0.945) and has the least calibration error (ECE 11.4% vs 11.7% at 13, 12.5% at 12).
+            self.weight = loo.scale(_fitted(self.W), _fitted(self.b), default=ONE_SHOT_SCALE * nu)
         else:
             self._fit_with_text(X[:m], raw_mu, loo, nu)
 
@@ -534,11 +659,14 @@ class GDAClassifier(Classifier):
         dist = (mu[on] ** 2).sum(1)[:, None] + (anchors[on] ** 2).sum(1)[None, :] - 2 * mu[on] @ anchors[on].T
         if not self._text_matches(dist, on, X):
             return lam
-        d2 = float(np.diag(dist).mean()) / mu.shape[1]
+        fits = _anchors_fit(dist)
+        if not fits.any():
+            return lam
+        d2 = float(np.diag(dist)[fits].mean()) / mu.shape[1]
         s2 = nu if spread_known else ONE_SHOT_SPREAD * d2  # no spread to measure with 1 image each
         k = float(np.median(imgs[imgs > 0]))
         t2 = max(d2 - s2 / k, 1e-3 * s2, 1e-12)  # a mean of k images is off by s2 / k itself
-        lam[on] = TEXT_PRIOR * s2 / t2
+        lam[np.flatnonzero(on)[fits]] = TEXT_PRIOR * s2 / t2
         return lam
 
     def _text_matches(self, dist: Scores, on: npt.NDArray[np.bool_], X: Vectors) -> bool:
@@ -558,15 +686,35 @@ class GDAClassifier(Classifier):
         image-only class's text side is its own centroid moved across the gap, so an example of one
         is scored against the centroid without it; one alone in its class has nothing left to
         stand for it (on either side) and is left out."""
-        zt = CLIP_LOGIT_SCALE * (X @ _fitted(self.Pt).T).astype(np.float64)
+        zt = self._text_logits(X).astype(np.float64)
         described = _fitted(self.described)[y]
         keep = described | (imgs[y] > 1)
         own = np.flatnonzero(~described & keep)
         if len(own):
             c, n = y[own], imgs[y[own], None]
             centroid = (n * raw_mu[c] - X[own]) / (n - 1)
-            zt[own, c] = CLIP_LOGIT_SCALE * (X[own] * _unit(centroid + _fitted(self.gap))).sum(1)
+            sim = (X[own] * _unit(centroid + _fitted(self.gap))).sum(1)
+            zt[own, c] = CLIP_LOGIT_SCALE * (_fitted(self.text_a)[c] * sim + _fitted(self.text_b)[c])
         return zt, keep
+
+
+def _anchors_fit(dist: Scores) -> npt.NDArray[np.bool_]:
+    """Which described classes' anchors pull their means (see ``GDAClassifier._prior_strength``),
+    given the squared distances ``dist`` from their means (rows) to their anchors: as for names
+    (see ``with_names``), one whose own mean ranks near it against the other means (at
+    ``ANCHOR_FDR``: a lower level, as for names, cost 0.4 points with correct descriptions at 1
+    image per class, where single images are noisy means), or that is its mean's nearest
+    anchor. Every one with fewer than ``MEAN_TEST_CLASSES``, too few to rank.
+    A description that doesn't match its images would otherwise be pulled on as hard as the
+    others, since the pull's strength is estimated from them all: with a quarter of the
+    descriptions swapped round, this adds 0.5-1 point at 2-8 images per class."""
+    n = len(dist)
+    if n < MEAN_TEST_CLASSES:
+        return np.ones(n, bool)
+    rank = (dist <= np.diag(dist)[None, :]).sum(0) / n  # share of the means at least as near, itself too
+    seen = dist.argmin(1) == np.arange(n)
+    out: npt.NDArray[np.bool_] = (meaningless_chance(rank, 1.0 / n) < ANCHOR_FDR) | (seen & (rank <= NAME_SEEN_RANK))
+    return out
 
 
 def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: float,  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -582,30 +730,48 @@ def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: 
     zt, loo, y = zt[keep], loo[keep], y[keep]
     if len(y) < 2:
         return prior * rel, 1.0
-    chosen = _least_nll([zt + a * rel * loo for a in GDA_ALPHAS], GDA_ALPHAS, y, what="image-term weight")
+    chosen = least_nll(loo, GDA_ALPHAS, y, zt, factor=rel, what="image-term weight")
     pull = 1.0 / (1.0 + (k - 1) / 2)  # all prior at 1 image per class, less with more
     weight = float(np.exp((1 - pull) * np.log(chosen) + pull * np.log(prior))) * rel
     fused = text_weight * zt + weight * exact()[keep]
-    scales = np.geomspace(0.1, 10, 41)
-    return weight, _least_nll([s * fused for s in scales], scales, y, what="fused logit scale")
+    return weight, least_nll(fused, FUSED_SCALES, y, what="fused logit scale")
 
 
-def _least_nll(logits: list[Scores], values: Scores, y: Labels, smooth: bool = False,
-               what: str = "value") -> float:
-    """The value whose logits give the true classes ``y`` the least mean cross-entropy. With
-    ``smooth``, against targets smoothed by 1/(n+2) (as for a task's temperature): examples that
-    all came out right don't prove the scores are never wrong, and fitting them as certain would
-    push the scale, and every confidence, to the limit. A choice at either end of the grid may be
-    clamped; it is logged at debug level as ``what``."""
-    rows = np.arange(len(y))
-    if smooth:
-        eps = 1.0 / (len(y) + 2)
-        C = logits[0].shape[1]
-        Y = np.full(logits[0].shape, eps / max(C - 1, 1))  # (one class: nothing to spread it over)
-        Y[rows, y] = 1.0 - eps
-        best = int(np.argmin([-(Y * _log_softmax(z)).sum(1).mean() for z in logits]))
-    else:
-        best = int(np.argmin([-_log_softmax(z)[rows, y].mean() for z in logits]))
+def nll_grid(B: Scores, multipliers: Scores, y: Labels, A: Scores | None = None, *,  # pylint: disable=too-many-arguments,too-many-locals
+             smooth: bool = False, floor: float = 0.0) -> Scores:
+    """Mean cross-entropy of the true classes ``y`` under logits ``A + m * B`` (``A`` absent: 0)
+    for each m in ``multipliers``. With ``smooth``, against targets smoothed by 1/(n+2): examples
+    that all came out right don't prove the scores are never wrong, and fitting them as certain
+    would push the scale, and every confidence, to the limit. ``floor`` bounds the probabilities
+    from below (for logits that are -inf).
+
+    Each candidate is scored in blocks of rows (``PREDICT_CELLS`` values each) and summed, so a
+    grid search needs memory for one block, not for every candidate's (n, C) logits at once."""
+    n, C = B.shape
+    eps = 1.0 / (n + 2) if smooth else 0.0
+    spread = eps / max(C - 1, 1)  # (one class: nothing to spread it over)
+    low = math.log(floor) if floor > 0 else -np.inf
+    rows = max(1, PREDICT_CELLS // max(C, 1))
+    nll = np.zeros(len(multipliers))
+    for start in range(0, n, rows):
+        b, t = B[start:start + rows], y[start:start + rows]
+        a = None if A is None else A[start:start + rows]
+        idx = np.arange(len(t))
+        for i, m in enumerate(multipliers):
+            z = float(m) * b
+            ls = np.maximum(_log_softmax(z if a is None else a + z), low)
+            own = ls[idx, t]
+            nll[i] -= float(((1.0 - eps) * own + spread * (ls.sum(1) - own)).sum() if smooth else own.sum())
+    out: Scores = nll / max(n, 1)
+    return out
+
+
+def least_nll(B: Scores, values: Scores, y: Labels, A: Scores | None = None,  # pylint: disable=too-many-arguments
+              *, factor: float = 1.0, smooth: bool = False, what: str = "value") -> float:
+    """The value v in ``values`` whose logits ``A + (v * factor) * B`` give ``y`` the least
+    cross-entropy (see ``nll_grid``). A choice at either end of the grid may be clamped; it is
+    logged at debug level as ``what``."""
+    best = int(np.argmin(nll_grid(B, np.array([float(v) * factor for v in values]), y, A, smooth=smooth)))
     log_clamped(what, values, best)
     return float(values[best])
 
@@ -722,7 +888,7 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
             return default
         L, t = L[ok], self.y[ok]
         base = 10.0 / max(float(L.std()), 1e-12)
-        fitted = _least_nll([a * base * L for a in GDA_ALPHAS], GDA_ALPHAS, t, smooth=True, what="score scale") * base
+        fitted = least_nll(L, GDA_ALPHAS, t, factor=base, smooth=True, what="score scale") * base
         # Examples of a single class can't show how often the others are mistaken for it, so then
         # the fit only caps the default.
         return fitted if len(set(t.tolist())) > 1 else min(fitted, default)
@@ -752,15 +918,19 @@ CLASSIFIERS: dict[str, type[Classifier]] = {
 
 
 # Upper bounds keep the scores finite: logits are at most about scale + text_weight * 100.
-PARAM_MAX = {"k": 100_000, "scale": 1000.0, "C": 1e6, "text_weight": 100.0}
+PARAM_MAX = {"k": 100_000, "scale": 1000.0, "C": 1e6}
+# Keyword arguments every classifier takes that are task settings, not the classifier's own
+# parameters (so an error doesn't call one "gda parameter ..."), with their upper bounds.
+SETTING_MAX = {"text_weight": 100.0}
 POSITIVE_PARAMS = {"k", "C"}
 
 
 def check_params(name: str, params: dict[str, Any]) -> None:
     """Raise ``ValueError`` unless ``params`` are valid keyword arguments for classifier ``name``.
 
-    Every parameter is a number between 0 and ``PARAM_MAX``; ``k`` must be a positive integer and
-    ``C`` positive. Python and NumPy numbers are accepted; bools are not.
+    Every parameter is a number between 0 and ``PARAM_MAX`` (``SETTING_MAX`` for the task settings
+    among them, such as ``text_weight``); ``k`` must be a positive integer and ``C`` positive.
+    Python and NumPy numbers are accepted; bools are not.
     """
     if name not in CLASSIFIERS:
         raise ValueError(f"Unknown classifier {name!r}; choose from {sorted(CLASSIFIERS)}")
@@ -771,13 +941,13 @@ def check_params(name: str, params: dict[str, Any]) -> None:
     for key, value in params.items():
         if key not in defaults:
             raise ValueError(f"Unknown parameter {key!r} for {name}; choose from {sorted(defaults)}")
+        what = f"task setting {key!r}" if key in SETTING_MAX else f"{name} parameter {key!r}"
         want_int = isinstance(defaults[key], int)
         kind = numbers.Integral if want_int else numbers.Real
         if isinstance(value, (bool, np.bool_)) or not isinstance(value, kind):
-            raise ValueError(f"{name} parameter {key!r} must be {'an integer' if want_int else 'a number'}, "
-                             f"got {value!r}")
+            raise ValueError(f"{what} must be {'an integer' if want_int else 'a number'}, got {value!r}")
         low = 1 if want_int else 0.0
-        high = PARAM_MAX.get(key, 1e6)
+        high = SETTING_MAX.get(key, PARAM_MAX.get(key, 1e6))
         try:
             v = float(value)
             ok = low <= v <= high and (key not in POSITIVE_PARAMS or v > 0)
@@ -785,7 +955,7 @@ def check_params(name: str, params: dict[str, Any]) -> None:
             ok = False
         if not ok:  # also catches NaN, which fails every comparison
             bound = "> 0" if key in POSITIVE_PARAMS else f">= {low}"
-            raise ValueError(f"{name} parameter {key!r} must be {bound} and <= {high:g}, got {value!r}")
+            raise ValueError(f"{what} must be {bound} and <= {high:g}, got {value!r}")
 
 
 def make_classifier(name: str, **params: Any) -> Classifier:

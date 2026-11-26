@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from .classifiers import (
     knn_similarity,
     log_clamped,
     make_classifier,
+    nll_grid,
     temper,
     top_k,
 )
@@ -263,13 +265,11 @@ TEMPERATURES = np.geomspace(0.01, 100, 81)  # the range a task's temperature may
 def _fit_temperature(P: np.ndarray, t: np.ndarray) -> float:
     """The grid temperature minimising cross-entropy against the true labels, smoothed by
     1/(n+2): held-out predictions that were all right still don't prove the model is never wrong,
-    and fitting them as certain would push the temperature (and every confidence) to the limit."""
-    eps = 1.0 / (len(t) + 2)
-    Y = np.full(P.shape, eps / (P.shape[1] - 1))
-    Y[np.arange(len(t)), t] = 1.0 - eps
+    and fitting them as certain would push the temperature (and every confidence) to the limit.
+    Tempering by T divides the log-probabilities by T (see ``temper``)."""
     with np.errstate(divide="ignore"):
-        logs = [np.log(np.clip(temper(P, float(T)), 1e-12, 1)) for T in TEMPERATURES]
-    best = int(np.argmin([-(Y * lg).sum() for lg in logs]))
+        logs = np.log(P)
+    best = int(np.argmin(nll_grid(logs, 1.0 / TEMPERATURES, t, smooth=True, floor=1e-12)))
     log_clamped("temperature", TEMPERATURES, best)
     return float(TEMPERATURES[best])
 
@@ -313,28 +313,41 @@ def _macro_f1(cm: np.ndarray) -> float | None:
     return float(np.mean(2 * tp[has] / (support[has] + predicted[has])))
 
 
+def keep_threshold(sims: np.ndarray) -> float:
+    """The similarity that a new member, as similar as the held-out members ``sims`` were,
+    reaches with probability at least ``KEEP_CORRECT``: the k-th lowest of n, k = floor((1 -
+    KEEP_CORRECT) (n + 1)) (a conformal bound; for exchangeable similarities a new one falls below
+    it with probability k / (n + 1)). The 5% quantile of the sample is lower than that only on
+    average for large n: at n = 5 it kept about 80% of new members. Below n = 19 there is no such
+    order statistic, so it is the lowest (which a new member then reaches with probability
+    n / (n + 1)). Rounded down to 3 decimals, so the rounding never rejects that member."""
+    s = np.sort(sims)
+    k = int(np.floor((1 - KEEP_CORRECT) * (len(s) + 1) + 1e-9))
+    return math.floor(float(s[max(k, 1) - 1]) * 1000) / 1000
+
+
 def _suggest_threshold(h: HeldOut, truth: np.ndarray) -> float | None:
-    """A reject threshold that keeps ``KEEP_CORRECT`` of the correct held-out predictions:
-    images less similar to the task's examples than nearly all real members are likely outsiders."""
+    """A reject threshold that keeps ``KEEP_CORRECT`` of the correct predictions (see
+    ``keep_threshold``): images less similar to the task's examples than nearly all real members
+    are likely outsiders."""
     ok = (h.pred >= 0) & (h.pred == truth)
     if not ok.any():
         return None
-    return round(float(np.quantile(h.sim[ok], 1 - KEEP_CORRECT)), 3)
+    return keep_threshold(h.sim[ok])
 
 
 MIN_CLASS_THRESHOLD = 5  # correct held-out predictions of a class needed to suggest its own threshold
 
 
 def _suggest_class_thresholds(h: HeldOut, truth: np.ndarray, classes: list[str]) -> dict[str, float]:
-    """Like ``_suggest_threshold``, one per class: the similarity that keeps ``KEEP_CORRECT`` of
-    the class's correct held-out predictions. Classes with fewer than ``MIN_CLASS_THRESHOLD`` correct
-    predictions get none (the estimate would be noise)."""
+    """Like ``_suggest_threshold``, one per class, from the class's correct held-out predictions.
+    Classes with fewer than ``MIN_CLASS_THRESHOLD`` of them get none (the estimate would be noise)."""
     ok = (h.pred >= 0) & (h.pred == truth)
     out = {}
     for i, c in enumerate(classes):
         sims = h.sim[ok & (truth == i)]
         if len(sims) >= MIN_CLASS_THRESHOLD:
-            out[c] = round(float(np.quantile(sims, 1 - KEEP_CORRECT)), 3)
+            out[c] = keep_threshold(sims)
     return out
 
 

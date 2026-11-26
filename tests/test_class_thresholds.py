@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from fewshot import cli
+from fewshot import evaluate as ev
 from fewshot.classifiers import ClassData, make_classifier
 from fewshot.evaluate import evaluate_task
 from fewshot.pipeline import Pipeline
@@ -109,6 +110,24 @@ def test_evaluation_suggests_class_thresholds(ws):
     r = evaluate_task(Pipeline(ws), t)
     assert set(r["suggested_class_thresholds"]) == {"red", "blue"}
     assert all(0 < v <= 1 for v in r["suggested_class_thresholds"].values())
+
+
+def test_suggested_threshold_keeps_95_percent_of_new_members():
+    """A suggested threshold is a conformal order statistic: a new member as similar as the
+    held-out ones reaches it with probability >= 95% (n / (n + 1) below 19 of them, where only the
+    lowest will do), which the sample's 5% quantile missed at small n (about 80% at n = 5)."""
+    rng = np.random.default_rng(0)
+    for n in (5, 10, 19, 40, 100):
+        kept = []
+        for _ in range(2000):
+            sims = rng.random(n)
+            kept.append(rng.random() >= ev.keep_threshold(sims))
+        assert np.mean(kept) >= min(0.95, n / (n + 1)) - 0.015
+    sims = np.arange(1, 40) / 100  # 0.01 .. 0.39
+    assert ev.keep_threshold(sims[:5]) == 0.01  # the lowest
+    assert ev.keep_threshold(sims[:19]) == 0.01  # floor(0.05 * 20) = 1st
+    assert ev.keep_threshold(sims) == 0.02  # floor(0.05 * 40) = 2nd
+    assert ev.keep_threshold(np.array([0.8126, 0.9])) == 0.812  # rounded down, so 0.8126 still passes
 
 
 # ---- API ------------------------------------------------------------------------
