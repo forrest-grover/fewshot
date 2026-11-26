@@ -1015,12 +1015,13 @@ label.inline {
   font-weight: inherit;
 }
 
-.chart-wrap .bin:focus {
-  outline: none;
+.chart-wrap svg:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
-.chart-wrap .bin:focus-visible rect.hit {
-  fill: var(--accent-soft);
+/* The bar chosen with the arrow keys. */
+.chart-wrap svg:focus-visible .bin.hover rect.hit {
   stroke: var(--accent);
   stroke-width: 2;
 }
@@ -1359,4 +1360,17 @@ label.inline {
 
 .danger-text {
   color: var(--danger);
+}
+
+/* Read by screen readers, not shown. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }

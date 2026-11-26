@@ -196,6 +196,7 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
       <DropZone disabled={uploading !== null} onFiles={(fs) => { void upload(fs); }}>
         {uploading ? `${uploading.stopping ? "Stopping" : "Uploading"} ${progressText(uploading)}…` : saving ? "Saving…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
       </DropZone>
+      <span className="sr-only" role="status">{uploading ? `${uploading.stopping ? "Stopping" : "Uploading"} to the inbox: ${progressText(uploading)}` : ""}</span>
       {uploading && <div className="row"><button className="ghost small" disabled={uploading.stopping} onClick={uploading.cancel}>Cancel upload</button></div>}
       {viewing !== null && list.length > 0 && (
         <Lightbox
@@ -264,6 +265,8 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
               const s = suggested(i);
               return (
                 <article key={i.id} className={`inbox-card ${cur?.id === i.id ? "current" : ""} ${picked.has(i.id) ? "picked" : ""}`}
+                  aria-label={`${i.source || i.id}: ${p ? (s ? `suggested ${s}, ${pct(p.confidence)}` : `unknown, closest ${p.top_label}`) : "no suggestion"}`}
+                  aria-current={cur?.id === i.id ? "true" : undefined}
                   tabIndex={cur?.id === i.id ? 0 : -1} ref={(el) => { if (el) cards.current.set(i.id, el); else cards.current.delete(i.id); }}
                   onClick={() => { setCurrentNow(i.id); }} onFocus={() => { if (currentNow.current !== i.id) setCurrentNow(i.id); }}>
                   <label className="inbox-pick" title="Tick to select">

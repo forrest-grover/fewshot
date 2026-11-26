@@ -5,7 +5,7 @@ import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
 import NewTask from "./NewTask";
-import { taskUndoKey, typingAt } from "./keys";
+import { taskUndoKey, topModal, typingAt } from "./keys";
 import { usePredictResults } from "./predictResults";
 import { Gate, Latest, stepToast, useByTask } from "./state";
 import { useUploads, type UploadStop } from "./useUploads";
@@ -146,7 +146,7 @@ export default function App() {
   useEffect(() => { // "?" shows the keyboard shortcuts
     const on = (e: KeyboardEvent) => {
       if (e.key !== "?" || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (typingAt(e.target)) return;
+      if (typingAt(e.target) || topModal()) return; // not over the image viewer or another dialog
       e.preventDefault();
       setHelp(true);
     };

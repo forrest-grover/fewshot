@@ -399,6 +399,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
                 {up ? `${up.stopping ? "Stopping" : "Uploading"} ${progressText(up)}…` : "+ Add images"}
               </DropZone>
               {up && <button className="ghost small" disabled={up.stopping} onClick={up.cancel}>Cancel upload</button>}
+              <span className="sr-only" role="status">{up ? `${up.stopping ? "Stopping" : "Uploading"} to ${c.name}: ${progressText(up)}` : ""}</span>
             </div>}</NearViewport>}
             {moved > 0 && (
               <div className="row note-moved" role="status">
