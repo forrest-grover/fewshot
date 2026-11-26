@@ -18,6 +18,7 @@ import functools
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -83,7 +86,7 @@ from .schemas import (
     TaskSummary,
     Urls,
 )
-from .server_settings import MAX_JSON_BYTES, ServerSettings
+from .server_settings import MAX_BULK_JSON_BYTES, MAX_JSON_BYTES, ServerSettings
 from .store import Task, Workspace
 from .text import check_class_name
 
@@ -182,10 +185,46 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
     app.state.server = server
     app.include_router(router)
     app.middleware("http")(_guard)
+    app.add_exception_handler(RequestValidationError, _invalid)
     # Added last, so it runs first.
-    app.add_middleware(LimitBody, limit=server.settings.max_request_bytes, other_limit=MAX_JSON_BYTES)
+    app.add_middleware(LimitBody, limit=functools.partial(body_limit, server.settings))
     mount_ui(app, Path(__file__).resolve().parent.parent / "web" / "dist")
     return app
+
+
+# Routes whose bodies may be large: uploads (multipart only) and JSON lists of ids. The limit
+# comes from the route, never from what the client says the body is, so a body labelled as an
+# upload gets the small limit anywhere else (FastAPI would read it whole to parse JSON).
+UPLOAD_ROUTES = re.compile(r"/api/tasks/(?:import|[^/]+/(?:examples|inbox|predict))")  # POST
+BULK_ROUTES = {"PATCH": re.compile(r"/api/tasks/[^/]+/examples"),
+               "POST": re.compile(r"/api/tasks/[^/]+/(?:examples/delete|inbox/accept|inbox/accept-confident"
+                                  r"|inbox/dismiss)")}
+
+
+def body_limit(settings: ServerSettings, scope: Any) -> int:
+    """The largest body the request in ``scope`` may send: ``max_request_bytes`` for a multipart
+    body to an upload route, ``MAX_BULK_JSON_BYTES`` for a route taking a list of ids, else
+    ``MAX_JSON_BYTES``."""
+    path, method = scope["path"], scope["method"]
+    root = scope.get("root_path", "")
+    if root and path.startswith(root):
+        path = path[len(root):]
+    if method == "POST" and UPLOAD_ROUTES.fullmatch(path):
+        ctype = dict(scope["headers"]).get(b"content-type", b"").lower()
+        if ctype.startswith(b"multipart/form-data"):  # any other body there is no upload: small
+            return settings.max_request_bytes
+    bulk = BULK_ROUTES.get(method)
+    if bulk is not None and bulk.fullmatch(path):
+        return MAX_BULK_JSON_BYTES
+    return MAX_JSON_BYTES
+
+
+async def _invalid(_: Request, exc: Exception) -> JSONResponse:
+    """422 for a request that doesn't validate, like FastAPI's own but without each error's
+    ``input``, so a large bad body isn't sent back."""
+    assert isinstance(exc, RequestValidationError)
+    errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
+    return JSONResponse({"detail": jsonable_encoder(errors)}, 422)
 
 
 @functools.cache

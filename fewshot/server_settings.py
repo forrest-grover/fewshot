@@ -23,8 +23,11 @@ way a bad value is refused with a message naming it, before the server starts.
     Accept image URLs (``.../predict/urls``, ``.../examples/urls``): the server downloads them,
     from public addresses only.
 ``FEWSHOT_MAX_UPLOAD_MB`` / ``FEWSHOT_MAX_REQUEST_MB``
-    Largest image per upload (default 50) and largest multipart request body (default 1024).
-    Other request bodies (JSON) are limited to ``MAX_JSON_BYTES``.
+    Largest image per upload (default 50) and largest upload request (default 1024): a multipart
+    body sent to an upload route (adding examples or inbox images, predicting, importing a
+    task). Bodies listing ids (bulk edits and deletes, accepting and dismissing inbox images) are
+    limited to ``MAX_BULK_JSON_BYTES``, and every other request body, wherever it is sent and
+    whatever its Content-Type says, to ``MAX_JSON_BYTES``.
 ``FEWSHOT_FORWARDED_ALLOW_IPS``
     Comma-separated addresses of reverse proxies whose ``X-Forwarded-For`` and
     ``X-Forwarded-Proto`` headers are trusted (``*``: any; default 127.0.0.1). Behind a proxy,
@@ -46,7 +49,8 @@ from pathlib import Path
 from .guard import host_name
 
 MB = 1024 * 1024
-MAX_JSON_BYTES = 1 * MB  # request bodies other than multipart uploads
+MAX_JSON_BYTES = 1 * MB  # request bodies other than uploads and lists of ids
+MAX_BULK_JSON_BYTES = 16 * MB  # JSON bodies listing ids (bulk edit, delete, accept, dismiss)
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 _TRUE, _FALSE = {"1", "true", "yes", "on"}, {"", "0", "false", "no", "off"}
 

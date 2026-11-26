@@ -16,7 +16,7 @@ import fewshot.guard
 import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
 from fewshot.pipeline import Prediction
-from fewshot.server_settings import MAX_JSON_BYTES, ServerSettings
+from fewshot.server_settings import MAX_BULK_JSON_BYTES, MAX_JSON_BYTES, ServerSettings
 from fewshot.store import Task
 from tests.conftest import RED, api_client, api_task, png, query_files, set_settings
 
@@ -42,6 +42,49 @@ def test_request_size_limit_by_content_length(tmp_path):
     r = client.post("/api/tasks/c/examples", data={"label": "red"}, files=big)
     assert r.status_code == 413
     assert r.json()["detail"] == "Request is larger than the 0.5 MB limit"
+
+
+def test_the_body_limit_comes_from_the_route_not_the_content_type(tmp_path):
+    """Only an upload route takes a large multipart body: a body labelled as an upload gets the
+    JSON limit anywhere else (as on /api/login, which needs no token), and so does a body to an
+    upload route that isn't multipart."""
+    client = api_client(tmp_path, token="0123456789abcdef-token")
+    multipart = {"Content-Type": "multipart/form-data; boundary=x"}
+    body = b"x" * (MAX_JSON_BYTES + 10)
+    for path in ("/api/login", "/api/tasks", "/api/tasks/t/examples/urls", "/api/nowhere", "/"):
+        r = client.post(path, content=body, headers=multipart)
+        assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 1 MB limit"), path
+    for path in ("/api/tasks/t/examples", "/api/tasks/t/inbox", "/api/tasks/t/predict", "/api/tasks/import"):
+        r = client.post(path, content=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        assert r.status_code == 413, path
+        assert client.post(path, content=body, headers=multipart).status_code == 401, path  # past the limit
+    assert client.request("GET", "/api/tasks/t/examples", content=body, headers=multipart).status_code == 413
+    root = fewshot.api.body_limit(ServerSettings(), {"path": "/app/api/tasks/import", "root_path": "/app",
+                                                    "method": "POST", "headers": [(b"content-type", b"multipart/form-data")]})
+    assert root == ServerSettings().max_request_bytes
+
+
+@pytest.mark.usefixtures("task_t")
+def test_lists_of_ids_have_a_larger_limit(client):
+    """Bulk edits, deletes and inbox decisions may list tens of thousands of ids (16 MB)."""
+    ids = {"ids": [f"{i:032x}" for i in range(60_000)]}  # about 2.6 MB
+    assert client.patch("/api/tasks/t/examples", json={**ids, "label": "red"}).status_code == 404
+    for path in ("examples/delete", "inbox/dismiss"):
+        assert client.post(f"/api/tasks/t/{path}", json=ids).status_code == 404, path
+    accept = {"labels": {i: "red" for i in ids["ids"]}}
+    assert client.post("/api/tasks/t/inbox/accept", json=accept).status_code == 404
+    assert client.post("/api/tasks/t/inbox/accept-confident", json={**ids, "min_confidence": 0.5}).status_code == 200
+    r = client.post("/api/tasks/t/examples/delete", content=b" " * (MAX_BULK_JSON_BYTES + 1),
+                    headers={"Content-Type": "application/json"})
+    assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 16 MB limit")
+
+
+def test_validation_errors_dont_echo_the_body(client):
+    """A 422 says what is wrong without sending the bad input back."""
+    r = client.post("/api/tasks", json={"name": "x", "junk": "y" * 500_000})
+    assert r.status_code == 422
+    assert len(r.content) < 1000
+    assert r.json()["detail"] == [{"type": "extra_forbidden", "loc": ["body", "junk"], "msg": "Extra inputs are not permitted"}]
 
 
 def _asgi(chunks, inner):
