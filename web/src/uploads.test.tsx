@@ -51,6 +51,23 @@ describe("useUploads", () => {
     expect(stops).toEqual([]);
   });
 
+  it("gives each drop its own undo group, shared by all of its batches", async () => {
+    const { hook } = setup("pets");
+    const sent: { slot: string; group: string }[] = [];
+    const sendTo = (slot: string): SendBatch => (batch, _signal, group) => {
+      sent.push({ slot, group });
+      return Promise.resolve({ added: batch, errors: [], task: taskDetail() });
+    };
+    await act(() => Promise.all([hook.result.current.start("cat", files(5), sendTo("cat")),
+      hook.result.current.start("dog", files(3), sendTo("dog"))]));
+    await act(() => hook.result.current.start("cat", files(3), sendTo("again")));
+    const groupsOf = (slot: string) => new Set(sent.filter((s) => s.slot === slot).map((s) => s.group));
+    expect(sent.map((s) => s.slot).sort()).toEqual(["again", "again", "cat", "cat", "cat", "dog", "dog"]);
+    const [cat, dog, again] = ["cat", "dog", "again"].map(groupsOf);
+    expect([cat.size, dog.size, again.size]).toEqual([1, 1, 1]);
+    expect(new Set([...cat, ...dog, ...again]).size).toBe(3);
+  });
+
   it("goes on while the task stays open, and stops when another opens, counting the batch in flight", async () => {
     const { hook, stops } = setup("pets");
     const { send, release } = gatedSend();
