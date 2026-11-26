@@ -10,9 +10,10 @@ import fewshot.access
 import fewshot.api
 import fewshot.auth
 import fewshot.guard
+from fewshot.access import NO_TOKEN, exposure_problem
 from fewshot.auth import Sessions, WrongTokens
 from fewshot.guard import host_allowed
-from tests.conftest import RED, api_client, host_client, png
+from tests.conftest import RED, api_client, api_task, host_client, png
 
 
 # ---- tokens and sessions -------------------------------------------------
@@ -245,7 +246,8 @@ def test_cross_site_writes_are_refused(tmp_path, monkeypatch):
     for headers in ({"Origin": "https://evil.example"}, {"Origin": "null"}, {"Origin": "http://localhost:9999"},
                     {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}):
         r = c.post("/api/tasks", json=body, headers=headers)
-        assert (r.status_code, r.json()["detail"]) == (403, "Cross-site requests are not allowed"), headers
+        assert r.status_code == 403, headers
+        assert r.json()["detail"].startswith("Cross-site request refused"), headers
     files = [("files", ("a.png", png(RED), "image/png"))]
     assert c.post("/api/tasks/t/examples", data={"label": "red"}, files=files,
                   headers={"Origin": "https://evil.example"}).status_code == 403
@@ -254,3 +256,119 @@ def test_cross_site_writes_are_refused(tmp_path, monkeypatch):
     assert c.post("/api/tasks", json={**body, "name": "u"}, headers=same).status_code == 201
     assert c.post("/api/tasks", json={**body, "name": "v"}).status_code == 201  # curl, the CLI
     assert c.get("/api/tasks", headers={"Origin": "https://evil.example"}).status_code == 200
+
+
+def test_cross_site_check_behind_a_proxy_that_rewrites_host(tmp_path, monkeypatch):
+    """Behind a proxy sending its own Host (nginx's default), the browser's Origin is compared
+    with X-Forwarded-Host too; a refusal says what was compared and how to fix the proxy."""
+    c = host_client(tmp_path, monkeypatch, hosts="*")
+    body = {"name": "t", "embedder": "fake:color"}
+    page = {"Host": "127.0.0.1:8000", "Origin": "https://fewshot.example.com", "Sec-Fetch-Site": "same-origin"}
+    r = c.post("/api/tasks", json=body, headers=page)
+    assert r.status_code == 403
+    assert r.json()["detail"] == ("Cross-site request refused: its Origin 'https://fewshot.example.com' doesn't "
+                                  "match the Host '127.0.0.1:8000'. Behind a reverse proxy, pass the browser's "
+                                  "Host header on (nginx: proxy_set_header Host $host).")
+    forwarded = {**page, "X-Forwarded-Host": "fewshot.example.com"}
+    assert c.post("/api/tasks", json=body, headers=forwarded).status_code == 201
+    evil = {**forwarded, "Origin": "https://evil.example"}
+    r = c.post("/api/tasks", json={**body, "name": "u"}, headers=evil)
+    assert r.status_code == 403
+    assert "Host '127.0.0.1:8000' or X-Forwarded-Host 'fewshot.example.com'" in r.json()["detail"]
+    r = c.post("/api/tasks", json={**body, "name": "u"}, headers={"Sec-Fetch-Site": "same-site"})
+    assert r.json()["detail"] == ("Cross-site request refused: the browser sent it from another site "
+                                  "(Sec-Fetch-Site: same-site)")
+
+
+# ---- no token on another interface ---------------------------------------
+def test_a_server_without_token_refuses_other_interfaces(tmp_path, monkeypatch, caplog):
+    """A server without a token reached on an address other than loopback (a container serving on
+    0.0.0.0 with FEWSHOT_TOKEN unset) refuses everything but /healthz, and logs why once; on
+    loopback, with a token, or with FEWSHOT_ALLOW_NO_TOKEN=1 it serves."""
+    app = api_client(tmp_path).app
+    outside = TestClient(app, base_url="http://172.17.0.2:8000")  # the address the request arrived at
+    refused = NO_TOKEN.format(addr="172.17.0.2")
+    for path in ("/api/tasks", "/api/health", "/"):
+        r = outside.get(path)
+        assert (r.status_code, r.json()["detail"]) == (403, refused), path
+    assert outside.post("/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 403
+    assert outside.get("/healthz").status_code == 200
+    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == [refused]
+    for local in ("http://127.0.0.1:8000", "http://[::1]:8000", "http://[::ffff:127.0.0.1]:8000"):
+        assert TestClient(app, base_url=local).get("/api/tasks").status_code == 200, local
+    tokened = api_client(tmp_path / "b", base_url="http://172.17.0.2", token="0123456789abcdef0123")
+    assert tokened.get("/api/tasks").status_code == 401  # the token protects it
+    allowed = TestClient(fewshot.api.create_app(app.state.server.settings, allow_no_token=True),
+                         base_url="http://172.17.0.2")
+    assert allowed.get("/api/tasks").status_code == 200
+    monkeypatch.setenv("FEWSHOT_ALLOW_NO_TOKEN", "1")
+    from_env = TestClient(fewshot.api.create_app(app.state.server.settings), base_url="http://172.17.0.2")
+    assert from_env.get("/api/tasks").status_code == 200
+
+
+def test_exposure_problem():
+    """For ``fewshot serve`` to refuse before starting: no token on a non-loopback bind address."""
+    assert exposure_problem("0.0.0.0", None, False) == NO_TOKEN.format(addr="0.0.0.0")
+    assert exposure_problem("::", None, False) is not None
+    assert exposure_problem("box.lan", None, False) is not None  # a name: whichever interface it is
+    for host in ("127.0.0.1", "127.0.0.2", "::1", "localhost"):
+        assert exposure_problem(host, None, False) is None, host
+    assert exposure_problem("0.0.0.0", "0123456789abcdef0123", False) is None
+    assert exposure_problem("0.0.0.0", None, True) is None
+
+
+# ---- reads from other sites, caching, and the shape of answers --------------
+def test_cross_site_reads_are_refused_but_images(client):
+    """A page on another site can't make the browser read /api (say, inbox suggestions running the
+    model, by <img src>), except example images; same-origin reads and clients without the
+    header go through."""
+    task = api_task(client, n=1)
+    eid = client.get(f"/api/tasks/{task}").json()["examples"][0]["id"]
+    for site in ("cross-site", "same-site"):
+        r = client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": site})
+        assert r.status_code == 403, site
+        assert r.json()["detail"] == ("Cross-site request refused: the browser sent it from another site "
+                                      f"(Sec-Fetch-Site: {site})")
+    image = f"/api/tasks/{task}/examples/{eid}/image"
+    assert client.get(image, headers={"Sec-Fetch-Site": "cross-site"}).status_code == 200
+    assert client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+    assert client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": "none"}).status_code == 200
+    assert client.get(f"/api/tasks/{task}/inbox").status_code == 200
+
+
+def test_api_answers_are_not_cached_but_images_are(client):
+    """/api answers are "no-store" (they may need the token); images, whose ids are content
+    hashes, are kept by the browser only ("private")."""
+    task = api_task(client, n=1)
+    eid = client.get(f"/api/tasks/{task}").json()["examples"][0]["id"]
+    for path in (f"/api/tasks/{task}", "/api/tasks/nope", f"/api/tasks/{task}/export"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+    for size in ("", "?size=32"):
+        img = client.get(f"/api/tasks/{task}/examples/{eid}/image{size}")
+        assert img.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+
+def test_no_content_answers_have_no_content_type(tmp_path):
+    """204s (login, logout, deleting a task) have no body, so no Content-Type either; login still
+    sets its cookie."""
+    c = api_client(tmp_path, token=TOKEN)
+    r = c.post("/api/login", json={"token": TOKEN})
+    assert r.status_code == 204
+    assert "content-type" not in r.headers
+    assert fewshot.access.SESSION_COOKIE in r.cookies
+    api_task(c, n=1)
+    r = c.delete("/api/tasks/c")
+    assert r.status_code == 204
+    assert "content-type" not in r.headers
+    r = c.post("/api/logout")
+    assert r.status_code == 204
+    assert "content-type" not in r.headers
+
+
+def test_schema_declares_the_access_errors(client):
+    """The OpenAPI schema lists what the access checks and size limits can answer anywhere."""
+    paths = client.get("/openapi.json").json()["paths"]
+    for op in (paths["/api/tasks"]["post"], paths["/api/tasks/{name}/examples"]["post"]):
+        assert {"401", "403", "413", "429"} <= set(op["responses"]), op["operationId"]
+        schema = op["responses"]["403"]["content"]["application/json"]["schema"]
+        assert schema == {"$ref": "#/components/schemas/Problem"}

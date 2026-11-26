@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import services
-from .access import SESSION_COOKIE, TOO_MANY_TOKENS, check_token, client_address, guard
+from .access import SESSION_COOKIE, TOO_MANY_TOKENS, allow_no_token_from_env, check_token, client_address, guard
 from .archive import export_task as write_export
 from .archive import import_task as read_export
 from .auth import SESSION_DAYS, Sessions, WrongTokens
@@ -55,7 +55,7 @@ from .images import thumbnail
 from .inbox import chunked
 from .jobs import Job, Jobs, TooManyJobs
 from .pipeline import Pipeline
-from .responses import json_response
+from .responses import ERRORS, UI_HEADERS, json_response
 from .schemas import (
     AcceptConfident,
     AddResult,
@@ -104,14 +104,17 @@ T = TypeVar("T")
 class Server:  # pylint: disable=too-many-instance-attributes  # the server's parts, one each
     """Everything one app serves: its settings, workspace, pipeline, jobs and access control."""
 
-    def __init__(self, settings: ServerSettings, workspace: Workspace | None = None) -> None:
+    def __init__(self, settings: ServerSettings, workspace: Workspace | None = None,
+                 allow_no_token: bool = False) -> None:
         self.settings = settings
+        self.allow_no_token = allow_no_token  # see access.guard
         self.ws = workspace or Workspace(settings.home)
         self.pipe = Pipeline(self.ws)
         self.jobs = Jobs()
         self.wrong_tokens = WrongTokens()
         self.sessions = Sessions(settings.token) if settings.token else None
         self.warned_proxy = False  # see access._note_untrusted_proxy
+        self.warned_exposed = False  # see access.guard
         self._heavy: ThreadPoolExecutor | None = None  # made when first needed, after each shutdown too
         self._heavy_lock = threading.Lock()
 
@@ -190,10 +193,13 @@ Srv = Annotated[Server, Depends(_server)]  # async, so resolving it takes no thr
 
 
 # ---- the app -------------------------------------------------------------
-def create_app(settings: ServerSettings | None = None, workspace: Workspace | None = None) -> FastAPI:
+def create_app(settings: ServerSettings | None = None, workspace: Workspace | None = None,
+               allow_no_token: bool | None = None) -> FastAPI:
     """The server for ``settings`` (default: from the environment), on ``workspace`` (default:
-    ``settings.home``)."""
-    server = Server(settings or ServerSettings.from_env(), workspace)
+    ``settings.home``). Without a token, it refuses requests that reach it on an address other
+    than loopback, unless ``allow_no_token`` (default: ``FEWSHOT_ALLOW_NO_TOKEN``)."""
+    allow = allow_no_token_from_env() if allow_no_token is None else allow_no_token
+    server = Server(settings or ServerSettings.from_env(), workspace, allow)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -237,7 +243,7 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-router = APIRouter()
+router = APIRouter(responses=ERRORS)
 
 
 def _missing(e: KeyError) -> HTTPException:
@@ -287,11 +293,12 @@ async def health(srv: Srv) -> dict[str, Any]:
     """Liveness check; also lists loaded models and running jobs. Needs no token, and no thread, so
     it answers even while every thread is busy."""
     return {"status": "ok", "auth_required": srv.settings.token is not None, "models_loaded": loaded_embedders(),
-            "jobs_running": len(srv.jobs.running()), "url_fetch": srv.settings.allow_urls,
+            "jobs_running": len(srv.jobs.running()), "jobs_cancelling": len(srv.jobs.stopping()),
+            "url_fetch": srv.settings.allow_urls,
             "max_request_bytes": srv.settings.max_request_bytes, "max_upload_bytes": srv.settings.max_upload_bytes}
 
 
-@router.post("/api/login", status_code=204)
+@router.post("/api/login", status_code=204, response_class=Response)
 async def login(srv: Srv, body: Login, request: Request, response: Response) -> None:
     """Check the server token and start a session: an HttpOnly, SameSite=Strict cookie (Secure over
     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
@@ -311,7 +318,7 @@ async def login(srv: Srv, body: Login, request: Request, response: Response) -> 
                             samesite="strict", secure=https)
 
 
-@router.post("/api/logout", status_code=204)
+@router.post("/api/logout", status_code=204, response_class=Response)
 async def logout(srv: Srv, request: Request, response: Response) -> None:
     """End the session: the cookie is deleted, and its session refused from now on."""
     if srv.sessions is not None:
@@ -378,7 +385,7 @@ async def update_task(srv: Srv, name: str, body: TaskSettings) -> Response:
     return await srv.run(_update_task, srv, name, body)
 
 
-@router.delete("/api/tasks/{name}", status_code=204)
+@router.delete("/api/tasks/{name}", status_code=204, response_class=Response)
 def delete_task(srv: Srv, name: str) -> None:
     """Delete a task and its images."""
     srv.task(name)
@@ -563,13 +570,21 @@ def list_examples(srv: Srv, name: str, offset: int = Query(0, ge=0), limit: int 
 
 def _uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
     """The uploaded files, each read only when it is needed, so a big upload is never held in
-    memory whole; one over the upload limit carries an error instead of its bytes."""
+    memory whole; one over the upload limit carries an error instead of its bytes. A file that
+    can't be read any more (closed as the request was abandoned) stops the upload with a 400 and
+    a log line: the batch being read isn't stored, batches stored before it stay."""
     limit = srv.settings.max_upload_bytes
-    for f in files:
+    for i, f in enumerate(files):
         # Browsers (and fewshot.client) send a '"' in a file name as %22, per the HTML standard;
         # the multipart parser leaves it encoded.
         name = f.filename.replace("%22", '"') if f.filename else ""
-        data = f.file.read(limit + 1)
+        try:
+            data = f.file.read(limit + 1)
+        except (ValueError, OSError) as e:  # ValueError: read of a closed file
+            log.warning("Stopped an upload at file %d of %d (%s): it can't be read any more (%s), most likely as "
+                        "the client went away; batches stored before it are kept", i + 1, len(files), name, e)
+            raise HTTPException(400, f"The upload stopped at file {i + 1} of {len(files)} ({name}): it could no "
+                                     "longer be read; images before it may have been stored") from None
         if len(data) > limit:
             yield services.Blob(name, None, f"File is larger than the {limit / 1024 / 1024:g} MB upload limit")
         else:
@@ -693,7 +708,9 @@ def delete_examples(srv: Srv, name: str, body: ExampleIds) -> Response:
     return _task_json(t)
 
 
-CACHE_FOREVER = {"Cache-Control": "max-age=31536000, immutable"}  # image ids are content hashes
+# Image ids are content hashes, so an image never changes; "private": kept by the browser only, not by
+# shared caches (it may need the token). Other /api responses get "no-store" (see access.guard).
+CACHE_FOREVER = {"Cache-Control": "private, max-age=31536000, immutable"}
 IMAGE_HEADERS = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox"}
 
 
@@ -897,11 +914,13 @@ def _job(srv: Server, jid: str) -> Job:
 
 
 def _start(srv: Server, job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> Response:
-    """Start ``job``, or return the same one already running; 429 if ``MAX_JOBS`` are running."""
+    """Start ``job``, or return the same one already running; 429 if ``MAX_JOBS`` are running or
+    being cancelled."""
     try:
         return json_response(JobOut, srv.jobs.start(job, work, limit=MAX_JOBS).to_dict(), 202)
     except TooManyJobs:
-        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished") from None
+        raise HTTPException(429, f"{MAX_JOBS} jobs are already running or being cancelled; try again when one "
+                                 "has finished") from None
 
 
 @router.post("/api/tasks/{name}/evaluate/jobs", status_code=202, response_model=JobOut)
@@ -951,8 +970,8 @@ def get_job(srv: Srv, jid: str) -> Response:
 
 @router.delete("/api/jobs/{jid}", response_model=JobOut)
 def cancel_job(srv: Srv, jid: str) -> Response:
-    """Ask a running job to stop: its status becomes "cancelling" (no longer counted against the
-    job limit), then "cancelled" at its next progress step."""
+    """Ask a running job to stop: its status becomes "cancelling", then "cancelled" at its next
+    progress step. Until then it still counts towards the job limit."""
     job = _job(srv, jid)
     job.request_cancel()
     return json_response(JobOut, job.to_dict())
@@ -972,5 +991,5 @@ def mount_ui(application: FastAPI, dist: Path) -> None:
             raise HTTPException(404, "Not Found")  # unknown API routes must not get the HTML page
         f = dist / path
         if path and f.is_file() and dist in f.resolve().parents:
-            return FileResponse(f)
-        return FileResponse(dist / "index.html")
+            return FileResponse(f, headers=UI_HEADERS)
+        return FileResponse(dist / "index.html", headers={**UI_HEADERS, "Cache-Control": "no-cache"})
