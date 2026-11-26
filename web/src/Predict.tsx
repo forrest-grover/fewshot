@@ -1,9 +1,9 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, type Prediction, type TaskDetail } from "./api";
 import { downloadCsv } from "./csv";
 import { usePasteImages, usePredictResults, useShortcuts, type Item, type Results } from "./hooks";
 import { shrinkImages } from "./images";
-import { Bar, DropZone } from "./ui";
+import { Bar, ClassSelect, DropZone } from "./ui";
 import { progressText, sendInBatches } from "./upload";
 
 type ResultsState = ReturnType<typeof usePredictResults>;
@@ -41,7 +41,9 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
   };
   const cardRefs = useRef(new Map<number, HTMLElement>());
   // "Added" only while that example is still in the task, so an undone add can be made again.
-  const addedAs = (it: Item) => (it.added && task.examples.some((e) => e.id === it.added?.id) ? it.added.label : null);
+  const exampleIds = useMemo(() => new Set(task.examples.map((e) => e.id)), [task.examples]);
+  const classNames = useMemo(() => task.classes.map((c) => c.name), [task.classes]);
+  const addedAs = (it: Item) => (it.added && exampleIds.has(it.added.id) ? it.added.label : null);
   const actionable = (it: Item) => !it.pred.error && !addedAs(it);
   const current = items.find((it) => it.key === results.current && actionable(it)) ?? items.find(actionable);
 
@@ -247,12 +249,9 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
                       {!it.pred.rejected && (
                         <button className="small" disabled={it.adding} onClick={() => { void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
                       )}
-                      <select className="small" value="" disabled={it.adding} onChange={(e) => { if (e.target.value) void addAs(it, e.target.value); }} aria-label="Add as another class">
-                        <option value="">{it.pred.rejected ? "Add as…" : "Add as other…"}</option>
-                        {task.classes.map((c, i) => c.name === it.pred.top_label && !it.pred.rejected ? null : (
-                          <option key={c.name} value={c.name}>{i < 9 ? `${String(i + 1)} · ` : ""}{c.name}</option>
-                        ))}
-                      </select>
+                      <ClassSelect className="small" classes={classNames} numbered disabled={it.adding} aria-label="Add as another class"
+                        placeholder={it.pred.rejected ? "Add as…" : "Add as other…"} exclude={it.pred.rejected ? undefined : it.pred.top_label}
+                        onPick={(c) => { void addAs(it, c); }} />
                     </>
                   )}
                 </div>

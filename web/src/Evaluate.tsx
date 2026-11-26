@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, type DuplicatePair, type ModelInfo, type TaskDetail } from "./api";
 import Compare from "./Compare";
 import { downloadCsv } from "./csv";
@@ -70,8 +70,11 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
     ]);
   };
   const stale = report && rev !== task.revision;
-  const classThreshold = (c: string) => task.classes.find((k) => k.name === c)?.reject_below ?? null;
-  const exists = (c: string) => task.classes.some((k) => k.name === c);
+  // Looked up per listed example and per class: built once per task version.
+  const examples = useMemo(() => new Map(task.examples.map((e) => [e.id, e])), [task.examples]);
+  const classes = useMemo(() => new Map(task.classes.map((c) => [c.name, c])), [task.classes]);
+  const classThreshold = (c: string) => classes.get(c)?.reject_below ?? null;
+  const exists = (c: string) => classes.has(c);
   const applicable = report
     ? Object.entries(report.suggested_class_thresholds).filter(([c, v]) => exists(c) && classThreshold(c) !== v).map(([c]) => c)
     : [];
@@ -216,7 +219,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
               )}
               <div className="thumbs">
                 {listed.map((m) => {
-                  const exists = task.examples.find((e) => e.id === m.id);
+                  const exists = examples.get(m.id);
                   return (
                     <figure key={m.id} className="thumb wide">
                       {/* 400 px: 2x the 200 px tile */}
@@ -263,7 +266,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
       {pairs && pairs.length > 0 && (
         <div className="dupes">
           {pairs.map((d) => {
-            const now = (id: string) => task.examples.find((e) => e.id === id); // labels as they are now
+            const now = (id: string) => examples.get(id); // labels as they are now
             const exists = (id: string) => now(id) !== undefined;
             const [la, lb] = [now(d.a)?.label ?? d.labels[0], now(d.b)?.label ?? d.labels[1]];
             const same = la === lb;

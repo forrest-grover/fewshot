@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, HttpError, type InboxAdded, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
 import { pct } from "./format";
 import { useAbortOnLeave, useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
-import { DropZone } from "./ui";
+import { ClassSelect, DropZone } from "./ui";
 import { progressText, sendInBatches } from "./upload";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
@@ -33,6 +33,7 @@ export default function Inbox({ task, setTask, run }: Props) {
   const [viewing, setViewing] = useState<number | null>(null); // index into the list, full size
   const [gone, setGone] = useState<ReadonlySet<string>>(new Set()); // accepted or dismissed, until the list reloads
   const cards = useRef(new Map<string, HTMLElement>());
+  const classNames = useMemo(() => task.classes.map((c) => c.name), [task.classes]);
 
   // Suggestions depend on the task's examples and settings: reload whenever it changes.
   const key = `${task.name}\u0000${String(task.revision)}\u0000${sort}`;
@@ -258,11 +259,8 @@ export default function Inbox({ task, setTask, run }: Props) {
                     ) : <span className="muted">No classes yet</span>}
                     <div className="row">
                       {s && <button className="small" disabled={locked} onClick={(e) => { e.stopPropagation(); void label({ [i.id]: s }); }}>✓ {s}</button>}
-                      <select className="small" value="" disabled={locked} aria-label="Label as"
-                        onChange={(e) => { if (e.target.value) void label({ [i.id]: e.target.value }); }}>
-                        <option value="">Label as…</option>
-                        {task.classes.map((c, k) => <option key={c.name} value={c.name}>{k < 9 ? `${String(k + 1)} · ` : ""}{c.name}</option>)}
-                      </select>
+                      <ClassSelect className="small" classes={classNames} numbered placeholder="Label as…" disabled={locked} aria-label="Label as"
+                        onPick={(c) => { void label({ [i.id]: c }); }} />
                       <button className="ghost small danger" aria-label="Dismiss" title="Dismiss (Delete)" disabled={locked}
                         onClick={(e) => { e.stopPropagation(); void dismiss([i.id]); }}>×</button>
                     </div>
