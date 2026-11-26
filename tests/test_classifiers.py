@@ -3,10 +3,12 @@
 import numpy as np
 import pytest
 
+from fewshot import classifiers
 from fewshot.classifiers import (
     CLASSIFIERS,
     ClassData,
     Classifier,
+    GDAClassifier,
     KNNClassifier,
     LogRegClassifier,
     PrototypeClassifier,
@@ -290,3 +292,84 @@ def test_gda_with_text_and_a_single_image():
     assert clf.logit_scale == 1.0
     probs, _ = clf.predict(unit([[0.1, 1, 0], [1, 0, 0.1]]))
     assert list(probs.argmax(1)) == [1, 0]
+
+
+def noise(rng, n, d=64):
+    """``n`` random unit vectors in ``d`` dimensions."""
+    return unit(rng.normal(size=(n, d)))
+
+
+def test_gda_confidence_when_only_one_class_can_be_left_out():
+    """Image-only GDA on pure noise with 3 examples of one class and 1 of the other: leaving out
+    the lone example leaves nothing to score it against, and the other class's examples, all
+    "right", can't show how often its class is mistaken for the other. The scale must not then
+    make every prediction certain."""
+    rng = np.random.default_rng(9)
+    confs = []
+    for _ in range(10):
+        clf = make_classifier("gda").fit(ClassData(["a", "b"], noise(rng, 4), np.array([0, 0, 0, 1])))
+        confs.append(clf.predict(noise(rng, 200))[0].max(1).mean())
+    assert np.mean(confs) < 0.9
+
+
+def test_gda_leaves_an_image_only_examples_own_text_side_out(monkeypatch):
+    """With some classes described, an image-only class's text side is its centroid moved across
+    the gap. Choosing the fusion weight, an example's own class is scored by the centroid without
+    it, and an example alone in its class (with nothing left to stand for it) is left out."""
+    seen: dict[str, np.ndarray] = {}
+    fusion = classifiers._fusion  # pylint: disable=protected-access
+
+    def spy(zt, loo, exact, y, k, text_weight, keep):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        seen.update(zt=zt, y=y[keep])
+        return fusion(zt, loo, exact, y, k, text_weight, keep)
+
+    monkeypatch.setattr(classifiers, "_fusion", spy)
+    rng = np.random.default_rng(3)
+    y = np.array([0, 0, 1, 1, 2, 2, 3])  # 0, 1 described; 2 image-only with 2 examples; 3 alone
+    X = noise(rng, len(y))
+    clf = make_classifier("gda").fit(ClassData(list("abcd"), X, y, {0: noise(rng, 1)[0], 1: noise(rng, 1)[0]}))
+    assert seen["y"].tolist() == [0, 0, 1, 1, 2, 2]
+    for row, other in ((4, 5), (5, 4)):
+        side = unit(X[other] + clf.gap)
+        assert seen["zt"][row, 2] == pytest.approx(100 * float(X[row] @ side), abs=1e-3)
+
+
+def test_gda_text_weight_scales_the_tuned_balance():
+    """The image term's weight is tuned for text at weight 1; ``text_weight`` then multiplies the
+    text's share, so a small one leaves the image term to decide and a large one the text."""
+    rng = np.random.default_rng(2)
+    centres = unit(rng.normal(size=(5, 32)))
+    text = dict(enumerate(unit(centres + 0.5 * rng.normal(size=(5, 32)))))
+    y = np.repeat(np.arange(5), 3)
+    X = unit(centres[y] + 0.25 * rng.normal(size=(len(y), 32)))
+    Q = unit(centres[np.repeat(np.arange(5), 20)] + 0.3 * rng.normal(size=(100, 32)))
+    data = ClassData(list("abcde"), X, y, text)
+    fits = {w: GDAClassifier(text_weight=w) for w in (0.001, 1.0, 100.0)}
+    for clf in fits.values():
+        clf.fit(data)
+    assert fits[0.001].weight == pytest.approx(fits[1.0].weight)
+    image_only = fits[0.001]._image_logprobs(Q).argmax(1)  # pylint: disable=protected-access
+    text_only = (Q @ np.stack(list(text.values())).T).argmax(1)
+    assert (fits[0.001].predict(Q)[0].argmax(1) == image_only).all()
+    assert (fits[100.0].predict(Q)[0].argmax(1) == text_only).mean() > 0.9
+    assert not (image_only == text_only).all()
+
+
+def test_gda_pulls_class_means_towards_their_text(monkeypatch):
+    """With a few noisy images per class and text that knows where each class lies (across a
+    modality gap), pulling the means towards the text beats leaving them as the images' means."""
+    rng = np.random.default_rng(4)
+    centres = unit(rng.normal(size=(10, 32)))
+    gap = 0.5 * unit(rng.normal(size=32))
+    text = dict(enumerate(unit(centres + gap)))
+    y = np.repeat(np.arange(10), 2)
+    yq = np.repeat(np.arange(10), 30)
+    X = unit(centres[y] + 0.45 * rng.normal(size=(len(y), 32)))
+    Q = unit(centres[yq] + 0.45 * rng.normal(size=(len(yq), 32)))
+    data = ClassData([str(i) for i in range(10)], X, y, text)
+    clf = GDAClassifier()
+    clf.fit(data)
+    pulled = (clf.predict(Q)[0].argmax(1) == yq).mean()
+    monkeypatch.setattr(classifiers, "TEXT_PRIOR", 0.0)
+    plain = (GDAClassifier().fit(data).predict(Q)[0].argmax(1) == yq).mean()
+    assert pulled > plain + 0.02

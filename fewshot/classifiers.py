@@ -125,6 +125,10 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         self.classes: list[str] = []
         self.zero_shot = False
         self.Pt: Vectors | None = None  # (C, d) text-side vector per class, if any text is used
+        # Whether each class has its own text (the others' ``Pt`` rows are image centroids moved
+        # across the gap ``gap``), when ``Pt`` is set.
+        self.described: npt.NDArray[np.bool_] | None = None
+        self.gap: Vectors | None = None
         self._X: Vectors | None = None  # image-space support points (examples + text anchors)
         self._y: Labels | None = None  # class of each support point
 
@@ -179,6 +183,8 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
                 else:  # image-only class: centroid moved into text space
                     Pt[i] = _unit(data.X[data.y == i].mean(0) + _fitted(gap))
             self.Pt = _unit(Pt)
+            self.described = np.array([i in data.text for i in range(C)])
+            self.gap = gap
         if self.zero_shot:
             return self
 
@@ -330,6 +336,8 @@ class LogRegClassifier(Classifier):
 
 
 GDA_ALPHAS = np.geomspace(0.01, 100, 41)  # image-term weights tried, relative to the text term
+TEXT_PRIOR = 1.5  # multiplies the empirical-Bayes weight of a class's text in its mean
+ONE_SHOT_SPREAD = 0.1  # with 1 image per class: share of the image-to-text distance put down to noise
 
 
 class GDAClassifier(Classifier):
@@ -339,7 +347,17 @@ class GDAClassifier(Classifier):
 
     The covariance is shrunk towards ``nu * I`` by ``D / (D + dof)`` (dof = images minus
     classes): with one image per class it is a nearest-class-mean classifier, and with many it
-    uses how the classes actually spread. The image term's weight against the text term is chosen
+    uses how the classes actually spread.
+
+    With text, each described class's mean is also pulled towards its text moved across the
+    modality gap (its anchor), as if the anchor were lam more images: a Gaussian prior on the
+    mean, with lam = ``TEXT_PRIOR`` * sigma^2 / tau^2 by empirical Bayes (sigma^2: the images'
+    spread around their class mean; tau^2: the true means' spread around their anchors, i.e. the
+    class means' distance from them less the share their own noise explains). A few images are
+    a noisy estimate of where a class lies and the text a biased but steady one, so this helps
+    most at 2-8 images per class (about +1 point), on top of fusing the text scores below.
+
+    The image term's weight against the text term is chosen
     by leave-one-out cross-entropy on the examples, pulled (in log space) towards
     ``0.2 * k**0.6`` for k images per class, the more so the fewer images there are; a class
     whose only image is left out is represented by its text moved across the modality gap.
@@ -375,50 +393,106 @@ class GDAClassifier(Classifier):
         mu /= n[:, None]
         m = self.n_images  # the rows after these are text anchors of classes without images
         prec, nu, downdate = _shared_precision(Z, y, mu, n, m)
+        loo = _GDALeaveOneOut(Z[:m], y[:m], mu, n, prec, downdate)
+        if self.Pt is None or self.text_weight <= 0:
+            self._set_means(loo.mu, prec)
+            self.weight = loo.scale(_fitted(self.W), _fitted(self.b), default=15.0 * nu)
+        else:
+            self._fit_with_text(X[:m], raw_mu, loo, nu)
+
+    def _fit_with_text(self, X: Vectors, raw_mu: Scores, loo: _GDALeaveOneOut, nu: float) -> None:
+        """The class means pulled towards their text, and the text fusion weight and scale."""
+        y = loo.y
+        imgs = np.bincount(y, minlength=len(self.classes))
+        # Each class's text moved across the gap into this space: where the text says its images are.
+        gap = (_fitted(self.Pt)[imgs > 0] - raw_mu[imgs > 0]).mean(0)
+        anchors = self._centred((_fitted(self.Pt) - gap).astype(np.float32)).astype(np.float64)
+        lam = self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None)
+        loo.pull_towards(anchors, lam)
+        self._set_means(loo.mu, loo.prec)
+        stand_in = anchors.copy()
+        if (lam > 0).any():  # a class whose only image is left out is represented by its anchor
+            # alone, shortened to the class means' length: a longer mean would be penalised for it
+            stand_in[lam > 0] *= float(np.linalg.norm(loo.mu[lam > 0], axis=1).mean())
+        zt, keep = self._text_scores(X, y, raw_mu, imgs)
+        W, b = _fitted(self.W), _fitted(self.b)
+        self.weight, self.logit_scale = _fusion(
+            zt, loo.scores(W, b, stand_in, exact=False), lambda: loo.scores(W, b, stand_in),
+            y, float(np.median(imgs[imgs > 0])), self.text_weight, keep)
+
+    def _set_means(self, mu: Scores, prec: Scores) -> None:
+        """The discriminant's weights and offsets for class means ``mu``."""
         W = mu @ prec
         self.W, self.b = W.astype(np.float32), (-0.5 * (W * mu).sum(1)).astype(np.float32)
-        loo = _GDALeaveOneOut(Z[:m], y[:m], mu, n, prec, downdate)
-        if self.Pt is not None and self.text_weight > 0:
-            self.weight, self.logit_scale = self._text_fusion_weight(X[:m], y[:m], raw_mu, loo)
-        else:
-            self.weight = loo.scale(self.W, self.b, default=15.0 * nu)
 
-    def _text_fusion_weight(self, X: Vectors, y: Labels, raw_mu: Scores, loo: _GDALeaveOneOut
-                            ) -> tuple[float, float]:
-        """The image term's weight against the text term (see the class doc), and a scale for the
-        fused logits that minimises their leave-one-out cross-entropy (so confidence matches
-        accuracy; 1 with fewer than two examples)."""
-        Pt = _fitted(self.Pt)
-        imgs = np.bincount(y, minlength=len(self.classes))
-        have = imgs > 0
-        gap = (Pt[have] - raw_mu[have]).mean(0)
-        anchors = self._centred((Pt - gap).astype(np.float32))
-        W, b = _fitted(self.W), _fitted(self.b)
-        zt = self.text_weight * CLIP_LOGIT_SCALE * (X @ Pt.T).astype(np.float64)
-        return _fusion(zt, loo.scores(W, b, anchors=anchors, exact=False),
-                       lambda: loo.scores(W, b, anchors=anchors), y, float(np.median(imgs[have])))
+    def _prior_strength(self, mu: Scores, anchors: Scores, imgs: Labels, nu: float,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                        spread_known: bool) -> Scores:
+        """How many images' worth of weight each class's text anchor gets in its mean (see the
+        class doc): ``TEXT_PRIOR`` times sigma^2 / tau^2, the images' spread around their class
+        mean over the class means' spread around their anchors (per dimension, estimated from
+        all the classes), or 0 for a class without both images and its own text."""
+        lam = np.zeros(len(imgs))
+        on = _fitted(self.described) & (imgs > 0)
+        if not on.any():
+            return lam
+        d2 = float(((mu[on] - anchors[on]) ** 2).sum(1).mean()) / mu.shape[1]
+        s2 = nu if spread_known else ONE_SHOT_SPREAD * d2  # no spread to measure with 1 image each
+        k = float(np.median(imgs[imgs > 0]))
+        t2 = max(d2 - s2 / k, 1e-3 * s2, 1e-12)  # a mean of k images is off by s2 / k itself
+        lam[on] = TEXT_PRIOR * s2 / t2
+        return lam
+
+    def _text_scores(self, X: Vectors, y: Labels, raw_mu: Scores, imgs: Labels
+                     ) -> tuple[Scores, npt.NDArray[np.bool_]]:
+        """Each example's text scores, and whether it can help choose the fusion weight. An
+        image-only class's text side is its own centroid moved across the gap, so an example of one
+        is scored against the centroid without it; one alone in its class has nothing left to
+        stand for it (on either side) and is left out."""
+        zt = CLIP_LOGIT_SCALE * (X @ _fitted(self.Pt).T).astype(np.float64)
+        described = _fitted(self.described)[y]
+        keep = described | (imgs[y] > 1)
+        own = np.flatnonzero(~described & keep)
+        if len(own):
+            c, n = y[own], imgs[y[own], None]
+            centroid = (n * raw_mu[c] - X[own]) / (n - 1)
+            zt[own, c] = CLIP_LOGIT_SCALE * (X[own] * _unit(centroid + _fitted(self.gap))).sum(1)
+        return zt, keep
 
 
-def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: float) -> tuple[float, float]:
+def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: float,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+            text_weight: float, keep: npt.NDArray[np.bool_]) -> tuple[float, float]:
     """(weight of the image scores ``loo`` against the text scores ``zt``, scale of the fused
     logits): see ``GDAClassifier``. ``exact()`` gives the image scores with each example also left
-    out of the covariance, for the scale."""
+    out of the covariance, for the scale. The weight is chosen for text at weight 1; the fused
+    logits (and so the scale) have the text scores times ``text_weight``, which therefore
+    multiplies the text's share against the chosen balance. Only the rows in ``keep`` are used to
+    choose; all set the two kinds of scores' relative spread."""
     rel = float(zt.std()) / max(float(loo.std()), 1e-12)
     prior = 0.2 * k**0.6
+    zt, loo, y = zt[keep], loo[keep], y[keep]
     if len(y) < 2:
         return prior * rel, 1.0
     chosen = _least_nll([zt + a * rel * loo for a in GDA_ALPHAS], GDA_ALPHAS, y)
     pull = 1.0 / (1.0 + (k - 1) / 2)  # all prior at 1 image per class, less with more
     weight = float(np.exp((1 - pull) * np.log(chosen) + pull * np.log(prior))) * rel
-    fused = zt + weight * exact()
+    fused = text_weight * zt + weight * exact()[keep]
     scales = np.geomspace(0.1, 10, 41)
     return weight, _least_nll([s * fused for s in scales], scales, y)
 
 
-def _least_nll(logits: list[Scores], values: Scores, y: Labels) -> float:
-    """The value whose logits give the true classes ``y`` the least mean cross-entropy."""
+def _least_nll(logits: list[Scores], values: Scores, y: Labels, smooth: bool = False) -> float:
+    """The value whose logits give the true classes ``y`` the least mean cross-entropy. With
+    ``smooth``, against targets smoothed by 1/(n+2) (as for a task's temperature): examples that
+    all came out right don't prove the scores are never wrong, and fitting them as certain would
+    push the scale, and every confidence, to the limit."""
     rows = np.arange(len(y))
-    return float(values[int(np.argmin([-_log_softmax(z)[rows, y].mean() for z in logits]))])
+    if not smooth:
+        return float(values[int(np.argmin([-_log_softmax(z)[rows, y].mean() for z in logits]))])
+    eps = 1.0 / (len(y) + 2)
+    C = logits[0].shape[1]
+    Y = np.full(logits[0].shape, eps / max(C - 1, 1))  # (one class: nothing to spread it over)
+    Y[rows, y] = 1.0 - eps
+    return float(values[int(np.argmin([-(Y * _log_softmax(z)).sum(1).mean() for z in logits]))])
 
 
 def _shared_precision(Z: Scores, y: Labels, mu: Scores, n: Scores, m: int  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -441,7 +515,7 @@ def _shared_precision(Z: Scores, y: Labels, mu: Scores, n: Scores, m: int  # pyl
     return prec, nu, (b_inv, u)
 
 
-class _GDALeaveOneOut:  # pylint: disable=too-few-public-methods  # a helper holding fit-time arrays
+class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a helper holding fit-time arrays
     """Leave-one-out discriminant scores of a GDA fit's examples: each with itself taken out of its
     class mean and (given ``downdate``) of the shared covariance, by a rank-one update.
 
@@ -452,9 +526,20 @@ class _GDALeaveOneOut:  # pylint: disable=too-few-public-methods  # a helper hol
 
     def __init__(self, Z: Scores, y: Labels, mu: Scores, n: Scores, prec: Scores,  # pylint: disable=too-many-arguments,too-many-positional-arguments
                  downdate: tuple[Scores, Scores] | None = None) -> None:
-        self.Z, self.y, self.mu, self.n, self.prec, self.downdate = Z, y, mu, n, prec, downdate
+        """``mu`` are the class means of ``Z`` (over ``n`` rows each): the fit's means ``self.mu``
+        unless ``pull_towards`` moves them."""
+        self.Z, self.y, self.n, self.prec, self.downdate = Z, y, n, prec, downdate
+        self.sample_mu = self.mu = mu
+        self.lam: Scores = np.zeros(len(n))
+        self.pull = np.zeros_like(mu)
 
-    def scores(self, W: Vectors, b: Vectors, anchors: Vectors | None = None, exact: bool = True) -> Scores:  # pylint: disable=too-many-locals
+    def pull_towards(self, anchors: Scores, lam: Scores) -> None:
+        """Pull class c's mean to ``anchors[c]`` as if that were ``lam[c]`` more examples: the
+        fit's means become (n mu + lam anchor) / (n + lam), and so do the left-out ones."""
+        self.lam, self.pull = lam, lam[:, None] * anchors
+        self.mu = (self.n[:, None] * self.sample_mu + self.pull) / (self.n + lam)[:, None]
+
+    def scores(self, W: Vectors, b: Vectors, anchors: Scores | None = None, exact: bool = True) -> Scores:  # pylint: disable=too-many-locals
         """(n, C) scores; an example alone in its class gets ``anchors[class]`` as the left-out
         mean, or NaN in its row without anchors. ``W`` and ``b`` are the full fit's, used when
         there is no downdate. ``exact=False`` keeps the full covariance (only the mean is left
@@ -463,7 +548,8 @@ class _GDALeaveOneOut:  # pylint: disable=too-few-public-methods  # a helper hol
         Z, y, n, mu = self.Z, self.y, self.n, self.mu
         rows = np.arange(len(y))
         alone = n[y] <= 1
-        M = (n[y, None] * mu[y] - Z) / np.maximum(n[y, None] - 1, 1)  # own class mean without it
+        left = n[y] - 1 + self.lam[y]  # own class mean without it (an anchor if nothing is left)
+        M = (n[y, None] * self.sample_mu[y] - Z + self.pull[y]) / np.where(left > 0, left, 1)[:, None]
         if anchors is not None:
             M[alone] = anchors[y[alone]]
         if self.downdate is None or not exact:
@@ -486,17 +572,18 @@ class _GDALeaveOneOut:  # pylint: disable=too-few-public-methods  # a helper hol
         return L
 
     def scale(self, W: Vectors, b: Vectors, default: float) -> float:
-        """The factor on the scores with the least leave-one-out cross-entropy (``default`` if
-        fewer than two examples can be left out)."""
+        """The factor on the scores with the least (smoothed) leave-one-out cross-entropy: the
+        default if no example can be left out, at most the default if they all have one class."""
         L = self.scores(W, b)
         ok = ~np.isnan(L).any(1)
-        if ok.sum() < 2:
+        if not ok.any():
             return default
         L, t = L[ok], self.y[ok]
         base = 10.0 / max(float(L.std()), 1e-12)
-        rows = np.arange(len(t))
-        nll = [-_log_softmax(a * base * L)[rows, t].mean() for a in GDA_ALPHAS]
-        return float(GDA_ALPHAS[int(np.argmin(nll))]) * base
+        fitted = _least_nll([a * base * L for a in GDA_ALPHAS], GDA_ALPHAS, t, smooth=True) * base
+        # Examples of a single class can't show how often the others are mistaken for it, so then
+        # the fit only caps the default.
+        return fitted if len(set(t.tolist())) > 1 else min(fitted, default)
 
 
 def _log_softmax(z: Scores) -> Scores:

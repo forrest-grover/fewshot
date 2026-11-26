@@ -7,10 +7,11 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import fewshot.pipeline as pipeline_mod
 from fewshot.classifiers import KNNClassifier
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.images import image_id
-from fewshot.pipeline import Pipeline, Prediction, binomial_tail
+from fewshot.pipeline import Pipeline, Prediction, binomial_tail, names_match
 from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
@@ -206,6 +207,33 @@ def test_binomial_tail():
     assert binomial_tail(3, 3, 1.0) == 1.0
     assert binomial_tail(2000, 2000, 0.01) < 1e-300  # no overflow
     assert binomial_tail(500, 1000, 0.5) == pytest.approx(0.5126, abs=1e-3)
+
+
+def test_names_match_allows_for_unbalanced_classes():
+    """Names that send every image to the largest class match no better than chance, however many
+    examples that gets right; names that tell the classes apart do, even with one example each."""
+    truth = np.repeat([0, 1], [30, 5])
+    assert not names_match(np.zeros(35, int), truth)  # 30/35 right, but so would any constant guess
+    assert names_match(truth.copy(), truth)
+    one_each = np.arange(5)
+    assert names_match(one_each.copy(), one_each)
+    assert names_match(np.array([0, 1, 2, 3, 9]), one_each)  # 9: a described class, never right
+    assert not names_match(np.array([1, 2, 3, 4, 0]), one_each)
+
+
+def test_same_lazy_pil_image_decoded_more_than_once():
+    """A lazily loaded PIL image given several times decodes the same each time (its file is
+    read once at a time, not by several threads at once)."""
+    rng = np.random.default_rng(0)
+    buf = io.BytesIO()
+    Image.fromarray((rng.random((600, 600, 3)) * 255).astype(np.uint8)).save(buf, "JPEG", quality=95)
+    ref = np.asarray(Image.open(io.BytesIO(buf.getvalue())).convert("RGB"))
+    for _ in range(3):
+        im = Image.open(io.BytesIO(buf.getvalue()))
+        errors: dict[int, str] = {}
+        out = pipeline_mod._decode([(i, None, im) for i in range(8)], errors)  # pylint: disable=protected-access
+        assert not errors
+        assert all(np.array_equal(np.asarray(r), ref) for _, _, r in out)
 
 
 # ---- classifier caching ------------------------------------------------

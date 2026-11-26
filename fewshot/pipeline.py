@@ -220,9 +220,9 @@ class Pipeline:
     def _name_texts(self, cfg: TaskConfig, X: Vectors, y: Labels, text: dict[int, Vectors],  # pylint: disable=too-many-arguments,too-many-positional-arguments
                     labelled: set[int]) -> dict[int, Vectors]:
         """Text from ``NAME_TEMPLATE`` for the classes with examples but no description, if those
-        names classify their examples better than chance would (one-sided binomial test at
-        ``NAME_TEST_LEVEL``, among every class with text or examples); otherwise none, since
-        meaningless names (codes, numbers) would only pull predictions off."""
+        names classify their examples better than chance would (see ``names_match``, among every
+        class with text or examples); otherwise none, since meaningless names (codes, numbers)
+        would only pull predictions off."""
         named = {i: fill_template(NAME_TEMPLATE, cfg.classes[i].name) for i in sorted(labelled - set(text))}
         if not named:
             return {}
@@ -231,8 +231,7 @@ class Pipeline:
         T = np.stack([text[i] if i in text else names[i] for i in candidates])
         rows = np.isin(y, list(names))
         guess = np.array(candidates)[(X[rows] @ T.T).argmax(1)]
-        correct = int((guess == y[rows]).sum())
-        return names if binomial_tail(correct, int(rows.sum()), 1 / len(candidates)) < NAME_TEST_LEVEL else {}
+        return names if names_match(guess, y[rows]) else {}
 
     def _indexed_texts(self, spec: str, texts: dict[int, str]) -> dict[int, Vectors]:
         """Embed ``{class index: text}``, keeping the indices."""
@@ -393,6 +392,18 @@ NAME_TEMPLATE = "a photo of a {}."  # text for a class described only by its nam
 NAME_TEST_LEVEL = 0.05  # names are used as text when matching the examples this well is unlikely by chance
 
 
+def names_match(guess: Labels, truth: Labels) -> bool:
+    """Whether text guesses ``guess`` hit the true classes ``truth`` more often than chance would
+    (one-sided binomial test at ``NAME_TEST_LEVEL``). Chance is the hit rate of guesses unrelated
+    to the images: a guess of class c is right with probability (share of examples in c), so
+    texts that send every image to the largest class score no better than chance however
+    unbalanced the classes are."""
+    n = len(truth)
+    share = np.bincount(truth, minlength=int(max(guess.max(), truth.max())) + 1) / n
+    chance = float(share[guess].sum()) / n
+    return binomial_tail(int((guess == truth).sum()), n, chance) < NAME_TEST_LEVEL
+
+
 def binomial_tail(k: int, n: int, p: float) -> float:
     """P(X >= k) for X ~ Binomial(n, p), computed in log space so large n doesn't overflow."""
     if k <= 0 or p >= 1:
@@ -497,10 +508,15 @@ def _decode(todo: list[tuple[int, str | None, ImageInput]], errors: dict[int, st
         except (ValueError, OSError) as e:
             return e
 
-    with ThreadPoolExecutor(max_workers=max(1, min(DECODE_THREADS, len(todo)))) as pool:
-        results = list(pool.map(one, [im for _, _, im in todo]))
+    # PIL images are converted here, one at a time: the same lazily loaded image can come more
+    # than once, and Pillow reads its file without a lock, so threads would garble its pixels.
+    done = {j: one(im) for j, (_, _, im) in enumerate(todo) if isinstance(im, Image.Image)}
+    rest = [j for j in range(len(todo)) if j not in done]
+    with ThreadPoolExecutor(max_workers=max(1, min(DECODE_THREADS, len(rest)))) as pool:
+        done.update(zip(rest, pool.map(one, [todo[j][2] for j in rest]), strict=True))
     decoded = []
-    for (i, k, _), r in zip(todo, results, strict=True):
+    for j, (i, k, _) in enumerate(todo):
+        r = done[j]
         if isinstance(r, Image.Image):
             decoded.append((i, k, r))
             continue
