@@ -363,6 +363,19 @@ def test_heavy_work_waits_on_its_own_threads(tmp_path, monkeypatch):
     assert done == [200]
 
 
+def test_the_app_can_be_started_again(tmp_path):
+    """Stopping the app stops its heavy-work threads, and starting it again makes new ones, so an
+    app can be served (or tested) more than once."""
+    c = api_client(tmp_path)
+    c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
+    c.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(1))
+    for _ in range(2):
+        with c:
+            assert c.post("/api/tasks/t/predict", files=query_files(1)).status_code == 200
+    c.srv.stop_heavy()  # stopping twice is harmless
+    assert c.post("/api/tasks/t/predict", files=query_files(1)).status_code == 200
+
+
 # ---- uploads -------------------------------------------------------------
 @pytest.mark.usefixtures("task_t")
 def test_uploads_are_read_and_classified_a_chunk_at_a_time(client, monkeypatch):

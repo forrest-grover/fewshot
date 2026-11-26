@@ -109,7 +109,24 @@ class Server:  # pylint: disable=too-many-instance-attributes  # the server's pa
         self.wrong_tokens = WrongTokens()
         self.sessions = Sessions(settings.token) if settings.token else None
         self.warned_proxy = False  # see _note_untrusted_proxy
-        self.heavy = ThreadPoolExecutor(settings.workers, thread_name_prefix="fewshot-work")
+        self._heavy: ThreadPoolExecutor | None = None  # made when first needed, after each shutdown too
+        self._heavy_lock = threading.Lock()
+
+    @property
+    def heavy(self) -> ThreadPoolExecutor:
+        """The threads for heavy work (``settings.workers`` of them)."""
+        with self._heavy_lock:
+            if self._heavy is None:
+                self._heavy = ThreadPoolExecutor(self.settings.workers, thread_name_prefix="fewshot-work")
+            return self._heavy
+
+    def stop_heavy(self) -> None:
+        """Stop the heavy-work threads, dropping work not started yet (the app is shutting down); the
+        next heavy request, if the app is started again, gets new ones."""
+        with self._heavy_lock:
+            pool, self._heavy = self._heavy, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """``fn(*args)`` on the heavy-work threads, so it waits there, not in Starlette's pool."""
@@ -176,7 +193,7 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
         if server.settings.warm:
             threading.Thread(target=server.warm_models, name="fewshot-warm", daemon=True).start()
         yield
-        server.heavy.shutdown(wait=False, cancel_futures=True)
+        server.stop_heavy()
 
     # Operation ids are the function names (predict, add_examples...), which make tidy generated clients.
     app = FastAPI(title="fewshot", version="0.1.0", lifespan=lifespan,
