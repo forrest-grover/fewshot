@@ -342,6 +342,18 @@ def class_threshold(
         _fail(_error_text(e))
 
 
+@cls_app.command("rename")
+def class_rename(name: str, label: str, new_label: str, root: Path | None = ROOT_OPT) -> None:
+    """Rename a class, relabelling its examples (one undo step)."""
+    t = _task(root, name)
+    n = sum(e.label == label for e in t.config.examples)
+    try:
+        t.rename_class(label, new_label)
+    except (KeyError, ValueError) as e:
+        _fail(_error_text(e))
+    typer.echo(f"Renamed class {label} to {new_label.strip()} ({n} examples)")
+
+
 @cls_app.command("rm")
 def class_rm(name: str, label: str, root: Path | None = ROOT_OPT) -> None:
     """Delete a class and its examples."""

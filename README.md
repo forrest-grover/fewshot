@@ -83,6 +83,7 @@ fewshot create pets --embedder openclip:PE-Core-B-16@meta
 fewshot import pets ./photos --shots 5        # ./photos/<class>/<image>; skips .ipynb_checkpoints, __MACOSX...
 fewshot add pets Beagle a.jpg b.jpg
 fewshot class describe pets "a photo of a {}, a type of pet"
+fewshot class rename pets Beagle beagle       # relabels its examples; also: class add/rm/threshold
 fewshot eval pets                             # leave-one-out cross-validation; --csv for every prediction
 fewshot eval pets --apply-class-thresholds    # also set each class's suggested reject threshold
 fewshot compare pets --presets                # cross-validate the task with every preset embedder

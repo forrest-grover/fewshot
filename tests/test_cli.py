@@ -231,6 +231,21 @@ def test_delete(run, root, task):
     assert run("list").output == ""
 
 
+def test_class_rename(run, root, task):
+    """`class rename` renames a class and relabels its examples, in one undo step."""
+    r = run("class", "rename", task, "red", "crimson")
+    assert r.exit_code == 0
+    assert "Renamed class red to crimson (4 examples)" in r.output
+    assert load(root).summary()["counts"] == {"blue": 4, "crimson": 4, "green": 4}
+    for args, message in ((["nope", "x"], "No class 'nope'"), (["blue", "green"], "Class 'green' already exists"),
+                          (["blue", "a/b"], "can't be '.' or '..'"), (["blue", "blue"], "already exists")):
+        r = run("class", "rename", task, *args)
+        assert r.exit_code == 1
+        assert message in r.output
+    run("undo", task)
+    assert "red" in load(root).class_names()
+
+
 def test_class_commands(run, root, task):
     """`class add`, `class describe` and `class rm` change classes on disk."""
     assert run("class", "add", task, "dog_breed").exit_code == 0
