@@ -17,7 +17,7 @@ from PIL import Image, ImageOps
 
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, Labels, binomial_tail, make_classifier
-from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
+from .embedders import Embedder, Vectors, cache_namespace, get_embedder, hold, spec_supports_text
 from .images import image_id, load_image, to_rgb
 from .store import Task, TaskConfig, Workspace
 from .text import fill_template, prompts
@@ -87,6 +87,12 @@ class Pipeline:
         """
         if not items:
             return np.zeros((0, 0), np.float32)
+        with hold(spec):
+            return self._embed_images(spec, items, errors, progress, flip)
+
+    def _embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                      errors: dict[int, str] | None, progress: Progress | None, flip: bool) -> Vectors:
+        """``embed_images`` with the model held."""
         ns = cache_namespace(spec)
         if flip:
             items = [(k + FLIP_KEY if k else None, im) for k, im in items]
@@ -143,11 +149,12 @@ class Pipeline:
         """Embed image files, reading each once (for both its cache key and decoding) and holding
         only ``chunk`` files' bytes at a time. ``progress(done, total)`` counts files."""
         parts = []
-        for start in range(0, len(paths), chunk):
-            blobs = [p.read_bytes() for p in paths[start : start + chunk]]
-            parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs], flip=flip))
-            if progress:
-                progress(min(start + chunk, len(paths)), len(paths))
+        with hold(spec):  # also while reading the next chunk's files
+            for start in range(0, len(paths), chunk):
+                blobs = [p.read_bytes() for p in paths[start : start + chunk]]
+                parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs], flip=flip))
+                if progress:
+                    progress(min(start + chunk, len(paths)), len(paths))
         return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
 
     def embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
@@ -190,6 +197,12 @@ class Pipeline:
         """Training data for ``task`` (as of ``cfg``, default its current config), leaving out
         example indices in ``exclude``. ``progress`` reports images embedded (see ``embed_images``)."""
         cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
+        with hold(cfg.embedder):
+            return self._class_data(task, exclude, cfg, progress)
+
+    def _class_data(self, task: Task, exclude: set[int] | None, cfg: TaskConfig,
+                    progress: Progress | None) -> ClassData:
+        """``class_data`` with the model held."""
         classes = [c.name for c in cfg.classes]
         idx = {c: i for i, c in enumerate(classes)}
         X = self.example_embeddings(task, cfg, progress)
@@ -273,11 +286,12 @@ class Pipeline:
             raise ValueError(f"top_k must be at least 1, got {top_k}")
         task = self.ws.get(task) if isinstance(task, str) else task
         cfg = cfg or task.config
-        clf = self.fitted(task, cfg)
-        if not images:
-            return []
         errors: dict[int, str] = {}
-        Q = self._embed_queries(cfg, images, errors, progress)
+        with hold(cfg.embedder):  # one model for the fit and every chunk of images
+            clf = self.fitted(task, cfg)
+            if not images:
+                return []
+            Q = self._embed_queries(cfg, images, errors, progress)
         probs, sims, per_class = clf.predict_full(Q)
         thr = threshold_for(cfg, clf)
         preds = [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)

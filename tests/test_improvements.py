@@ -42,6 +42,29 @@ def test_models_in_use_are_not_unloaded(monkeypatch):
     assert list(embedders._loaded) == ["m:busy", "m:new"]  # pylint: disable=protected-access
 
 
+def test_model_is_held_between_batches(ws, monkeypatch):
+    """A model stays loaded for a whole pipeline operation, not just while a batch is in the model:
+    another model loaded between two batches (here, from the progress callback) doesn't unload it."""
+    emb = ColorEmbedder()
+    emb.batch_size = 1
+    monkeypatch.setattr(embedders, "_loaded", {"m:a": emb})
+    monkeypatch.setenv("FEWSHOT_MAX_MODELS", "1")
+    evicted = []
+
+    def load_another(done, total):
+        assert emb.users == 0  # between batches: no embed call is running
+        with embedders._load_lock:  # pylint: disable=protected-access
+            embedders._loaded[f"m:other{done}"] = ColorEmbedder()  # pylint: disable=protected-access
+            evicted.extend(embedders._evict_locked(keep=f"m:other{done}"))  # pylint: disable=protected-access
+
+    items = [(None, Image.new("RGB", (2, 2), (i * 50, 0, 0))) for i in range(3)]
+    Pipeline(ws).embed_images("m:a", items, progress=load_another)
+    assert "m:a" not in evicted and evicted == ["m:other1", "m:other2"]
+    assert not embedders._held  # pylint: disable=protected-access
+    with embedders._load_lock:  # pylint: disable=protected-access
+        assert embedders._evict_locked(keep="m:other3") == ["m:a"]  # pylint: disable=protected-access
+
+
 def test_use_count_follows_embedding():
     """users counts embed calls in progress, and drops back on errors too."""
     seen = []

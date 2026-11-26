@@ -351,6 +351,7 @@ _loaded: dict[str, Embedder] = {}  # in least- to most-recently used order
 _load_lock = threading.Lock()  # guards the dicts here; never held while a model loads
 _spec_locks: dict[str, threading.Lock] = {}  # one per spec: two loads of one model wait for each other
 _registered: set[str] = set()  # specs whose embedder came from register_embedder
+_held: dict[str, int] = {}  # spec -> operations in progress that may embed with it (see ``hold``)
 _namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once computed
 
 
@@ -428,6 +429,25 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
     return emb
 
 
+@contextlib.contextmanager
+def hold(spec: str) -> Iterator[None]:
+    """Keep ``spec``'s model loaded (if it is, or once it is) until the block ends.
+
+    ``Embedder.users`` only counts calls into the model, so an operation that embeds batch by
+    batch, decoding images or reading files in between, would leave it idle between calls; held
+    for the whole operation (embedding a task, predicting, evaluating), the model can't be
+    unloaded for another one halfway and loaded again for the next batch. Doesn't load anything."""
+    with _load_lock:
+        _held[spec] = _held.get(spec, 0) + 1
+    try:
+        yield
+    finally:
+        with _load_lock:
+            _held[spec] -= 1
+            if not _held[spec]:
+                del _held[spec]
+
+
 def _build(spec: str) -> Embedder:
     backend, _, rest = spec.partition(":")
     if not rest:
@@ -446,11 +466,13 @@ def _build(spec: str) -> Embedder:
 def _evict_locked(keep: str | None = None) -> list[str]:
     """Drop least recently used built-in models beyond ``max_models()``; returns their specs.
 
-    A model in use (embedding right now) is skipped, so a later request can't load a second copy
-    of it while the first still holds its memory; the limit may be exceeded until it is free.
+    A model in use (embedding right now, or held by an operation, see ``hold``) is skipped, so a
+    later request can't load a second copy of it while the first still holds its memory; the limit
+    may be exceeded until it is free.
     """
     built_in = [s for s in _loaded if s not in _registered]
-    idle = [s for s in built_in if _loaded[s].users == 0 and s != keep]  # never the model just loaded
+    idle = [s for s in built_in  # never the model just loaded
+            if _loaded[s].users == 0 and not _held.get(s) and s != keep]
     gone = idle[: max(0, len(built_in) - max_models())]
     for spec in gone:
         del _loaded[spec]
