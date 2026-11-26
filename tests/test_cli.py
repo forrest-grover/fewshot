@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 from fewshot import cache as cache_module
 from fewshot import cli, cli_common, embedders
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
+from fewshot.server_settings import ServerSettings, served_host
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, served, two_each, write_images
 
@@ -537,8 +538,60 @@ def test_serve_refuses_a_weak_token(monkeypatch):
     monkeypatch.setenv("FEWSHOT_TOKEN", "hunter2")
     r = CliRunner().invoke(cli.app, ["serve"])
     assert r.exit_code == 1
-    assert "The token is too weak to be safe: it has 7 characters" in r.output
-    assert "(--token / FEWSHOT_TOKEN)" in r.output
+    assert "FEWSHOT_TOKEN is too weak to be safe: it has 7 characters" in r.output
+    r = CliRunner().invoke(cli.app, ["serve", "--token", "s3cret"])
+    assert r.exit_code == 1
+    assert "The token is too weak to be safe: it has 6 characters" in r.output
+    assert "(--token)" in r.output
+
+
+@pytest.mark.parametrize("env", [
+    {"FEWSHOT_WARM": ""}, {"FEWSHOT_WARM": "off"}, {"FEWSHOT_ALLOW_URLS": "y"}, {"FEWSHOT_ALLOW_ANY_MODEL": "yes"},
+    {"FEWSHOT_WORKERS": "0"}, {"FEWSHOT_MAX_UPLOAD_MB": "2"}, {"FEWSHOT_FORWARDED_ALLOW_IPS": "10.0.0.9"},
+    {"FEWSHOT_ALLOWED_HOSTS": "box.lan"},
+])
+def test_serve_reads_the_environment_as_the_server_does(monkeypatch, env):
+    """`serve` without options gets the settings ServerSettings.from_env makes of the same
+    environment, or refuses with the same error."""
+    for k in ("FEWSHOT_TOKEN", "FEWSHOT_ALLOW_ANY_MODEL", "FEWSHOT_WARM", "FEWSHOT_ALLOWED_HOSTS"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    if env == {"FEWSHOT_WORKERS": "0"}:
+        with pytest.raises(ValueError, match="FEWSHOT_WORKERS must be a whole number") as refused:
+            ServerSettings.from_env()
+        monkeypatch.setattr("uvicorn.run", lambda *a, **kw: pytest.fail("started"))
+        r = CliRunner().invoke(cli.app, ["serve"])
+        assert r.exit_code == 1
+        assert str(refused.value) in " ".join(r.output.split())
+        return
+    expected = ServerSettings.from_env()
+    _, srv, kw = served(monkeypatch)
+    assert srv.settings == expected
+    assert kw["forwarded_allow_ips"] == expected.forwarded_allow_ips
+
+
+def test_serve_options_win_over_the_environment(monkeypatch):
+    """An option replaces its variable, which then isn't read at all (so a bad one doesn't matter)."""
+    monkeypatch.setenv("FEWSHOT_WARM", "maybe")
+    monkeypatch.setenv("FEWSHOT_TOKEN", "weak")
+    monkeypatch.setenv("FEWSHOT_WORKERS", "2")
+    monkeypatch.setenv("FEWSHOT_ALLOW_URLS", "1")
+    _, srv, _ = served(monkeypatch, "--no-warm", "--token", "a-good-long-t0ken", "--no-urls")
+    assert (srv.settings.warm, srv.settings.token, srv.settings.workers, srv.settings.allow_urls) == (
+        False, "a-good-long-t0ken", 2, False)
+
+
+def test_uvicorn_listening_beyond_localhost_answers_to_the_machine_names():
+    """Run by uvicorn on a non-local address, the app allows the machine's names as serve does."""
+    name = socket.gethostname().lower()
+    assert served_host(["/x/bin/uvicorn", "fewshot.api:app", "--host", "0.0.0.0"], {}) == "0.0.0.0"
+    assert served_host(["/x/site-packages/uvicorn/__main__.py", "fewshot.api:app", "--host=::"], {}) == "::"
+    assert served_host(["/x/bin/uvicorn", "fewshot.api:app"], {"UVICORN_HOST": "10.1.1.1"}) == "10.1.1.1"
+    assert served_host(["pytest", "--host", "0.0.0.0"], {}) == "127.0.0.1"
+    assert name in ServerSettings.from_env({}, host="0.0.0.0").allowed_hosts
+    assert ServerSettings.from_env({}, host="localhost").allowed_hosts == {"localhost", "127.0.0.1", "::1"}
+    assert ServerSettings.from_env({"UVICORN_HOST": "0.0.0.0"}).allowed_hosts >= {name}
 
 
 def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):
