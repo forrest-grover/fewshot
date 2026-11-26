@@ -20,6 +20,7 @@ from .cli_common import (
     CLASSIFIER_LIST,
     FAILED,
     JSON_OPT,
+    MAX_DOWNLOAD,
     ROOT_OPT,
     ClassifierName,
     Source,
@@ -36,7 +37,6 @@ from .cli_common import get_task as _task
 from .cli_common import images_in as _images_in
 from .cli_common import make_pipeline as _pipe
 from .cli_common import progress as _progress
-from .cli_common import read_source as _read
 from .cli_common import usage as _usage
 from .cli_common import workspace as _ws
 from .cli_common import write_csv as _write_csv
@@ -688,16 +688,11 @@ def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, 
 
 
 def _loaded(files: list[Source]) -> list[services.Blob]:
-    """Files as they are (the pipeline reads them a few at a time) and URLs downloaded; a URL that
-    can't be fetched carries its error."""
-    return [services.Blob(str(f), f) if isinstance(f, Path) else _fetched(f) for f in files]
-
-
-def _fetched(url: str) -> services.Blob:
-    try:
-        return services.Blob(url, _read(url))
-    except ValueError as e:
-        return services.Blob(url, None, str(e))
+    """Files as they are (the pipeline reads them a few at a time) and URLs downloaded, several at
+    a time; a URL that can't be fetched carries its error."""
+    urls = [f for f in files if isinstance(f, str)]
+    fetched = iter(services.fetch_urls(urls, MAX_DOWNLOAD) if urls else [])
+    return [services.Blob(str(f), f) if isinstance(f, Path) else next(fetched) for f in files]
 
 
 def _print_predictions(files: list[Source], preds: list[Prediction], top: int) -> None:
