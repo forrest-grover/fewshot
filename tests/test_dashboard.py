@@ -1,16 +1,12 @@
 """Recorded evaluations, warnings for the dashboard, and duplicating tasks."""
 
-
 import pytest
 from typer.testing import CliRunner
 
-import fewshot.api
 import fewshot.store
 from fewshot import cli
 from fewshot.store import Workspace
-from tests.conftest import api_client, png
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
+from tests.conftest import BLUE, RED, api_client, png
 
 
 def _task(ws, name="t", n=3):

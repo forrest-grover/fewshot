@@ -1,8 +1,10 @@
 """Unit tests for fewshot.classifiers on small hand-built embeddings."""
 
+
 import numpy as np
 import pytest
 
+import fewshot.evaluate as ev
 from fewshot import classifiers
 from fewshot.classifiers import (
     CLASSIFIERS,
@@ -13,6 +15,7 @@ from fewshot.classifiers import (
     LogRegClassifier,
     PrototypeClassifier,
     make_classifier,
+    top_k,
 )
 
 ALL = ["prototype", "knn", "logreg", "gda"]
@@ -454,7 +457,6 @@ def test_gda_text_weight_scales_the_prior(monkeypatch):
 def test_grid_searches_log_when_they_hit_an_end(caplog):
     """A grid search that chooses an end of its grid (where the best value may lie beyond it) says
     so at debug level; one that chooses inside it doesn't. So do evaluation's temperatures."""
-    import fewshot.evaluate as ev  # pylint: disable=import-outside-toplevel
 
     caplog.set_level("DEBUG", logger="fewshot")
     y = np.array([0, 1])
@@ -543,3 +545,53 @@ def test_gda_stand_in_anchors_are_shortened_without_the_pull(monkeypatch):
     norms, mean = lengths[-1]
     assert mean < 0.9
     np.testing.assert_allclose(norms, mean, rtol=1e-6)
+
+
+def test_top_k_breaks_ties_by_column():
+    """``top_k`` takes the largest entries, and the lowest columns among equal ones."""
+    S = np.array([[1.0, 3, 3, 3, 0], [5, 4, 3, 2, 1], [0, 0, 0, 0, 0]])
+    assert top_k(S, 2).tolist() == [[1, 2], [0, 1], [0, 1]]
+    assert top_k(S, 5).tolist() == [[0, 1, 2, 3, 4]] * 3
+
+
+@pytest.mark.parametrize("name", ["prototype", "knn", "logreg", "gda"])
+def test_queries_are_scored_in_blocks(monkeypatch, name):
+    """Scoring queries a block at a time gives the same results as all at once; the block holds
+    about PREDICT_CELLS similarities, so it shrinks as the examples grow."""
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(12, 4)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    clf = make_classifier(name).fit(ClassData(["a", "b", "c"], X, np.arange(12) % 3))
+    Q = rng.normal(size=(7, 4)).astype(np.float32)
+    Q /= np.linalg.norm(Q, axis=1, keepdims=True)
+    whole = clf.predict_full(Q)
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 36)  # 12 examples: 3 queries at a time
+    blocks = []
+    real = type(clf)._predict_rows  # pylint: disable=protected-access
+
+    def counted(self, rows):
+        blocks.append(len(rows))
+        return real(self, rows)
+
+    monkeypatch.setattr(type(clf), "_predict_rows", counted)
+    for a, b in zip(whole, clf.predict_full(Q), strict=True):
+        np.testing.assert_allclose(a, b, rtol=1e-6)
+    assert blocks == [3, 3, 1]
+
+
+def test_knn_compares_with_examples_once(monkeypatch):
+    """kNN's vote and per-class similarity share one queries x examples product."""
+    X = np.eye(3, dtype=np.float32)
+    clf = make_classifier("knn", k=2).fit(ClassData(["a", "b", "c"], X, np.arange(3)))
+    calls = []
+    real = classifiers.Classifier._support_similarity  # pylint: disable=protected-access
+
+    def counted(self, Q):
+        calls.append(len(Q))
+        return real(self, Q)
+
+    monkeypatch.setattr(classifiers.Classifier, "_support_similarity", counted)
+    clf.predict_full(X)
+    assert calls == [3]
+    clf._image_logprobs(X)  # pylint: disable=protected-access  # without S, the hook computes it
+    assert calls == [3, 3]

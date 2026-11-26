@@ -15,10 +15,9 @@ import threading
 import pytest
 
 from fewshot import fsutil
+from fewshot.fsutil import write_atomic
 from fewshot.store import Workspace
-from tests.conftest import png
-
-RED = (220, 30, 30)
+from tests.conftest import RED, png
 
 
 @pytest.fixture(name="pair")
@@ -227,3 +226,14 @@ def test_lock_file_is_closed_when_locking_fails(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="no locks here"), fsutil.file_lock(tmp_path / ".lock"):  # pylint: disable=protected-access
         pass  # pragma: no cover
     assert len(closed) == 1
+
+
+def test_write_atomic_cleans_up(tmp_path, monkeypatch):
+    """A failed atomic write leaves neither the file nor a temporary file."""
+    def broken(*_):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", broken)
+    with pytest.raises(OSError, match="disk full"):
+        write_atomic(tmp_path / "x", b"data")
+    assert not list(tmp_path.iterdir())

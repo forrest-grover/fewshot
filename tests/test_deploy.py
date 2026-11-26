@@ -4,34 +4,14 @@ import csv
 import io
 import json
 import shutil
+import time
 
 import pytest
-from typer.testing import CliRunner
 
 from fewshot import cli
 from fewshot.cli_common import images_in
 from fewshot.store import Workspace
-from tests.conftest import api_client, png
-from tests.test_cli import PlainResult
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
-
-
-@pytest.fixture(name="root")
-def root_fixture(tmp_path):
-    """Workspace directory for the test."""
-    return tmp_path / "ws"
-
-
-@pytest.fixture(name="run")
-def run_fixture(root):
-    """Invoke the CLI against the temporary workspace."""
-    runner = CliRunner()
-
-    def invoke(*args, stdin=None):
-        return PlainResult(runner.invoke(cli.app, [str(a) for a in args] + ["--root", str(root)], input=stdin))
-
-    return invoke
+from tests.conftest import BLUE, RED, api_client, png, write_images
 
 
 @pytest.fixture(name="task")
@@ -268,3 +248,101 @@ def test_api_predict_at_a_revision(tmp_path):
     assert client.post("/api/tasks/c/predict", files=q).json()[0]["revision"] > before
     r = client.post("/api/tasks/c/predict", params={"revision": 9999}, files=q)
     assert r.status_code == 404
+
+
+# ---- CLI predict --from-file ---------------------------------------------
+@pytest.mark.usefixtures("task")
+def test_from_file_is_read_as_it_arrives(run, tmp_path, monkeypatch):
+    """Each batch is classified as soon as its lines have been read, before the list ends."""
+    monkeypatch.setattr(cli, "PREDICT_CHUNK", 1)
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    a.write_bytes(png(RED, seed=9))
+    b.write_bytes(png(BLUE, seed=9))
+    order = []
+    real = cli._named_in  # pylint: disable=protected-access
+
+    def lines(src):
+        for x in real(src):
+            order.append(("read", str(x).rsplit("/", 1)[-1]))
+            yield x
+
+    monkeypatch.setattr(cli, "_named_in", lines)
+    monkeypatch.setattr(cli, "_output_predictions",
+                        lambda part, *_a, **_k: order.append(("out", part[0].name)))
+    assert run("predict", "t", "--from-file", "-", "--jsonl", stdin=f"{a}\n{b}\n").exit_code == 0
+    assert order == [("read", "a.png"), ("out", "a.png"), ("read", "b.png"), ("out", "b.png")]
+
+
+@pytest.mark.usefixtures("task")
+def test_from_file_entries_that_cant_be_read(run, tmp_path):
+    """A listed path that is missing gets an error row (the rest are still classified); a folder is
+    expanded; a missing list file or an empty list is an error."""
+    a = tmp_path / "a.png"
+    a.write_bytes(png(RED, seed=9))
+    folder = tmp_path / "more"
+    folder.mkdir()
+    (folder / "b.png").write_bytes(png(BLUE, seed=9))
+    listing = tmp_path / "list.txt"
+    listing.write_text(f"{tmp_path / 'gone.png'}\n{a}\n{folder}\nhttp://127.0.0.1:1/x.png\n")
+    r = run("predict", "t", "--from-file", listing, "--jsonl")
+    rows = [json.loads(line) for line in r.stdout.splitlines()]
+    assert [(x["label"], x["error"] is not None) for x in rows] == [
+        (None, True), ("red", False), ("blue", False), (None, True)]
+    assert rows[3]["file"] == "http://127.0.0.1:1/x.png"
+    assert (r.exit_code, "2 of 4 images could not be read" in r.stderr) == (1, True)
+    r = run("predict", "t", "--from-file", tmp_path / "nope.txt")
+    assert (r.exit_code, "Can't read" in r.output) == (1, True)
+    (tmp_path / "empty.txt").write_text("\n")
+    r = run("predict", "t", "--from-file", tmp_path / "empty.txt")
+    assert (r.exit_code, "No images to classify" in r.output) == (1, True)
+    r = run("predict", "t", "--from-file", listing, "--json")
+    assert [x["file"] for x in json.loads(r.stdout)][:3] == [str(tmp_path / "gone.png"), str(a), str(folder / "b.png")]
+
+
+# ---- CLI watch: failed moves ---------------------------------------------
+def test_watch_backs_off_from_a_file_it_cannot_move(tmp_path, monkeypatch):
+    """Failures double the wait before the next try, up to a maximum."""
+    retry = cli.Backoff(1.0)
+    f = tmp_path / "a.png"
+    assert not retry.waiting(f)
+    assert [retry.failed(f) for _ in range(3)] == [1.0, 2.0, 4.0]
+    assert retry.waiting(f)
+    for _ in range(20):
+        retry.failed(f)
+    assert retry.failed(f) == cli.WATCH_MAX_BACKOFF
+    retry.keep([])
+    assert not retry.waiting(f)
+    retry.failed(f)
+    retry.succeeded(f)
+    assert not retry.waiting(f)
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    retry.failed(f)
+    clock[0] = 1.5
+    assert not retry.waiting(f)  # due again
+
+
+def test_watch_retries_a_failed_move_later(run, task, tmp_path, monkeypatch):
+    """watch doesn't retry a file it couldn't move at every look."""
+    inbox = tmp_path / "in"
+    write_images(inbox, RED, 1)
+    tries = []
+
+    def place(f, folder, copy):  # pylint: disable=unused-argument
+        """Fail to move anything."""
+        tries.append(f.name)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(cli, "_place", place)
+    sleeps = []
+
+    def sleep(_s):
+        """Stop after a few looks."""
+        sleeps.append(1)
+        if len(sleeps) > 6:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    r = run("watch", task, inbox, "--out", tmp_path / "out", "--interval", "100")
+    assert "trying again in 100 s" in r.output
+    assert len(tries) == 1  # waits out its back-off instead of retrying every look

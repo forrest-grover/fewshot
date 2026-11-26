@@ -1,4 +1,5 @@
-"""Evidence (nearest labelled examples) and confidence calibration."""
+"""Confidence calibration: tempering, the task's temperature, suggesting one from evaluation, and
+the API and CLI for it."""
 
 
 import numpy as np
@@ -7,50 +8,12 @@ from typer.testing import CliRunner
 
 import fewshot.evaluate as ev
 from fewshot import cli
-from fewshot.classifiers import ClassData, make_classifier, temper
+from fewshot.classifiers import temper
 from fewshot.evaluate import evaluate_task
-from fewshot.models import TaskConfig
 from fewshot.pipeline import Pipeline
-from tests.conftest import api_client, png
-
-RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
+from tests.conftest import BLUE, RED, api_client, png
 
 
-def unit(rows):
-    """Rows scaled to unit length, as float32."""
-    a = np.array(rows, np.float32)
-    return a / np.linalg.norm(a, axis=1, keepdims=True)
-
-
-# ---- evidence -----------------------------------------------------------
-def test_nearest_skips_text_anchors():
-    """nearest returns example rows only, most similar first; text anchors and zero-shot give none."""
-    data = ClassData(["a", "b", "c"], unit([[1, 0, 0], [0.9, 0.1, 0], [0, 1, 0]]), np.array([0, 0, 1]),
-                     {2: unit([[0, 0, 1]])[0]})
-    clf = make_classifier("knn").fit(data)
-    idx, sims = clf.nearest(unit([[0, 0.1, 1]]), 5)  # nearest is the text anchor, which is left out
-    assert idx.tolist() == [[2, 1, 0]]
-    assert sims[0, 0] > sims[0, 1] > sims[0, 2]
-    zero = make_classifier("prototype").fit(ClassData(["a", "b"], np.zeros((0, 3), np.float32), np.zeros(0, int),
-                                                      {0: unit([[1, 0, 0]])[0], 1: unit([[0, 1, 0]])[0]}))
-    assert zero.nearest(unit([[1, 0, 0]]), 3)[0].shape == (1, 0)
-
-
-def test_predictions_carry_evidence(ws):
-    """With evidence=k each prediction lists the k most similar examples; errors get none."""
-    t = ws.create("t", embedder="fake:color")
-    ids = {label: t.add_example(png(rgb, noise=10, seed=1), label).id for label, rgb in
-           (("red", RED), ("green", GREEN), ("blue", BLUE))}
-    t.add_example(png(RED, noise=10, seed=2), "red")
-    good, bad = Pipeline(ws).predict(t, [png((200, 50, 40)), b"junk"], evidence=2)
-    assert [e["label"] for e in good.evidence] == ["red", "red"]
-    assert good.evidence[0]["similarity"] >= good.evidence[1]["similarity"]
-    assert ids["red"] in {e["id"] for e in good.evidence}
-    assert bad.evidence == []
-    assert Pipeline(ws).predict(t, [png(RED)])[0].evidence == []
-
-
-# ---- calibration --------------------------------------------------------
 def test_temper():
     """Tempering keeps the top class, softens with T > 1 and sharpens with T < 1."""
     p = np.array([[0.7, 0.2, 0.1], [0.0, 1.0, 0.0]])
@@ -110,20 +73,29 @@ def test_no_calibration_with_few_examples(ws):
     assert evaluate_task(Pipeline(ws), t)["calibration"] is None
 
 
-def test_fast_leave_one_out_is_tempered_like_refitting():
-    """The closed-form leave-one-out applies the task's temperature like a refit does."""
-    rng = np.random.default_rng(3)
-    X = unit(rng.normal(size=(12, 5)))
-    data = ClassData(["a", "b", "c"], X, np.arange(12) % 3)
-    cfg = TaskConfig(name="t", classifier="knn", classifier_params={"k": 3}, temperature=2.5)
-    fast = ev._fast_leave_one_out(data, cfg, None)  # pylint: disable=protected-access
-    slow = ev.HeldOut.empty(12, 3)
-    for test in ev._folds(data.y, 12, 0):  # pylint: disable=protected-access
-        ev._fold(data, cfg, test, slow)  # pylint: disable=protected-access
-    assert np.allclose(fast.conf, slow.conf, atol=1e-5)
+def _held_out(P, truth):
+    h = ev.HeldOut.empty(len(truth), P.shape[1])
+    h.record(np.arange(len(truth)), P, np.ones(len(truth)), truth, np.ones(len(truth), bool))
+    return h
 
 
-# ---- API and CLI --------------------------------------------------------
+def test_calibration_when_held_out_predictions_are_all_right():
+    """All-correct predictions suggest a sharper but bounded temperature, not the grid's minimum,
+    and the suggested absolute temperature stays within the range settings accept."""
+    n = 60
+    truth = np.arange(n) % 3
+    P = np.full((n, 3), 0.14)
+    P[np.arange(n), truth] = 0.72
+    cal = ev._calibration(_held_out(P, truth), truth, 1.0)  # pylint: disable=protected-access
+    assert cal is not None
+    assert 0.05 < cal["temperature"] < 1
+    assert cal["ece_calibrated"] < cal["ece"]
+    cal = ev._calibration(_held_out(P, truth), truth, 0.02)  # pylint: disable=protected-access
+    assert cal is not None
+    assert cal["temperature"] == 0.01  # 0.02 times the fitted one, clamped
+
+
+# ---- API and CLI ---------------------------------------------------------
 @pytest.fixture(name="client")
 def client_fixture(tmp_path):
     """A TestClient on a fresh API, with task 'c' (one red and one blue example)."""

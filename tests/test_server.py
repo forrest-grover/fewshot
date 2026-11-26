@@ -1,45 +1,24 @@
-"""Server operations: health, token auth, request size limit, model allowlist, warm-up and jobs."""
+"""Server operations: settings and the app factory, health, threads for heavy work, request and
+upload limits, the model allowlist and warm-up."""
 
 import asyncio
+import importlib
+import subprocess
+import sys
 import threading
 import time
 
+import anyio.to_thread
 import pytest
-from fastapi.testclient import TestClient
 
 import fewshot.api
-import fewshot.auth
-import fewshot.evaluate
 import fewshot.guard
 import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
-from tests.conftest import api_client, png, set_settings
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
-
-
-@pytest.fixture(name="client")
-def client_fixture(tmp_path):
-    """A TestClient on a new server with default settings."""
-    return api_client(tmp_path)
-
-
-def _task(client, name="c", n=3):
-    """Create a task with ``n`` red and ``n`` blue examples."""
-    assert client.post("/api/tasks", json={"name": name, "embedder": "fake:color"}).status_code == 201
-    for label, rgb in (("red", RED), ("blue", BLUE)):
-        files = [("files", (f"{label}{i}.png", png(rgb, noise=15, seed=i), "image/png")) for i in range(n)]
-        assert client.post(f"/api/tasks/{name}/examples", data={"label": label}, files=files).status_code == 201
-    return name
-
-
-def _wait(client, jid, timeout=10.0):
-    deadline = time.time() + timeout
-    while True:
-        job = client.get(f"/api/jobs/{jid}").json()
-        if job["status"] not in {"running", "cancelling"} or time.time() > deadline:
-            return job
-        time.sleep(0.02)
+from fewshot.pipeline import Prediction
+from fewshot.server_settings import MAX_JSON_BYTES, ServerSettings
+from fewshot.store import Task
+from tests.conftest import RED, api_client, api_task, png, query_files, set_settings
 
 
 # ---- health -------------------------------------------------------------
@@ -54,40 +33,11 @@ def test_health(client):
     assert "fake:color" in client.get("/api/health").json()["models_loaded"]
 
 
-# ---- auth ---------------------------------------------------------------
-def test_token_auth(tmp_path):
-    """With a token set, /api needs it as a Bearer header or the login cookie."""
-    client = api_client(tmp_path, token="s3cret")
-    assert client.get("/api/tasks").status_code == 401
-    assert client.get("/api/tasks").headers["www-authenticate"] == "Bearer"
-    assert client.get("/api/tasks", headers={"Authorization": "Bearer nope"}).status_code == 401
-    assert client.get("/api/tasks", headers={"Authorization": "Bearer s3cret"}).status_code == 200
-    health = client.get("/api/health")
-    assert health.status_code == 200
-    assert health.json()["auth_required"] is True
-    assert client.get("/docs").status_code == 200  # only /api is protected
-
-    assert client.post("/api/login", json={"token": "nope"}).status_code == 401
-    r = client.post("/api/login", json={"token": "s3cret"})
-    assert r.status_code == 204
-    assert "httponly" in r.headers["set-cookie"].lower()
-    assert client.get("/api/tasks").status_code == 200  # the cookie now signs requests in
-    assert client.post("/api/logout").status_code == 204
-    assert client.get("/api/tasks").status_code == 401
-
-
-def test_login_without_token_configured(client):
-    """With no token configured, login succeeds and sets no cookie."""
-    r = client.post("/api/login", json={"token": "anything"})
-    assert r.status_code == 204
-    assert "set-cookie" not in r.headers
-
-
 # ---- request size -------------------------------------------------------
 def test_request_size_limit_by_content_length(tmp_path):
     """A body over FEWSHOT_MAX_REQUEST_MB is refused with 413 before it is read."""
     client = api_client(tmp_path, max_request_mb=0.5)
-    _task(client, n=1)  # small requests still work
+    api_task(client, n=1)  # small requests still work
     big = [("files", ("x.png", b"x" * 600_000, "image/png"))]
     r = client.post("/api/tasks/c/examples", data={"label": "red"}, files=big)
     assert r.status_code == 413
@@ -199,72 +149,6 @@ def test_warm_at_startup(tmp_path, monkeypatch):
         assert done.wait(5)
 
 
-# ---- jobs ---------------------------------------------------------------
-def test_evaluation_job(client):
-    """An evaluation job reports progress and ends with the same report as the direct endpoint."""
-    task = _task(client)
-    r = client.post(f"/api/tasks/{task}/evaluate/jobs")
-    assert r.status_code == 202
-    job = _wait(client, r.json()["id"])
-    assert job["status"] == "done"
-    assert (job["task"], job["kind"], job["stage"]) == (task, "evaluate", "evaluating")
-    assert job["done"] == job["total"] == 6  # leave-one-out: one fold per example
-    assert job["result"] == client.post(f"/api/tasks/{task}/evaluate").json()
-    assert client.get("/api/health").json()["jobs_running"] == 0
-
-
-def test_evaluation_job_errors(client):
-    """Bad arguments fail at once; errors during the work are reported on the job."""
-    assert client.post("/api/tasks/nope/evaluate/jobs").status_code == 404
-    client.post("/api/tasks", json={"name": "empty", "embedder": "fake:color"})
-    assert client.post("/api/tasks/empty/evaluate/jobs", params={"folds": 1}).status_code == 400
-    job = _wait(client, client.post("/api/tasks/empty/evaluate/jobs").json()["id"])
-    assert (job["status"], job["error"]) == ("failed", "Task has no examples to evaluate")
-    assert client.get("/api/jobs/nope").status_code == 404
-    assert client.delete("/api/jobs/nope").status_code == 404
-
-
-def test_job_internal_error_and_cancel(client, monkeypatch):
-    """An unexpected exception fails the job; cancelling stops it at its next progress step."""
-    task = _task(client, n=1)
-
-    def broken(*_args, **_kw):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", broken)
-    job = _wait(client, client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"])
-    assert (job["status"], job["error"]) == ("failed", "Internal error; see the server log")
-
-    started = threading.Event()
-
-    def slow(_pipe, _task, _folds, progress):
-        for i in range(1000):
-            progress("evaluating", i, 1000)
-            started.set()
-            time.sleep(0.01)
-
-    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
-    jid = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
-    assert started.wait(5)
-    assert client.get("/api/health").json()["jobs_running"] == 1
-    assert client.delete(f"/api/jobs/{jid}").status_code == 200
-    job = _wait(client, jid)
-    assert job["status"] == "cancelled"
-    assert job["done"] < 999  # stopped long before the end
-
-
-def test_old_jobs_are_forgotten(client, monkeypatch):
-    """Only the most recent `kept` finished jobs are remembered."""
-    task = _task(client, n=1)
-    monkeypatch.setattr(client.srv.jobs, "kept", 2)
-    ids = []
-    for _ in range(3):
-        ids.append(client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"])
-        _wait(client, ids[-1])
-    assert client.get(f"/api/jobs/{ids[0]}").status_code == 404
-    assert all(client.get(f"/api/jobs/{j}").status_code == 200 for j in ids[1:])
-
-
 def test_no_warm_when_off(client):
     """With warm-up off, startup loads nothing in the background."""
     with client:
@@ -292,10 +176,10 @@ def test_request_size_limit_cuts_off_the_app():
         _asgi([b"1"], broken)
 
 
-# ---- second review: server limits ---------------------------------------
+# ---- URL budget, export headers ---------------------------------------------
 def test_url_fetches_have_a_budget(client, monkeypatch):
     """URLs share a time and size budget per request; what doesn't fit is reported per URL."""
-    task = _task(client, n=1)
+    task = api_task(client, n=1)
     set_settings(monkeypatch, client, allow_urls=True)
     monkeypatch.setattr(fewshot.services, "fetch_url", lambda url, max_bytes, timeout=20.0, public_only=False: png(RED))
     set_settings(monkeypatch, client, max_request_mb=(len(png(RED)) + 1) / 2**20)
@@ -307,81 +191,9 @@ def test_url_fetches_have_a_budget(client, monkeypatch):
     assert "budget for URLs ran out" in preds[0]["error"]
 
 
-def test_jobs_are_capped_and_shared(client, monkeypatch):
-    """The same evaluation already running is shared; past MAX_JOBS running jobs, 429."""
-    task = _task(client, n=1)
-    release = threading.Event()
-
-    def slow(_pipe, _task, _folds, progress):
-        progress("evaluating", 0, 1)
-        release.wait(5)
-
-    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
-    monkeypatch.setattr(fewshot.api, "MAX_JOBS", 1)
-    first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()
-    assert client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"] == first["id"]  # shared
-    r = client.post(f"/api/tasks/{task}/evaluate/jobs", params={"folds": 2})
-    assert r.status_code == 429
-    release.set()
-    _wait(client, first["id"])
-
-
-def test_a_cancelled_evaluation_is_not_shared(client, monkeypatch):
-    """An evaluation asked to stop, though still running, isn't handed to the next request."""
-    task = _task(client, n=1)
-    release = threading.Event()
-
-    def slow(_pipe, _task, _folds, progress):
-        release.wait(5)
-        progress("evaluating", 0, 1)  # raises Cancelled
-
-    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
-    first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
-    assert client.delete(f"/api/jobs/{first}").status_code == 200
-    second = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
-    assert second != first
-    client.delete(f"/api/jobs/{second}")
-    release.set()
-    assert [_wait(client, j)["status"] for j in (first, second)] == ["cancelled", "cancelled"]
-
-
-def test_login_is_rate_limited_and_secure_over_https(tmp_path, monkeypatch):
-    """Too many wrong tokens get 429 for a while; over HTTPS the cookie is Secure."""
-    monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
-    c = api_client(tmp_path, token="s3cret")
-    assert c.post("/api/login", json={"token": "a"}).status_code == 401
-    assert c.post("/api/login", json={"token": "b"}).status_code == 401
-    r = c.post("/api/login", json={"token": "s3cret"})
-    assert (r.status_code, r.json()["detail"]) == (429, "Too many wrong tokens; try again in a minute")
-    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)  # the window has passed
-    r = c.post("/api/login", json={"token": "s3cret"})
-    assert r.status_code == 204
-    assert "secure" not in r.headers["set-cookie"].lower()
-    https = TestClient(c.app, base_url="https://testserver")
-    assert "secure" in https.post("/api/login", json={"token": "s3cret"}).headers["set-cookie"].lower()
-
-
-def test_wrong_tokens_on_any_request_count_towards_the_limit(tmp_path, monkeypatch):
-    """Guessing with Bearer tokens is limited like /api/login (no token at all isn't a guess, and
-    a session cookie can't be guessed), and the limit then covers login too."""
-    api = fewshot.api
-    monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
-    c = api_client(tmp_path, token="s3cret")
-    for _ in range(3):
-        assert c.get("/api/tasks").status_code == 401
-        assert c.get("/api/tasks", headers={"Cookie": f"{api.SESSION_COOKIE}=b"}).status_code == 401
-    assert c.get("/api/tasks", headers={"Authorization": "Bearer a"}).status_code == 401
-    assert c.get("/api/tasks", headers={"Authorization": "Bearer b"}).status_code == 401
-    r = c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"})
-    assert (r.status_code, r.json()["detail"]) == (429, api.TOO_MANY_TOKENS)
-    assert c.post("/api/login", json={"token": "s3cret"}).status_code == 429
-    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)
-    assert c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"}).status_code == 200
-
-
 def test_export_headers_and_import_with_another_embedder(client):
     """The export says its size and how many examples were left out; import can switch embedder."""
-    task = _task(client, n=1)
+    task = api_task(client, n=1)
     t = client.srv.ws.get(task)
     (t.path / t.config.examples[0].file).unlink()
     r = client.get(f"/api/tasks/{task}/export")
@@ -390,3 +202,145 @@ def test_export_headers_and_import_with_another_embedder(client):
     up = client.post("/api/tasks/import", files={"file": ("c.zip", r.content, "application/zip")},
                      data={"name": "copy", "embedder": "fake:color"})
     assert (up.status_code, up.json()["embedder"]) == (201, "fake:color")
+
+
+# ---- settings and the app factory ----------------------------------------
+def test_settings_from_the_environment_are_checked():
+    """Every setting is read and checked in one place, with a message naming the bad variable."""
+    s = ServerSettings.from_env({"FEWSHOT_TOKEN": "x", "FEWSHOT_WARM": "0", "FEWSHOT_ALLOW_URLS": "yes",
+                                 "FEWSHOT_ALLOWED_HOSTS": "a.lan, B.lan:8000", "FEWSHOT_MAX_UPLOAD_MB": "2",
+                                 "FEWSHOT_WORKERS": "3", "FEWSHOT_HOME": "/w",
+                                 "FEWSHOT_FORWARDED_ALLOW_IPS": "10.0.0.1"})
+    assert (s.token, s.warm, s.allow_urls, s.allowed_hosts) == ("x", False, True, frozenset({"a.lan", "b.lan"}))
+    assert (s.max_upload_bytes, s.workers, str(s.home), s.forwarded_allow_ips) == (2 * 2**20, 3, "/w", "10.0.0.1")
+    d = ServerSettings.from_env({})
+    assert (d.token, d.warm, d.max_request_mb) == (None, True, 1024)
+    assert d.allowed_hosts == {"localhost", "127.0.0.1", "::1"}
+    for env, message in [({"FEWSHOT_MAX_UPLOAD_MB": "abc"}, "FEWSHOT_MAX_UPLOAD_MB must be a number"),
+                         ({"FEWSHOT_MAX_REQUEST_MB": "-5"}, "FEWSHOT_MAX_REQUEST_MB must be a positive number"),
+                         ({"FEWSHOT_MAX_UPLOAD_MB": "inf"}, "must be a positive number"),
+                         ({"FEWSHOT_WARM": "maybe"}, "FEWSHOT_WARM must be 1 or 0")]:
+        with pytest.raises(ValueError, match=message):
+            ServerSettings.from_env(env)
+    with pytest.raises(ValueError, match="max_upload_mb must be a positive"):
+        ServerSettings(max_upload_mb=0)
+    with pytest.raises(ValueError, match="workers must be between"):
+        ServerSettings(workers=0)
+    assert ServerSettings(token="  ").token is None
+
+
+def test_importing_the_api_reads_no_settings_and_makes_no_workspace(tmp_path, monkeypatch):
+    """`import fewshot.api` has no side effects; `fewshot.api.app` is built from the environment
+    on first use, and a bad setting stops it with a message instead of a traceback."""
+    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
+    monkeypatch.setenv("FEWSHOT_MAX_UPLOAD_MB", "abc")
+    api = importlib.reload(fewshot.api)
+    assert not (tmp_path / "ws").exists()
+    with pytest.raises(SystemExit, match="fewshot: FEWSHOT_MAX_UPLOAD_MB must be a number"):
+        _ = api.app
+    monkeypatch.setenv("FEWSHOT_MAX_UPLOAD_MB", "3")
+    api = importlib.reload(fewshot.api)
+    first = api.app
+    assert api.app is first  # built once
+    assert api.app.state.server.settings.max_upload_mb == 3
+    assert (tmp_path / "ws" / "tasks").is_dir()
+    with pytest.raises(AttributeError, match="no attribute 'nope'"):
+        _ = api.nope
+    importlib.reload(fewshot.api)
+
+
+def test_uvicorn_app_string_loads(tmp_path):
+    """`uvicorn fewshot.api:app` finds the app, as `fewshot serve` would build it."""
+    code = ("import uvicorn.importer as i; app = i.import_from_string('fewshot.api:app'); "
+            "print(type(app).__name__, app.state.server.settings.warm)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120,
+                         env={"PATH": "", "FEWSHOT_HOME": str(tmp_path / "ws"), "FEWSHOT_WARM": "0"})
+    assert out.stdout.split() == ["FastAPI", "False"]
+
+
+# ---- threads -------------------------------------------------------------
+@pytest.mark.usefixtures("task_t")
+def test_healthz_answers_while_every_thread_is_busy(client, monkeypatch):
+    """With Starlette's thread pool used up by slow requests, /healthz still answers."""
+    release = threading.Event()
+    real = Task.summary
+    monkeypatch.setattr(Task, "summary", lambda self: release.wait(10) and real(self))
+    with client:  # one event loop, whose thread limit is set to one
+        client.portal.call(lambda: setattr(anyio.to_thread.current_default_thread_limiter(), "total_tokens", 1))
+        stuck = threading.Thread(target=lambda: client.get("/api/tasks"))
+        stuck.start()
+        time.sleep(0.2)
+        answered = []
+        probe = threading.Thread(target=lambda: answered.append(client.get("/healthz").status_code))
+        probe.start()
+        probe.join(5)
+        release.set()
+        stuck.join(10)
+    assert answered == [200]
+
+
+def test_heavy_work_waits_on_its_own_threads(tmp_path, monkeypatch):
+    """Predictions queue on the server's worker threads; cheap requests are still answered."""
+    c = api_client(tmp_path, workers=1)
+    c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
+    c.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(1))
+    release = threading.Event()
+    monkeypatch.setattr(fewshot.services, "predict", lambda _pipe, _t, blobs, **k: release.wait(10) and
+                        [Prediction.failed("not really") for _ in blobs])
+    with c:  # one event loop for every request
+        slow = [threading.Thread(target=lambda: c.post("/api/tasks/t/predict", files=query_files(1))) for _ in range(3)]
+        for th in slow:
+            th.start()
+        time.sleep(0.2)
+        done = []
+        probe = threading.Thread(target=lambda: done.append(c.get("/api/tasks/t").status_code))
+        probe.start()
+        probe.join(5)
+        release.set()
+        for th in slow:
+            th.join(10)
+    assert done == [200]
+
+
+# ---- uploads -------------------------------------------------------------
+@pytest.mark.usefixtures("task_t")
+def test_uploads_are_read_and_classified_a_chunk_at_a_time(client, monkeypatch):
+    """Uploaded images are read lazily and classified PREDICT_CHUNK at a time, with one version."""
+    monkeypatch.setattr(fewshot.api, "PREDICT_CHUNK", 2)
+    seen = []
+    real = fewshot.services.predict
+
+    def spy(pipe, task, blobs, **kw):
+        seen.append((len(blobs), kw["cfg"].revision))
+        return real(pipe, task, blobs, **kw)
+
+    monkeypatch.setattr(fewshot.services, "predict", spy)
+    preds = client.post("/api/tasks/t/predict", files=query_files(5)).json()
+    assert [p["label"] for p in preds] == ["red"] * 5
+    assert [n for n, _ in seen] == [2, 2, 1]
+    assert len({rev for _, rev in seen}) == 1
+
+
+@pytest.mark.usefixtures("task_t")
+def test_added_images_are_handed_over_lazily(client, monkeypatch):
+    """The store gets the uploads as a generator, so it holds one chunk of images at a time."""
+    kinds = []
+    real = Task.add_examples
+
+    def spy(self, items, chunk=256):
+        kinds.append(isinstance(items, list))
+        return real(self, items, chunk)
+
+    monkeypatch.setattr(Task, "add_examples", spy)
+    assert client.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(3)).status_code == 201
+    assert kinds == [False]
+
+
+@pytest.mark.usefixtures("task_t")
+def test_json_bodies_have_a_small_limit(client):
+    """Bodies that aren't uploads are refused past 1 MB, though uploads may be far larger."""
+    big = {"name": "x" * (MAX_JSON_BYTES + 10)}
+    r = client.post("/api/tasks", json=big)
+    assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 1 MB limit")
+    assert client.post("/api/tasks/t/examples", data={"label": "red"},
+                       files=[("files", ("big.png", png(RED, size=800, noise=60), "image/png"))]).status_code == 201

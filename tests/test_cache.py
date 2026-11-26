@@ -3,8 +3,10 @@
 import sqlite3
 
 import numpy as np
+import pytest
 
-from fewshot.cache import EmbeddingCache
+from fewshot.cache import EmbeddingCache, prune_unused
+from tests.conftest import two_each
 
 
 def _rows(path):
@@ -84,3 +86,67 @@ def test_stats_and_prune(tmp_path):
     assert c.prune({"keep"}) == 2
     assert _rows(c.path) == [("s1", "keep"), ("s1", "text:x")]
     assert c.prune({"keep"}) == 0
+
+
+# ---- damaged and busy caches ---------------------------------------------
+def test_corrupt_cache_is_moved_aside(tmp_path, caplog):
+    """A damaged cache file is renamed (with its WAL files) and a new cache started."""
+    path = tmp_path / "cache.sqlite"
+    path.write_bytes(b"this is not a database" * 100)
+    (tmp_path / "cache.sqlite-wal").write_bytes(b"junk")
+    cache = EmbeddingCache(path)
+    cache.put_many("s", {"k": np.ones(3, np.float32)})
+    assert set(cache.get_many("s", ["k"])) == {"k"}
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert any(n.startswith("cache.sqlite.corrupt-") and not n.endswith(("-wal", "-shm")) for n in names)
+    assert "unreadable" in caplog.text
+
+
+def test_busy_cache_is_not_moved_aside(tmp_path, monkeypatch):
+    """A cache that is only locked or unwritable is reported, never mistaken for a damaged one."""
+    path = tmp_path / "cache.sqlite"
+    EmbeddingCache(path).put_many("s", {"k": np.ones(3, np.float32)})
+
+    def locked(_self):
+        e = sqlite3.OperationalError("database is locked")
+        e.sqlite_errorcode = 5  # SQLITE_BUSY
+        raise e
+
+    monkeypatch.setattr(EmbeddingCache, "_open", locked)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        EmbeddingCache(path)
+    assert not [p for p in tmp_path.iterdir() if "corrupt" in p.name]
+
+
+# ---- pruning -------------------------------------------------------------
+def test_prune_cache_holds_the_task_locks(ws, monkeypatch):
+    """Pruning decides what to keep and deletes the rest with every task locked."""
+    t = two_each(ws)
+    seen = []
+    real = EmbeddingCache.prune
+
+    def prune(self, keep, dry_run=False):
+        """Record whether the task lock is held."""
+        seen.append(t._lock._is_owned())  # pylint: disable=protected-access
+        return real(self, keep, dry_run)
+
+    monkeypatch.setattr(EmbeddingCache, "prune", prune)
+    assert prune_unused(ws, ) == (0, 0)
+    assert seen == [True]
+
+
+def test_prune_cache_vacuums_only_when_asked(ws, monkeypatch):
+    """VACUUM, which blocks other writers, runs only with vacuum=True."""
+    two_each(ws)
+    cache = EmbeddingCache(ws.cache_path)
+    cache.put_many("fake:color", {"gone": np.array([1.0, 0.0, 0.0], np.float32)})
+    vacuums: list[int] = []
+    monkeypatch.setattr(EmbeddingCache, "vacuum", lambda self: vacuums.append(1))
+    assert prune_unused(ws, dry_run=True) == (1, 0)
+    assert prune_unused(ws, ) == (1, 0)
+    assert not vacuums
+    cache.put_many("fake:color", {"gone": np.array([1.0, 0.0, 0.0], np.float32)})
+    monkeypatch.undo()
+    assert prune_unused(ws, vacuum=True) == (1, 0)
+    with sqlite3.connect(ws.cache_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM emb WHERE key='gone'").fetchone() == (0,)

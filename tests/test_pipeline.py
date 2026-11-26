@@ -1,20 +1,23 @@
 """Pipeline: embedding cache use, training data, classifier caching and prediction inputs."""
 
 import io
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
-import fewshot.pipeline as pipeline_mod
+import fewshot.evaluate as ev
+from fewshot import embedders, pipeline
+from fewshot.cache import FLIP_KEY
 from fewshot.classifiers import KNNClassifier, binomial_tail, names_match, with_names
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.images import image_id
 from fewshot.pipeline import Pipeline, Prediction
-from tests.conftest import ColorEmbedder, png
+from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, red_blue_task
 
-RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
 TEXT_SPEC = "openclip:fake-color"
 
 
@@ -262,7 +265,7 @@ def test_same_lazy_pil_image_decoded_more_than_once():
     for _ in range(3):
         im = Image.open(io.BytesIO(buf.getvalue()))
         errors: dict[int, str] = {}
-        out = pipeline_mod._decode([(i, None, im) for i in range(8)], errors)  # pylint: disable=protected-access
+        out = pipeline._decode([(i, None, im) for i in range(8)], errors)  # pylint: disable=protected-access
         assert not errors
         assert all(np.array_equal(np.asarray(r), ref) for _, _, r in out)
 
@@ -515,7 +518,6 @@ def test_names_gate_is_decided_per_fold_without_the_held_out_example(ws, monkeyp
     """Whether names are used as text is decided from each fold's training examples: here all 5
     examples pass the test (0.52**5 < 0.05) but no 4 of them do (0.5**4), so no fold may use the
     names, while a fit on every example does."""
-    import fewshot.evaluate as ev  # pylint: disable=import-outside-toplevel
 
     t = ws.create("t", embedder=TEXT_SPEC)
     for label, rgb, n in (("red", RED, 3), ("blue", BLUE, 2)):
@@ -524,7 +526,7 @@ def test_names_gate_is_decided_per_fold_without_the_held_out_example(ws, monkeyp
     pipe = Pipeline(ws)
     assert pipe.fitted(t).names_used
     folds = []
-    real = pipeline_mod.new_classifier
+    real = pipeline.new_classifier
 
     def spy(cfg):
         folds.append(real(cfg))
@@ -535,3 +537,175 @@ def test_names_gate_is_decided_per_fold_without_the_held_out_example(ws, monkeyp
     assert report["method"] == "leave-one-out"
     assert len(folds) == 5
     assert not any(c.names_used for c in folds)
+
+
+# ---- fitting -------------------------------------------------------------
+def test_an_older_fit_does_not_replace_a_newer_one(ws):
+    """A slow fit of an older revision, finishing late, leaves the newer fit cached."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_example(png(RED), "red")
+    old = t.config
+    t.add_example(png(BLUE), "blue")
+    pipe = Pipeline(ws)
+    newer = pipe.fitted(t)
+    pipe.fitted(t, cfg=old)  # the late, older fit
+    assert pipe.fitted(t) is newer
+
+
+def test_concurrent_cold_requests_fit_once(ws, monkeypatch):
+    """Requests for a task that isn't fitted yet share one fit instead of each fitting it; a fit
+    that fails lets the next request try again."""
+
+    t = ws.create("t", embedder="fake:color")
+    t.add_example(png(RED), "red")
+    t.add_example(png(BLUE), "blue")
+    pipe = Pipeline(ws)
+    fits = []
+    real = pipeline.new_classifier
+
+    def slow(cfg):
+        clf = real(cfg)
+        fit = clf.fit
+
+        def counted(data):
+            fits.append(1)
+            time.sleep(0.1)
+            if len(fits) == 1:
+                raise RuntimeError("first fit fails")
+            return fit(data)
+
+        clf.fit = counted  # type: ignore[method-assign]
+        return clf
+
+    monkeypatch.setattr(pipeline, "new_classifier", slow)
+    with pytest.raises(RuntimeError):
+        pipe.fitted(t)
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(pipe.fitted(t))) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(fits) == 2
+    assert len(out) == 6
+    assert all(c is out[0] for c in out)
+    assert not pipe._fitting  # pylint: disable=protected-access
+
+
+# ---- flip averaging, prompt ensembles, repeated and chunked input --------
+class LeftRight(Embedder):  # pylint: disable=abstract-method
+    """Mean colour of the left half, then of the right half: sensitive to mirroring."""
+
+    spec = "fake:lr"
+    cache_version = "test"
+
+    @property
+    def dim(self):
+        return 6
+
+    def _embed_image_batch(self, images):
+        rows = []
+        for im in images:
+            a = np.asarray(im, np.float32)
+            w = a.shape[1] // 2
+            rows.append(np.concatenate([a[:, :w].reshape(-1, 3).mean(0), a[:, w:].reshape(-1, 3).mean(0)]) + 1)
+        v = np.stack(rows)
+        return (v / np.linalg.norm(v, axis=1, keepdims=True)).astype(np.float32)
+
+
+def halves(left, right, size=8):
+    """PNG bytes with the left half one colour and the right half another."""
+    a = np.zeros((size, size, 3), np.uint8)
+    a[:, : size // 2] = left
+    a[:, size // 2 :] = right
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_flip_averages_with_the_mirror_image(ws):
+    """With flip, an image and its mirror get the same vector, cached under a separate key."""
+    register_embedder("fake:lr", LeftRight())
+    try:
+        pipe = Pipeline(ws)
+        a, b = halves(RED, BLUE), halves(BLUE, RED)
+        plain = pipe.embed_images("fake:lr", [("a", a), ("b", b)])
+        assert not np.allclose(plain[0], plain[1])
+        flipped = pipe.embed_images("fake:lr", [("a", a), ("b", b)], flip=True)
+        assert np.allclose(flipped[0], flipped[1])
+        assert np.allclose(np.linalg.norm(flipped, axis=1), 1)
+        assert set(pipe.cache.get_many(embedders.cache_namespace("fake:lr"), ["a", "a" + FLIP_KEY])) == {
+            "a", "a" + FLIP_KEY}
+        assert pipe.embed_images("fake:lr", []).shape == (0, 0)
+
+        t = ws.create("t", embedder="fake:lr")
+        t.add_example(halves(RED, BLUE), "rb")
+        t.add_example(halves(GREEN, GREEN), "g")
+        t.update_settings(flip=True)
+        p = pipe.predict(t, [halves(BLUE, RED)])[0]
+        assert p.label == "rb"
+        assert p.similarity == pytest.approx(1.0, abs=1e-5)  # the mirror matches exactly
+    finally:
+        unregister_embedder("fake:lr")
+
+
+def test_prompt_ensembles_are_averaged(ws, text_spec):
+    """A description with several lines is embedded as the normalised mean of its prompts."""
+    pipe = Pipeline(ws)
+    v = pipe.embed_descriptions(text_spec, ["a red thing\na blue thing", "red"])
+    red, blue = pipe.embed_texts(text_spec, ["red", "blue"])
+    want = (red + blue) / np.linalg.norm(red + blue)
+    assert np.allclose(v[0], want, atol=1e-6)
+    assert np.allclose(v[1], red)
+    assert pipe.embed_descriptions(text_spec, []).shape == (0, 0)
+
+
+def test_repeated_images_are_embedded_once(ws):
+    """The same uncached image twice in one call goes through the model once; a repeated bad
+    image gets the error at every position."""
+    count = []
+
+    class Count(ColorEmbedder):
+        """Counts the images it embeds."""
+
+        def _embed_image_batch(self, images):
+            count.append(len(images))
+            return super()._embed_image_batch(images)
+
+    embedders.register_embedder("fake:count", Count())
+    try:
+        pipe = Pipeline(ws)
+        v = pipe.embed_images("fake:count", [("a", png(RED)), ("b", png(BLUE)), ("a", png(RED))])
+        assert sum(count) == 2
+        assert np.allclose(v[0], v[2])
+        errors: dict[int, str] = {}
+        pipe.embed_images("fake:count", [("bad", b"junk"), ("bad", b"junk")], errors)
+        assert set(errors) == {0, 1}
+    finally:
+        embedders.unregister_embedder("fake:count")
+
+
+def test_predict_reads_files_a_chunk_at_a_time(ws, tmp_path, monkeypatch):
+    """Files are read READ_CHUNK at a time; errors keep their index; progress covers the whole."""
+    monkeypatch.setattr(pipeline, "READ_CHUNK", 2)
+    t = red_blue_task(ws)
+    files = []
+    for i, rgb in enumerate((RED, BLUE, RED, BLUE)):
+        f = tmp_path / f"{i}.png"
+        f.write_bytes(png(rgb, seed=40 + i))
+        files.append(f)
+    files.insert(3, tmp_path / "missing.png")
+    reads = []
+    real = pipeline._keyed  # pylint: disable=protected-access
+    def keyed(part, errs):
+        reads.append(len(part))
+        return real(part, errs)
+
+    monkeypatch.setattr(pipeline, "_keyed", keyed)
+    seen = []
+    preds = pipeline.Pipeline(ws).predict(t, files, progress=lambda done, total: seen.append((done, total)))
+    assert reads == [2, 2, 1]
+    assert [p.label for p in preds] == ["red", "blue", "red", None, "blue"]
+    assert "Could not read" in (preds[3].error or "")
+    assert seen[-1] == (5, 5)
+    assert all(total == 5 for _, total in seen)

@@ -5,13 +5,16 @@ from typing import Any
 import numpy as np
 import pytest
 
+import fewshot.evaluate as ev
 from fewshot import Pipeline, benchmark, evaluate_task
 from fewshot.classifiers import ClassData
 from fewshot.embedders import cache_namespace, register_embedder, unregister_embedder
 from fewshot.evaluate import _folds, _subset, load_folder_dataset  # pylint: disable=protected-access  # unit tests
-from tests.conftest import ColorEmbedder, png
+from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, red_blue_task
 
 COLORS = {"red": (220, 30, 30), "green": (30, 220, 30), "blue": (30, 30, 220), "yellow": (220, 220, 30)}
+
+
 TEXT_SPEC = "openclip:fake-color"  # "openclip:" prefix makes the pipeline use class descriptions
 
 
@@ -44,8 +47,6 @@ def colour_task(ws, n=3, classes=("red", "green", "blue"), embedder="fake:color"
     return t
 
 
-# ---- _folds / _subset ---------------------------------------------------
-
 def test_folds_leave_one_out_when_k_covers_all():
     """k >= n gives one fold per example."""
     assert [f.tolist() for f in _folds(np.array([0, 1, 1]), 3, 0)] == [[0], [1], [2]]
@@ -74,8 +75,6 @@ def test_subset_drops_empty_classes_but_keeps_text_ones():
     assert list(sub.text) == [1]
     np.testing.assert_array_equal(sub.X, X[[1, 3]])
 
-
-# ---- evaluate_task -----------------------------------------------------
 
 def test_empty_task_is_an_error(ws):
     """Evaluating a task with no examples raises."""
@@ -147,8 +146,6 @@ def test_described_class_stays_trainable_in_every_fold(ws, text_embedder):
     assert r["accuracy"] == 1.0
     assert r["per_class"]["blue"]["recall"] == 1.0
 
-
-# ---- load_folder_dataset / benchmark --------------------------------------
 
 def make_folder(root, per_class=6, classes=tuple(COLORS)):
     """Write ``root/<class>/<i>.png`` images of noisy solid colours."""
@@ -276,3 +273,76 @@ def test_default_folds_depend_on_the_classifier(ws, classifier, n, method):
         t.add_example(png((200, 30, 30), noise=10, seed=i), "red")
         t.add_example(png((30, 30, 200), noise=10, seed=1000 + i), "blue")
     assert evaluate_task(Pipeline(ws), t)["method"] == method
+
+
+# ---- reports -------------------------------------------------------------
+def test_report_metrics(ws):
+    """The report has macro-F1, top-k accuracy, every held-out prediction and a threshold suggestion."""
+    t = ws.create("t", embedder="fake:color", classifier="logreg")
+    for label, rgb in (("red", RED), ("green", GREEN), ("blue", BLUE), ("yellow", (220, 220, 30))):
+        for i in range(3):
+            t.add_example(png(rgb, noise=20, seed=i), label)
+    t.add_example(png(GREEN, noise=20, seed=7), "red")  # a mislabelled one
+    r = evaluate_task(Pipeline(ws), t)
+    assert r["method"] == "leave-one-out"
+    assert 0 < r["macro_f1"] < 1
+    assert set(r["top_k_accuracy"]) == {"2", "3"}  # 5 is not below 4 classes
+    assert r["top_k_accuracy"]["3"] >= r["top_k_accuracy"]["2"] >= r["accuracy"]
+    assert len(r["predictions"]) == r["n_scored"] == 13
+    assert {p["id"] for p in r["predictions"] if not p["correct"]} == {m["id"] for m in r["mistakes"]}
+    assert -1 <= r["suggested_reject_below"] <= 1
+
+
+def test_folds_that_leave_out_a_class(ws):
+    """A fold whose training part lacks enough classes leaves its examples unscored; with nothing
+    correct there is no threshold suggestion and no macro-F1."""
+    t = ws.create("t", embedder="fake:color")
+    for i in range(3):
+        t.add_example(png(RED, noise=10, seed=i), "red")
+    t.add_example(png(BLUE), "blue")
+    r = evaluate_task(Pipeline(ws), t, folds=2)
+    assert r["n_scored"] < 4
+    assert ev._macro_f1(np.zeros((2, 2), int)) is None  # pylint: disable=protected-access
+    empty = ev.HeldOut.empty(2, 2)
+    assert ev._suggest_threshold(empty, np.array([0, 1])) is None  # pylint: disable=protected-access
+
+
+def test_ties_count_against_the_true_class():
+    """A true class tied with others is ranked below all of them, so ties never earn top-k credit."""
+    probs = np.array([[0.5, 0.25, 0.25, 0.0], [0.4, 0.2, 0.2, 0.2]])
+    assert ev._ranks(probs, np.array([1, 3]), np.array([True, True])).tolist() == [2, 3]  # pylint: disable=protected-access
+
+
+def test_top_k_is_not_inflated_by_knn_ties(ws):
+    """Random labels with kNN (k=1) give chance-level top-2, not 100%."""
+    t = ws.create("t", embedder="fake:color", classifier="knn", classifier_params={"k": 1})
+    rng = np.random.default_rng(0)
+    for i in range(40):
+        t.add_example(png(tuple(int(c) for c in rng.integers(0, 255, 3)), seed=i), f"c{rng.integers(5)}")
+    r = evaluate_task(Pipeline(ws), t)
+    assert r["top_k_accuracy"]["2"] < 0.9
+
+
+def test_late_evaluation_lands_on_its_own_task_only(ws):
+    """An evaluation recorded after its task was deleted, or deleted and made again, is dropped."""
+    old = red_blue_task(ws)
+    report = {"revision": 7, "accuracy": 1.0, "n_examples": 4}
+    old.record_evaluation(report)
+    assert old.last_evaluation()["accuracy"] == 1.0
+    ws.delete("t")
+    old.record_evaluation(report)  # no error, nothing written
+    new = ws.create("t", embedder="fake:color")
+    old.record_evaluation(report)
+    assert new.last_evaluation() is None
+
+
+def test_benchmark_flip_and_prompt_ensembles(ws, tmp_path, text_spec):
+    """bench passes flip through and averages several prompts per class."""
+    for c, rgb in (("red", RED), ("blue", BLUE)):
+        (tmp_path / "d" / c).mkdir(parents=True)
+        for i in range(3):
+            (tmp_path / "d" / c / f"{i}.png").write_bytes(png(rgb, noise=10, seed=i))
+    r = ev.benchmark(Pipeline(ws), tmp_path / "d", text_spec, way=2, shot=0, query=2, episodes=3,
+                     text_template="a {}\nthe {} one", flip=True)
+    assert r["accuracy"] == 1.0
+    assert r["flip"] is True

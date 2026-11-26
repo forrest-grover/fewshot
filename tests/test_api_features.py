@@ -9,15 +9,7 @@ import fewshot.api
 import fewshot.embedders
 import fewshot.services
 import fewshot.store
-from tests.conftest import api_client, png, set_settings
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
-
-
-@pytest.fixture(name="client")
-def client_fixture(tmp_path):
-    """A TestClient on a new server whose workspace lives in tmp_path."""
-    return api_client(tmp_path)
+from tests.conftest import BLUE, RED, api_client, png, set_settings
 
 
 @pytest.fixture(name="task")
@@ -222,7 +214,7 @@ def test_openapi_has_typed_responses(client):
     assert ok == {"$ref": "#/components/schemas/TaskDetail"}
 
 
-# ---- second review: API correctness -------------------------------------
+# ---- API correctness -----------------------------------------------------
 def test_model_that_cannot_load_is_a_400(client, task, monkeypatch):
     """If a task's model can't be loaded (offline, removed), predict, duplicates and evaluate say
     so with 400, and an evaluation job fails with the reason, instead of a 500."""

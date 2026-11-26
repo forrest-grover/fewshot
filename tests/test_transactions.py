@@ -11,9 +11,7 @@ import pytest
 
 from fewshot import fsutil, store
 from fewshot.store import Workspace
-from tests.conftest import png
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
+from tests.conftest import BLUE, RED, png
 
 
 @pytest.fixture(name="task")

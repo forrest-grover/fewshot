@@ -15,10 +15,7 @@ from fewshot.evaluate import compare_embedders
 from fewshot.jobs import Cancelled
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
-from tests.conftest import api_client, png
-from tests.test_cli import PlainResult
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
+from tests.conftest import BLUE, RED, PlainResult, api_client, png
 
 
 class NoiseEmbedder(Embedder):  # pylint: disable=abstract-method

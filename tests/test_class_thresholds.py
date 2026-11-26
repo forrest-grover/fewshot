@@ -7,13 +7,12 @@ import pytest
 from typer.testing import CliRunner
 
 from fewshot import cli
+from fewshot.classifiers import ClassData, make_classifier
 from fewshot.evaluate import evaluate_task
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
-from tests.conftest import api_client, png
-from tests.test_cli import PlainResult
+from tests.conftest import BLUE, RED, PlainResult, api_client, png, red_blue_task
 
-RED, BLUE = (220, 30, 30), (30, 30, 220)
 PURPLE = (150, 30, 160)  # between the two, nearer blue
 
 
@@ -86,7 +85,6 @@ def test_other_labels_use_their_own_thresholds(ws):
 
 def test_zero_shot_ignores_class_thresholds(ws):
     """Without example images the zero-shot threshold applies, not the classes' own."""
-    from fewshot.classifiers import ClassData, make_classifier  # pylint: disable=import-outside-toplevel
     from fewshot.pipeline import threshold_for  # pylint: disable=import-outside-toplevel
 
     text = {0: np.array([1, 0, 0], np.float32), 1: np.array([0, 1, 0], np.float32)}
@@ -205,3 +203,11 @@ def test_cli_eval_apply_keeps_an_old_report_old(run, monkeypatch):
     monkeypatch.setattr("fewshot.evaluate.evaluate_task", older)
     r = run("eval", "t", "--apply-class-thresholds", "--json")
     assert json.loads(r.stdout)["revision"] < json.loads(run("show", "t", "--json").output)["revision"] - 1
+
+
+def test_empty_threshold_change_does_nothing(ws):
+    """set_class_thresholds({}) saves nothing and adds no undo step."""
+    t = red_blue_task(ws)
+    rev = t.config.revision
+    t.set_class_thresholds({})
+    assert t.config.revision == rev

@@ -11,9 +11,7 @@ import fewshot.api
 from fewshot.api import create_app
 from fewshot.client import BATCH_BYTES, ApiError, Client, _batches
 from fewshot.server_settings import ServerSettings
-from tests.conftest import png
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
+from tests.conftest import BLUE, RED, png
 
 
 def _serve(tmp_path, **settings):

@@ -28,6 +28,8 @@ from fewshot.embedders import (
 from tests.conftest import ColorEmbedder
 
 CLIP_DIM = 4
+
+
 TIMM_DIM = 5
 
 
@@ -194,9 +196,6 @@ def fixture_fake_cuda(monkeypatch):
     return moves, autocasts
 
 
-# --- module-level helpers -------------------------------------------------------------------------------------------
-
-
 def test_device_follows_cuda_availability(monkeypatch):
     """_device picks CUDA exactly when torch reports it available."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -247,9 +246,6 @@ def test_presets_and_spec_supports_text():
     assert spec_supports_text("openclip:anything")
     assert not spec_supports_text("timm:vit_small_patch14_dinov2.lvd142m")
     assert not spec_supports_text("fake:color")
-
-
-# --- OpenCLIP -------------------------------------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("fake_backends", "cpu")
@@ -343,9 +339,6 @@ def test_openclip_on_cuda_moves_inputs_and_uses_fp16_autocast(calls, fake_cuda):
     np.testing.assert_allclose(txt, unit([text_ref("hello")]), rtol=1e-6)
 
 
-# --- timm -----------------------------------------------------------------------------------------------------------
-
-
 @pytest.mark.usefixtures("fake_backends", "cpu")
 def test_timm_construction_on_cpu(calls):
     """TimmEmbedder builds a headless pretrained model and its matching transform."""
@@ -402,9 +395,6 @@ def test_timm_on_cuda_moves_model_and_inputs_and_uses_fp16_autocast(calls, fake_
     assert moves == ["cuda"]
     assert autocasts == [("cuda", torch.float16, True)]
     np.testing.assert_allclose(out, unit([timm_ref((9, 8, 7)), timm_ref((1, 1, 1))]), rtol=1e-6)
-
-
-# --- get_embedder ---------------------------------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("fake_backends", "cpu")
@@ -484,9 +474,6 @@ def test_register_and_unregister_embedder():
 def test_register_embedder_is_exported_lazily():
     """The top-level package re-exports register_embedder."""
     assert fewshot.register_embedder is register_embedder
-
-
-# --- output checks, locking and the loaded-model limit -----------------------------------------------------------
 
 
 @pytest.mark.usefixtures("fake_backends", "cpu")

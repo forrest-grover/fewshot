@@ -8,9 +8,7 @@ import pytest
 
 import fewshot
 from fewshot import ClassData, Pipeline, Workspace, evaluate_task, history, make_classifier, store
-from tests.conftest import png
-
-RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
+from tests.conftest import BLUE, GREEN, RED, png
 
 
 def make_task(ws, classifier="prototype", n=4):

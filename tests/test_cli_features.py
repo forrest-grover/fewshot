@@ -10,27 +10,7 @@ from typer.testing import CliRunner
 
 from fewshot import cli, cli_common
 from fewshot.store import Workspace
-from tests.conftest import png
-from tests.test_cli import ANSI, PlainResult, served
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
-
-
-@pytest.fixture(name="root")
-def root_fixture(tmp_path):
-    """Workspace directory for the test."""
-    return tmp_path / "ws"
-
-
-@pytest.fixture(name="run")
-def run_fixture(root):
-    """Invoke the CLI against the temporary workspace."""
-    runner = CliRunner()
-
-    def invoke(*args):
-        return PlainResult(runner.invoke(cli.app, [str(a) for a in args] + ["--root", str(root)]))
-
-    return invoke
+from tests.conftest import ANSI, BLUE, RED, png, served
 
 
 @pytest.fixture(name="task")

@@ -6,15 +6,12 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-import fewshot.api
 import fewshot.services
 from fewshot import cli, cli_common
 from fewshot.archive import export_task, import_task
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
-from tests.conftest import api_client, png, set_settings
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
+from tests.conftest import BLUE, RED, api_client, png, set_settings
 
 
 def _task(ws):
@@ -223,3 +220,15 @@ def test_inbox_edges(ws, monkeypatch):
     r = runner.invoke(cli.app, ["inbox", "accept", "t", first.id, "--label", "a/b", "--root", str(ws.root)])
     assert r.exit_code == 1, r.output
     assert "can't be" in r.output
+
+
+def test_inbox_lists_without_a_predictable_class(ws):
+    """With classes but no examples or descriptions, the inbox lists its images unpredicted."""
+    t = ws.create("t", embedder="fake:color")
+    t.upsert_class("red")
+    t.add_to_inbox([(png(RED), "a.png")])
+    items = Pipeline(ws).inbox_suggestions(t)
+    assert len(items) == 1
+    assert "prediction" not in items[0]
+    t.add_example(png(RED, noise=5), "red")
+    assert "prediction" in Pipeline(ws).inbox_suggestions(t)[0]

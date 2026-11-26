@@ -1,21 +1,19 @@
 """Tests for the REST API (fewshot.api) using the fake colour embedder."""
 
+import contextlib
 import io
+from typing import Any
 
 import pytest
 from PIL import Image
 
 import fewshot.api
 import fewshot.history
-from tests.conftest import api_client, png, set_settings
-
-RED, BLUE = (220, 30, 30), (30, 30, 220)
-
-
-@pytest.fixture(name="client")
-def client_fixture(tmp_path):
-    """A TestClient on a new server whose workspace lives in tmp_path."""
-    return api_client(tmp_path)
+from fewshot import models
+from fewshot.images import image_id
+from fewshot.store import Task, Workspace
+from fewshot.text import MAX_DESCRIPTION, MAX_PROMPTS
+from tests.conftest import BLUE, RED, api_client, host_client, png, query_files, red_blue_task, set_settings
 
 
 def _upload(client, task, label, rgb, seeds=range(3)):
@@ -461,3 +459,120 @@ def test_uploads_over_the_size_limit_are_refused(client, task, monkeypatch):
     big_pred, small_pred = r.json()
     assert big_pred["error"].startswith("File is larger than")
     assert small_pred["error"] is None
+
+
+# ---- one request, one change ---------------------------------------------
+@pytest.mark.usefixtures("task_t")
+def test_patch_requests_are_one_undo_step(client):
+    """Renaming and describing a class, or moving and tagging an example, is one undo step."""
+    t = client.get("/api/tasks/t").json()
+    rev = t["revision"]
+    t = client.patch("/api/tasks/t/classes/red", json={"name": "crimson", "description": "deep red"}).json()
+    assert t["revision"] == rev + 1
+    eid = t["examples"][0]["id"]
+    t = client.patch(f"/api/tasks/t/examples/{eid}", json={"label": "blue", "tags": ["x"], "note": "n"}).json()
+    assert t["revision"] == rev + 2
+    t = client.patch("/api/tasks/t/examples", json={"ids": [eid], "label": "crimson", "add_tags": ["y"]}).json()
+    assert t["revision"] == rev + 3
+    t = client.post("/api/tasks/t/undo").json()
+    assert next(e for e in t["examples"] if e["id"] == eid)["tags"] == ["x"]
+    t = client.post("/api/tasks/t/undo").json()
+    assert next(e for e in t["examples"] if e["id"] == eid)["label"] == "crimson"
+    t = client.post("/api/tasks/t/undo").json()
+    assert [c["name"] for c in t["classes"]] == ["red", "blue"]
+    assert client.patch("/api/tasks/t/classes/nope", json={"description": "x"}).status_code == 404
+
+
+@pytest.mark.usefixtures("task_t")
+def test_empty_edits_change_nothing(client):
+    """An edit with nothing in it is accepted and changes nothing."""
+    t = client.get("/api/tasks/t").json()
+    eid = t["examples"][0]["id"]
+    assert client.patch(f"/api/tasks/t/examples/{eid}", json={}).json()["revision"] == t["revision"]
+    assert client.patch("/api/tasks/t/examples", json={"ids": [eid]}).json()["revision"] == t["revision"]
+
+
+@pytest.mark.usefixtures("task_t")
+def test_descriptions_are_capped_over_the_api(client):
+    """A description too long is refused by the schema; too many prompts by the store."""
+    r = client.post("/api/tasks/t/classes", json={"name": "red", "description": "x" * (MAX_DESCRIPTION + 1)})
+    assert r.status_code == 422
+    r = client.patch("/api/tasks/t/classes/red", json={"description": "a\n" * (MAX_PROMPTS + 1)})
+    assert (r.status_code, "prompts" in r.json()["detail"]) == (400, True)
+    r = client.post("/api/tasks/t/classes", json={"name": "red", "description": "a\n" * (MAX_PROMPTS + 1)})
+    assert r.status_code == 400
+
+
+@pytest.mark.usefixtures("task_t")
+def test_a_task_deleted_meanwhile_is_404_not_500(client, monkeypatch):
+    """Every change to a task that another process deleted after it was looked up gets 404."""
+    eid = client.get("/api/tasks/t").json()["examples"][0]["id"]
+    assert client.post("/api/tasks/t/inbox", files=query_files(1, BLUE)).status_code == 201
+
+    @contextlib.contextmanager
+    def gone(_self):
+        raise KeyError("No task 't'")
+        yield  # pylint: disable=unreachable
+
+    monkeypatch.setattr(Task, "_writing", gone)
+    def delete(_self, name):
+        raise KeyError(f"No task {name!r}")
+
+    monkeypatch.setattr(Workspace, "delete", delete)
+    calls: list[tuple[str, str, dict[str, Any]]] = [
+        ("patch", "/api/tasks/t", {"json": {"flip": True}}),
+        ("delete", "/api/tasks/t", {}),
+        ("post", "/api/tasks/t/classes", {"json": {"name": "green"}}),
+        ("post", "/api/tasks/t/describe", {"json": {"template": "a {}"}}),
+        ("post", "/api/tasks/t/examples", {"data": {"label": "red"}, "files": query_files(1)}),
+        ("post", "/api/tasks/t/inbox", {"files": query_files(1, (30, 220, 30))}),
+        ("post", "/api/tasks/t/inbox/accept-confident", {"json": {"min_confidence": 0}}),
+        ("patch", f"/api/tasks/t/examples/{eid}", {"json": {"label": "blue"}}),
+    ]
+    for method, url, kw in calls:
+        r = getattr(client, method)(url, **kw)
+        assert (r.status_code, r.json()["detail"]) == (404, "No task 't'"), url
+
+
+@pytest.mark.usefixtures("task_t")
+def test_accept_confident_suggestions(client):
+    """The inbox's confident suggestions can be accepted in one request, as `inbox accept --min-confidence`."""
+    assert client.post("/api/tasks/t/inbox", files=query_files(2) + query_files(1, BLUE)[:0]).status_code == 201
+    t = client.post("/api/tasks/t/inbox/accept-confident", json={"min_confidence": 0.0}).json()
+    assert (t["inbox_count"], len(t["examples"])) == (0, 6)
+    assert client.post("/api/tasks/t/inbox/accept-confident", json={"min_confidence": 0.5}).status_code == 200
+    assert client.post("/api/tasks/t/inbox/accept-confident", json={"min_confidence": 2}).status_code == 422
+    assert client.post("/api/tasks/nope/inbox/accept-confident", json={"min_confidence": 0.5}).status_code == 404
+
+
+def test_quotes_in_uploaded_file_names(tmp_path):
+    """A '"' that a browser sent as %22 comes back as a quote."""
+    c = api_client(tmp_path)
+    red_blue_task(c.srv.ws)
+    r = c.post("/api/tasks/t/predict", files=[("files", ('say "cheese".png', png(RED, seed=3), "image/png"))])
+    assert r.json()[0]["file"] == 'say "cheese".png'
+
+
+def test_images_are_served_only_as_images(tmp_path, monkeypatch):
+    """Example images carry nosniff and a sandboxing CSP; a file whose name isn't an image type is
+    served as an opaque download, never as a page."""
+    c = host_client(tmp_path, monkeypatch, hosts="*")
+    c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
+    eid = c.post("/api/tasks/t/examples", data={"label": "red"},
+                 files=[("files", ("a.png", png(RED), "image/png"))]).json()["added"][0]["id"]
+    for url in (f"/api/tasks/t/examples/{eid}/image", f"/api/tasks/t/examples/{eid}/image?size=32"):
+        r = c.get(url)
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert "sandbox" in r.headers["content-security-policy"]
+        assert r.headers["content-type"].startswith("image/")
+
+    # A file named .html (as a crafted import used to allow) is not served as HTML.
+    page = b"<script>alert(1)</script>"
+    hid = image_id(page)
+    t = c.srv.ws.get("t")
+    (t.path / f"images/{hid}.html").write_bytes(page)
+    with t._writing():  # pylint: disable=protected-access
+        t.config.examples.append(models.Example(id=hid, label="red", file=f"images/{hid}.html"))
+        t._save()  # pylint: disable=protected-access
+    r = c.get(f"/api/tasks/t/examples/{hid}/image")
+    assert r.headers["content-type"] == "application/octet-stream"

@@ -1,35 +1,18 @@
-"""Undo history, the shared image store, renaming, export/import, tags and notes."""
+"""Undo and redo: stepping through versions, labels, damaged history, pruning, and one undo step
+per change."""
 
-import io
-import json
-import os
-import zipfile
 
 import pytest
 
-from fewshot import history, models, store
-from fewshot.archive import export_task, import_task
-from fewshot.images import image_id
-from fewshot.models import Example, TaskConfig
+from fewshot import history
 from fewshot.store import Workspace
-from fewshot.text import check_tag, check_template, prompts
-from tests.conftest import png
-
-RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
-
-
-def _task(ws, name="t", n=2):
-    t = ws.create(name, embedder="fake:color")
-    for i in range(n):
-        t.add_example(png(RED, noise=10, seed=i), "red")
-        t.add_example(png(GREEN, noise=10, seed=i), "green")
-    return t
+from tests.conftest import BLUE, GREEN, RED, png, red_green_task, red_task, two_each
 
 
 # ---- undo ---------------------------------------------------------------
 def test_undo_steps_back_through_changes(ws):
     """Each undo restores the version before the last change of any kind; the revision keeps rising."""
-    t = _task(ws)
+    t = red_green_task(ws)
     rev = t.config.revision
     t.update_settings(classifier="knn")
     t.upsert_class("blue", "a blue thing")
@@ -44,7 +27,7 @@ def test_undo_steps_back_through_changes(ws):
 
 def test_undo_brings_back_deleted_images(ws):
     """Deleted examples come back with their image files, which stay until no kept version needs them."""
-    t = _task(ws)
+    t = red_green_task(ws)
     gone = t.config.examples[0]
     t.delete_example(gone.id)
     assert (t.path / gone.file).exists()  # kept for undo
@@ -61,7 +44,7 @@ def test_undo_brings_back_deleted_images(ws):
 def test_undone_images_go_once_redo_is_impossible(ws):
     """An undone add keeps its image for redo; a new change drops it, unless a kept version
     still uses it."""
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     new = t.add_example(png(BLUE), "blue")
     t.undo()
     assert (t.path / new.file).exists()  # redo may bring it back
@@ -78,7 +61,7 @@ def test_undone_images_go_once_redo_is_impossible(ws):
 def test_redo(ws):
     """Redo makes undone changes again, newest undo first, with images; a new change ends it.
     Each step has a label describing the change."""
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     new = t.add_example(png(BLUE), "blue")
     t.delete_class("red")
     assert t.undo_label() == "delete class red"
@@ -105,7 +88,7 @@ def test_redo(ws):
 
 def test_labels(ws):
     """Every kind of change describes itself for undo."""
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     ids = [e.id for e in t.config.examples]
     steps = [
         (lambda: t.update_settings(classifier="knn"), "change settings"),
@@ -129,7 +112,7 @@ def test_labels(ws):
 
 def test_broken_redo_version(ws):
     """A damaged redo version is removed with an error, like a damaged undo one."""
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     t.upsert_class("x")
     t.undo()
     next((t.path / "history" / "redo").glob("*.json")).write_text("{bad")
@@ -161,7 +144,7 @@ def test_history_is_pruned_and_old_images_deleted(ws, monkeypatch):
     """Only HISTORY_KEPT versions are kept; an image goes once the last version naming it does,
     but not if a later version drops it again (that one deletes it later)."""
     monkeypatch.setattr(history, "HISTORY_KEPT", 2)
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     red, green = t.config.examples
     t.delete_example(red.id)
     t.upsert_class("a")
@@ -184,7 +167,7 @@ def test_pruning_keeps_images_a_redone_version_uses(ws, monkeypatch):
     """Redo records the files it drops, and pruning keeps every file a kept version names: a
     re-added, re-deleted, undone and redone example can still be undone back after pruning."""
     monkeypatch.setattr(history, "HISTORY_KEPT", 3)
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     red = t.config.examples[0]
     t.delete_example(red.id)
     t.add_example(png(RED, noise=10, seed=0), "red")
@@ -207,317 +190,90 @@ def test_pruning_keeps_images_a_redone_version_uses(ws, monkeypatch):
 
 def test_history_survives_files_read_without_validation(ws):
     """A kept version that can't be parsed names no files (it is still listed for undo)."""
-    t = _task(ws, n=1)
+    t = red_green_task(ws, n=1)
     t.upsert_class("x")
     (t.path / "history" / "0000000099.json").write_text("not json")
     assert t._files_in(t.path / "history" / "0000000099.json") == set()  # pylint: disable=protected-access
 
 
-# ---- shared image store -------------------------------------------------
-def test_images_are_stored_once_across_tasks(ws, monkeypatch):
-    """The same image in two tasks is one blob hard-linked into both; it goes with the last link."""
-    a = ws.create("a", embedder="fake:color")
-    b = ws.create("b", embedder="fake:color")
-    ea = a.add_example(png(RED), "red")
-    b.add_example(png(RED), "red")
-    blob = ws.blobs / ea.id[:2] / f"{ea.id}.png"
-    assert blob.stat().st_nlink == 3
-    assert os.path.samefile(blob, a.path / ea.file)
-    ws.delete("a")
-    assert blob.stat().st_nlink == 2
-    b.delete_example(ea.id)
-    monkeypatch.setattr(history, "HISTORY_KEPT", 0)
-    b.upsert_class("x")  # prunes the version holding the image
-    assert not blob.exists()
-
-
-def test_store_falls_back_to_copies(ws, monkeypatch):
-    """Without hard links (or if the blob vanishes), the task gets its own copy."""
-
-    def no_links(*_):
-        raise OSError("not supported")
-
-    monkeypatch.setattr(os, "link", no_links)
-    t = ws.create("t", embedder="fake:color")
-    e = t.add_example(png(RED), "red")
-    assert (t.path / e.file).read_bytes() == png(RED)
-    assert (t.path / e.file).stat().st_nlink == 1
-
-
-def test_store_link_race(ws, monkeypatch):
-    """If another writer links the same file first, that copy is kept."""
-    t = ws.create("t", embedder="fake:color")
-    real_link = os.link
-
-    def racing_link(src, dst):
-        real_link(src, dst)
-        if "images" in str(dst):  # not the history snapshot
-            raise FileExistsError(dst)
-
-    monkeypatch.setattr(os, "link", racing_link)
-    e = t.add_example(png(RED), "red")
-    assert (t.path / e.file).read_bytes() == png(RED)
-
-
-def test_gc_blobs(ws):
-    """gc_blobs removes blobs that no task links to."""
-    assert ws.gc_blobs() == 0
-    t = ws.create("t", embedder="fake:color")
-    e = t.add_example(png(RED), "red")
-    (t.path / e.file).unlink()
-    (ws.blobs / "zz").mkdir()
-    assert ws.gc_blobs() == 1
-    assert ws.gc_blobs() == 0
-
-
-def test_without_a_blob_store(tmp_path):
-    """A Task made without a workspace store writes plain files."""
-    p = tmp_path / "t"
-    p.mkdir()
-    t = store.Task.new(p, TaskConfig(name="t", embedder="fake:color"))
-    e = t.add_example(png(RED), "red")
-    t.delete_example(e.id)
-    assert (p / e.file).exists()  # kept for undo
-    t._drop_file(e.file)  # pylint: disable=protected-access
-    assert not (p / e.file).exists()
-
-
-# ---- rename -------------------------------------------------------------
-def test_rename_task(ws):
-    """Renaming moves the folder and keeps examples, history and links; the old name is gone."""
-    t = _task(ws)
-    t.upsert_class("x")
-    r = ws.rename("t", "u")
-    assert r is t
-    assert t.name == "u"
-    assert t.path == ws.root / "tasks" / "u"
-    assert len(t.config.examples) == 4
-    assert t.image_path(t.config.examples[0].id).exists()
-    with pytest.raises(KeyError):
-        ws.get("t")
-    assert Workspace(ws.root).get("u").name == "u"
-    t.undo()  # history from before the rename still works, under the new name
-    assert t.class_names() == ["red", "green"]
-    assert t.name == "u"
-    assert ws.rename("u", "u") is t
-
-
-def test_concurrent_renames(ws, monkeypatch):
-    """Of two renames of one task that both looked it up first, only the first succeeds; a cached
-    task under a name it no longer has is never returned for that name."""
-    t = _task(ws)
-    real_get = ws.get
-    monkeypatch.setattr(ws, "get", lambda name: t if name == "t" else real_get(name))  # a stale lookup
-    ws.rename("t", "u")
-    with pytest.raises(KeyError, match="No task 't'"):
-        ws.rename("t", "v")
-    monkeypatch.setattr(ws, "get", real_get)
-    assert not (ws.root / "tasks" / "v").exists()
-    ws._tasks["v"] = t  # pylint: disable=protected-access  # as if cached under a name it has lost
-    with pytest.raises(KeyError, match="No task 'v'"):
-        ws.get("v")
-    assert ws.get("u") is t
-
-
-def test_rename_errors(ws, monkeypatch):
-    """A bad or taken new name is a ValueError; a failed save puts the folder back."""
-    _task(ws)
-    ws.create("other")
-    with pytest.raises(ValueError, match="already exists"):
-        ws.rename("t", "other")
-    with pytest.raises(ValueError, match="Task names use"):
-        ws.rename("t", "bad name")
-    with pytest.raises(KeyError):
-        ws.rename("nope", "x")
-    real_replace = os.replace
-    calls = []
-
-    def failing_replace(src, dst):
-        calls.append(dst)
-        if str(dst).endswith("task.json"):
-            raise OSError("disk full")
-        real_replace(src, dst)
-
-    monkeypatch.setattr(os, "replace", failing_replace)
-    with pytest.raises(OSError, match="disk full"):
-        ws.rename("t", "u")
-    monkeypatch.setattr(os, "replace", real_replace)
-    assert ws.get("t").name == "t"
-    assert not (ws.root / "tasks" / "u").exists()
-
-
-# ---- export and import --------------------------------------------------
-def _export(ws, name="t"):
-    buf = io.BytesIO()
-    n, _ = export_task(ws, name, buf)
-    buf.seek(0)
-    return buf, n
-
-
-def test_export_and_import(ws, tmp_path):
-    """A task exported to a zip imports into another workspace with its settings, labels and images."""
-    t = _task(ws)
-    t.update_settings(classifier="knn", reject_below=0.5, flip=True)
-    t.upsert_class("blue", "a photo of\na blue thing")
-    t.annotate([t.config.examples[0].id], tags=["hard"], note="blurry")
-    (t.path / t.config.examples[1].file).unlink()  # gone from disk: left out of the export
-    buf, n = _export(ws)
-    assert n == 3
-    other = Workspace(tmp_path / "other")
-    u = import_task(other, buf)
-    assert u.name == "t"
-    assert u.config.classifier == "knn"
-    assert u.config.flip
-    assert u.config.uid != t.config.uid
-    assert u.config.revision == 1
-    assert [c.name for c in u.config.classes] == ["red", "green", "blue"]
-    assert u.config.examples[0].tags == ("hard",)
-    assert len(u.config.examples) == 3
-    for e in u.config.examples:
-        assert u.image_path(e.id).read_bytes() == t.image_path(e.id).read_bytes()
-    assert not u.can_undo()
-    buf.seek(0)
-    assert import_task(other, buf, name="copy").name == "copy"
-    buf.seek(0)
-    with pytest.raises(ValueError, match="already exists"):
-        import_task(other, buf)
-
-
-def _zip(files):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        for name, data in files.items():
-            z.writestr(name, data)
-    buf.seek(0)
-    return buf
-
-
-def test_import_rejects_bad_zips(ws):
-    """Bad archives are refused with a ValueError and leave no task folder behind."""
-    img = png(RED)
-    eid = image_id(img)
-    good = {"name": "t", "classes": [{"name": "red"}],
-            "examples": [{"id": eid, "label": "red", "file": f"images/{eid}.png"}]}
-    cases = {
-        "Not a task export: File is not a zip": io.BytesIO(b"nope"),
-        "no task.json": _zip({"x.txt": "hi"}),
-        "task.json is invalid": _zip({"task.json": "{}"}),
-        "is missing": _zip({"task.json": json.dumps(good)}),
-        "doesn't match its id": _zip({"task.json": json.dumps(good), f"images/{eid}.png": png(BLUE)}),
-        "reject_below must be": _zip({"task.json": json.dumps({**good, "reject_below": 3})}),
-    }
-    for msg, src in cases.items():
-        with pytest.raises(ValueError, match=msg):
-            import_task(ws, src)
-    assert not list((ws.root / "tasks").iterdir())
-
-
-def test_import_fixes_up_labels_and_duplicates(ws):
-    """Examples whose class is missing get it added; repeated ids are kept once."""
-    img = png(RED)
-    eid = image_id(img)
-    ex = {"id": eid, "label": "red", "file": f"images/{eid}.png"}
-    t = import_task(ws, _zip({"task.json": json.dumps({"name": "t", "examples": [ex, ex]}),
-                              f"images/{eid}.png": img}))
-    assert t.class_names() == ["red"]
+# ---- one undo step per change --------------------------------------------
+def test_one_undo_takes_back_a_whole_bulk_add(ws):
+    """However many chunks an add_examples call is saved in, one undo removes all of it."""
+    t = red_task(ws, n=1)
+    t.add_examples([(png(GREEN, noise=10, seed=i), "green", "") for i in range(5)], chunk=2)
+    assert len(t.config.examples) == 6
+    t.undo()
     assert len(t.config.examples) == 1
+    assert len(list((t.path / "images").iterdir())) == 6  # kept for redo...
+    t.upsert_class("x")  # ...until another change makes redo impossible
+    assert len(list((t.path / "images").iterdir())) == 1
 
 
-def test_import_refuses_oversized_members(ws, monkeypatch):
-    """Members unpacking beyond the limit are refused."""
-    import fewshot.archive  # pylint: disable=import-outside-toplevel
-
-    img = png(RED)
-    eid = image_id(img)
-    zip_ = _zip({"task.json": json.dumps({"name": "t", "examples": [
-        {"id": eid, "label": "red", "file": f"images/{eid}.png"}]}), f"images/{eid}.png": img})
-    monkeypatch.setattr(fewshot.archive, "MAX_IMPORT_IMAGE", 10)
-    with pytest.raises(ValueError, match="larger than 0 MB"):
-        import_task(ws, zip_)
-
-
-def test_import_cleans_up_on_failure(ws, monkeypatch):
-    """If writing the new task fails, its folder is removed."""
-    _task(ws)
-    buf, _ = _export(ws)
-
-    def broken(*_args, **_kw):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(store.Task, "_store_image", broken)
-    with pytest.raises(OSError, match="disk full"):
-        import_task(ws, buf, name="copy")
-    assert not (ws.root / "tasks" / "copy").exists()
-
-
-# ---- tags, notes and lookups --------------------------------------------
-def test_tags_and_notes(ws):
-    """Tags can be replaced, added and removed (kept unique, in order); notes set and cleared."""
-    t = _task(ws)
-    a, b = (e.id for e in t.config.examples[:2])
-    assert t.annotate([a, b], add_tags=["hard", " blurry ", "hard"]) == 2
-    assert t.example(a).tags == ("hard", "blurry")
-    t.annotate([a], remove_tags=["hard"], note="  check this  ")
-    assert t.example(a).tags == ("blurry",)
-    assert t.example(a).note == "check this"
-    t.annotate([b], tags=["x"])
-    assert t.example(b).tags == ("x",)
-    assert [e.id for e in t.find_examples(tag="x")] == [b]
-    assert [e.id for e in t.find_examples(label="green", tag="hard")] == []
-    assert len(t.find_examples()) == 4
+def test_edit_class_renames_and_describes_in_one_undo_step(ws):
+    """Renaming a class and describing it is one change: one undo takes back both."""
+    t = two_each(ws)
+    rev = t.config.revision
+    t.edit_class("red", "crimson", "a photo of something crimson")
+    assert t.config.revision == rev + 1
+    assert (t.config.classes[0].name, t.config.classes[0].description) == ("crimson", "a photo of something crimson")
+    assert {e.label for e in t.config.examples} == {"crimson", "blue"}
+    t.undo()
+    assert (t.config.classes[0].name, t.config.classes[0].description) == ("red", "")
+    with pytest.raises(ValueError, match="already exists"):
+        t.edit_class("red", "blue")
     with pytest.raises(KeyError):
-        t.annotate(["nope"], tags=[])
-    with pytest.raises(ValueError, match="Note is longer"):
-        t.annotate([a], note="x" * (models.MAX_NOTE + 1))
-    assert Workspace(ws.root).get("t").example(a).note == "check this"
+        t.edit_class("nope", description="x")
+    t.edit_class("red", "crimson")
+    assert t.undo_label() == "rename class red to crimson"
+    with pytest.raises(ValueError, match="already exists"):
+        t.rename_class("crimson", "crimson")
 
 
-def test_check_tag_and_example_validation():
-    """Tags must be short, non-empty and free of commas; a file must be named by its example id."""
-    assert check_tag(" ok ") == "ok"
-    for bad, msg in (("", "empty"), ("x" * 51, "longer"), ("a,b", "can't contain"), ("a\nb", "can't contain")):
-        with pytest.raises(ValueError, match=msg):
-            check_tag(bad)
-    eid = "ab" * 16
-    with pytest.raises(ValueError, match="not named by the example id"):
-        Example(id=eid, label="x", file=f"images/{'cd' * 16}.png")
-    with pytest.raises(ValueError, match="note is longer"):
-        Example(id=eid, label="x", file=f"images/{eid}.png", note="x" * 3000)
-    assert Example(id=eid, label="x", file=f"images/{eid}.png", tags=("a", "a")).tags == ("a",)
+def test_edit_examples_relabels_and_tags_in_one_undo_step(ws):
+    """Moving and tagging examples is one change: one undo takes back both."""
+    t = two_each(ws)
+    ids = [e.id for e in t.config.examples if e.label == "red"]
+    rev = t.config.revision
+    assert t.edit_examples(ids, label="blue", add_tags=["x"], note="n") == 2
+    assert t.config.revision == rev + 1
+    assert all((e.label, e.tags, e.note) == ("blue", ("x",), "n") for e in t.config.examples if e.id in ids)
+    t.undo()
+    assert all((e.label, e.tags) == ("red", ()) for e in t.config.examples if e.id in ids)
+    t.edit_examples(ids, label="green")
+    assert t.undo_label() == "move 2 examples to green"
+    with pytest.raises(ValueError, match="contain '/'"):
+        t.edit_examples(ids, label="a/b")
 
 
-def test_resolve_ids(ws):
-    """Unique prefixes of 4+ characters resolve to full ids."""
-    t = _task(ws)
-    eid = t.config.examples[0].id
-    assert t.resolve_ids([eid[:6], eid]) == [eid, eid]
-    with pytest.raises(KeyError, match="'abc' is too short: give at least 4 characters"):
-        t.resolve_ids(["abc"])
-    with pytest.raises(KeyError, match="No example"):
-        t.resolve_ids(["zzzzzz"])
-    twins = [Example(id=i, label="red", file=f"images/{i}.png") for i in ("abcd" + "0" * 28, "abcd" + "1" * 28)]
-    t.config = t.config.model_copy(update={"examples": twins})  # in memory only
-    with pytest.raises(KeyError, match="ambiguous"):
-        t.resolve_ids(["abcd"])
+# ---- damaged history -----------------------------------------------------
+def test_unreadable_gone_list_keeps_the_task_working(ws, monkeypatch):
+    """A truncated .gone file (a crash while writing it) doesn't break later edits or deletion;
+    its files are kept rather than lost."""
+    monkeypatch.setattr(history, "HISTORY_KEPT", 1)
+    t = red_task(ws)
+    gone = t.config.examples[0]
+    t.delete_example(gone.id)
+    for f in (t.path / "history").glob("*.gone"):
+        f.write_text("")
+    t.upsert_class("a")  # prunes the version whose .gone is unreadable
+    t.upsert_class("b")
+    assert t.class_names() == ["red", "a", "b"]
+    assert (t.path / gone.file).exists()  # kept, for gc to judge
+    assert t._gone(t.path / "history" / "x.json") == set()  # pylint: disable=protected-access
+    (t.path / "history" / "x.gone").write_text('{"not": "a list"}')
+    assert t._gone(t.path / "history" / "x.json") == set()  # pylint: disable=protected-access
+    ws.delete("t")
+    assert not (ws.root / "tasks" / "t").exists()
 
 
-def test_prompts_and_templates(ws):
-    """Descriptions hold one prompt per line; multi-line templates fill each line."""
-    assert prompts(" a \n\n b ") == ["a", "b"]
-    check_template("a {}\nthe {}")
-    for bad in ("", "no braces", "a {}\nno braces"):
-        with pytest.raises(ValueError, match="must contain"):
-            check_template(bad)
-    t = _task(ws)
-    t.describe_classes("a photo of a {}\n\n  a {} thing ")
-    assert t.config.classes[0].description == "a photo of a red\na red thing"
-
-
-def test_zero_shot_threshold_and_flip_settings(ws):
-    """The zero-shot threshold is range-checked like reject_below; flip is a plain switch."""
-    t = ws.create("t", embedder="fake:color")
-    t.update_settings(reject_below_zero_shot=0.25, flip=True)
-    assert (t.config.reject_below_zero_shot, t.config.flip) == (0.25, True)
-    with pytest.raises(ValueError, match="reject_below_zero_shot must be between"):
-        t.update_settings(reject_below_zero_shot=2)
-    assert t.summary()["revision"] == t.config.revision
+def test_damaged_version_is_skipped_by_undo(ws):
+    """Undo past a damaged version removes it and says so; the next undo goes further back."""
+    t = red_task(ws, n=1)
+    t.upsert_class("a")
+    t.upsert_class("b")
+    newest = sorted((t.path / "history").glob("*.json"))[-1]
+    newest.write_text("{broken")
+    with pytest.raises(ValueError, match="is invalid and was removed; undo again"):
+        t.undo()
+    t.undo()
+    assert t.class_names() == ["red"]

@@ -1,8 +1,9 @@
 """Tests for the ``fewshot`` command-line interface."""
 
+import csv
+import io
 import json
 import os
-import re
 import socket
 from pathlib import Path
 
@@ -10,55 +11,13 @@ import numpy as np
 import pytest
 from typer.testing import CliRunner
 
+from fewshot import cache as cache_module
 from fewshot import cli, embedders
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
 from fewshot.store import Workspace
-from tests.conftest import ColorEmbedder, png
+from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, served, two_each, write_images
 
-RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
 COLORS = {"red": RED, "green": GREEN, "blue": BLUE}
-
-
-@pytest.fixture(name="root")
-def root_fixture(tmp_path):
-    """Workspace directory for the test."""
-    return tmp_path / "ws"
-
-
-ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
-
-class PlainResult:  # pylint: disable=too-few-public-methods  # stands in for click's Result
-    """A click Result with ANSI styling removed from ``output``.
-
-    Typer forces coloured error output when GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS is set,
-    and the escape codes split text such as ``--shots`` that tests look for.
-    """
-
-    def __init__(self, result):
-        self._result = result
-        self.output = ANSI.sub("", result.output)
-
-    def __getattr__(self, name):
-        return getattr(self._result, name)
-
-
-@pytest.fixture(name="run")
-def run_fixture(root):
-    """Invoke the CLI against the temporary workspace; returns the Result with plain-text output."""
-    runner = CliRunner()
-
-    def invoke(*args, stdin=None):
-        return PlainResult(runner.invoke(cli.app, [str(a) for a in args] + ["--root", str(root)], input=stdin))
-
-    return invoke
-
-
-def write_images(folder, rgb, n, start=0):
-    """Write ``n`` noisy PNGs of colour ``rgb`` into ``folder``."""
-    folder.mkdir(parents=True, exist_ok=True)
-    for i in range(start, start + n):
-        (folder / f"{i}.png").write_bytes(png(rgb, noise=20, seed=i))
 
 
 @pytest.fixture(name="photos")
@@ -488,16 +447,6 @@ def test_bench_default_embedder_and_errors(run, bench_data, monkeypatch):
     assert "Not a directory" in r.output
 
 
-def served(monkeypatch, *args):
-    """Run `fewshot serve ARGS` with uvicorn stubbed out; returns (result, the server, uvicorn's options)."""
-    calls = []
-    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls.append((app, kw)))
-    r = CliRunner().invoke(cli.app, ["serve", *args])
-    assert r.exit_code == 0, r.output
-    app, kw = calls[-1]
-    return PlainResult(r), app.state.server, kw
-
-
 def test_serve(monkeypatch, tmp_path):
     """`serve` starts uvicorn with an app for its settings, on the given host/port and --root."""
     _, srv, kw = served(monkeypatch, "--port", "9001")
@@ -637,3 +586,110 @@ def test_cache_prune_refuses_with_unreadable_task(run, root, task):
     r = run("cache", "prune")
     assert r.exit_code == 1
     assert f"Can't read task(s) {task}" in r.output
+
+
+# ---- unreadable tasks and file system errors -----------------------------
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read anything")
+def test_an_unreadable_task_is_skipped_not_a_crash(run, root):
+    """A task.json that can't be read is skipped by list and refused by show and prune, cleanly."""
+    ws = Workspace(root)
+    two_each(ws)
+    ws.create("other", embedder="fake:color")
+    (root / "tasks" / "t" / "task.json").chmod(0)
+    try:
+        assert [t.name for t in Workspace(root).list_tasks()] == ["other"]
+        r = run("list")
+        assert (r.exit_code, r.output.split()[0]) == (0, "other")
+        r = run("show", "t")
+        assert r.exit_code == 1
+        assert "can't be loaded" in r.output
+        assert "Permission denied" in r.output
+        r = run("cache", "prune")
+        assert (r.exit_code, "Can't read task(s) t" in r.output) == (1, True)
+        fresh = Workspace(root)
+        fresh.get("other")
+        with pytest.raises(KeyError, match="Permission denied"):
+            fresh.get("t")
+    finally:
+        (root / "tasks" / "t" / "task.json").chmod(0o644)
+    cached = Workspace(root)
+    cached.get("t")
+    (root / "tasks" / "t" / "task.json").chmod(0)
+    os.utime(root / "tasks" / "t" / "task.json", (1, 1))  # changed: the next get re-reads it
+    try:
+        with pytest.raises(KeyError, match="Permission denied"):
+            cached.get("t")
+    finally:
+        (root / "tasks" / "t" / "task.json").chmod(0o644)
+
+
+def test_cli_reports_file_system_errors_without_a_traceback(monkeypatch, capsys):
+    """An OSError escaping a command is an error message and exit status 1."""
+    def broken():
+        """Fail like an unreadable workspace."""
+        raise PermissionError(13, "Permission denied", "/data/tasks")
+
+    monkeypatch.setattr(cli, "app", broken)
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 1
+    assert "Error: /data/tasks: Permission denied" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "app", lambda: (_ for _ in ()).throw(OSError("disk on fire")))
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "Error: disk on fire" in capsys.readouterr().err
+
+
+def test_read_only_commands_make_no_workspace(run, root):
+    """list and show with a mistyped --root don't create it; create does."""
+    r = run("list")
+    assert (r.exit_code, r.output) == (0, "")
+    assert run("show", "x").exit_code == 1
+    assert not root.exists()
+    assert run("create", "x", "--embedder", "fake:color").exit_code == 0
+    assert root.exists()
+
+
+# ---- options -------------------------------------------------------------
+def test_cli_cache_prune_vacuum_option(run, task, monkeypatch):  # pylint: disable=unused-argument
+    """`cache prune --vacuum` asks for a vacuum; plain prune doesn't."""
+    calls: list[bool] = []
+
+    def prune(_ws, dry_run, vacuum):  # pylint: disable=unused-argument
+        """Record whether a vacuum was asked for."""
+        calls.append(vacuum)
+        return 0, 0
+
+    monkeypatch.setattr(cache_module, "prune_unused", prune)
+    run("cache", "prune")
+    run("cache", "prune", "--vacuum")
+    assert calls == [False, True]
+
+
+def test_cli_temperature_one_and_class_add_keeps_description(run, task):
+    """`class add` keeps a description; --temperature 1 clears it."""
+    assert run("class", "describe", task, "a photo of a {} thing").exit_code == 0
+    assert run("class", "add", task, "red").exit_code == 0
+    assert "a photo of a red thing" in run("show", task).output  # not wiped by `class add`
+    assert run("config", task, "--temperature", "2").exit_code == 0
+    assert "temperature: 2.0" in run("config", task, "--temperature", "2").output
+    assert "temperature: 1" in run("config", task, "--temperature", "1").output
+
+
+def test_usage_errors_exit_2(run, task):
+    """Options that don't go together exit 2, like Typer's own usage errors."""
+    assert run("predict", task, "--json", "--csv", "x.png").exit_code == 2
+    r = run("eval", task, "--json", "--csv")
+    assert r.exit_code == 2
+    assert "at most one" in r.output
+    assert run("class", "threshold", task, "red").exit_code == 2
+
+
+def test_csv_booleans_are_lowercase(run, task, tmp_path):
+    """CSV output writes booleans as true/false."""
+    q = tmp_path / "q.png"
+    q.write_bytes(png(RED, seed=3))
+    rows = list(csv.DictReader(io.StringIO(run("predict", task, q, "--csv").output)))
+    assert rows[0]["rejected"] == "false"
+    rows = list(csv.DictReader(io.StringIO(run("eval", task, "--csv").output)))
+    assert {r["correct"] for r in rows} <= {"true", "false"}

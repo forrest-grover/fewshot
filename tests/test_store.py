@@ -1,20 +1,20 @@
-"""Workspace and Task: on-disk layout, validation and mutations."""
+"""Workspace and Task: on-disk layout, validation and mutations, renaming, tags, notes and
+descriptions."""
 
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from fewshot import embedders, history, store
+from fewshot import embedders, history, models, store
 from fewshot.images import image_id, load_image
-from fewshot.models import TaskConfig
+from fewshot.models import Example, TaskConfig
 from fewshot.store import Workspace
-from fewshot.text import check_class_name
-from tests.conftest import png
-
-RED, GREEN = (220, 30, 30), (30, 220, 30)
+from fewshot.text import MAX_DESCRIPTION, MAX_PROMPTS, check_class_name, check_tag, check_template, prompts
+from tests.conftest import GREEN, RED, png, red_green_task, two_each
 
 
 def jpeg(size=(4, 2), orientation=None, mode="RGB"):
@@ -490,3 +490,142 @@ def test_add_examples_from_dir_raises_after_adding_the_rest(ws, tmp_path):
     with pytest.raises(ValueError, match="Not a readable image"):
         t.add_examples_from_dir(src)
     assert [e.source for e in t.config.examples] == ["a.png"]
+
+
+# ---- rename --------------------------------------------------------------
+def test_rename_task(ws):
+    """Renaming moves the folder and keeps examples, history and links; the old name is gone."""
+    t = red_green_task(ws)
+    t.upsert_class("x")
+    r = ws.rename("t", "u")
+    assert r is t
+    assert t.name == "u"
+    assert t.path == ws.root / "tasks" / "u"
+    assert len(t.config.examples) == 4
+    assert t.image_path(t.config.examples[0].id).exists()
+    with pytest.raises(KeyError):
+        ws.get("t")
+    assert Workspace(ws.root).get("u").name == "u"
+    t.undo()  # history from before the rename still works, under the new name
+    assert t.class_names() == ["red", "green"]
+    assert t.name == "u"
+    assert ws.rename("u", "u") is t
+
+
+def test_concurrent_renames(ws, monkeypatch):
+    """Of two renames of one task that both looked it up first, only the first succeeds; a cached
+    task under a name it no longer has is never returned for that name."""
+    t = red_green_task(ws)
+    real_get = ws.get
+    monkeypatch.setattr(ws, "get", lambda name: t if name == "t" else real_get(name))  # a stale lookup
+    ws.rename("t", "u")
+    with pytest.raises(KeyError, match="No task 't'"):
+        ws.rename("t", "v")
+    monkeypatch.setattr(ws, "get", real_get)
+    assert not (ws.root / "tasks" / "v").exists()
+    ws._tasks["v"] = t  # pylint: disable=protected-access  # as if cached under a name it has lost
+    with pytest.raises(KeyError, match="No task 'v'"):
+        ws.get("v")
+    assert ws.get("u") is t
+
+
+def test_rename_errors(ws, monkeypatch):
+    """A bad or taken new name is a ValueError; a failed save puts the folder back."""
+    red_green_task(ws)
+    ws.create("other")
+    with pytest.raises(ValueError, match="already exists"):
+        ws.rename("t", "other")
+    with pytest.raises(ValueError, match="Task names use"):
+        ws.rename("t", "bad name")
+    with pytest.raises(KeyError):
+        ws.rename("nope", "x")
+    real_replace = os.replace
+    calls = []
+
+    def failing_replace(src, dst):
+        calls.append(dst)
+        if str(dst).endswith("task.json"):
+            raise OSError("disk full")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="disk full"):
+        ws.rename("t", "u")
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert ws.get("t").name == "t"
+    assert not (ws.root / "tasks" / "u").exists()
+
+
+# ---- tags, notes, descriptions and lookups -------------------------------
+def test_tags_and_notes(ws):
+    """Tags can be replaced, added and removed (kept unique, in order); notes set and cleared."""
+    t = red_green_task(ws)
+    a, b = (e.id for e in t.config.examples[:2])
+    assert t.annotate([a, b], add_tags=["hard", " blurry ", "hard"]) == 2
+    assert t.example(a).tags == ("hard", "blurry")
+    t.annotate([a], remove_tags=["hard"], note="  check this  ")
+    assert t.example(a).tags == ("blurry",)
+    assert t.example(a).note == "check this"
+    t.annotate([b], tags=["x"])
+    assert t.example(b).tags == ("x",)
+    assert [e.id for e in t.find_examples(tag="x")] == [b]
+    assert [e.id for e in t.find_examples(label="green", tag="hard")] == []
+    assert len(t.find_examples()) == 4
+    with pytest.raises(KeyError):
+        t.annotate(["nope"], tags=[])
+    with pytest.raises(ValueError, match="Note is longer"):
+        t.annotate([a], note="x" * (models.MAX_NOTE + 1))
+    assert Workspace(ws.root).get("t").example(a).note == "check this"
+
+
+def test_check_tag_and_example_validation():
+    """Tags must be short, non-empty and free of commas; a file must be named by its example id."""
+    assert check_tag(" ok ") == "ok"
+    for bad, msg in (("", "empty"), ("x" * 51, "longer"), ("a,b", "can't contain"), ("a\nb", "can't contain")):
+        with pytest.raises(ValueError, match=msg):
+            check_tag(bad)
+    eid = "ab" * 16
+    with pytest.raises(ValueError, match="not named by the example id"):
+        Example(id=eid, label="x", file=f"images/{'cd' * 16}.png")
+    with pytest.raises(ValueError, match="note is longer"):
+        Example(id=eid, label="x", file=f"images/{eid}.png", note="x" * 3000)
+    assert Example(id=eid, label="x", file=f"images/{eid}.png", tags=("a", "a")).tags == ("a",)
+
+
+def test_resolve_ids(ws):
+    """Unique prefixes of 4+ characters resolve to full ids."""
+    t = red_green_task(ws)
+    eid = t.config.examples[0].id
+    assert t.resolve_ids([eid[:6], eid]) == [eid, eid]
+    with pytest.raises(KeyError, match="'abc' is too short: give at least 4 characters"):
+        t.resolve_ids(["abc"])
+    with pytest.raises(KeyError, match="No example"):
+        t.resolve_ids(["zzzzzz"])
+    twins = [Example(id=i, label="red", file=f"images/{i}.png") for i in ("abcd" + "0" * 28, "abcd" + "1" * 28)]
+    t.config = t.config.model_copy(update={"examples": twins})  # in memory only
+    with pytest.raises(KeyError, match="ambiguous"):
+        t.resolve_ids(["abcd"])
+
+
+def test_prompts_and_templates(ws):
+    """Descriptions hold one prompt per line; multi-line templates fill each line."""
+    assert prompts(" a \n\n b ") == ["a", "b"]
+    check_template("a {}\nthe {}")
+    for bad in ("", "no braces", "a {}\nno braces"):
+        with pytest.raises(ValueError, match="must contain"):
+            check_template(bad)
+    t = red_green_task(ws)
+    t.describe_classes("a photo of a {}\n\n  a {} thing ")
+    assert t.config.classes[0].description == "a photo of a red\na red thing"
+
+
+def test_descriptions_are_capped(ws):
+    """A description can't be longer than MAX_DESCRIPTION or hold more than MAX_PROMPTS prompts."""
+    t = two_each(ws)
+    with pytest.raises(ValueError, match="longer than"):
+        t.upsert_class("red", "x" * (MAX_DESCRIPTION + 1))
+    with pytest.raises(ValueError, match="prompts"):
+        t.edit_class("red", description="a\n" * (MAX_PROMPTS + 1))
+    with pytest.raises(ValueError, match="prompts"):
+        t.describe_classes("a {}\n" * (MAX_PROMPTS + 1))
+    t.upsert_class("red", "a\n" * MAX_PROMPTS)  # at the limit is fine
