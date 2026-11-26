@@ -69,6 +69,9 @@ class Pipeline:
         # deleted-and-recreated task that reaches the same revision from reusing a stale fit.
         self._fitted: dict[str, tuple[tuple[str, int, str], Classifier]] = {}
         self._lock = threading.Lock()
+        # (task name, stamp) -> lock held while that version is fitted, so concurrent requests for
+        # a task that isn't fitted yet wait for one fit instead of each fitting it themselves.
+        self._fitting: dict[tuple[str, tuple[str, int, str]], threading.Lock] = {}
 
     # ---- embeddings --------------------------------------------------
     def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],
@@ -258,16 +261,27 @@ class Pipeline:
         cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
         # The model's namespace is part of the key, so re-registering a spec's embedder refits.
         stamp = (cfg.uid, cfg.revision, cache_namespace(cfg.embedder))
+        key = (cfg.name, stamp)
         with self._lock:
             hit = self._fitted.get(cfg.name)
             if hit and hit[0] == stamp:
                 return hit[1]
-        clf = new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
-        with self._lock:
-            # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
-            cur = self._fitted.get(cfg.name)
-            if cur is None or cur[0][0] != stamp[0] or cur[0][1] <= stamp[1]:
-                self._fitted[cfg.name] = (stamp, clf)
+            gate = self._fitting.setdefault(key, threading.Lock())
+        with gate:
+            with self._lock:  # fitted by another request while this one waited?
+                hit = self._fitted.get(cfg.name)
+                if hit and hit[0] == stamp:
+                    return hit[1]
+            try:
+                clf = new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
+                with self._lock:
+                    # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
+                    cur = self._fitted.get(cfg.name)
+                    if cur is None or cur[0][0] != stamp[0] or cur[0][1] <= stamp[1]:
+                        self._fitted[cfg.name] = (stamp, clf)
+            finally:
+                with self._lock:
+                    self._fitting.pop(key, None)
         return clf
 
     # ---- prediction --------------------------------------------------

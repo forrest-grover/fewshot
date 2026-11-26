@@ -151,6 +151,76 @@ def test_an_older_fit_does_not_replace_a_newer_one(ws):
     assert pipe.fitted(t) is newer
 
 
+def test_concurrent_cold_requests_fit_once(ws, monkeypatch):
+    """Requests for a task that isn't fitted yet share one fit instead of each fitting it; a fit
+    that fails lets the next request try again."""
+    import threading  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+
+    from fewshot import pipeline  # pylint: disable=import-outside-toplevel
+
+    t = ws.create("t", embedder="fake:color")
+    t.add_example(png(RED), "red")
+    t.add_example(png(BLUE), "blue")
+    pipe = Pipeline(ws)
+    fits = []
+    real = pipeline.new_classifier
+
+    def slow(cfg):
+        clf = real(cfg)
+        fit = clf.fit
+
+        def counted(data):
+            fits.append(1)
+            time.sleep(0.1)
+            if len(fits) == 1:
+                raise RuntimeError("first fit fails")
+            return fit(data)
+
+        clf.fit = counted
+        return clf
+
+    monkeypatch.setattr(pipeline, "new_classifier", slow)
+    with pytest.raises(RuntimeError):
+        pipe.fitted(t)
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(pipe.fitted(t))) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(fits) == 2 and len(out) == 6 and all(c is out[0] for c in out)
+    assert not pipe._fitting  # pylint: disable=protected-access
+
+
+def test_batch_size_changes_under_the_model_lock(monkeypatch):
+    """Out-of-memory halving and growing back change ``batch_size`` only while holding the model's
+    lock, so concurrent jobs can't undo each other's changes."""
+    monkeypatch.setattr(embedders, "_free_gpu_memory", lambda: None)
+    monkeypatch.setattr(embedders, "GROW_AFTER", 1)
+
+    class Guarded(ColorEmbedder):
+        """Fails batches over 2 with out-of-memory; checks the lock on every batch size change."""
+
+        batch_size = 4
+        armed = False
+
+        def __setattr__(self, name, value):
+            if self.armed and name in {"batch_size", "_good_batches", "_full_batch"}:
+                assert self._lock.locked(), name
+            super().__setattr__(name, value)
+
+        def _embed_image_batch(self, images):
+            if len(images) > 2:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return super()._embed_image_batch(images)
+
+    emb = Guarded()
+    emb.armed = True
+    emb.embed_images([Image.new("RGB", (2, 2))] * 8)
+    assert emb._full_batch == 4 and emb.batch_size == 4  # pylint: disable=protected-access  # halved, grown back
+
+
 def test_repeated_images_are_embedded_once(ws):
     """The same uncached image twice in one call goes through the model once; a repeated bad
     image gets the error at every position."""

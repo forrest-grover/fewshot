@@ -214,7 +214,7 @@ class Embedder(ABC):
         try:
             with self._lock, torch.inference_mode():
                 vecs = self._checked(forward(batch), n)
-            self._fitted_batch()
+                self._fitted_batch()
             return vecs
         except Exception as e:  # pylint: disable=broad-exception-caught  # only OOM is handled; re-raised
             if n == 1 or not _is_oom(e):
@@ -223,16 +223,17 @@ class Embedder(ABC):
         # the failed forward pass's tensors alive, so freeing memory couldn't help the retry.
         _free_gpu_memory()
         half = n // 2
-        self._full_batch = self._full_batch or self.batch_size
-        self._good_batches = 0
-        self.batch_size = max(1, min(self.batch_size, half))
+        with self._lock:  # like ``_fitted_batch``: another job's update mustn't interleave
+            self._full_batch = self._full_batch or self.batch_size
+            self._good_batches = 0
+            self.batch_size = max(1, min(self.batch_size, half))
         return np.concatenate([self._embed_halving(batch[:half], half, forward),
                                self._embed_halving(batch[half:], n - half, forward)])
 
     def _fitted_batch(self) -> None:
         """Count a batch that fitted; after ``GROW_AFTER`` in a row, double a halved ``batch_size``
         again (up to its original size), since an out-of-memory error may have been caused by
-        another job that has finished since."""
+        another job that has finished since. Called holding the model lock."""
         if self._full_batch is None or self.batch_size >= self._full_batch:
             return
         self._good_batches += 1
