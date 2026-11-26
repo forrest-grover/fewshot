@@ -1,61 +1,42 @@
-export interface TaskSummary {
-  name: string; embedder: string; classifier: string; revision: number;
-  n_classes: number; n_examples: number; n_inbox: number; counts: Record<string, number>; created: string;
-  last_evaluation: { at: string; revision: number | null; method: string | null; accuracy: number | null } | null;
-  warnings: string[];
-}
-export interface ClassInfo { name: string; description: string; count: number; reject_below: number | null } // reject_below: the class's own threshold
-export interface Example {
-  id: string; label: string; file: string; source: string; added: string; tags: string[]; note: string;
-}
-export interface TaskDetail {
-  name: string; embedder: string; supports_text: boolean; classifier: string;
-  classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
-  reject_below_zero_shot: number | null; flip: boolean; names_as_text: boolean; temperature: number | null; inbox_count: number;
-  can_undo: boolean; can_redo: boolean; undo_label: string; redo_label: string; // labels: e.g. "delete 3 examples"
-  revision: number; classes: ClassInfo[]; examples: Example[];
-}
-export interface Prediction {
-  file?: string | null; label: string | null; top_label: string; confidence: number;
-  similarity: number; rejected: boolean; scores: Record<string, number>; // scores: highest first
-  labels: string[]; // every class the image matches (with a reject threshold), label first unless rejected
-  evidence: { id: string; label: string; similarity: number }[]; // most similar labelled examples, if asked for
-  error: string | null; // set when the image could not be read; the other fields are then empty
-}
+import type { components } from "./api-schema";
+
+// Response and body types come from the server's OpenAPI schema (src/api-schema.ts, regenerated
+// with `npm run gen:api`), so they can't drift from it unnoticed.
+type S = components["schemas"];
+export type TaskSummary = S["TaskSummary"];
+export type LastEvaluation = S["LastEvaluation"];
+/** A class; ``reject_below`` is its own threshold, overriding the task's. */
+export type ClassInfo = S["ClassOut"];
+export type Example = S["ExampleOut"];
+/** A task; ``undo_label`` and ``redo_label`` say what undo and redo would do, e.g. "delete 3 examples". */
+export type TaskDetail = S["TaskDetail"];
+/** ``scores`` are highest first; ``labels`` is every class the image matches (label first unless
+ * rejected); ``evidence`` the most similar labelled examples, if asked for; ``error`` is set when
+ * the image could not be read (the other fields are then empty); ``revision`` the task version used. */
+export type Prediction = S["PredictionOut"];
 /** An example's prediction by a classifier fitted without it. */
-export interface HeldOut { id: string; true: string; pred: string; confidence: number; similarity: number; correct: boolean }
-export interface EvalReport {
-  revision: number; method: string; n_scored: number; n_examples: number; accuracy: number | null; macro_f1: number | null;
-  top_k_accuracy: Record<string, number>; classes: string[]; confusion: number[][];
-  per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
-  mistakes: HeldOut[]; predictions: HeldOut[]; suggested_reject_below: number | null;
-  suggested_class_thresholds: Record<string, number>; // per class, for classes with 5+ correct predictions
-  calibration: { temperature: number; ece: number; ece_calibrated: number } | null;
-}
+export type HeldOut = S["HeldOutPrediction"];
+export type EvalReport = S["EvalReport"];
 /** One embedder's cross-validation on a task, or why it couldn't be used. */
-export interface CompareResult {
-  embedder: string; accuracy: number | null; macro_f1: number | null; top_k_accuracy: Record<string, number>;
-  n_scored: number; seconds: number | null; method: string | null; error: string | null;
-}
-export interface CompareReport { revision: number; current: string; n_examples: number; results: CompareResult[]; best: string | null }
-export interface InboxEntry {
-  id: string; file: string; source: string; added: string;
-  prediction?: Prediction | null; margin?: number | null; // absent while the task has no classes
-}
+export type CompareResult = S["CompareResult"];
+export type CompareReport = S["CompareReport"];
+/** An inbox image; ``prediction`` and ``margin`` are null while the task has no classes. */
+export type InboxEntry = S["InboxEntry"];
+export type InboxPage = S["InboxPage"];
+export type InboxAdded = S["InboxAdded"];
 export type InboxSort = "uncertain" | "confident" | "novel" | "added";
-export interface DuplicatePair { a: string; b: string; similarity: number; labels: string[]; same_label: boolean }
-export interface Health { status: string; auth_required: boolean; models_loaded: string[]; jobs_running: number; url_fetch: boolean }
+export type DuplicatePair = S["DuplicatePair"];
+export type Health = S["Health"];
 /** An upload that couldn't be used: its file name (or URL, when known) and why. */
-export interface FileError { file: string | null; error: string }
-export interface AddResult { added: Example[]; errors: FileError[]; task: TaskDetail }
-export interface Job<T> {
-  id: string; task: string; kind: string; status: "running" | "done" | "failed" | "cancelled";
-  stage: string; done: number; total: number; result: T | null; error: string | null;
-}
-export interface ModelInfo {
-  embedders: { spec: string; label: string; supports_text: boolean; notes: string }[];
-  classifiers: string[];
-}
+export type FileError = S["FileError"];
+export type AddResult = S["AddResult"];
+export type ModelInfo = S["ModelsOut"];
+/** PATCH /api/tasks/{name}: every field is optional (the schema marks the clear_* flags required
+ * only because they have defaults). */
+export type TaskSettings = Partial<S["TaskSettings"]>;
+export type JobStatus = "running" | "done" | "failed" | "cancelled";
+/** A background job whose ``result`` (once done) is a ``T``. */
+export type Job<T> = Omit<S["JobOut"], "status" | "result"> & { status: JobStatus; result: T | null };
 
 /** Fired on window when a request is refused for want of the server's token. */
 export const AUTH_EVENT = "fewshot:auth-required";
@@ -115,7 +96,7 @@ export const api = {
   // An undefined embedder is left out of the body, so the server uses its default.
   createTask: (name: string, embedder: string | undefined, classifier: string) =>
     req<TaskDetail>("POST", "/api/tasks", { name, embedder, classifier }),
-  updateTask: (n: string, s: Record<string, unknown>) => req<TaskDetail>("PATCH", t(n), s),
+  updateTask: (n: string, s: TaskSettings) => req<TaskDetail>("PATCH", t(n), s),
   deleteTask: (n: string) => req<undefined>("DELETE", t(n)),
   addClass: (n: string, name: string, description = "") =>
     req<TaskDetail>("POST", `${t(n)}/classes`, { name, description }),
@@ -148,9 +129,10 @@ export const api = {
     return req<TaskDetail>("POST", "/api/tasks/import", fd);
   },
   health: () => req<Health>("GET", "/api/health"),
-  inbox: (n: string, sort: InboxSort) => req<{ total: number; items: InboxEntry[] }>("GET", `${t(n)}/inbox?sort=${sort}&limit=1000`),
+  inbox: (n: string, sort: InboxSort, offset = 0, limit = 1000) =>
+    req<InboxPage>("GET", `${t(n)}/inbox?sort=${sort}&offset=${String(offset)}&limit=${String(limit)}`),
   addToInbox: (n: string, fs: File[]) =>
-    req<{ added: InboxEntry[]; errors: FileError[]; task: TaskDetail }>("POST", `${t(n)}/inbox`, files(fs)),
+    req<InboxAdded>("POST", `${t(n)}/inbox`, files(fs)),
   acceptInbox: (n: string, labels: Record<string, string>) => req<TaskDetail>("POST", `${t(n)}/inbox/accept`, { labels }),
   dismissInbox: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/inbox/dismiss`, { ids }),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
