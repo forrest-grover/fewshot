@@ -66,6 +66,16 @@ def png(rgb, size=8, noise=0, seed=0):
     return buf.getvalue()
 
 
+def pytest_collection_modifyitems(config, items):  # pylint: disable=unused-argument  # pytest's hook signature
+    """Skip the tests marked ``model`` (they load real models) unless FEWSHOT_TEST_MODELS=1."""
+    if os.environ.get("FEWSHOT_TEST_MODELS") == "1":
+        return
+    skip = pytest.mark.skip(reason="loads a real model: set FEWSHOT_TEST_MODELS=1 to run it")
+    for item in items:
+        if item.get_closest_marker("model"):
+            item.add_marker(skip)
+
+
 # Made by the tools that run the tests, not by the tests themselves.
 _RUNNER_FILES = re.compile(r"\.coverage.*|\.pytest_cache|__pycache__|\.mypy_cache|\.ruff_cache|\.hypothesis")
 
