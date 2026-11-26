@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import fewshot.api
-from fewshot import cli
+from fewshot import cli, cli_common
 from fewshot.archive import export_task, import_task
 from fewshot.pipeline import Pipeline
 from fewshot.store import Workspace
@@ -204,7 +204,7 @@ def test_inbox_edges(ws, monkeypatch):
     def no_fetch(url, *_a, **_k):
         raise ValueError(f"Could not fetch {url}")
 
-    monkeypatch.setattr(cli, "fetch_url", no_fetch)
+    monkeypatch.setattr(cli_common, "fetch_url", no_fetch)
     runner = CliRunner()
     r = runner.invoke(cli.app, ["inbox", "add", "t", "http://h/x.png", "--root", str(ws.root)])
     assert "skip http://h/x.png: Could not fetch" in r.output

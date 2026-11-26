@@ -1,0 +1,158 @@
+"""A small client for a fewshot server's REST API, using only the standard library.
+
+    from fewshot.client import Client
+
+    fs = Client("http://localhost:8000", token="...")
+    fs.add_examples("pets", "Beagle", ["a.jpg", "b.jpg"])
+    for p in fs.predict("pets", ["new.jpg"]):
+        print(p["file"], p["label"], p["confidence"])
+
+Images are file paths or ``(filename, bytes)`` pairs. Every method returns the API's JSON; an error
+response raises ``ApiError`` with the HTTP status and the server's ``detail``.
+"""
+
+from __future__ import annotations
+
+import json
+import mimetypes
+import uuid
+from collections.abc import Iterable, Sequence
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+Image = str | Path | tuple[str, bytes]
+
+
+class ApiError(Exception):
+    """An error response from the server."""
+
+    def __init__(self, status: int, detail: Any) -> None:
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+
+class Client:
+    """Calls the API of the fewshot server at ``url``, sending ``token`` (if the server needs one)."""
+
+    def __init__(self, url: str = "http://127.0.0.1:8000", token: str | None = None, timeout: float = 300) -> None:
+        self.url = url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    # ---- transport -----------------------------------------------------
+    def request(  # pylint: disable=too-many-arguments  # keyword-only body options
+            self, method: str, path: str, *, params: dict[str, Any] | None = None, json_body: Any = None,
+            fields: dict[str, str] | None = None, files: Sequence[Image] = ()) -> Any:
+        """Send a request to ``path`` (under ``/api``) and return the decoded JSON (None if empty).
+
+        ``params`` become the query string (None values are left out); ``json_body`` is sent as JSON;
+        ``fields`` and ``files`` as a multipart form, the files under the name ``files``.
+        """
+        query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        data = None
+        if json_body is not None:
+            data = json.dumps(json_body).encode()
+            headers["Content-Type"] = "application/json"
+        elif fields is not None or files:
+            data, headers["Content-Type"] = _multipart(fields or {}, files)
+        req = Request(f"{self.url}/api{path}{'?' + query if query else ''}", data=data, headers=headers,
+                      method=method)
+        try:
+            with urlopen(req, timeout=self.timeout) as r:
+                body = r.read()
+        except HTTPError as e:
+            raise _api_error(e) from None
+        return json.loads(body) if body else None
+
+    # ---- tasks ---------------------------------------------------------
+    def health(self) -> dict[str, Any]:
+        """Server status: loaded models, running jobs, whether a token is required."""
+        return self.request("GET", "/health")  # type: ignore[no-any-return]
+
+    def tasks(self) -> list[dict[str, Any]]:
+        """A summary of every task."""
+        return self.request("GET", "/tasks")  # type: ignore[no-any-return]
+
+    def task(self, name: str) -> dict[str, Any]:
+        """One task's details: classes, examples, settings, revision."""
+        return self.request("GET", f"/tasks/{_seg(name)}")  # type: ignore[no-any-return]
+
+    def create_task(self, name: str, **settings: Any) -> dict[str, Any]:
+        """Create a task; ``settings`` are the other fields of the create body (``embedder``, ...)."""
+        return self.request("POST", "/tasks", json_body={"name": name, **settings})  # type: ignore[no-any-return]
+
+    def delete_task(self, name: str) -> None:
+        """Delete a task and its images."""
+        self.request("DELETE", f"/tasks/{_seg(name)}")
+
+    # ---- data ----------------------------------------------------------
+    def add_examples(self, task: str, label: str, images: Iterable[Image]) -> dict[str, Any]:
+        """Add labelled examples (the class is created if needed)."""
+        return self.request("POST", f"/tasks/{_seg(task)}/examples", fields={"label": label},  # type: ignore[no-any-return]
+                            files=list(images))
+
+    def add_to_inbox(self, task: str, images: Iterable[Image]) -> dict[str, Any]:
+        """Add unlabelled images to the task's inbox."""
+        return self.request("POST", f"/tasks/{_seg(task)}/inbox", files=list(images))  # type: ignore[no-any-return]
+
+    def inbox(self, task: str, sort: str = "uncertain") -> dict[str, Any]:
+        """The inbox with the model's suggestion for each image (``sort``: uncertain, confident, novel, added)."""
+        return self.request("GET", f"/tasks/{_seg(task)}/inbox", params={"sort": sort})  # type: ignore[no-any-return]
+
+    def accept_inbox(self, task: str, labels: dict[str, str]) -> dict[str, Any]:
+        """Label inbox images (``{id: class}``), moving them to the task's examples."""
+        return self.request("POST", f"/tasks/{_seg(task)}/inbox/accept",  # type: ignore[no-any-return]
+                            json_body={"labels": labels})
+
+    # ---- inference -----------------------------------------------------
+    def predict(self, task: str, images: Iterable[Image], *, top_k: int | None = None, evidence: int = 0,
+                revision: int | None = None) -> list[dict[str, Any]]:
+        """Classify images; each result has ``label``, ``confidence``, ``scores``, ``revision`` (or ``error``).
+
+        ``revision`` predicts with an earlier version of the task that the server still keeps.
+        """
+        params = {"top_k": top_k, "evidence": evidence or None, "revision": revision}
+        return self.request("POST", f"/tasks/{_seg(task)}/predict", params=params,  # type: ignore[no-any-return]
+                            files=list(images))
+
+    def evaluate(self, task: str) -> dict[str, Any]:
+        """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...)."""
+        return self.request("POST", f"/tasks/{_seg(task)}/evaluate")  # type: ignore[no-any-return]
+
+
+def _api_error(e: HTTPError) -> ApiError:
+    """``e`` as an ``ApiError`` carrying the server's ``detail`` (or the body as text if it has none)."""
+    raw = e.read()
+    try:
+        detail = json.loads(raw).get("detail", raw.decode(errors="replace"))
+    except (ValueError, AttributeError):
+        detail = raw.decode(errors="replace")
+    return ApiError(e.code, detail)
+
+
+def _seg(s: str) -> str:
+    """``s`` quoted as one path segment."""
+    return quote(s, safe="")
+
+
+def _multipart(fields: dict[str, str], files: Sequence[Image]) -> tuple[bytes, str]:
+    """A multipart/form-data body with ``fields`` and each image as a ``files`` part, and its content type."""
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+    for k, v in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    for img in files:
+        name, data = (img[0], img[1]) if isinstance(img, tuple) else (Path(img).name, Path(img).read_bytes())
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        safe = name.replace('"', "%22").replace("\r", "").replace("\n", "")
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{safe}"\r\n'
+                     f"Content-Type: {ctype}\r\n\r\n".encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"

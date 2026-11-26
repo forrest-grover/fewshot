@@ -1,0 +1,91 @@
+"""fewshot.client against a real server, and the API's operation ids."""
+
+import importlib
+import socket
+import threading
+import time
+
+import pytest
+import uvicorn
+
+import fewshot.api
+from fewshot.client import ApiError, Client
+from tests.conftest import png
+
+RED, BLUE = (220, 30, 30), (30, 30, 220)
+
+
+@pytest.fixture(name="server")
+def server_fixture(tmp_path, monkeypatch):
+    """The API served by uvicorn on a free local port, with token 'secret'; yields its URL."""
+    monkeypatch.setenv("FEWSHOT_HOME", str(tmp_path / "ws"))
+    monkeypatch.setenv("FEWSHOT_TOKEN", "secret")
+    monkeypatch.setenv("FEWSHOT_WARM", "0")
+    api = importlib.reload(fewshot.api)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    srv = uvicorn.Server(uvicorn.Config(api.app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not srv.started and time.time() < deadline:
+        time.sleep(0.02)
+    yield f"http://127.0.0.1:{port}/"
+    srv.should_exit = True
+    thread.join(10)
+
+
+def test_client_round_trip(server, tmp_path):
+    """Create, add, predict (at a revision), inbox, evaluate and delete through the client."""
+    fs = Client(server, token="secret")
+    assert fs.health()["auth_required"] is True
+    fs.create_task("my-pets", embedder="fake:color")
+    f = tmp_path / "r.png"
+    f.write_bytes(png(RED, noise=15, seed=1))
+    fs.add_examples("my-pets", "red", [f, ("r2.png", png(RED, noise=15, seed=2))])
+    added = fs.add_examples("my-pets", "blue", [(f'b"{i}.png', png(BLUE, noise=15, seed=i)) for i in range(2)])
+    assert [x["source"] for x in added["added"]] == ["b%220.png", "b%221.png"]  # quotes escaped as browsers do
+    rev = fs.task("my-pets")["revision"]
+    [p] = fs.predict("my-pets", [("q.png", png(BLUE, seed=9))], top_k=1, evidence=1)
+    assert (p["label"], list(p["scores"]), len(p["evidence"]), p["revision"]) == ("blue", ["blue"], 1, rev)
+    assert fs.predict("my-pets", [f], revision=rev)[0]["label"] == "red"
+    fs.add_to_inbox("my-pets", [("u.png", png(RED, seed=5))])
+    [item] = fs.inbox("my-pets", sort="confident")["items"]
+    assert item["prediction"]["label"] == "red"
+    assert len(fs.accept_inbox("my-pets", {item["id"]: "red"})["examples"]) == 5
+    assert fs.evaluate("my-pets")["n_examples"] == 5
+    assert [t["name"] for t in fs.tasks()] == ["my-pets"]
+    fs.delete_task("my-pets")
+    assert fs.tasks() == []
+
+
+def test_client_errors(server):
+    """Error responses raise ApiError with the status and the server's detail."""
+    with pytest.raises(ApiError) as e:
+        Client(server, token="wrong").tasks()
+    assert e.value.status == 401
+    with pytest.raises(ApiError, match="HTTP 404") as e:
+        Client(server, token="secret").task("nope")
+    assert "nope" in e.value.detail
+
+
+def test_non_json_error_body(monkeypatch):
+    """An error body that isn't JSON (a proxy's HTML page, say) becomes the detail as text."""
+    import io  # pylint: disable=import-outside-toplevel
+    from urllib.error import HTTPError  # pylint: disable=import-outside-toplevel
+
+    def fail(*_a, **_k):
+        raise HTTPError("http://x", 502, "Bad Gateway", {}, io.BytesIO(b"<html>bad gateway</html>"))  # type: ignore[arg-type]
+
+    monkeypatch.setattr("fewshot.client.urlopen", fail)
+    with pytest.raises(ApiError, match="HTTP 502: <html>bad gateway</html>"):
+        Client().health()
+
+
+def test_operation_ids_are_function_names():
+    """Every operation id is its handler's name, so generated clients get tidy method names."""
+    ops = [op for path in fewshot.api.app.openapi()["paths"].values() for op in path.values()]
+    ids = [op["operationId"] for op in ops]
+    assert len(ids) == len(set(ids))
+    assert {"predict", "add_examples", "list_tasks", "health"} <= set(ids)

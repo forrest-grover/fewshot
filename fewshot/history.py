@@ -159,6 +159,20 @@ class TaskHistory:
         files = self._redo_files() | set().union(*(self._files_in(p) for _, p in self._history()))
         return files - self.config.files()
 
+    def version(self, revision: int) -> TaskConfig:
+        """The task as it was at ``revision``: the current version, or one kept for undo (the last
+        ``HISTORY_KEPT``, whose images are kept too). Raises ``KeyError`` for any other."""
+        if revision == self.config.revision:
+            return self.config
+        for rev, snap in self._history():
+            if rev == revision:
+                try:
+                    cfg = type(self.config).model_validate_json(snap.read_bytes())
+                except ValidationError:
+                    break
+                return cfg.model_copy(update={"name": self.config.name})
+        raise KeyError(f"Revision {revision} of {self.config.name!r} is not kept (the last {HISTORY_KEPT} are)")
+
     def can_undo(self) -> bool:
         """Whether there is an earlier version to go back to."""
         return bool(self._history())

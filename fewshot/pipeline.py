@@ -5,7 +5,7 @@ from __future__ import annotations
 import heapq
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ class Prediction:  # pylint: disable=too-many-instance-attributes  # one field p
     # The labelled examples most like the image ({id, label, similarity}), when asked for.
     evidence: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None  # set (with every other field empty) when the image could not be read
+    revision: int | None = None  # of the task version that made the prediction
 
     @classmethod
     def failed(cls, error: str) -> Prediction:
@@ -238,19 +239,20 @@ class Pipeline:
 
     # ---- prediction --------------------------------------------------
     def predict(self, task: Task | str, images: Sequence[ImageInput], top_k: int | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                progress: Progress | None = None, evidence: int = 0) -> list[Prediction]:
+                progress: Progress | None = None, evidence: int = 0, cfg: TaskConfig | None = None) -> list[Prediction]:
         """Classify images given as bytes, file paths or PIL images.
 
         An image that cannot be read or decoded (including a missing file) gets a ``Prediction``
         with ``error`` set; the others are still classified. Classes with neither examples nor a
         description are left out. ``top_k`` keeps only that many of the highest ``scores``;
         ``progress`` counts images embedded (see ``embed_images``); ``evidence`` adds that many of
-        the most similar labelled examples to each prediction.
+        the most similar labelled examples to each prediction. ``cfg`` predicts with that version of
+        the task (see ``Task.version``) instead of the current one.
         """
         if top_k is not None and top_k < 1:
             raise ValueError(f"top_k must be at least 1, got {top_k}")
         task = self.ws.get(task) if isinstance(task, str) else task
-        cfg = task.config
+        cfg = cfg or task.config
         clf = self.fitted(task, cfg)
         if not images:
             return []
@@ -262,7 +264,7 @@ class Pipeline:
                  for i, row in enumerate(zip(probs, sims, per_class, strict=True))]
         if evidence > 0:
             _attach_evidence(clf, cfg, Q, preds, evidence)
-        return preds
+        return [replace(p, revision=cfg.revision) for p in preds]
 
     # ---- inbox ---------------------------------------------------------
     def inbox_suggestions(self, task: Task, sort: str = "uncertain") -> list[dict[str, Any]]:

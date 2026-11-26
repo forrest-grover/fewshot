@@ -108,7 +108,9 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="fewshot", version="0.1.0", lifespan=_lifespan)
+# Operation ids are the function names (predict, add_examples...), which make tidy generated clients.
+app = FastAPI(title="fewshot", version="0.1.0", lifespan=_lifespan,
+              generate_unique_id_function=lambda route: route.name)
 
 
 def warm_models() -> list[str]:
@@ -848,12 +850,18 @@ def dismiss_inbox(name: str, body: ExampleIds) -> dict[str, Any]:
 # ---- inference ----------------------------------------------------------
 TOP_K = Query(None, ge=1, description="Return only this many of the highest scores per image")
 EVIDENCE = Query(0, ge=0, le=20, description="Also return this many of the most similar labelled examples")
+REVISION = Query(None, ge=0, description="Predict with this earlier version of the task (one kept for undo)")
 
 
-def _predict(t: Task, blobs: list[Blob], top_k: int | None, evidence: int = 0) -> list[dict[str, Any]]:
+def _predict(t: Task, blobs: list[Blob], top_k: int | None, evidence: int = 0,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+             revision: int | None = None) -> list[dict[str, Any]]:
+    try:
+        cfg = None if revision is None else t.version(revision)
+    except KeyError as e:
+        raise _missing(e) from e
     try:
         preds = pipe.predict(t, [data if data is not None else b"" for _, data, _ in blobs], top_k=top_k,
-                             evidence=evidence)
+                             evidence=evidence, cfg=cfg)
     except ValueError as e:
         raise _bad(e) from e
     return [{"file": f, **(p if data is not None else Prediction.failed(err or "")).to_dict()}
@@ -862,17 +870,19 @@ def _predict(t: Task, blobs: list[Blob], top_k: int | None, evidence: int = 0) -
 
 @app.post("/api/tasks/{name}/predict", response_model=list[PredictionOut])
 def predict(name: str, files: list[UploadFile] = File(...), top_k: int | None = TOP_K,
-            evidence: int = EVIDENCE) -> list[dict[str, Any]]:
-    """Classify uploaded images; an unreadable file gets ``error`` set instead of a label."""
+            evidence: int = EVIDENCE, revision: int | None = REVISION) -> list[dict[str, Any]]:
+    """Classify uploaded images; an unreadable file gets ``error`` set instead of a label. Each
+    prediction says which ``revision`` of the task made it."""
     t = _task(name)
-    return _predict(t, _uploads(files), top_k, evidence)
+    return _predict(t, _uploads(files), top_k, evidence, revision)
 
 
 @app.post("/api/tasks/{name}/predict/urls", response_model=list[PredictionOut])
-def predict_urls(name: str, body: Urls, top_k: int | None = TOP_K, evidence: int = EVIDENCE) -> list[dict[str, Any]]:
+def predict_urls(name: str, body: Urls, top_k: int | None = TOP_K, evidence: int = EVIDENCE,
+                 revision: int | None = REVISION) -> list[dict[str, Any]]:
     """Download images (server started with --allow-urls) and classify them; ``file`` is the URL."""
     t = _task(name)
-    return _predict(t, _downloads(body.urls), top_k, evidence)
+    return _predict(t, _downloads(body.urls), top_k, evidence, revision)
 
 
 @app.get("/api/tasks/{name}/duplicates", response_model=list[DuplicatePair])

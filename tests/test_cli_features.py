@@ -9,7 +9,7 @@ import sys
 import pytest
 from typer.testing import CliRunner
 
-from fewshot import cli
+from fewshot import cli, cli_common
 from fewshot.store import Workspace
 from tests.conftest import png
 from tests.test_cli import ANSI, PlainResult
@@ -138,12 +138,12 @@ def test_predict_csv_json_and_urls(run, task, tmp_path, monkeypatch):
     """predict reads URLs, prints CSV, and limits JSON scores to --top."""
 
     def fake_fetch(url, max_bytes):
-        assert max_bytes == cli.MAX_DOWNLOAD
+        assert max_bytes == cli_common.MAX_DOWNLOAD
         if "bad" in url:
             raise ValueError(f"Could not fetch {url}: HTTP 404 Not Found")
         return png(BLUE, seed=7)
 
-    monkeypatch.setattr(cli, "fetch_url", fake_fetch)
+    monkeypatch.setattr(cli_common, "fetch_url", fake_fetch)
     q = tmp_path / "q.png"
     q.write_bytes(png(RED, seed=8))
     r = run("predict", task, q, "http://h/b.png", "--csv")
@@ -185,7 +185,7 @@ def test_eval_top_k_lines(run, task, tmp_path):
 def test_progress_bar_on_a_terminal(monkeypatch, capsys):
     """On a terminal the progress helper draws a bar; elsewhere it is silent."""
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
-    with cli._progress("Working") as update:  # pylint: disable=protected-access
+    with cli_common.progress("Working") as update:
         update(1, 2)
     assert "Working" in ANSI.sub("", capsys.readouterr().err)
 

@@ -63,6 +63,9 @@ fewshot add pets Beagle a.jpg b.jpg
 fewshot class describe pets "a photo of a {}, a type of pet"
 fewshot eval pets                             # leave-one-out cross-validation; --csv for every prediction
 fewshot predict pets new/ https://example.com/cat.jpg --json   # also --csv
+fewshot predict pets --from-file list.txt --jsonl  # a JSON line per image, printed 256 images at a time
+fewshot predict pets new/ --revision 41       # with an earlier version of the task (one kept for undo)
+fewshot watch pets ./incoming --out ./sorted  # sort new images into ./sorted/<class>/ as they arrive
 fewshot config pets --classifier knn --param k=3 --reject-below 0.7 --flip
 fewshot example ls pets --label Beagle        # also: rm, relabel, tag --add/--remove, note
 fewshot dupes pets                            # near-duplicate examples
@@ -88,6 +91,16 @@ task.add_example(open("crack.jpg", "rb").read(), "crack")
 pred = Pipeline(ws).predict(task, ["new.jpg"])[0]   # .label, .confidence, .similarity, .scores
 ```
 
+To call a running server from another program, `fewshot.client.Client` wraps the REST API with only the standard library (images are paths or `(filename, bytes)` pairs; errors raise `ApiError` with the HTTP status and the server's message):
+
+```python
+from fewshot.client import Client
+fs = Client("http://gpu-box:8000", token="...")
+fs.add_examples("pets", "Beagle", ["a.jpg", "b.jpg"])
+for p in fs.predict("pets", ["new.jpg"], top_k=3):
+    print(p["file"], p["label"], p["confidence"], p["revision"])
+```
+
 `task.undo()`, `task.annotate(ids, add_tags=[...], note=...)`, `ws.rename(old, new)` and `fewshot.archive.export_task` / `import_task` do what the matching commands do. To add many images, `task.add_examples(items)` takes `(bytes, label, source)` tuples (a generator is fine) and saves `task.json` once per 256 images instead of once per image.
 
 To use your own model, subclass `fewshot.embedders.Embedder` (implement `dim` and `_embed_image_batch`, returning L2-normalised float32 rows) and register it under any spec string; `unregister_embedder` removes it again. Output with the wrong shape or non-finite values raises `ValueError`; rows that aren't unit length are normalised. To keep CPU preprocessing outside the per-model lock, also override `_prepare_images` (runs unlocked) and `_embed_prepared` (runs locked).
@@ -100,11 +113,26 @@ task = ws.create("parts", embedder="mine:v1")
 
 ## REST API
 
-`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `PATCH .../examples` (`{"ids": [...], "label": ...}` moves several) and `POST .../examples/delete` (`{"ids": [...]}`), both changing nothing if any id is unknown, `GET .../examples/{id}/image` (`?size=N` returns a JPEG scaled down to fit N×N pixels, 16–2048), `POST .../predict` (multipart `files`, optional `?top_k=N`; an unreadable file gets an `error` field instead of a label), `POST .../evaluate`, `GET /api/health` (also `/healthz`). Also: `GET .../examples?offset=&limit=&label=&tag=` (one page of examples), `PATCH .../examples/{id}` with `tags` and `note`, `PATCH .../examples` with `add_tags`/`remove_tags`, `POST .../undo`, `POST .../rename` (`{"name": ...}`), `GET .../export` (zip) and `POST /api/tasks/import` (multipart `file`, optional `name`), `GET .../duplicates?threshold=0.95`, the inbox (`POST .../inbox` with files, `POST .../inbox/urls`, `GET .../inbox?sort=uncertain|confident|novel|added`, `POST .../inbox/accept` with `{"labels": {id: class}}`, `POST .../inbox/dismiss`), and, on a server started with `--allow-urls`, `POST .../predict/urls` and `POST .../examples/urls` (`{"urls": [...]}`, plus `label` to add). OpenAPI docs are served at `/docs`. Request bodies reject unknown fields (422). Each uploaded image is limited to 50 MB (`FEWSHOT_MAX_UPLOAD_MB`), a whole request to 1024 MB (`FEWSHOT_MAX_REQUEST_MB`, refused with 413 before the body is stored), and a request to 1000 files.
+`GET/POST /api/tasks`, `GET/PATCH/DELETE /api/tasks/{name}`, `POST /api/tasks/{name}/classes`, `PATCH/DELETE .../classes/{label}`, `POST .../describe`, `POST .../examples` (multipart `label` + `files`), `PATCH/DELETE .../examples/{id}`, `PATCH .../examples` (`{"ids": [...], "label": ...}` moves several) and `POST .../examples/delete` (`{"ids": [...]}`), both changing nothing if any id is unknown, `GET .../examples/{id}/image` (`?size=N` returns a JPEG scaled down to fit N×N pixels, 16–2048), `POST .../predict` (multipart `files`, optional `?top_k=N`, `?evidence=N` and `?revision=N` to use an earlier version still kept for undo; each prediction carries the `revision` that made it, and an unreadable file gets an `error` field instead of a label), `POST .../evaluate`, `GET /api/health` (also `/healthz`). Also: `GET .../examples?offset=&limit=&label=&tag=` (one page of examples), `PATCH .../examples/{id}` with `tags` and `note`, `PATCH .../examples` with `add_tags`/`remove_tags`, `POST .../undo`, `POST .../rename` (`{"name": ...}`), `GET .../export` (zip) and `POST /api/tasks/import` (multipart `file`, optional `name`), `GET .../duplicates?threshold=0.95`, the inbox (`POST .../inbox` with files, `POST .../inbox/urls`, `GET .../inbox?sort=uncertain|confident|novel|added`, `POST .../inbox/accept` with `{"labels": {id: class}}`, `POST .../inbox/dismiss`), and, on a server started with `--allow-urls`, `POST .../predict/urls` and `POST .../examples/urls` (`{"urls": [...]}`, plus `label` to add). OpenAPI docs are served at `/docs` and the schema at `/openapi.json`; each operation id is the handler's name (`predict`, `add_examples`, `list_tasks`...), so generated clients get readable method names. Request bodies reject unknown fields (422). Each uploaded image is limited to 50 MB (`FEWSHOT_MAX_UPLOAD_MB`), a whole request to 1024 MB (`FEWSHOT_MAX_REQUEST_MB`, refused with 413 before the body is stored), and a request to 1000 files.
 
 Evaluation of a large task can take a while, so it can also run as a background job: `POST .../evaluate/jobs` returns a job; `GET /api/jobs/{id}` reports `status` (`running`, `done`, `failed`, `cancelled`), `stage` (`embedding` counts images, `evaluating` counts folds), `done`/`total`, and the report as `result` once done; `DELETE /api/jobs/{id}` cancels it. The web UI uses this to show progress and a Cancel button.
 
 When the server was started with a token, send it as `Authorization: Bearer <token>`, or `POST /api/login` with `{"token": ...}` to get a cookie. After 10 wrong tokens within a minute from one address, `/api/login` answers 429 for the rest of that minute; over HTTPS the cookie is `Secure`. At most 4 background jobs run at once (429 beyond that), and starting an evaluation that is already running returns that job. URL downloads share a budget per request: the request size limit in total and 2 minutes in all, 4 at a time. `serve --max-upload-mb/--max-request-mb` set the size limits. `POST /api/tasks/import` also takes an `embedder` field to import with another model; the export's `X-Fewshot-Skipped` header counts examples left out because their image was missing. `/api/health` and `/api/login` need no token.
+
+## Deploying
+
+`fewshot predict` streams: with `--jsonl` or `--csv` each batch of 256 images is printed as soon as it is classified, so a long list (`--from-file`, or `-` for stdin) can be piped onward, and every prediction records the task `revision` that made it. `fewshot watch TASK FOLDER --out OUT` classifies images as they land in FOLDER (once a file's size has stopped changing) and moves each into `OUT/<class>/`, `OUT/_unknown/` (rejected, or below `--min-confidence`) or `OUT/_error/`, appending a JSON line per image to `OUT/predictions.jsonl`; files are never overwritten, `--copy` leaves the originals, `--once` handles what is there and stops, and the task is re-read each time, so labelling more examples improves the sorting while it runs.
+
+The Dockerfile builds the web UI and a server image (CPU PyTorch by default):
+
+```bash
+export FEWSHOT_TOKEN=$(openssl rand -hex 16)
+docker compose up -d                      # http://localhost:8000; sign in with the token
+docker build --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu128 -t fewshot:gpu .   # NVIDIA
+docker run --gpus all -p 8000:8000 -e FEWSHOT_TOKEN -v fewshot-data:/data -v fewshot-models:/models fewshot:gpu
+```
+
+Tasks, images and the embedding cache live in the `/data` volume and downloaded model weights in `/models`, so both survive rebuilds. The container serves on all interfaces, so set `FEWSHOT_TOKEN`, and set `FEWSHOT_ALLOWED_HOSTS` (comma-separated) to the host names clients use when that isn't localhost. It runs as an unprivileged user and its health check polls `/healthz`. Put HTTPS in front of it with a reverse proxy; over HTTPS the login cookie is `Secure`.
 
 ## Tests and checks
 

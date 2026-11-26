@@ -518,14 +518,19 @@ def test_serve_settings(monkeypatch):
     r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--no-warm", "--allow-any-model"])
     assert "Warning: serving on 0.0.0.0 without --token" in ANSI.sub("", r.output)
     assert (os.environ["FEWSHOT_ALLOW_ANY_MODEL"], os.environ["FEWSHOT_WARM"]) == ("1", "")
+    monkeypatch.delenv("FEWSHOT_ALLOWED_HOSTS", raising=False)
     r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--token", "t0k"])
     assert "Warning" not in r.output
     assert os.environ["FEWSHOT_TOKEN"] == "t0k"
     assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "*"  # reached by any name on an open address
+    monkeypatch.delenv("FEWSHOT_ALLOWED_HOSTS")
     runner.invoke(cli.app, ["serve"])
     assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "localhost,127.0.0.1,::1"
-    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allowed-host", "box.lan", "--allowed-host", "10.0.0.5"])
+    monkeypatch.setenv("FEWSHOT_ALLOWED_HOSTS", " box.lan, ,10.0.0.5")  # as in docker-compose.yml
+    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0"])
     assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "box.lan,10.0.0.5"
+    runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allowed-host", "a.lan"])  # the option wins
+    assert os.environ["FEWSHOT_ALLOWED_HOSTS"] == "a.lan"
 
 
 def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):

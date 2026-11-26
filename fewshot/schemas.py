@@ -157,6 +157,7 @@ class PredictionOut(BaseModel):
     rejected: bool
     evidence: list[Evidence]  # the most similar labelled examples, when asked for (?evidence=N)
     error: str | None
+    revision: int | None = None  # the task version that made the prediction
 
 
 class InboxEntry(InboxItemOut):

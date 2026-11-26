@@ -2,21 +2,61 @@
 
 from __future__ import annotations
 
-import contextlib
-import csv
 import json
 import os
+import shutil
 import sys
-from collections.abc import Callable, Iterator, Sequence
+import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any
 
 import typer
 
+from .cli_common import (
+    JSON_OPT,
+    ROOT_OPT,
+    Source,
+)
+from .cli_common import (
+    add_files as _add_files,
+)
+from .cli_common import (
+    echo_json as _echo_json,
+)
+from .cli_common import (
+    error_text as _error_text,
+)
+from .cli_common import (
+    expand as _expand,
+)
+from .cli_common import (
+    fail as _fail,
+)
+from .cli_common import (
+    get_task as _task,
+)
+from .cli_common import (
+    images_in as _images_in,
+)
+from .cli_common import (
+    make_pipeline as _pipe,
+)
+from .cli_common import (
+    progress as _progress,
+)
+from .cli_common import (
+    read_source as _read,
+)
+from .cli_common import (
+    workspace as _ws,
+)
+from .cli_common import (
+    write_csv as _write_csv,
+)
+from .cli_data import ex_app, inbox_app
 from .embedders import DEFAULT_SPEC, PRESETS, check_embedder, spec_supports_text
-from .fetch import fetch_url, is_url
-from .images import IMAGE_EXTS
-from .store import Task, Workspace
+from .store import Workspace
 from .text import check_class_name
 
 if TYPE_CHECKING:
@@ -27,135 +67,8 @@ cls_app = typer.Typer(help="Manage a task's classes.", no_args_is_help=True)
 app.add_typer(cls_app, name="class")
 cache_app = typer.Typer(help="Inspect and prune the embedding cache.", no_args_is_help=True)
 app.add_typer(cache_app, name="cache")
-ex_app = typer.Typer(help="List, move, tag and delete a task's examples (ids may be shortened to a unique "
-                          "prefix of 4+ characters).", no_args_is_help=True)
 app.add_typer(ex_app, name="example")
-inbox_app = typer.Typer(help="Unlabelled images waiting to be labelled, with the model's suggestions (ids may be "
-                             "shortened to a unique prefix of 4+ characters).", no_args_is_help=True)
 app.add_typer(inbox_app, name="inbox")
-
-MAX_DOWNLOAD = 50 * 1024 * 1024  # largest image fetched from a URL
-JSON_OPT = typer.Option(False, "--json", help="Print JSON")
-
-ROOT_OPT = typer.Option(None, "--root", envvar="FEWSHOT_HOME", help="Workspace directory [default: ./fewshot_data]")
-
-
-def _fail(msg: str) -> NoReturn:
-    typer.secho(f"Error: {msg}", fg="red", err=True)
-    raise typer.Exit(1)
-
-
-def _error_text(e: Exception) -> str:
-    # str(KeyError("x")) is "'x'"; the first argument is the readable message.
-    return str(e.args[0]) if isinstance(e, KeyError) and e.args else str(e)
-
-
-def _ws(root: Path | None) -> Workspace:
-    return Workspace(root)
-
-
-def _task(root: Path | None, name: str) -> Task:
-    try:
-        return _ws(root).get(name)
-    except KeyError as e:
-        _fail(_error_text(e))
-
-
-def _pipe(ws: Workspace) -> Pipeline:
-    # Pipeline imports torch; importing it lazily keeps `fewshot --help` fast.
-    from .pipeline import Pipeline  # pylint: disable=import-outside-toplevel
-
-    return Pipeline(ws)
-
-
-Source = Path | str  # an image file, or an http(s) URL
-
-
-def _images_in(folder: Path, recursive: bool = True) -> list[Path]:
-    """Image files under ``folder``, sorted; folders and broken links with image names are left out."""
-    found = folder.rglob("*") if recursive else folder.iterdir()
-    return sorted(f for f in found if f.suffix.lower() in IMAGE_EXTS and f.is_file())
-
-
-def _expand(paths: list[str]) -> list[Source]:
-    """URLs and files named on the command line plus the images inside named folders; fails if
-    there are none."""
-    out: list[Source] = []
-    for arg in paths:
-        if is_url(arg):
-            out.append(arg)
-            continue
-        p = Path(arg)
-        if not p.exists():
-            _fail(f"No such file or directory: {p}")
-        out += _images_in(p) if p.is_dir() else [p]
-    if not out:
-        _fail("No images found in " + ", ".join(paths))
-    return out
-
-
-def _read(src: Source) -> bytes:
-    """The bytes of a file or URL; ``ValueError`` says why they couldn't be read."""
-    if isinstance(src, str):
-        return fetch_url(src, MAX_DOWNLOAD)
-    try:
-        return src.read_bytes()
-    except OSError as e:
-        raise ValueError(e.strerror or str(e)) from None
-
-
-def _name(src: Source) -> str:
-    return src.name if isinstance(src, Path) else src.rstrip("/").rsplit("/", 1)[-1]
-
-
-@contextlib.contextmanager
-def _progress(what: str) -> Iterator[Callable[[int, int], None]]:
-    """A progress bar on stderr while the block runs (only on a terminal); yields ``update(done, total)``."""
-    from rich.console import Console  # pylint: disable=import-outside-toplevel  # keeps --help fast
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn  # pylint: disable=import-outside-toplevel
-
-    with Progress(TextColumn(what), BarColumn(), MofNCompleteColumn(), TimeRemainingColumn(),
-                  console=Console(stderr=True), transient=True, disable=not sys.stderr.isatty()) as progress:
-        tid = progress.add_task(what, total=None)
-        yield lambda done, total: progress.update(tid, completed=done, total=total)
-
-
-def _add_files(task: Task, label: str, files: Sequence[Source]) -> int:
-    """Add ``files`` (paths or URLs) as examples of ``label``, skipping unreadable images; returns
-    how many were added."""
-
-    def readable(update: Callable[[int, int], None]) -> Iterator[tuple[bytes, str, str]]:
-        for i, f in enumerate(files):
-            update(i, len(files))
-            try:
-                data = _read(f)
-            except ValueError as e:
-                typer.secho(f"skip {f}: {e}", fg="yellow", err=True)
-                continue
-            names.append(f)
-            yield data, label, _name(f)
-
-    names: list[Source] = []  # the files actually read, in step with add_examples' results
-    with _progress(f"Adding to {label}") as update:
-        results = task.add_examples(readable(update))
-    n = 0
-    for f, r in zip(names, results, strict=True):
-        if isinstance(r, ValueError):
-            typer.secho(f"skip {f}: {r}", fg="yellow", err=True)
-        else:
-            n += 1
-    return n
-
-
-def _echo_json(obj: Any) -> None:
-    typer.echo(json.dumps(obj, indent=2))
-
-
-def _write_csv(header: list[str], rows: list[list[Any]]) -> None:
-    w = csv.writer(sys.stdout, lineterminator="\n")
-    w.writerow(header)
-    w.writerows(rows)
-
 
 def _check_embedder(spec: str) -> None:
     try:
@@ -468,32 +381,136 @@ def import_dir(
         _fail(f"No images were imported; expected {folder}/<class>/<image>")
 
 
+PREDICT_CHUNK = 256  # images classified (and printed) at a time
+
+
 @app.command()
-def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
+def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
-    paths: list[str],
+    paths: list[str] = typer.Argument(None, help="Image files, directories or http(s) URLs"),
+    from_file: Path | None = typer.Option(None, "--from-file", help="Read more paths or URLs, one per line, from "
+                                                                     "this file ('-' for stdin)"),
     as_json: bool = JSON_OPT,
+    as_jsonl: bool = typer.Option(False, "--jsonl", help="Print one JSON object per image as each batch finishes"),
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: one row per image"),
-    top: int = typer.Option(3, min=1, help="Scores to show per image (and to include, with --json)"),
+    top: int = typer.Option(3, min=1, help="Scores to show per image (and to include, with --json/--jsonl)"),
     evidence: int = typer.Option(0, min=0, max=20, help="Also show this many of the most similar labelled examples"),
+    revision: int | None = typer.Option(None, help="Use this earlier version of the task (one kept for undo)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Classify images (files, directories or http(s) URLs)."""
+    """Classify images (files, directories or http(s) URLs), PREDICT_CHUNK at a time: text, CSV and
+    JSON lines are printed as each batch finishes."""
     t = _task(root, name)
-    files = _expand(paths)
-    images, fetch_errors = _download(files)
+    if sum((as_json, as_jsonl, as_csv)) > 1:
+        _fail("Give at most one of --json, --jsonl and --csv")
+    args = list(paths or [])
+    if from_file is not None:
+        text = sys.stdin.read() if str(from_file) == "-" else from_file.read_text()
+        args += [line.strip() for line in text.splitlines() if line.strip()]
+    if not args:
+        _fail("Give images to classify, or --from-file")
+    files = _expand(args)
+    fmt = "json" if as_json else "jsonl" if as_jsonl else "csv" if as_csv else "text"
     try:
-        with _progress("Embedding") as update:
-            preds = _pipe(_ws(root)).predict(t, images, top_k=top if as_json else None, progress=update,
-                                             evidence=evidence)
-    except ValueError as e:
-        _fail(str(e))
-    preds = _with_fetch_errors(preds, fetch_errors)
-    failed = sum(p.error is not None for p in preds)
-    _output_predictions(files, preds, "json" if as_json else "csv" if as_csv else "text", top)
+        cfg = None if revision is None else t.version(revision)
+    except KeyError as e:
+        _fail(_error_text(e))
+    pipe = _pipe(_ws(root))
+    collected: list[Prediction] = []
+    failed = 0
+    with _progress("Classifying") as update:
+        for start in range(0, len(files), PREDICT_CHUNK):
+            part = files[start : start + PREDICT_CHUNK]
+            images, fetch_errors = _download(part)
+            try:
+                preds = pipe.predict(t, images, top_k=top if fmt in {"json", "jsonl"} else None, evidence=evidence,
+                                     cfg=cfg)
+            except ValueError as e:
+                _fail(str(e))
+            preds = _with_fetch_errors(preds, fetch_errors)
+            failed += sum(p.error is not None for p in preds)
+            if fmt == "json":
+                collected += preds
+            else:
+                _output_predictions(part, preds, fmt, top, header=start == 0)
+            update(start + len(part), len(files))
+    if fmt == "json":
+        _output_predictions(files, collected, fmt, top)
     if failed:
-        typer.secho(f"{failed} of {len(preds)} images could not be read", fg="red", err=True)
+        typer.secho(f"{failed} of {len(files)} images could not be read", fg="red", err=True)
         raise typer.Exit(1)
+
+
+@app.command()
+def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
+    name: str,
+    folder: Path = typer.Argument(..., help="Folder new images arrive in"),
+    out: Path = typer.Option(..., help="Where images go: OUT/<class>/, OUT/_unknown/ (rejected or not confident "
+                                       "enough) or OUT/_error/"),
+    copy: bool = typer.Option(False, "--copy", help="Copy instead of moving (then each file is handled once per run)"),
+    min_confidence: float | None = typer.Option(None, min=0, max=1, help="Below this, an image goes to _unknown"),
+    interval: float = typer.Option(2.0, min=0.1, help="Seconds between looks at the folder"),
+    once: bool = typer.Option(False, "--once", help="Handle what is there now and stop"),
+    root: Path | None = ROOT_OPT,
+) -> None:
+    """Classify images as they arrive in FOLDER and sort them into OUT, logging each to OUT/predictions.jsonl.
+
+    A file is handled once its size has stayed the same for one interval (so half-copied files wait).
+    The task is re-read every time, so labelling more examples improves the sorting as it runs.
+    """
+    if not folder.is_dir():
+        _fail(f"Not a directory: {folder}")
+    ws = _ws(root)
+    _task(root, name)
+    pipe = _pipe(ws)
+    sizes: dict[Path, int] = {}
+    done: set[Path] = set()  # with --copy, files already copied
+    try:
+        while True:
+            ready = []
+            for f in _images_in(folder, recursive=False):
+                size = f.stat().st_size
+                if f not in done and size > 0 and (once or sizes.get(f) == size):
+                    ready.append(f)
+                sizes[f] = size
+            if ready:
+                _sort_files(ws, pipe, name, ready, out, copy, min_confidence)
+                if copy:
+                    done.update(ready)
+            if once:
+                return
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        typer.echo("Stopped")
+
+
+def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out: Path,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                copy: bool, min_confidence: float | None) -> None:
+    """Classify ``files`` with the task's current version and move (or copy) each into its folder
+    under ``out``, appending a JSON line per file to ``out/predictions.jsonl``."""
+    t = ws.get(name)
+    preds = pipe.predict(t, files)
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "predictions.jsonl", "a", encoding="utf-8") as log:
+        for f, p in zip(files, preds, strict=True):
+            unsure = p.rejected or (min_confidence is not None and p.confidence < min_confidence)
+            folder = "_error" if p.error else "_unknown" if unsure or not p.label else p.label
+            dest = _free_name(out / folder / f.name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            (shutil.copy2 if copy else shutil.move)(str(f), str(dest))
+            log.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "file": str(f), "to": str(dest),
+                                  "task": name, **p.to_dict()}) + "\n")
+            typer.echo(f"{f.name} -> {folder}")
+
+
+def _free_name(path: Path) -> Path:
+    """``path``, or ``name-1.ext``, ``name-2.ext``... if it is taken: files are never overwritten."""
+    n = 0
+    candidate = path
+    while candidate.exists():
+        n += 1
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+    return candidate
 
 
 def _with_fetch_errors(preds: list[Prediction], errors: dict[int, str]) -> list[Prediction]:
@@ -503,16 +520,19 @@ def _with_fetch_errors(preds: list[Prediction], errors: dict[int, str]) -> list[
     return [Prediction.failed(errors[i]) if i in errors else p for i, p in enumerate(preds)]
 
 
-def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, top: int) -> None:
-    """Print predictions as JSON, CSV or text."""
+def _output_predictions(files: list[Source], preds: list[Prediction], fmt: str, top: int, header: bool = True) -> None:
+    """Print predictions as JSON, JSON lines, CSV (with a ``header`` row) or text."""
     if fmt == "json":
         _echo_json([{"file": str(f), **p.to_dict()} for f, p in zip(files, preds, strict=True)])
+    elif fmt == "jsonl":
+        for f, p in zip(files, preds, strict=True):
+            typer.echo(json.dumps({"file": str(f), **p.to_dict()}))
     elif fmt == "csv":
         _write_csv(["file", "label", "labels", "top_label", "confidence", "similarity", "rejected", "error", "scores"],
                    [[str(f), p.label or "", ";".join(p.labels), p.top_label, f"{p.confidence:.4f}",
                      f"{p.similarity:.4f}", p.rejected, p.error or "",
                      ";".join(f"{c}={v:.4f}" for c, v in list(p.scores.items())[:top])]
-                    for f, p in zip(files, preds, strict=True)])
+                    for f, p in zip(files, preds, strict=True)], header)
     else:
         _print_predictions(files, preds, top)
 
@@ -687,7 +707,8 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     max_request_mb: float = typer.Option(1024, help="Largest request body accepted"),
     allowed_host: list[str] = typer.Option(
         [], "--allowed-host", help="Host name clients use to reach the server; others are refused. Repeatable. "
-                                   "[default: localhost names when serving locally, else any]"),
+                                   "[default: $FEWSHOT_ALLOWED_HOSTS (comma-separated), else localhost names when "
+                                   "serving locally, else any]"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Run the REST API and web UI."""
@@ -697,7 +718,8 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     if root:
         os.environ["FEWSHOT_HOME"] = str(root)
     local = host in {"127.0.0.1", "localhost", "::1"}
-    hosts = allowed_host or (["localhost", "127.0.0.1", "::1"] if local else ["*"])
+    from_env = [h.strip() for h in os.environ.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    hosts = allowed_host or from_env or (["localhost", "127.0.0.1", "::1"] if local else ["*"])
     # fewshot.api reads its settings from the environment when uvicorn imports it.
     settings = {
         "FEWSHOT_TOKEN": token or "", "FEWSHOT_ALLOW_ANY_MODEL": "1" if allow_any_model else "",
@@ -769,183 +791,6 @@ def _mb(n: int) -> str:
     return f"{n / 1024 / 1024:.1f} MB"
 
 
-# ---- examples -------------------------------------------------------------
-def _ids(t: Task, ids: list[str]) -> list[str]:
-    try:
-        return t.resolve_ids(ids)
-    except KeyError as e:
-        _fail(_error_text(e))
-
-
-@ex_app.command("ls")
-def example_ls(
-    name: str,
-    label: str | None = typer.Option(None, help="Only this class"),
-    tag: str | None = typer.Option(None, help="Only examples with this tag"),
-    as_json: bool = JSON_OPT,
-    root: Path | None = ROOT_OPT,
-) -> None:
-    """List examples: id, class, tags, source file and note."""
-    found = _task(root, name).find_examples(label, tag)
-    if as_json:
-        _echo_json([e.model_dump() for e in found])
-        return
-    for e in found:
-        tags = f"  [{', '.join(e.tags)}]" if e.tags else ""
-        note = f"  # {e.note}" if e.note else ""
-        typer.echo(f"{e.id[:12]}  {e.label:20} {e.source}{tags}{note}")
-
-
-@ex_app.command("rm")
-def example_rm(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
-    """Delete examples (undo brings them back)."""
-    t = _task(root, name)
-    n = t.delete_examples(_ids(t, ids))
-    typer.echo(f"Deleted {n} examples")
-
-
-@ex_app.command("relabel")
-def example_relabel(name: str, label: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
-    """Move examples to class LABEL (created if needed)."""
-    t = _task(root, name)
-    try:
-        n = t.relabel_many(_ids(t, ids), label)
-    except ValueError as e:
-        _fail(str(e))
-    typer.echo(f"Moved {n} examples to {label}")
-
-
-@ex_app.command("tag")
-def example_tag(
-    name: str,
-    ids: list[str],
-    add_tag: list[str] = typer.Option([], "--add", help="Tag to add. Repeatable."),
-    remove_tag: list[str] = typer.Option([], "--remove", help="Tag to remove. Repeatable."),
-    root: Path | None = ROOT_OPT,
-) -> None:
-    """Add or remove tags on examples."""
-    if not add_tag and not remove_tag:
-        _fail("Give --add and/or --remove")
-    t = _task(root, name)
-    try:
-        n = t.annotate(_ids(t, ids), add_tags=add_tag, remove_tags=remove_tag)
-    except ValueError as e:
-        _fail(str(e))
-    typer.echo(f"Tagged {n} examples")
-
-
-@ex_app.command("note")
-def example_note(name: str, example_id: str, note: str, root: Path | None = ROOT_OPT) -> None:
-    """Set an example's note ("" clears it)."""
-    t = _task(root, name)
-    try:
-        t.annotate(_ids(t, [example_id]), note=note)
-    except ValueError as e:
-        _fail(str(e))
-    typer.echo("Note saved")
-
-
-# ---- inbox ----------------------------------------------------------------
-def _inbox_ids(t: Task, prefixes: list[str]) -> list[str]:
-    ids = [x.id for x in t.config.inbox]
-    out = []
-    for p in prefixes:
-        hits = [i for i in ids if i.startswith(p)] if len(p) >= 4 else []
-        if len(hits) != 1:
-            _fail(f"No inbox image {p!r}" if not hits else f"Inbox id {p!r} is ambiguous")
-        out.append(hits[0])
-    return out
-
-
-@inbox_app.command("add")
-def inbox_add(name: str, paths: list[str], root: Path | None = ROOT_OPT) -> None:
-    """Put unlabelled images (files, directories or http(s) URLs) in the inbox; exits 1 if none could be."""
-    t = _task(root, name)
-    files = _expand(paths)
-    names: list[Source] = []
-
-    def readable(update: Callable[[int, int], None]) -> Iterator[tuple[bytes, str]]:
-        for i, f in enumerate(files):
-            update(i, len(files))
-            try:
-                data = _read(f)
-            except ValueError as e:
-                typer.secho(f"skip {f}: {e}", fg="yellow", err=True)
-                continue
-            names.append(f)
-            yield data, _name(f)
-
-    with _progress("Adding to the inbox") as update:
-        results = t.add_to_inbox(readable(update))
-    for f, r in zip(names, results, strict=True):
-        if isinstance(r, ValueError):
-            typer.secho(f"skip {f}: {r}", fg="yellow", err=True)
-    n = sum(not isinstance(r, ValueError) for r in results)
-    typer.echo(f"{name}: {len(t.config.inbox)} images in the inbox")
-    if n == 0:
-        _fail("Nothing was added to the inbox")
-
-
-@inbox_app.command("ls")
-def inbox_ls(
-    name: str,
-    sort: str = typer.Option("uncertain", help="uncertain (most useful to label first) | confident | novel | added"),
-    limit: int = typer.Option(50, min=1, help="Show at most this many"),
-    as_json: bool = JSON_OPT,
-    root: Path | None = ROOT_OPT,
-) -> None:
-    """List inbox images with the model's suggestion, in the order to label them."""
-    t = _task(root, name)
-    try:
-        items = _pipe(_ws(root)).inbox_suggestions(t, sort)[:limit]
-    except ValueError as e:
-        _fail(str(e))
-    if as_json:
-        _echo_json(items)
-        return
-    for i in items:
-        p = i.get("prediction")
-        hint = "" if p is None else (f"unknown (closest: {p['top_label']})" if p["rejected"] else p["label"])
-        stats = "" if p is None else f"conf={p['confidence']:.2f} margin={i['margin']:.2f} sim={p['similarity']:.3f}"
-        typer.echo(f"{i['id'][:12]}  {hint:24} {stats}  {i['source']}")
-    typer.echo(f"{len(t.config.inbox)} images in the inbox")
-
-
-@inbox_app.command("accept")
-def inbox_accept(
-    name: str,
-    ids: list[str] = typer.Argument(None, help="Inbox ids to label as --label"),
-    label: str | None = typer.Option(None, help="Class for the given ids"),
-    min_confidence: float | None = typer.Option(
-        None, min=0, max=1, help="Instead, accept every suggestion at least this confident (not rejected)"),
-    root: Path | None = ROOT_OPT,
-) -> None:
-    """Label inbox images as examples: the given ids as --label, or every suggestion above --min-confidence."""
-    t = _task(root, name)
-    if (min_confidence is None) == (label is None) or (label is not None and not ids):
-        _fail("Give ids with --label, or --min-confidence alone")
-    if label is not None:
-        labels = dict.fromkeys(_inbox_ids(t, ids or []), label)
-    else:
-        items = _pipe(_ws(root)).inbox_suggestions(t, "confident")
-        labels = {i["id"]: i["prediction"]["label"] for i in items if i.get("prediction")
-                  and not i["prediction"]["rejected"] and i["prediction"]["confidence"] >= (min_confidence or 0)}
-    if not labels:
-        typer.echo("Nothing to accept")
-        return
-    try:
-        n = t.accept(labels)
-    except (KeyError, ValueError) as e:
-        _fail(_error_text(e))
-    typer.echo(f"Labelled {n} inbox images; {len(t.config.inbox)} left")
-
-
-@inbox_app.command("dismiss")
-def inbox_dismiss(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
-    """Remove images from the inbox without labelling them (undo brings them back)."""
-    t = _task(root, name)
-    n = t.dismiss(_inbox_ids(t, ids))
-    typer.echo(f"Dismissed {n} images; {len(t.config.inbox)} left")
 
 
 if __name__ == "__main__":
