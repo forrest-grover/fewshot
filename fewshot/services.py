@@ -12,12 +12,13 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .classifiers import PARAM_MAX
 from .embedders import check_embedder
 from .fetch import fetch_url
 from .folders import class_folders, read_or_empty
@@ -54,28 +55,56 @@ def create_task(ws: Workspace, name: str, embedder: str | None = None, classifie
     return ws.create(name, **kw)
 
 
-def change_settings(task: Task, values: dict[str, Any], clear: dict[str, str] | None = None,  # pylint: disable=too-many-arguments
-                    merge_params: dict[str, Any] | None = None, *, embedder_ok: SpecCheck | None = None
-                    ) -> list[str]:
-    """Change ``task``'s settings: ``values`` are set, the settings in ``clear`` unset (it maps
-    each to what the caller calls clearing it, such as ``{"reject_below": "clear_reject"}``), and
-    ``merge_params`` set on top of the classifier's params (see ``Task.update_settings`` for the
-    rules). A new embedder is checked with ``embedder_ok`` (default
-    ``check_embedder``).
-    Returns the fitted settings the change cleared.
+@dataclass(frozen=True)
+class SettingsChange:
+    """A change to a task's settings, named by setting (see ``settings.SETTINGS``), whatever
+    interface asked for it: ``values`` to set, settings to ``clear`` (unset), and ``merge_params``
+    to set on top of the classifier's params (see ``Task.update_settings`` for the rules)."""
 
-    Raises ``ValueError`` for a setting both given and cleared, or a bad value."""
-    kw = dict(values)
-    for key, flag in (clear or {}).items():
+    values: Mapping[str, Any] = field(default_factory=dict)
+    clear: frozenset[str] = frozenset()
+    merge_params: Mapping[str, Any] = field(default_factory=dict)
+
+
+class SettingConflict(ValueError):
+    """A setting a change both sets and clears; ``setting`` names it, for an interface to say
+    which of its own options or fields clash."""
+
+    def __init__(self, setting: str) -> None:
+        super().__init__(f"{setting} can't be both set and cleared")
+        self.setting = setting
+
+
+def apply_settings(task: Task, change: SettingsChange, *, embedder_ok: SpecCheck | None = None) -> list[str]:
+    """Make ``change`` to ``task``'s settings; a new embedder is checked with ``embedder_ok``
+    (default ``check_embedder``) first. Returns the fitted settings the change cleared.
+
+    Raises ``SettingConflict`` for a setting both set and cleared, and ``ValueError`` naming the
+    setting for a bad value."""
+    kw = dict(change.values)
+    for key in sorted(change.clear):
         if kw.get(key) is not None:
-            raise ValueError(f"Give either {key} or {flag}, not both")
+            raise SettingConflict(key)
         kw[key] = None
+    if (w := kw.get("text_weight")) is not None and not 0 <= w <= PARAM_MAX["text_weight"]:
+        # checked here too so the message names the setting, not a classifier parameter
+        raise ValueError(f"text_weight must be between 0 and {PARAM_MAX['text_weight']:g}, got {w}")
     if "embedder" in kw:
         if kw["embedder"] == task.config.embedder:
             del kw["embedder"]
         else:
             (embedder_ok or check_embedder)(kw["embedder"])
-    return task.update_settings(merge_params=merge_params, **kw)
+    return task.update_settings(merge_params=dict(change.merge_params) or None, **kw)
+
+
+def change_settings(task: Task, values: dict[str, Any], clear: dict[str, str] | None = None,
+                    *, embedder_ok: SpecCheck | None = None) -> list[str]:
+    """``apply_settings`` for the REST API until it builds a ``SettingsChange`` itself: ``clear``
+    maps each setting to clear to the request field that clears it, for the error message."""
+    try:
+        return apply_settings(task, SettingsChange(values, frozenset(clear or {})), embedder_ok=embedder_ok)
+    except SettingConflict as e:
+        raise ValueError(f"Give either {e.setting} or {(clear or {})[e.setting]}, not both") from None
 
 
 def check_specs(specs: Iterable[str], limit: int | None = None) -> list[str]:

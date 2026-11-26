@@ -174,7 +174,13 @@ def test_config_and_create_validate_embedders(run, root, task):
     assert not (root / "tasks" / "new").exists()
     r = run("config", task, "--reject-below", "0.5", "--clear-reject")
     assert r.exit_code == 2  # a usage error
-    assert "not both" in r.output
+    assert "Give either --reject-below or --clear-reject, not both" in r.output
+    r = run("config", task, "--reject-below-zero-shot", "0.2", "--clear-reject-zero-shot")
+    assert r.exit_code == 2
+    assert "Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both" in r.output
+    r = run("config", task, "--text-weight", "-5")
+    assert r.exit_code == 1
+    assert "Error: text_weight must be between 0 and 100, got -5" in r.output
 
 
 @pytest.mark.parametrize(("args", "message"), [

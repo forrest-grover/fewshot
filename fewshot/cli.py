@@ -156,22 +156,24 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     """Change task settings; --param sets classifier params on top of the current ones, and switching
     classifier starts its params afresh (then --param sets some)."""
     t = _task(root, name)
-    if clear_reject and reject_below is not None:
-        _usage("Give either --reject-below or --clear-reject, not both")
-    if clear_reject_zero_shot and reject_below_zero_shot is not None:
-        _usage("Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both")
     values = {"embedder": embedder, "classifier": classifier or None, "text_weight": text_weight,
               "reject_below": reject_below, "reject_below_zero_shot": reject_below_zero_shot, "flip": flip,
               "names_as_text": names, "temperature": temperature}
-    flags = {"reject_below": ("--clear-reject", clear_reject),
-             "reject_below_zero_shot": ("--clear-reject-zero-shot", clear_reject_zero_shot)}
-    clear = {k: flag for k, (flag, on) in flags.items() if on}
+    clears = {"reject_below": clear_reject, "reject_below_zero_shot": clear_reject_zero_shot}
+    change = services.SettingsChange({k: v for k, v in values.items() if v is not None},
+                                     frozenset(k for k, on in clears.items() if on), _parse_params(param))
     try:
-        _say_cleared(name, services.change_settings(t, {k: v for k, v in values.items() if v is not None}, clear,
-                                                     _parse_params(param)))
+        _say_cleared(name, services.apply_settings(t, change))
+    except services.SettingConflict as e:
+        set_flag, clear_flag = _CONFIG_FLAGS[e.setting]
+        _usage(f"Give either {set_flag} or {clear_flag}, not both")
     except ValueError as e:
         _fail(str(e))
     show(name, False, root)
+
+
+_CONFIG_FLAGS = {"reject_below": ("--reject-below", "--clear-reject"),  # setting: (its option, clearing it)
+                 "reject_below_zero_shot": ("--reject-below-zero-shot", "--clear-reject-zero-shot")}
 
 
 def _say_cleared(name: str, cleared: list[str]) -> None:

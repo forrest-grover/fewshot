@@ -30,19 +30,35 @@ def test_settings_rules_live_in_the_library(ws):
     assert t.config.temperature is None  # 1 means uncalibrated, from any interface
 
 
-def test_change_settings_checks_clears_and_embedders(ws):
-    """change_settings refuses a value both set and cleared and checks only a new embedder."""
+def test_apply_settings_checks_clears_and_embedders(ws):
+    """apply_settings refuses a setting both set and cleared, naming the setting (not any
+    interface's option), and checks only a new embedder."""
     t = two_each(ws)
     t.update_settings(reject_below=0.5)
-    with pytest.raises(ValueError, match="not both"):
-        services.change_settings(t, {"reject_below": 0.4}, {"reject_below": "clear_reject"})
-    services.change_settings(t, {}, {"reject_below": "clear_reject"})
+    with pytest.raises(services.SettingConflict, match="reject_below can't be both set and cleared") as e:
+        services.apply_settings(t, services.SettingsChange({"reject_below": 0.4}, frozenset({"reject_below"})))
+    assert e.value.setting == "reject_below"
+    services.apply_settings(t, services.SettingsChange(clear=frozenset({"reject_below"})))
     assert t.config.reject_below is None
     checked: list[str] = []
-    services.change_settings(t, {"embedder": "fake:color"}, embedder_ok=checked.append)
+    services.apply_settings(t, services.SettingsChange({"embedder": "fake:color"}), embedder_ok=checked.append)
     assert not checked  # unchanged: not checked again
     with pytest.raises(ValueError, match="nobackend"):
-        services.change_settings(t, {"embedder": "nobackend:x"})
+        services.apply_settings(t, services.SettingsChange({"embedder": "nobackend:x"}))
+    services.apply_settings(t, services.SettingsChange({"classifier": "knn"}, merge_params={"k": 2}))
+    assert t.config.classifier_params == {"k": 2}
+    for bad in (-5, 101, float("nan")):
+        with pytest.raises(ValueError, match=r"^text_weight must be between 0 and 100"):
+            services.apply_settings(t, services.SettingsChange({"text_weight": bad}))
+
+
+def test_change_settings_names_the_request_fields(ws):
+    """change_settings, for the REST API, says which request fields clash."""
+    t = two_each(ws)
+    with pytest.raises(ValueError, match="Give either reject_below or clear_reject, not both"):
+        services.change_settings(t, {"reject_below": 0.4}, {"reject_below": "clear_reject"})
+    services.change_settings(t, {"reject_below": 0.4})
+    assert t.config.reject_below == 0.4
 
 
 def test_check_specs():
