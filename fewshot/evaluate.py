@@ -11,7 +11,16 @@ from typing import Any
 
 import numpy as np
 
-from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, log_clamped, make_classifier, temper, top_k
+from .classifiers import (
+    ClassData,
+    KNNClassifier,
+    PrototypeClassifier,
+    knn_similarity,
+    log_clamped,
+    make_classifier,
+    temper,
+    top_k,
+)
 from .folders import class_folders
 from .models import TaskConfig
 from .pipeline import Pipeline, new_classifier
@@ -193,7 +202,7 @@ def _loo_knn(clf: KNNClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
     """Probabilities and the similarity to the predicted class (its nearest other example) for
     ``rows``, each voted on by the other examples."""
     C = present.shape[1]
-    S = X[rows] @ X.T
+    S = knn_similarity(X[rows], X)  # as KNNClassifier computes it, so ties break the same way
     S[np.arange(len(rows)), rows] = -np.inf  # not its own neighbour
     k = min(clf.k, len(X) - 1)
     if k < 1:  # a single example: nothing left to vote

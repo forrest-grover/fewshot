@@ -52,6 +52,21 @@ def test_fast_knn_leave_one_out_matches_refitting_on_ties(k, at, labels):
     assert np.allclose(fast.conf, slow.conf, atol=1e-5)
 
 
+@pytest.mark.parametrize("k", [1, 3, 5])
+def test_fast_knn_leave_one_out_matches_refitting_on_float32_duplicates(k):
+    """Duplicates of dense float32 vectors tie exactly in both: in float32 BLAS can score one copy
+    1.0 and another 0.99999994 depending on its column, so refitting picked other neighbours."""
+    rng = np.random.default_rng(0)
+    v = rng.normal(size=(4, 16))
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    data = ClassData(["a", "b", "c"], v[rng.integers(0, 4, 40)].astype(np.float32), rng.integers(0, 3, 40))
+    cfg = TaskConfig(name="t", classifier="knn", classifier_params={"k": k})
+    fast = ev._fast_leave_one_out(data, cfg, None)  # pylint: disable=protected-access
+    slow = _slow_leave_one_out(data, cfg)
+    assert np.array_equal(fast.pred, slow.pred)
+    assert np.allclose(fast.conf, slow.conf, atol=1e-5)
+
+
 def test_fast_knn_with_a_single_example(ws):
     """One example leaves nothing to vote with: nothing is scored."""
     t = ws.create("t", embedder="fake:color", classifier="knn")

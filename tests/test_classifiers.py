@@ -584,13 +584,13 @@ def test_knn_compares_with_examples_once(monkeypatch):
     X = np.eye(3, dtype=np.float32)
     clf = make_classifier("knn", k=2).fit(ClassData(["a", "b", "c"], X, np.arange(3)))
     calls = []
-    real = classifiers.Classifier._support_similarity  # pylint: disable=protected-access
+    real = classifiers.KNNClassifier._support_similarity  # pylint: disable=protected-access
 
     def counted(self, Q):
         calls.append(len(Q))
         return real(self, Q)
 
-    monkeypatch.setattr(classifiers.Classifier, "_support_similarity", counted)
+    monkeypatch.setattr(classifiers.KNNClassifier, "_support_similarity", counted)
     clf.predict_full(X)
     assert calls == [3]
     clf._image_logprobs(X)  # pylint: disable=protected-access  # without S, the hook computes it
