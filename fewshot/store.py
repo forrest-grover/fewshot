@@ -37,7 +37,6 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator
@@ -54,6 +53,7 @@ from .fsutil import FileStamp, os_reason, reclaim
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import file_lock as _file_lock
 from .fsutil import fsync_dir as _fsync_dir
+from .fsutil import mkstemp as _mkstemp
 from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
@@ -250,7 +250,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         made: list[Path] = []
         stale_redo: Path | None = None
         self._pending_ino = None
-        fd, tmp = tempfile.mkstemp(dir=self.path, prefix=".task.json.", suffix=".tmp")
+        fd, tmp = _mkstemp(self.path / "task.json")
         try:
             with os.fdopen(fd, "wb") as f:
                 self._pending_ino = os.fstat(f.fileno()).st_ino
@@ -540,7 +540,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         checked = [_check_item(*item) for item in batch]  # decoding happens here, before locking
         out: list[Example | ValueError] = []
         created: list[str] = []
-        with self._writing():
+        with self._writing(), self._new_files(created):  # storing some may fail (a full disk)
             examples = self.config.examples
             at = {e.id: i for i, e in enumerate(examples)}  # id -> position
             legacy = {e.id: i for i, e in enumerate(examples) if len(e.id) == 16}  # 16 chars: older tasks
@@ -572,14 +572,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
     def _save_new(self, created: list[str], record: bool, label: str) -> None:
         """``_save`` after storing new image files; if the save fails before committing, the files
         ``created`` (named by no saved version) are removed again."""
-        commits = self._commits
-        try:
+        with self._new_files(created):
             self._save(record=record, label=label)
-        except BaseException:
-            if not self._committed_since(commits):  # no version names them
-                for f in created:
-                    self._drop_file(f)
-            raise
 
     def _ensure_class(self, label: str) -> None:
         """Add class ``label`` (already checked) if missing, without saving."""

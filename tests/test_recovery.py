@@ -1,5 +1,6 @@
 """Crash safety and clean-up: interrupted renames, creates and deletes, failed adds, and gc."""
 
+import errno
 import fcntl
 import os
 import shutil
@@ -156,3 +157,96 @@ def test_claim_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(fcntl, "flock", replaced)
     with fsutil.claim_dir(p) as held:
         assert not held
+
+
+def test_a_full_disk_part_way_through_an_add_leaves_no_images(ws, monkeypatch):
+    """Storing the third image of a chunk fails (ENOSPC): the two stored before it, named by no
+    version, go again, shared copies too."""
+    t = red_task(ws, n=1)
+    before = sorted(p.name for p in (t.path / "images").iterdir())
+    real, calls = store.Task._store_image, []  # pylint: disable=protected-access
+
+    def filling(self, file, data):
+        calls.append(file)
+        if len(calls) == 3:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, file, data)
+
+    monkeypatch.setattr(store.Task, "_store_image", filling)
+    with pytest.raises(OSError, match="No space"):
+        t.add_examples([(png(GREEN, noise=10, seed=i), "green", "") for i in range(5)])
+    assert sorted(p.name for p in (t.path / "images").iterdir()) == before
+    assert ws.gc_blobs() == 0
+
+
+def test_gc_removes_files_half_written_by_a_crash(ws):
+    """Temporary files a crashed write left in a task (task.json, an image, a kept version's side
+    file) are removed by gc."""
+    t = red_task(ws, n=1)
+    t.upsert_class("x")
+    t.undo()
+    stale = [t.path / ".task.json.abc.tmp", t.path / "images" / ".x.png.abc.tmp",
+             t.path / "history" / ".0000000001.label.abc.tmp", t.path / "history" / "redo" / ".x.tmp"]
+    for f in stale:
+        f.write_text("half")
+    ws.gc()
+    assert not [f for f in stale if f.exists()]
+    assert t.class_names() == ["red"]
+
+
+def test_undo_skips_steps_a_crash_left_that_change_nothing(ws):
+    """A save killed after keeping the current version but before replacing task.json, or an undo
+    killed after restoring a version but before forgetting it, leaves a step that would restore
+    what is already there: undo skips it."""
+    t = red_task(ws, n=1)
+    t.upsert_class("a")
+    t.upsert_class("b")
+    rev = t.config.revision
+    os.link(t.path / "task.json", t.path / "history" / f"{rev:010d}.json")  # the killed save's version
+    t = Workspace(ws.root).get("t")
+    t.undo()
+    assert t.class_names() == ["red", "a"]
+    newest = sorted((t.path / "history").glob("*.json"))[-1]
+    kept = newest.read_bytes()
+    t.undo()
+    newest.write_bytes(kept)  # as if the undo was killed before forgetting the version it restored
+    t = Workspace(ws.root).get("t")
+    assert t.class_names() == ["red"]
+    t.undo()  # skips the restored version
+    assert t.class_names() == []
+    with pytest.raises(ValueError, match="Nothing to undo"):
+        t.undo()
+
+
+def test_kept_versions_and_undo_are_durable(ws, monkeypatch):
+    """The history folder is synced once a version is kept (before the save commits) and once
+    undo forgets the version it restored."""
+    t = red_task(ws, n=1)
+    synced: list[object] = []
+    monkeypatch.setattr(history, "_fsync_dir", synced.append)
+    t.upsert_class("a")
+    assert t.path / "history" in synced
+    synced.clear()
+    t.undo()
+    assert synced.count(t.path / "history") == 1  # the redo version goes in history/redo
+    assert t.path / "history" / "redo" in synced
+
+
+def test_new_files_get_the_umask_not_0600(ws, monkeypatch, tmp_path):
+    """tempfile makes files 0600; the store's files get 0666 less the umask, so a group can share
+    a workspace."""
+    monkeypatch.setattr(fsutil, "_UMASK", 0o002)
+    t = red_task(ws, n=0)
+    t.add_example(png(RED), "red")
+    for f in (t.path / "task.json", t.path / t.config.examples[0].file):
+        assert f.stat().st_mode & 0o777 == 0o664
+    fsutil.write_atomic(tmp_path / "x", b"data")
+    assert (tmp_path / "x").stat().st_mode & 0o777 == 0o664
+
+    def refused(*_):
+        raise PermissionError("not allowed")
+
+    monkeypatch.setattr(os, "fchmod", refused)
+    with pytest.raises(PermissionError):
+        fsutil.write_atomic(tmp_path / "y", b"data")
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != "ws") == ["x"]

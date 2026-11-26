@@ -172,10 +172,34 @@ def _write_synced(fd: int, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
+def _read_umask() -> int:
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+_UMASK = _read_umask()  # read once: setting it to read it isn't thread-safe
+
+
+def mkstemp(path: Path) -> tuple[int, str]:
+    """A new temporary file next to ``path`` (``.<name>.*.tmp``), open for writing, with the
+    permissions an ordinary new file gets (``tempfile`` makes it 0600 whatever the umask, which
+    would lock the group out of a shared workspace). Returns its descriptor and path."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    if hasattr(os, "fchmod"):  # pragma: no branch  # POSIX
+        try:
+            os.fchmod(fd, 0o666 & ~_UMASK)
+        except BaseException:
+            os.close(fd)
+            os.unlink(tmp)
+            raise
+    return fd, tmp
+
+
 def write_atomic(path: Path, data: bytes) -> None:
     """Write ``path`` so that readers see either nothing or all of ``data``, and the content is on
     disk before the name points at it. (The rename itself is durable after ``fsync_dir``.)"""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = mkstemp(path)
     try:
         _write_synced(fd, data)
         os.replace(tmp, path)
@@ -190,7 +214,7 @@ def create_exclusive(path: Path, data: bytes) -> bool:
     created. Readers never see it partly written, and its content is on disk before it is linked
     into place. Raises ``OSError`` where hard links aren't supported (the file is written aside
     and linked into place)."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = mkstemp(path)
     try:
         _write_synced(fd, data)
         os.link(tmp, path)

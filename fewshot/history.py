@@ -23,12 +23,13 @@ import sys
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from .fsutil import fsync_dir as _fsync_dir
 from .fsutil import write_atomic as _write_atomic
 
 if TYPE_CHECKING:
@@ -115,6 +116,7 @@ class TaskHistory:
     path: Path
     config: TaskConfig
     _commits: int
+    _pending_ino: int | None
     # The kept version ``version`` parsed last, keyed by its file, for repeated predictions at it.
     _version_memo: tuple[tuple[str, int, int, int], TaskConfig] | None = None
 
@@ -149,11 +151,26 @@ class TaskHistory:
                 if data:
                     _write_atomic(snap.with_suffix(suffix), data.encode())
                     made.append(snap.with_suffix(suffix))
+            _fsync_dir(hist)  # kept before the save it belongs to commits
         except BaseException:
             for f in made:
                 f.unlink(missing_ok=True)
             raise
         return made
+
+    @contextlib.contextmanager
+    def _new_files(self, created: list[str]) -> Iterator[None]:
+        """Remove the image files listed in ``created`` (stored in the block, named by no saved
+        version) if the block fails before a save commits."""
+        commits = self._commits
+        self._pending_ino = None  # a save before the block is no commit of the block's
+        try:
+            yield
+        except BaseException:
+            if not self._committed_since(commits):
+                for f in created:
+                    self._drop_file(f)
+            raise
 
     @staticmethod
     def _forget(snap: Path) -> None:
@@ -315,6 +332,9 @@ class TaskHistory:
         with self._writing():
             for stale in (self.path / "history").glob(".redo-*"):  # set aside by a save that crashed
                 shutil.rmtree(stale, ignore_errors=True)
+            for folder in (self.path, self.path / "images", self.path / "history", self.path / "history" / "redo"):
+                for tmp in folder.glob(".*.tmp"):  # half-written by a write that crashed (writes hold the lock)
+                    tmp.unlink(missing_ok=True)
             used = self.config.files() | self._redo_files()
             used |= set().union(*(self._files_in(p) for _, p in self._history()))
             images = self.path / "images"
@@ -377,11 +397,18 @@ class TaskHistory:
         increases. Raises ``ValueError`` if there is nothing to undo.
         """
         with self._writing():
-            snaps = self._history()
-            if not snaps:
-                raise ValueError("Nothing to undo")
-            rev, snap = snaps[-1]
-            old = self._restorable(snap, "undo")
+            while True:
+                snaps = self._history()
+                if not snaps:
+                    raise ValueError("Nothing to undo")
+                rev, snap = snaps[-1]
+                old = self._restorable(snap, "undo")
+                if not self._same(old):
+                    break
+                # A step that changes nothing: left by a crash (after a version was kept but
+                # before the save replaced task.json, or after an undo but before it forgot the
+                # version it restored), or a save that changed nothing. Skip it.
+                self._forget(snap)
             # The current version becomes the next redo, under the undone change's description.
             redo = self._snapshot(self.config.revision, [], self._label(snap), folder="history/redo")
             commits = self._commits
@@ -393,7 +420,12 @@ class TaskHistory:
                         f.unlink(missing_ok=True)
                 raise
             self._forget(snap)
+            _fsync_dir(snap.parent)  # else a power cut could bring the step back as a no-op one
             return rev
+
+    def _same(self, cfg: TaskConfig) -> bool:
+        """Whether kept version ``cfg`` is the current one, but for name, uid and revision."""
+        return cfg.model_copy(update={k: getattr(self.config, k) for k in ("name", "uid", "revision")}) == self.config
 
     def redo(self) -> int:
         """Make the last undone change again; returns the revision it had. Raises ``ValueError``
