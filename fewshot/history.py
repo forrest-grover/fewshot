@@ -102,6 +102,13 @@ class _SnapshotFiles:  # pylint: disable=too-few-public-methods  # a memo
 _snapshot_files = _SnapshotFiles(MEMO_FILES)
 
 
+def _inode(path: Path) -> int | None:
+    try:
+        return path.stat().st_ino
+    except OSError:
+        return None
+
+
 class TaskHistory:
     """The undo/redo half of ``store.Task``, which provides the attributes and methods declared here."""
 
@@ -234,6 +241,31 @@ class TaskHistory:
         files -= self._redo_files()
         for f in files:
             self._drop_file(f)
+
+    def _ahead(self, cfg: TaskConfig, ino: int) -> TaskConfig:
+        """``cfg``, just read from task.json (inode ``ino``), with a revision above every kept and
+        undone version's and at least the last evaluation's.
+
+        Saves keep it so, but a task.json put back by hand (say, a kept version copied over it)
+        carries an old revision: kept as it is, its version would sort below older ones for undo
+        and pruning, a save would replace the kept version of the same revision, and an
+        evaluation of another version would show as current. It is taken as a new version, with
+        the next revision (written by the next save). A kept version that *is* task.json, left by
+        a save interrupted before replacing it, doesn't count."""
+        revs = [rev for rev, snap in [*self._history(), *self._redo_list()]
+                if not (rev == cfg.revision and _inode(snap) == ino)]
+        evaluated = (self.last_evaluation() or {}).get("revision")
+        evaluated = evaluated if isinstance(evaluated, int) else -1
+        top = max([*revs, evaluated], default=-1)
+        if cfg.revision > top or cfg.revision == evaluated > max(revs, default=-1):
+            return cfg
+        log.warning("%s: task.json has revision %d, but a kept version or evaluation has a later one; taking it as "
+                    "revision %d", self.path, cfg.revision, top + 1)
+        return cfg.model_copy(update={"revision": top + 1})
+
+    def last_evaluation(self) -> dict[str, Any] | None:  # pragma: no cover  # Task's
+        """Task's."""
+        raise NotImplementedError
 
     def _history(self) -> list[tuple[int, Path]]:
         """Kept versions as ``(revision, path)``, oldest first."""

@@ -116,6 +116,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
     def __init__(self, path: Path, config: TaskConfig, stamp: FileStamp | None = None,
                  blobs: Path | None = None) -> None:
         self.path = path
+        if stamp is not None:  # read from task.json
+            config = self._ahead(config, stamp[0])
         self.blobs = blobs  # the workspace's shared image store, if any
         self._writer: int | None = None  # thread id of the mutation in progress, if any
         self._draft: TaskConfig | None = None  # the config that mutation is editing
@@ -158,7 +160,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         with self._state:
             if self._stamp == _stamp(os.stat(self.path / "task.json")):
                 return False
-            self._published, self._stamp = _read_config(self.path)
+            cfg, self._stamp = _read_config(self.path)
+            self._published = self._ahead(cfg, self._stamp[0])
             return True
 
     @contextlib.contextmanager

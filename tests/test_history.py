@@ -2,6 +2,10 @@
 per change."""
 
 
+import json
+import os
+import shutil
+
 import pytest
 
 from fewshot import history
@@ -278,6 +282,59 @@ def test_damaged_version_is_skipped_by_undo(ws):
         t.undo()
     t.undo()
     assert t.class_names() == ["red"]
+
+
+def test_a_task_json_put_back_by_hand_is_a_new_version(ws, caplog):
+    """A kept version copied over task.json by hand carries an old revision: it is taken as the
+    next one, so kept versions survive, undo goes back to it and pruning keeps the newest steps."""
+    t = red_task(ws, n=1)
+    for i in range(5):
+        t.upsert_class(f"c{i}")
+    p = t.path
+    old = sorted((p / "history").glob("*.json"))[2]
+    rev = t.config.revision
+    shutil.copy(old, p / "task.json")
+    t = Workspace(ws.root).get("t")
+    assert t.config.revision == rev  # above every kept version
+    assert "taking it as revision" in caplog.text
+    rolled_back = t.class_names()
+    t.upsert_class("mine")
+    assert old.exists()  # its revision's version wasn't replaced
+    assert [r for r, _ in t._history()][-1] == rev  # pylint: disable=protected-access
+    t.undo()
+    assert t.class_names() == rolled_back
+    t.undo()
+    assert t.class_names() == ["red", "c0", "c1", "c2", "c3"]  # the newest kept before the hand edit
+
+
+def test_an_evaluation_of_a_later_revision_shows_as_out_of_date_after_a_rollback(ws):
+    """A rolled-back task.json takes a revision past the last evaluation's, which then no longer
+    reads as current; history removed too makes no difference."""
+    t = red_task(ws, n=1)
+    t.upsert_class("a")
+    t.record_evaluation({"revision": t.config.revision})
+    rev = t.config.revision
+    shutil.rmtree(t.path / "history")
+    data = json.loads((t.path / "task.json").read_text())
+    (t.path / "task.json").write_text(json.dumps({**data, "revision": 0}))
+    t = Workspace(ws.root).get("t")
+    assert t.config.revision == rev + 1
+    (t.path / "task.json").write_text(json.dumps({**data, "revision": rev}))
+    assert t.refresh()
+    assert t.config.revision == rev  # the evaluated revision itself is current
+
+
+def test_a_save_interrupted_after_keeping_its_version_is_not_a_rollback(ws):
+    """A save killed between keeping task.json as a version and replacing it leaves that version
+    as task.json itself: the revision stays (a dangling one counts as a later version)."""
+    t = red_task(ws, n=1)
+    t.upsert_class("a")
+    rev = t.config.revision
+    os.link(t.path / "task.json", t.path / "history" / f"{rev:010d}.json")
+    assert Workspace(ws.root).get("t").config.revision == rev
+    (t.path / "history" / f"{rev:010d}.json").unlink()
+    (t.path / "history" / f"{rev:010d}.json").symlink_to(t.path / "gone")
+    assert Workspace(ws.root).get("t").config.revision == rev + 1
 
 
 # ---- undo groups ----------------------------------------------------------
