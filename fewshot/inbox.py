@@ -101,13 +101,15 @@ class TaskInbox:
         created: list[str] = []  # files this call wrote (an image kept for undo may be there already)
         new = 0
         with self._writing():
+            # 16 characters: an example from a task made before 32-character ids, same content
             labelled = {e.id: e.label for e in self.config.examples}
+            short = {e.id: e.label for e in self.config.examples if len(e.id) == 16}
             waiting = {x.id: x for x in self.config.inbox}
             for c in checked:
                 if isinstance(c, ValueError):
                     out.append(c)
-                elif c[1] in labelled:
-                    out.append(ValueError(f"Already an example of {labelled[c[1]]}"))
+                elif c[1] in labelled or c[1][:16] in short:
+                    out.append(ValueError(f"Already an example of {labelled.get(c[1]) or short[c[1][:16]]}"))
                 elif c[1] in waiting:
                     out.append(waiting[c[1]])
                 else:

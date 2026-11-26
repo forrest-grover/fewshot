@@ -445,6 +445,7 @@ def test_legacy_16_char_ids_still_match(ws):
     assert again.id == fresh.config.examples[0].id
     assert [e.label for e in fresh.config.examples] == ["blue"]
     assert fresh.image_path(again.id).exists()
+    assert "Already an example of blue" in str(fresh.add_to_inbox([(png(RED), "")])[0])
 
 
 def test_add_examples_in_chunks(ws, monkeypatch):
