@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier, temper
+from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier, temper, top_k
 from .images import IMAGE_EXTS
 from .pipeline import Pipeline, new_classifier
 from .store import Task, TaskConfig
@@ -192,7 +192,7 @@ def _loo_knn(clf: KNNClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
     k = min(clf.k, len(X) - 1)
     if k < 1:  # a single example: nothing left to vote
         return np.zeros((len(rows), C)), np.full(len(rows), -np.inf)
-    top = np.argpartition(-S, k - 1, axis=1)[:, :k]
+    top = top_k(S, k)  # ties broken as KNNClassifier breaks them
     top_s = np.take_along_axis(S, top, axis=1)
     votes = np.exp(clf.scale * (top_s - top_s.max(axis=1, keepdims=True)))
     scores = np.where(present, 1e-6, 0.0)  # the same floor as KNNClassifier, for classes still present

@@ -300,7 +300,7 @@ class KNNClassifier(Classifier):
         S = self._support_similarity(Q) if S is None else S
         y, w = _fitted(self.y), _fitted(self.w)
         k = min(self.k, S.shape[1])
-        top = np.argpartition(-S, k - 1, axis=1)[:, :k]
+        top = top_k(S, k)
         scores = np.full((len(Q), len(self.classes)), 1e-6, np.float64)
         top_s = np.take_along_axis(S, top, axis=1)
         # Votes are relative to each query's nearest neighbour, so the 1e-6 floor for classes with no
@@ -309,6 +309,19 @@ class KNNClassifier(Classifier):
         rows = np.repeat(np.arange(len(Q)), k)
         np.add.at(scores, (rows, y[top.ravel()]), votes.ravel())
         return np.log(scores / scores.sum(axis=1, keepdims=True))
+
+
+def top_k(S: Scores, k: int) -> npt.NDArray[np.int_]:
+    """(m, k) columns of the ``k`` largest entries of each row of ``S`` (1 <= k <= columns), in
+    column order. Ties go to the lower column, so the choice among tied columns doesn't change
+    when another column is taken out: leave-one-out in closed form then matches refitting."""
+    kth = np.partition(S, S.shape[1] - k, axis=1)[:, S.shape[1] - k, None]
+    above, tied = S > kth, S == kth
+    need = k - above.sum(1)
+    crowded = np.flatnonzero(tied.sum(1) > need)  # rows where more columns tie than fit
+    tied[crowded] &= np.cumsum(tied[crowded], axis=1) <= need[crowded, None]
+    out: npt.NDArray[np.int_] = np.nonzero(above | tied)[1].reshape(len(S), k)
+    return out
 
 
 class LogRegClassifier(Classifier):
