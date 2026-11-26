@@ -237,6 +237,8 @@ def test_cancelled_jobs_are_capped_and_reported(client, monkeypatch):
     assert "being cancelled" in r.json()["detail"]
     health = client.get("/api/health").json()
     assert (health["jobs_running"], health["jobs_cancelling"]) == (0, 2)
+    with pytest.raises(pytest.fail.Exception, match=r"still cancelling after 0.05s: .*'status': 'cancelling'"):
+        wait_for_job(client, ids[0], timeout=0.05)  # the helper fails a test whose job never ends
     release.set()
     for jid in ids:
         wait_for_job(client, jid)

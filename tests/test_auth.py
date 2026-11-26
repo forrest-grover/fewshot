@@ -217,9 +217,9 @@ def test_allowed_host_entries_may_have_ports(tmp_path):
     assert c.get("/api/health", headers={"Host": "other.lan"}).status_code == 400
 
 
-def test_only_local_host_names_by_default(tmp_path, monkeypatch):
+def test_only_local_host_names_by_default(tmp_path):
     """By default only localhost names are answered; anything else is 400, the UI included."""
-    c = host_client(tmp_path, monkeypatch, base_url="http://localhost:8000")
+    c = host_client(tmp_path, base_url="http://localhost:8000")
     assert c.get("/api/tasks").status_code == 200
     for host in ("127.0.0.1:8000", "[::1]:8000", "LOCALHOST"):
         assert c.get("/api/tasks", headers={"Host": host}).status_code == 200
@@ -228,21 +228,21 @@ def test_only_local_host_names_by_default(tmp_path, monkeypatch):
         assert (r.status_code, r.json()["detail"]) == (400, "Unknown host; see FEWSHOT_ALLOWED_HOSTS")
 
 
-def test_configured_host_names(tmp_path, monkeypatch):
+def test_configured_host_names(tmp_path):
     """FEWSHOT_ALLOWED_HOSTS lists the names; '*' allows any."""
-    c = host_client(tmp_path, monkeypatch, hosts="box.lan, [fe80::1]")
+    c = host_client(tmp_path, hosts="box.lan, [fe80::1]")
     assert c.get("/api/tasks", headers={"Host": "box.lan:8000"}).status_code == 200
     assert c.get("/api/tasks", headers={"Host": "[fe80::1]:8000"}).status_code == 200
     assert c.get("/api/tasks", headers={"Host": "localhost"}).status_code == 400
-    c = host_client(tmp_path, monkeypatch, hosts="*")
+    c = host_client(tmp_path, hosts="*")
     assert c.get("/api/tasks", headers={"Host": "anything"}).status_code == 200
 
 
 # ---- cross-site writes (CSRF) --------------------------------------------
-def test_cross_site_writes_are_refused(tmp_path, monkeypatch):
+def test_cross_site_writes_are_refused(tmp_path):
     """A write whose Origin is another site, or that the browser marks cross-site, is 403;
     same-origin writes, reads, and clients that send neither header go through."""
-    c = host_client(tmp_path, monkeypatch, hosts="*", base_url="http://localhost:8000")
+    c = host_client(tmp_path, hosts="*", base_url="http://localhost:8000")
     body = {"name": "t", "embedder": "fake:color"}
     for headers in ({"Origin": "https://evil.example"}, {"Origin": "null"}, {"Origin": "http://localhost:9999"},
                     {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}):
@@ -259,10 +259,10 @@ def test_cross_site_writes_are_refused(tmp_path, monkeypatch):
     assert c.get("/api/tasks", headers={"Origin": "https://evil.example"}).status_code == 200
 
 
-def test_cross_site_check_behind_a_proxy_that_rewrites_host(tmp_path, monkeypatch):
+def test_cross_site_check_behind_a_proxy_that_rewrites_host(tmp_path):
     """Behind a proxy sending its own Host (nginx's default), the browser's Origin is compared
     with X-Forwarded-Host too; a refusal says what was compared and how to fix the proxy."""
-    c = host_client(tmp_path, monkeypatch, hosts="*")
+    c = host_client(tmp_path, hosts="*")
     body = {"name": "t", "embedder": "fake:color"}
     page = {"Host": "127.0.0.1:8000", "Origin": "https://fewshot.example.com", "Sec-Fetch-Site": "same-origin"}
     r = c.post("/api/tasks", json=body, headers=page)

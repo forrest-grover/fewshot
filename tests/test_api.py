@@ -567,10 +567,10 @@ def test_quotes_in_uploaded_file_names(tmp_path):
     assert r.json()[0]["file"] == 'say "cheese".png'
 
 
-def test_images_are_served_only_as_images(tmp_path, monkeypatch):
+def test_images_are_served_only_as_images(tmp_path):
     """Example images carry nosniff and a sandboxing CSP; a file whose name isn't an image type is
     served as an opaque download, never as a page."""
-    c = host_client(tmp_path, monkeypatch, hosts="*")
+    c = host_client(tmp_path, hosts="*")
     c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
     eid = c.post("/api/tasks/t/examples", data={"label": "red"},
                  files=[("files", ("a.png", png(RED), "image/png"))]).json()["added"][0]["id"]

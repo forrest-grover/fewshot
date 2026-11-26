@@ -143,13 +143,19 @@ def red_task(ws, name="t", n=2):
     return t
 
 
-def red_green_task(ws, name="t", n=2):
-    """Task ``name`` in ``ws`` with ``n`` red and ``n`` green examples, added one at a time."""
+def _alternating(ws, name, colours, n, noise):
+    """Task ``name`` in ``ws`` with ``n`` examples of each of ``colours`` ({label: rgb}), added one
+    at a time, the colours taking turns."""
     t = ws.create(name, embedder="fake:color")
     for i in range(n):
-        t.add_example(png(RED, noise=10, seed=i), "red")
-        t.add_example(png(GREEN, noise=10, seed=i), "green")
+        for label, rgb in colours.items():
+            t.add_example(png(rgb, noise=noise, seed=i), label)
     return t
+
+
+def red_green_task(ws, name="t", n=2):
+    """Task ``name`` in ``ws`` with ``n`` red and ``n`` green examples, added one at a time."""
+    return _alternating(ws, name, {"red": RED, "green": GREEN}, n, noise=10)
 
 
 def two_each(ws):
@@ -161,12 +167,9 @@ def two_each(ws):
 
 
 def red_blue_task(ws, name="t"):
-    """Task ``name`` in ``ws`` with two red and two blue examples."""
-    t = ws.create(name, embedder="fake:color")
-    for i in range(2):
-        t.add_example(png(RED, noise=5, seed=i), "red")
-        t.add_example(png(BLUE, noise=5, seed=i), "blue")
-    return t
+    """Task ``name`` in ``ws`` with two red and two blue examples, added one at a time (see
+    ``two_each`` for the same in one change)."""
+    return _alternating(ws, name, {"red": RED, "blue": BLUE}, 2, noise=5)
 
 
 @pytest.fixture(name="text_spec")
@@ -210,25 +213,22 @@ def client_fixture(tmp_path):
 @pytest.fixture(name="task_t")
 def task_t_fixture(client):
     """Task 't' on ``client``'s server: two red and two blue examples."""
-    client.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
-    for label, rgb in (("red", RED), ("blue", BLUE)):
-        files = [("files", (f"{label}{i}.png", png(rgb, noise=10, seed=i), "image/png")) for i in range(2)]
-        assert client.post("/api/tasks/t/examples", data={"label": label}, files=files).status_code == 201
-    return "t"
+    return api_task(client, "t", n=2, noise=10)
 
 
-def host_client(tmp_path, monkeypatch, hosts=None, base_url="http://testserver"):  # pylint: disable=unused-argument
+def host_client(tmp_path, hosts=None, base_url="http://testserver"):
     """A TestClient on a new server that answers the host names ``hosts`` (comma-separated), by default
     the server's default list."""
     allowed = ServerSettings().allowed_hosts if hosts is None else frozenset(hosts.split(","))
     return api_client(tmp_path, base_url=base_url, allowed_hosts=allowed)
 
 
-def api_task(client, name="c", n=3):
-    """Create a task with ``n`` red and ``n`` blue examples over the API."""
+def api_task(client, name="c", n=3, noise=15):
+    """Create a task with ``n`` red and ``n`` blue examples (red0.png, ..., blue0.png, ...) over the
+    API, one upload per class; returns its name."""
     assert client.post("/api/tasks", json={"name": name, "embedder": "fake:color"}).status_code == 201
     for label, rgb in (("red", RED), ("blue", BLUE)):
-        files = [("files", (f"{label}{i}.png", png(rgb, noise=15, seed=i), "image/png")) for i in range(n)]
+        files = [("files", (f"{label}{i}.png", png(rgb, noise=noise, seed=i), "image/png")) for i in range(n)]
         assert client.post(f"/api/tasks/{name}/examples", data={"label": label}, files=files).status_code == 201
     return name
 
@@ -239,12 +239,15 @@ def query_files(n, rgb=RED):
 
 
 def wait_for_job(client, jid, timeout=10.0):
-    """Poll job ``jid`` until it is neither running nor cancelling (or ``timeout`` passes); returns it."""
-    deadline = time.time() + timeout
+    """Poll job ``jid`` until it is neither running nor cancelling, and return it; fails the test,
+    showing the job's last state, if it is still going after ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
     while True:
         job = client.get(f"/api/jobs/{jid}").json()
-        if job["status"] not in {"running", "cancelling"} or time.time() > deadline:
+        if job["status"] not in {"running", "cancelling"}:
             return job
+        if time.monotonic() > deadline:
+            pytest.fail(f"job {jid} still {job['status']} after {timeout}s: {job}")
         time.sleep(0.02)
 
 

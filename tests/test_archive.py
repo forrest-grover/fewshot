@@ -143,7 +143,7 @@ def test_import_checks_the_embedder_first(ws):
 
 def test_api_import_applies_the_model_allowlist(tmp_path, monkeypatch):
     """Importing over the API can't bring in a model the server wouldn't otherwise load."""
-    c = host_client(tmp_path, monkeypatch, hosts="*")
+    c = host_client(tmp_path, hosts="*")
     loads: list[str] = []
     monkeypatch.setattr(fewshot.api, "check_embedder", loads.append)
     data = png(RED)
