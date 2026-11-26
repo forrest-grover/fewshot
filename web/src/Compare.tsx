@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { api, type ModelInfo, type TaskDetail } from "./api";
 import { pct } from "./format";
-import { Gate, type SetFor } from "./hooks";
+import { Gate, type SetFor } from "./state";
 import type { CompareRun } from "./runs";
 
 interface Props {

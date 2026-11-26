@@ -293,6 +293,12 @@ main > .error {
   font-size: 13px;
 }
 
+.note-moved {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 .error.skipped ul {
   margin: 4px 0 0;
   padding-left: 18px;
@@ -770,9 +776,8 @@ kbd {
   outline: none; /* the highlighted (current) result is the focused one, and is styled above */
 }
 
-.sign-in {
-  margin: 10vh auto 0;
-  max-width: 420px;
+.sign-in form {
+  gap: 12px;
 }
 
 .job {
@@ -1010,12 +1015,13 @@ label.inline {
   font-weight: inherit;
 }
 
-.chart-wrap .bin:focus {
-  outline: none;
+.chart-wrap svg:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
-.chart-wrap .bin:focus-visible rect.hit {
-  fill: var(--accent-soft);
+/* The bar chosen with the arrow keys. */
+.chart-wrap svg:focus-visible .bin.hover rect.hit {
   stroke: var(--accent);
   stroke-width: 2;
 }
@@ -1147,6 +1153,19 @@ label.inline {
 /* inbox */
 .inbox-bar {
   margin: 12px 0 4px;
+}
+
+/* The order menu's options are long: on a narrow screen it shrinks to fit (the chosen option
+   is cut off) instead of widening the page. */
+.inbox-bar label.inline {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.inbox-order {
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
 }
 
 .inbox-grid {
@@ -1341,4 +1360,17 @@ label.inline {
 
 .danger-text {
   color: var(--danger);
+}
+
+/* Read by screen readers, not shown. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }

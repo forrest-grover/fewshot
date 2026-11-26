@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { useFocusTrap } from "./hooks";
+import { useFocusTrap } from "./keys";
 
 /** What the editor saves: one example's tags and note, or tags added to and removed from several. */
 export type TagEdit = { tags: string[]; note: string } | { add: string[]; remove: string[] };

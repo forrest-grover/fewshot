@@ -1,6 +1,8 @@
-import { memo, useMemo, useRef, useState, type DragEvent } from "react";
+import { memo, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import { api, type Example, type TaskDetail } from "./api";
-import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts, type Uploads } from "./hooks";
+import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages } from "./files";
+import { useShortcuts } from "./keys";
+import type { Uploads } from "./useUploads";
 import { THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import TagEditor, { type TagEdit } from "./TagEditor";
@@ -35,8 +37,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
    * upload at a time. */
   const upload = async (label: string, files: File[]) => {
     if (uploads.slots[label]?.progress) { fail(`Still adding images to ${label}: wait for it or cancel it first.`); return; }
-    const name = task.name;
-    await uploads.start(label, files, (fs, signal, group) => api.addExamples(name, label, fs, signal, group));
+    await uploads.start(label, files, (fs, signal, group, t) => api.addExamples(t, label, fs, signal, group));
   };
   /** Run a mutation and show its result; resolves to whether it succeeded. */
   const save = async (p: Promise<TaskDetail>) => {
@@ -46,20 +47,17 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
   };
   const fail = (message: string) => { void run(Promise.reject(new Error(message))); };
 
-  const allTags = [...new Set(task.examples.flatMap((e) => e.tags))].sort();
+  // Derived from the examples once per task version (and filter), not on every render: a task
+  // can have thousands, and a tick or a keystroke re-renders the page.
+  const allTags = useMemo(() => [...new Set(task.examples.flatMap((e) => e.tags))].sort(), [task.examples]);
   if (tagFilter && !allTags.includes(tagFilter)) setTagFilter(""); // its tag is gone: don't revive it later
   const filter = allTags.includes(tagFilter) ? tagFilter : "";
-  const byClass = new Map<string, Example[]>(task.classes.map((c) => [c.name, []]));
-  const q = query.trim().toLowerCase();
-  const matches = (e: Example) => !q || [e.source, e.note, e.id, ...e.tags].some((v) => v.toLowerCase().includes(q));
-  for (const e of task.examples) if ((!filter || e.tags.includes(filter)) && matches(e)) byClass.get(e.label)?.push(e);
-  if (order !== "task") {
-    const key = (e: Example) => (order === "source" ? e.source.toLowerCase() : e.added);
-    for (const list of byClass.values()) {
-      list.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
-      if (order === "newest") list.reverse();
-    }
-  }
+  // The search box shows each keystroke at once; the classes catch up when React has time.
+  const q = useDeferredValue(query).trim().toLowerCase();
+  const byClass = useMemo(() => groupExamples(task, filter, q, order), [task.examples, task.classes, filter, q, order]); // eslint-disable-line react-hooks/exhaustive-deps -- task.name doesn't matter
+  const { byId, labelOf } = useMemo(() => ({
+    byId: new Map(task.examples.map((e) => [e.id, e])), labelOf: new Map(task.examples.map((e) => [e.id, e.label])),
+  }), [task.examples]);
   const fold = (c: string) => {
     setFolded((f) => {
       const next = new Set(f);
@@ -68,9 +66,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
       return next;
     });
   };
-  const byId = new Map(task.examples.map((e) => [e.id, e]));
   const open = (list: Example[], ex: Example) => { setViewer({ ids: list.map((e) => e.id), index: list.indexOf(ex) }); };
-  const labelOf = new Map(task.examples.map((e) => [e.id, e.label]));
   const selection = [...picked].filter((id) => labelOf.has(id)); // ids still in the task
 
   const move = async (ids: string[], label: string) => {
@@ -191,7 +187,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
 
   const nFolded = task.classes.filter((c) => folded.has(c.name)).length; // ``folded`` may name deleted classes
   const editedIds = editing ? ("one" in editing ? [editing.one.id] : editing.ids) : [];
-  const editedTags = [...new Set(task.examples.filter((e) => editedIds.includes(e.id)).flatMap((e) => e.tags))];
+  const editedTags = editing ? [...new Set(editedIds.flatMap((id) => byId.get(id)?.tags ?? []))] : [];
 
   const viewed = viewer ? viewer.ids.map((id) => byId.get(id)).filter((e): e is Example => e !== undefined) : [];
   const shownEx = viewer ? (viewed[Math.min(viewer.index, viewed.length - 1)] as Example | undefined) : undefined;
@@ -328,8 +324,10 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
       )}
 
       {task.classes.map((c, ci) => {
+        const near = ci < 3; // the first classes render at once; the others when scrolled near
         const limit = shown[c.name] ?? PAGE;
         const skip = uploads.slots[c.name]?.skipped ?? [];
+        const moved = uploads.slots[c.name]?.moved ?? 0; // of the last upload: images that were examples of other classes
         const up = uploads.slots[c.name]?.progress; // an upload in progress
         const list = byClass.get(c.name) ?? [];
         const allPicked = list.length > 0 && list.every((e) => picked.has(e.id));
@@ -385,7 +383,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
                 }}
               />
             )}
-            {!folded.has(c.name) && <div className="thumbs">
+            {!folded.has(c.name) && <NearViewport initially={near} items={Math.min(list.length, limit) + 2}>{() => <div className="thumbs">
               {list.slice(0, limit).map((ex) => (
                 <Thumb key={ex.id} ex={ex} task={task.name} picked={picked.has(ex.id)} classes={classNames} on={thumbActions} />
               ))}
@@ -398,10 +396,17 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
                 </button>
               )}
               <DropZone compact disabled={!!up} onFiles={(fs) => { void upload(c.name, fs); }}>
-                {up ? `Uploading ${progressText(up)}…` : "+ Add images"}
+                {up ? `${up.stopping ? "Stopping" : "Uploading"} ${progressText(up)}…` : "+ Add images"}
               </DropZone>
-              {up && <button className="ghost small" onClick={up.cancel}>Cancel upload</button>}
-            </div>}
+              {up && <button className="ghost small" disabled={up.stopping} onClick={up.cancel}>Cancel upload</button>}
+              <span className="sr-only" role="status">{up ? `${up.stopping ? "Stopping" : "Uploading"} to ${c.name}: ${progressText(up)}` : ""}</span>
+            </div>}</NearViewport>}
+            {moved > 0 && (
+              <div className="row note-moved" role="status">
+                <span>{moved} moved from other classes</span>
+                <button className="ghost small" aria-label="Dismiss" onClick={() => { uploads.dismiss(c.name); }}>×</button>
+              </div>
+            )}
             {skip.length > 0 && (
               <div className="error skipped" role="alert">
                 <div>
@@ -416,6 +421,51 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
       })}
     </div>
   );
+}
+
+/** Each class's examples (all classes, in order), with only those tagged ``tag`` (unless empty)
+ * and matching ``query`` (lower case: in the source, note, id or a tag), in ``order``. */
+function groupExamples(task: TaskDetail, tag: string, query: string, order: "task" | "newest" | "oldest" | "source") {
+  const byClass = new Map<string, Example[]>(task.classes.map((c) => [c.name, []]));
+  const matches = (e: Example) => !query || [e.source, e.note, e.id, ...e.tags].some((v) => v.toLowerCase().includes(query));
+  for (const e of task.examples) if ((!tag || e.tags.includes(tag)) && matches(e)) byClass.get(e.label)?.push(e);
+  if (order !== "task") {
+    const key = (e: Example) => (order === "source" ? e.source.toLowerCase() : e.added);
+    for (const list of byClass.values()) {
+      list.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+      if (order === "newest") list.reverse();
+    }
+  }
+  return byClass;
+}
+
+const TILE = { w: 128, h: 156 }; // a thumbnail with its gap, for a first guess at a class's height
+const NEAR = "1500px 0px"; // how close to the viewport a class's thumbnails are mounted
+
+/** Renders ``children`` only while near the viewport, else an empty box as tall as they were last
+ * (or as ``items`` tiles would be), so a task with thousands of examples mounts the thumbnails
+ * around what is on screen rather than all of them. Renders at once if ``initially``, and always
+ * where IntersectionObserver is missing. */
+function NearViewport({ initially, items, children }: { initially: boolean; items: number; children: () => ReactNode }) {
+  const box = useRef<HTMLDivElement>(null);
+  const [near, setNear] = useState(initially || typeof IntersectionObserver === "undefined");
+  const [height, setHeight] = useState<number | null>(null); // when last shown
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const el = box.current;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver((es) => { setNear(es[es.length - 1].isIntersecting); }, { rootMargin: NEAR });
+    io.observe(el);
+    return () => { io.disconnect(); };
+  }, []);
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    if (near) setHeight(el.offsetHeight);
+    else setWidth(el.clientWidth);
+  }, [near, items]);
+  const guess = Math.ceil(items / Math.max(1, Math.floor((width + 8) / TILE.w))) * TILE.h;
+  return <div ref={box} style={near ? undefined : { height: height ?? guess }}>{near && children()}</div>;
 }
 
 /** The example ids in an EXAMPLE_DRAG payload; none if it is malformed. */

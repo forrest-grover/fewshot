@@ -1,6 +1,7 @@
 import { memo, useRef, useState, type ReactNode } from "react";
 import type { Job } from "./api";
-import { filesFromDrop, isImage, usePollJob } from "./hooks";
+import { filesFromDrop, isImage } from "./files";
+import { usePollJob } from "./pollJob";
 
 export function DropZone(props: {
   onFiles: (files: File[]) => void;

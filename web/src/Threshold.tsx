@@ -12,11 +12,14 @@ interface Props {
 }
 
 /** Histogram of held-out similarities, correct and wrong predictions stacked, with the current and
- * suggested reject thresholds marked. Clicking a bar picks its lower edge as a threshold to apply. */
+ * suggested reject thresholds marked. Clicking a bar picks its lower edge as a threshold to apply.
+ * From the keyboard the chart is one control (a single tab stop): arrows (and Home, End) move
+ * between bars, Enter or Space picks the one shown. */
 export default function Threshold({ predictions, current, suggested, onSet }: Props) {
   // The threshold typed or picked from a bar, as typed (so the field can be cleared); null: the suggestion.
   const [text, setText] = useState<string | null>(null);
-  const [hover, setHover] = useState<number | null>(null);
+  const [hover, setHover] = useState<number | null>(null); // the bar under the pointer
+  const [active, setActive] = useState<number | null>(null); // the bar chosen with the keyboard, while focused
   if (predictions.length === 0) return null;
 
   const sims = predictions.map((p) => p.similarity);
@@ -41,6 +44,9 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
   const nCorrect = predictions.filter((p) => p.correct).length;
   const nWrong = predictions.length - nCorrect;
   const fmt = (v: number) => v.toFixed(3);
+  const pick = (i: number) => { setText(String(Number(bins[i].from.toFixed(3)))); };
+  const describe = (i: number) => `${fmt(bins[i].from)} to ${fmt(bins[i].from + step)}: ${String(bins[i].correct)} correct, ${String(bins[i].wrong)} wrong`;
+  const shown = hover ?? active; // the bar whose tooltip shows
 
   return (
     <div className="threshold">
@@ -51,8 +57,17 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
         {suggested !== null && <span><i className="swatch line dashed" /> suggested</span>}
       </div>
       <div className="chart-wrap">
-        <svg viewBox={`0 0 ${String(W)} ${String(H)}`} role="group"
-          aria-label={`Similarity of held-out predictions: ${String(nCorrect)} correct, ${String(nWrong)} wrong, from ${fmt(Math.min(...sims))} to ${fmt(Math.max(...sims))}`}>
+        <svg viewBox={`0 0 ${String(W)} ${String(H)}`} role="slider" tabIndex={0}
+          aria-label={`Similarity of held-out predictions: ${String(nCorrect)} correct, ${String(nWrong)} wrong, from ${fmt(Math.min(...sims))} to ${fmt(Math.max(...sims))}. Arrow keys choose a bar, Enter uses its lower edge as the threshold`}
+          aria-valuemin={0} aria-valuemax={BINS - 1} aria-valuenow={active ?? 0} aria-valuetext={describe(active ?? 0)}
+          onFocus={() => { setActive((a) => a ?? Math.max(0, bins.findIndex((b) => b.correct + b.wrong > 0))); }}
+          onBlur={() => { setActive(null); }}
+          onKeyDown={(e) => {
+            const a = active ?? 0;
+            const to: Record<string, number> = { ArrowLeft: a - 1, ArrowDown: a - 1, ArrowRight: a + 1, ArrowUp: a + 1, Home: 0, End: BINS - 1 };
+            if (e.key in to) { e.preventDefault(); setActive(Math.max(0, Math.min(BINS - 1, to[e.key]))); }
+            else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(a); }
+          }}>
           <line className="axis" x1={PAD.l} x2={W - PAD.r} y1={PAD.t + plotH} y2={PAD.t + plotH} />
           <text className="tick" x={PAD.l - 4} y={PAD.t + 8} textAnchor="end">{top}</text>
           <text className="tick" x={PAD.l - 4} y={PAD.t + plotH} textAnchor="end">0</text>
@@ -63,16 +78,9 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
             const bx = PAD.l + i * bw + 1, w = Math.max(1, bw - 2); // 2px gap between bars
             const hc = (b.correct / top) * plotH, hw = (b.wrong / top) * plotH;
             return (
-              <g key={i} className={hover === i ? "bin hover" : "bin"} tabIndex={0} role="button"
-                aria-label={`${fmt(b.from)} to ${fmt(b.from + step)}: ${String(b.correct)} correct, ${String(b.wrong)} wrong. Use ${fmt(b.from)} as the threshold`}
+              <g key={i} className={shown === i ? "bin hover" : "bin"}
                 onMouseEnter={() => { setHover(i); }} onMouseLeave={() => { setHover(null); }}
-                onFocus={() => { setHover(i); }} onBlur={() => { setHover(null); }}
-                onKeyDown={(e) => {
-                  if (e.key !== "Enter" && e.key !== " ") return;
-                  e.preventDefault();
-                  setText(String(Number(b.from.toFixed(3))));
-                }}
-                onClick={() => { setText(String(Number(b.from.toFixed(3)))); }}>
+                onClick={() => { pick(i); }}>
                 <rect className="hit" x={PAD.l + i * bw} y={PAD.t} width={bw} height={plotH} />
                 {b.correct > 0 && <rect className="correct" x={bx} y={y(b.correct)} width={w} height={Math.max(1, hc)} rx={2} />}
                 {b.wrong > 0 && <rect className="wrong" x={bx} y={y(b.correct + b.wrong)} width={w} height={Math.max(1, hw - (b.correct ? 2 : 0))} rx={2} />}
@@ -83,11 +91,11 @@ export default function Threshold({ predictions, current, suggested, onSet }: Pr
           {suggested !== null && <line className="mark dashed" x1={x(suggested)} x2={x(suggested)} y1={PAD.t} y2={PAD.t + plotH} />}
           {picked !== null && Number.isFinite(picked) && <line className="mark picked" x1={x(picked)} x2={x(picked)} y1={PAD.t} y2={PAD.t + plotH} />}
         </svg>
-        {hover !== null && (
-          <div className="tooltip" style={{ left: `${String((x(bins[hover].from + step / 2) / W) * 100)}%` }}>
-            <b>{fmt(bins[hover].from)}–{fmt(bins[hover].from + step)}</b>
-            <div>{bins[hover].correct} correct · {bins[hover].wrong} wrong</div>
-            <div className="muted">Click to use {fmt(bins[hover].from)}</div>
+        {shown !== null && (
+          <div className="tooltip" aria-hidden="true" style={{ left: `${String((x(bins[shown].from + step / 2) / W) * 100)}%` }}>
+            <b>{fmt(bins[shown].from)}–{fmt(bins[shown].from + step)}</b>
+            <div>{bins[shown].correct} correct · {bins[shown].wrong} wrong</div>
+            <div className="muted">{hover === null ? "Enter" : "Click"} to use {fmt(bins[shown].from)}</div>
           </div>
         )}
       </div>

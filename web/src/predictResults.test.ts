@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { Prediction } from "./api";
-import { usePredictResults, type Item } from "./hooks";
+import { usePredictResults, type Item } from "./predictResults";
 
 const item = (key: number, url: string): Item => ({ key, name: url, url, pred: {} as Prediction });
 

@@ -1,7 +1,9 @@
 import { useMemo, useRef, useState } from "react";
 import { api, type Prediction, type TaskDetail } from "./api";
 import { downloadCsv } from "./csv";
-import { usePasteImages, usePredictResults, useShortcuts, type Item, type Results } from "./hooks";
+import { usePasteImages } from "./files";
+import { useShortcuts } from "./keys";
+import { usePredictResults, type Item, type Results } from "./predictResults";
 import { shrinkImages } from "./images";
 import { Bar, ClassSelect, DropZone } from "./ui";
 import { BATCH, progressText, sendInBatches, type BatchLimits } from "./upload";

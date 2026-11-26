@@ -29,7 +29,9 @@ export type DuplicatePair = S["DuplicatePair"];
 export type Health = S["Health"];
 /** An upload that couldn't be used: its file name (or URL, when known) and why. */
 export type FileError = S["FileError"];
-export type AddResult = S["AddResult"];
+/** ``moved``: images that were already examples of another class, and were moved to this one
+ * (optional: servers before it was added don't send it). */
+export type AddResult = S["AddResult"] & { moved?: number };
 export type ModelInfo = S["ModelsOut"];
 /** PATCH /api/tasks/{name}: every field is optional (the schema marks the clear_* flags required
  * only because they have defaults). */
@@ -69,7 +71,7 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
   if (r.status === 401 && url !== "/api/login") {
     // The server wants its token: the App shows the sign-in form.
     window.dispatchEvent(new Event(AUTH_EVENT));
-    throw new Error("Not signed in");
+    throw new HttpError(401, "Not signed in");
   }
   if (!r.ok) {
     let msg: unknown = `${String(r.status)} ${r.statusText}`;
@@ -85,6 +87,8 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
 }
 
 const t = (name: string) => `/api/tasks/${encodeURIComponent(name)}`;
+/** An example of task ``n``, by id (encoded, like every name or id put in a path). */
+const ex = (n: string, id: string) => `${t(n)}/examples/${encodeURIComponent(id)}`;
 /** The multipart fields of upload ``B`` besides its files (``undo_group``: uploads with the same
  * one become one undo step). */
 type UploadFields<B> = Omit<B, "files">;
@@ -116,11 +120,11 @@ export const api = {
     req<AddResult>("POST", `${t(n)}/examples`,
       files(fs, { label, undo_group: undoGroup } satisfies UploadFields<S["Body_add_examples"]>), signal),
   addExampleUrls: (n: string, label: string, urls: string[]) => req<AddResult>("POST", `${t(n)}/examples/urls`, { label, urls }),
-  relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, { label }),
-  annotate: (n: string, id: string, p: { tags?: string[]; note?: string }) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, p),
+  relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", ex(n, id), { label }),
+  annotate: (n: string, id: string, p: { tags?: string[]; note?: string }) => req<TaskDetail>("PATCH", ex(n, id), p),
   tagMany: (n: string, ids: string[], add_tags: string[], remove_tags: string[] = []) =>
     req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, add_tags, remove_tags }),
-  deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", `${t(n)}/examples/${id}`),
+  deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", ex(n, id)),
   relabelMany: (n: string, ids: string[], label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, label }),
   deleteExamples: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/examples/delete`, { ids }),
   predict: (n: string, fs: File[], signal?: AbortSignal) =>
@@ -140,7 +144,7 @@ export const api = {
   },
   health: () => req<Health>("GET", "/api/health"),
   inbox: (n: string, sort: InboxSort, offset = 0, limit = 1000) =>
-    req<InboxPage>("GET", `${t(n)}/inbox?sort=${sort}&offset=${String(offset)}&limit=${String(limit)}`),
+    req<InboxPage>("GET", `${t(n)}/inbox?sort=${encodeURIComponent(sort)}&offset=${String(offset)}&limit=${String(limit)}`),
   addToInbox: (n: string, fs: File[], signal?: AbortSignal, undoGroup?: string) =>
     req<InboxAdded>("POST", `${t(n)}/inbox`, files(fs, { undo_group: undoGroup } satisfies UploadFields<S["Body_add_to_inbox"]>), signal),
   acceptInbox: (n: string, labels: Record<string, string>) => req<TaskDetail>("POST", `${t(n)}/inbox/accept`, { labels }),
@@ -150,10 +154,12 @@ export const api = {
   startComparison: (n: string, embedders: string[]) => req<Job<CompareReport>>("POST", `${t(n)}/compare/jobs`, { embedders }),
   setClassThresholds: (n: string, thresholds: Record<string, number | null>) =>
     req<TaskDetail>("PUT", `${t(n)}/class-thresholds`, { thresholds }),
-  job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${id}`),
-  cancelJob: (id: string) => req<Job<unknown>>("DELETE", `/api/jobs/${id}`),
+  job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${encodeURIComponent(id)}`),
+  cancelJob: (id: string) => req<Job<unknown>>("DELETE", `/api/jobs/${encodeURIComponent(id)}`),
   login: (token: string) => req<undefined>("POST", "/api/login", { token }),
+  /** End the session (its cookie stops working, here and in every other tab). */
+  logout: () => req<undefined>("POST", "/api/logout"),
   /** An example's image; with ``size``, a JPEG scaled down to fit in that many pixels. */
   imageUrl: (n: string, id: string, size?: number) =>
-    `${t(n)}/examples/${id}/image` + (size ? `?size=${String(size)}` : ""),
+    `${ex(n, id)}/image` + (size ? `?size=${String(size)}` : ""),
 };

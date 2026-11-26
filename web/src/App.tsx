@@ -4,10 +4,15 @@ import Evaluate from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { Gate, Latest, stepToast, taskUndoKey, typingAt, useByTask, usePredictResults, useUploads, type UploadStop } from "./hooks";
+import NewTask from "./NewTask";
+import { taskUndoKey, topModal, typingAt } from "./keys";
+import { usePredictResults } from "./predictResults";
+import { Gate, Latest, stepToast, useByTask } from "./state";
+import { useUploads, type UploadStop } from "./useUploads";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
+import SignIn from "./SignIn";
 import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
 import { ErrorBox, JobPoller } from "./ui";
 import { BATCH, batchLimits, isAbort } from "./upload";
@@ -40,10 +45,17 @@ export default function App() {
   const [models, setModels] = useState<ModelInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [signIn, setSignIn] = useState(false); // the server wants its token
+  const [signIn, setSignIn] = useState(false); // the server wants its token: the sign-in dialog is open
+  const [authRequired, setAuthRequired] = useState(false); // the server has a token (so one can log out)
+  const signedIn = useRef(false); // a request has worked: a sign-in after that is "again"
+  // Uploads that stopped for want of a session, said once signed in again (an error said while
+  // the sign-in dialog covers the page would go unseen).
+  const [missed, setMissed] = useState<string[]>([]);
   const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
   const [limits, setLimits] = useState(BATCH); // upload batch sizes the server takes
-  const [toast, setToast] = useState<{ text: string; then: "undo" | "redo" | null; key: number } | null>(null);
+  // A message for a few seconds. ``then`` offers the reverse of an undo or redo, while the task is
+  // still ``task`` at revision ``rev`` (after another change it would undo something else).
+  const [toast, setToast] = useState<{ text: string; then?: "undo" | "redo" | null; task?: string; rev?: number; key: number } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
   const [help, setHelp] = useState(false); // the keyboard shortcuts
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
@@ -77,20 +89,37 @@ export default function App() {
     try {
       return await p;
     } catch (e) {
-      // An error from a task the user has since left would only confuse the one now shown, and
-      // a cancelled request was meant to stop.
-      if (currentTask.current !== from || isAbort(e)) return undefined;
+      // An error from a task the user has since left would only confuse the one now shown, a
+      // cancelled request was meant to stop, and one refused for want of a session opens the
+      // sign-in dialog instead.
+      if (currentTask.current !== from || isAbort(e) || (e instanceof HttpError && e.status === 401)) return undefined;
       setError(e instanceof Error ? e.message : String(e));
       // Refused (say, an example or class that is gone): the task may have changed elsewhere.
-      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) reloadTask();
+      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) {
+        reloadTask();
+        if (e.status === 404) {
+          setError(`That is no longer there (${e.message}): it was probably changed in another tab or by the CLI. The task now shows as it is.`);
+        }
+      }
       return undefined;
     }
   }, [reloadTask]);
 
+  /** What the server says about itself, and its tasks: at startup, and again after signing in. */
+  const loadServer = useCallback(() => {
+    void refreshTasks();
+    void run(api.models()).then((m) => { if (m) setModels(m); });
+    void api.health().then((h) => {
+      setUrlFetch(h.url_fetch);
+      setAuthRequired(h.auth_required);
+      setLimits(batchLimits(h.max_request_bytes));
+    }, () => { /* an old server: no URL fetching, default batches */ });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- refreshTasks and run are stable
   const taskLists = useRef(new Latest()).current;
   const refreshTasks = useCallback(async () => {
     const latest = taskLists.begin();
     const t = await run(api.tasks());
+    if (t) signedIn.current = true;
     if (t && latest()) setTasks(t); // not an older list that arrived after a newer one
   }, [run, taskLists]);
 
@@ -103,12 +132,7 @@ export default function App() {
   useEffect(() => {
     const on = () => { setRoute(parseHash()); };
     window.addEventListener("hashchange", on);
-    void refreshTasks();
-    void run(api.models()).then((m) => { if (m) setModels(m); });
-    void api.health().then((h) => {
-      setUrlFetch(h.url_fetch);
-      setLimits(batchLimits(h.max_request_bytes));
-    }, () => { /* an old server: no URL fetching, default batches */ });
+    loadServer();
     // Tasks made or changed elsewhere (the CLI, another tab) show up when the window comes back.
     const back = () => { if (document.visibilityState === "visible") void refreshTasks(); };
     window.addEventListener("focus", back);
@@ -118,11 +142,11 @@ export default function App() {
       window.removeEventListener("focus", back);
       document.removeEventListener("visibilitychange", back);
     };
-  }, [refreshTasks, run]);
+  }, [refreshTasks, loadServer]);
   useEffect(() => { // "?" shows the keyboard shortcuts
     const on = (e: KeyboardEvent) => {
       if (e.key !== "?" || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (typingAt(e.target)) return;
+      if (typingAt(e.target) || topModal()) return; // not over the image viewer or another dialog
       e.preventDefault();
       setHelp(true);
     };
@@ -130,6 +154,7 @@ export default function App() {
     return () => { window.removeEventListener("keydown", on); };
   }, []);
 
+  const [attempt, setAttempt] = useState(0); // loading the task again after signing in
   useEffect(() => {
     currentTask.current = route.task;
     setMenuOpen(false);
@@ -147,7 +172,7 @@ export default function App() {
         setLoadFailed(true);
       },
     );
-  }, [route.task, taskLoads]);
+  }, [route.task, taskLoads, attempt]);
 
   // The task list (fetched again whenever the window comes back, and after each change) shows
   // the open task changed elsewhere, or gone: fetch it again.
@@ -171,8 +196,9 @@ export default function App() {
   /** An upload stopped part-way: say how much of it got in (of a task the user has left, too). */
   const uploadStopped = ({ task: name, added, total, error }: UploadStop) => {
     const text = `Upload${name === currentTask.current ? "" : ` to “${name}”`} stopped: ${String(added)} of ${String(total)} added`;
-    if (error) setError(`${error.message}. ${text}`);
-    else setToast({ text, then: null, key: Date.now() });
+    if (error instanceof HttpError && error.status === 401) setMissed((m) => [...m, `${text}; add the other ${String(total - added)} again`]);
+    else if (error) setError(`${error.message}. ${text}`);
+    else setToast({ text, key: Date.now() });
   };
   // Uploads live here so they go on while tabs are switched; opening another task stops them.
   const exampleUploads = useUploads(route.task, { onTask: updateTask, onStop: uploadStopped, limits });
@@ -180,14 +206,29 @@ export default function App() {
 
   /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse.
    * One step at a time: presses while one is in flight are ignored, so a double press or a held
-   * key doesn't walk back several versions. */
+   * key doesn't walk back several versions. Undo while images are being uploaded to the task
+   * stops the upload first (after its batch in flight, so none lands after the undo) and then
+   * undoes all of it, as one step; if none of it had landed, nothing is undone. */
   const stepGate = useRef(new Gate()).current;
   const step = (which: "undo" | "redo") => stepGate.run(async () => {
-    if (!task || !(which === "undo" ? task.can_undo : task.can_redo)) return;
-    const t = await run(which === "undo" ? api.undo(task.name) : api.redo(task.name));
+    if (!task) return;
+    let shown = task;
+    const stopping = which === "undo" && (exampleUploads.busy || inboxUploads.busy);
+    if (stopping) {
+      const added = (await Promise.all([exampleUploads.stop(), inboxUploads.stop()])).reduce((a, b) => a + b, 0);
+      if (currentTask.current !== shown.name) return;
+      if (!added) { setToast({ text: "Stopped the upload; none of it had been added", key: Date.now() }); return; }
+      const fresh = await run(api.task(shown.name)); // with every batch that landed
+      if (!fresh) return;
+      updateTask(fresh);
+      shown = fresh;
+    }
+    if (!(which === "undo" ? shown.can_undo : shown.can_redo)) return;
+    const t = await run(which === "undo" ? api.undo(shown.name) : api.redo(shown.name));
     if (!t) return;
     updateTask(t);
-    setToast({ ...stepToast(which, t, which === "undo" ? task.undo_label : task.redo_label), key: Date.now() });
+    const said = stepToast(which, t, which === "undo" ? shown.undo_label : shown.redo_label);
+    setToast({ ...said, text: stopping ? `Stopped the upload. ${said.text}` : said.text, task: t.name, rev: t.revision, key: Date.now() });
   });
   const undo = () => step("undo");
   useEffect(() => { // the toast goes after a few seconds
@@ -210,7 +251,21 @@ export default function App() {
     return () => { window.removeEventListener("keydown", on); };
   }, []);
 
-  if (signIn) return <SignIn />;
+  /** Signed in (again): close the dialog and fetch what failed meanwhile; everything shown stays. */
+  const afterSignIn = () => {
+    setSignIn(false);
+    loadServer();
+    if (task) reloadTask();
+    else setAttempt((n) => n + 1);
+    if (missed.length) { setError(`While you were signed out: ${missed.join(". ")}.`); setMissed([]); }
+  };
+  const logOut = () => {
+    if ((exampleUploads.busy || inboxUploads.busy) && !confirm("An upload is still running. Log out and stop it?")) return;
+    // A fresh page after it: nothing of the session is left on screen.
+    void api.logout().then(() => { location.hash = ""; location.reload(); }, (e: unknown) => {
+      setError(e instanceof Error ? e.message : String(e));
+    });
+  };
 
   return (
     <div className="app">
@@ -232,6 +287,7 @@ export default function App() {
         </nav>
         <button className="secondary" onClick={() => { go(null); }}>+ New task</button>
         <button className="ghost small" onClick={() => { setHelp(true); }} title="Keyboard shortcuts (?)">Keyboard shortcuts <kbd>?</kbd></button>
+        {authRequired && <button className="ghost small" onClick={logOut} title="End this session (in every tab)">Log out</button>}
       </aside>
 
       <main>
@@ -249,10 +305,11 @@ export default function App() {
                 {models?.embedders.find((e) => e.spec === task.embedder)?.label ?? task.embedder} · {task.classifier}
               </span>
               <span className="spacer" />
-              <button className="ghost small" disabled={!task.can_undo} onClick={() => { void undo(); }}
-                title={`Undo ${task.undo_label || "the last change"} (Ctrl+Z)`}>↶ Undo</button>
+              <button className="ghost small" disabled={!task.can_undo && !exampleUploads.busy && !inboxUploads.busy} onClick={() => { void undo(); }}
+                title={exampleUploads.busy || inboxUploads.busy ? "Stop the upload and undo it (Ctrl+Z)" : `Undo ${task.undo_label || "the last change"} (Ctrl+Z)`}
+                onMouseEnter={reloadTask} onFocus={reloadTask}>↶ Undo</button>
               <button className="ghost small" disabled={!task.can_redo} onClick={() => { void step("redo"); }}
-                title={`Redo ${task.redo_label || "the last undone change"} (Ctrl+Shift+Z)`}>↷ Redo</button>
+                title={`Redo ${task.redo_label || "the last undone change"} (Ctrl+Shift+Z)`} onMouseEnter={reloadTask} onFocus={reloadTask}>↷ Redo</button>
             </header>
             <div className="tabs" role="tablist" aria-label="Task views" onKeyDown={(e) => {
               // Arrow keys, Home and End move between tabs (the WAI-ARIA tabs pattern).
@@ -291,8 +348,10 @@ export default function App() {
                 <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { evals.setFor(task.name)(null); compares.setFor(task.name)(null); void refreshTasks(); go(null); }}
                   onDuplicated={(t) => { void refreshTasks(); go(t.name); }}
                   onRenamed={(t) => {
-                    // Results move with the task to its new name.
+                    // Results, and uploads in progress, move with the task to its new name.
                     predictState.rename(t.name);
+                    exampleUploads.rename(t.name);
+                    inboxUploads.rename(t.name);
                     evals.rename(task.name, t.name);
                     compares.rename(task.name, t.name);
                     void refreshTasks();
@@ -314,10 +373,11 @@ export default function App() {
           onError={(e) => { const id = r.job?.id ?? ""; compares.setFor(name)((s) => jobLost(s, id)); jobFailed(name, e.message); }} />
       ))}
       {help && <Shortcuts onClose={() => { setHelp(false); }} />}
+      {signIn && <SignIn again={signedIn.current} onSignedIn={afterSignIn} />}
       {toast && (
         <div className="toast" role="status" key={toast.key}>
           <span>{toast.text}</span>
-          {toast.then && (
+          {toast.then && task && task.name === toast.task && task.revision === toast.rev && (
             <button className="small secondary" onClick={() => { const then = toast.then; setToast(null); if (then) void step(then); }}>
               {toast.then === "redo" ? "Redo" : "Undo"}
             </button>
@@ -326,96 +386,5 @@ export default function App() {
         </div>
       )}
     </div>
-  );
-}
-
-/** Asks for the server's token (set with `fewshot serve --token`); the server keeps it in a cookie. */
-function SignIn() {
-  const [token, setToken] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  return (
-    <main className="sign-in">
-      <form
-        className="new-task"
-        onSubmit={(e) => {
-          e.preventDefault();
-          setBusy(true);
-          api.login(token).then(
-            () => { location.reload(); },
-            (err: unknown) => { setBusy(false); setError(err instanceof Error ? err.message : String(err)); },
-          );
-        }}
-      >
-        <h1>Sign in</h1>
-        <p className="muted">This fewshot server needs its access token (the one it was started with, <code>fewshot serve --token</code>).</p>
-        <ErrorBox error={error} onClose={() => { setError(null); }} />
-        <label>
-          <span>Token</span>
-          <input type="password" autoComplete="current-password" value={token} onChange={(e) => { setToken(e.target.value); }} required autoFocus />
-        </label>
-        <button type="submit" disabled={busy || !token}>{busy ? "Signing in…" : "Sign in"}</button>
-      </form>
-    </main>
-  );
-}
-
-function NewTask({ models, run, onCreated }: {
-  models: ModelInfo | null; run: <T>(p: Promise<T>) => Promise<T | undefined>; onCreated: (t: TaskDetail) => void;
-}) {
-  const [name, setName] = useState("");
-  const [embedder, setEmbedder] = useState("");
-  const [busy, setBusy] = useState(false);
-  const spec = embedder || (models?.embedders[0]?.spec ?? "");
-  const importZip = useRef<HTMLInputElement>(null);
-  return (
-    <>
-    <form
-      className="new-task"
-      onSubmit={(e) => {
-        e.preventDefault();
-        setBusy(true);
-        void run(api.createTask(name.trim(), spec || undefined, "gda")).then((t) => {
-          setBusy(false);
-          if (t) onCreated(t);
-        });
-      }}
-    >
-      <h1>New task</h1>
-      <p className="muted">
-        A task is a set of classes plus a few labeled images of each. New images are embedded with a pretrained vision model and
-        assigned to the closest class. No training run is needed: add, remove, or relabel examples and predictions update immediately.
-      </p>
-      <label>
-        <span>Name</span>
-        <input value={name} onChange={(e) => { setName(e.target.value); }} placeholder="e.g. weld-defects" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" required autoFocus />
-      </label>
-      <label>
-        <span>Embedder</span>
-        <select value={spec} onChange={(e) => { setEmbedder(e.target.value); }}>
-          {models?.embedders.map((m) => <option key={m.spec} value={m.spec}>{m.label}</option>)}
-        </select>
-        <small className="muted">{models?.embedders.find((m) => m.spec === spec)?.notes}</small>
-      </label>
-      <button type="submit" disabled={busy || !name.trim()}>{busy ? "Creating… (loads the model on first use)" : "Create task"}</button>
-    </form>
-    <div className="new-task import">
-      <h3>Or import a task</h3>
-      <p className="muted">From a zip made with “Export” on a task's Settings tab, or <code>fewshot export</code>.</p>
-      <input ref={importZip} type="file" accept=".zip,application/zip" hidden onChange={(e) => {
-        const f = e.target.files?.[0];
-        e.target.value = "";
-        if (!f) return;
-        setBusy(true);
-        void run(api.importTask(f, name.trim() || undefined)).then((t) => {
-          setBusy(false);
-          if (t) onCreated(t);
-        });
-      }} />
-      <button className="secondary" disabled={busy} onClick={() => { importZip.current?.click(); }}>
-        Import zip{name.trim() ? ` as “${name.trim()}”` : ""}…
-      </button>
-    </div>
-    </>
   );
 }

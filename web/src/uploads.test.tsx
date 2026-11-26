@@ -1,7 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
-import { useUploads, type SendBatch, type UploadStop } from "./hooks";
+import { useUploads, type SendBatch, type UploadStop } from "./useUploads";
 import { taskDetail } from "./test-data";
 import { BATCH, batchLimits, newUndoGroup } from "./upload";
 
@@ -51,7 +51,7 @@ describe("useUploads", () => {
     expect(stops).toEqual([]);
   });
 
-  it("goes on while the task stays open, and stops when another opens, saying how much got in", async () => {
+  it("goes on while the task stays open, and stops when another opens, counting the batch in flight", async () => {
     const { hook, stops } = setup("pets");
     const { send, release } = gatedSend();
     act(() => { void hook.result.current.start("cat", files(5), send); });
@@ -61,9 +61,55 @@ describe("useUploads", () => {
     hook.rerender({ t: "pets" }); // the App re-rendering, e.g. for a tab switch: nothing stops
     expect(stops).toEqual([]);
     hook.rerender({ t: "birds" });
-    await waitFor(() => { expect(stops).toEqual([{ task: "pets", added: 2, total: 5, error: null }]); });
-    expect(send).toHaveBeenCalledTimes(2);
     expect(hook.result.current.slots).toEqual({});
+    expect(send.mock.calls[1][1].aborted).toBe(false); // the server may store it: wait and count it
+    release();
+    await waitFor(() => { expect(stops).toEqual([{ task: "pets", added: 4, total: 5, error: null }]); });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps going when the task is renamed, sending the rest to its new name", async () => {
+    const { hook, stops } = setup("pets");
+    const { send, release } = gatedSend();
+    let done: Promise<unknown> = Promise.resolve();
+    act(() => { done = hook.result.current.start("cat", files(5), send); });
+    await waitFor(() => { expect(send).toHaveBeenCalledTimes(1); });
+    act(() => { hook.result.current.rename("cats"); });
+    expect(hook.result.current.slots.cat?.progress).toBeDefined(); // shown while the route catches up
+    hook.rerender({ t: "cats" });
+    expect(hook.result.current.slots.cat?.progress).toBeDefined();
+    release();
+    await waitFor(() => { expect(send).toHaveBeenCalledTimes(2); });
+    release();
+    await waitFor(() => { expect(send).toHaveBeenCalledTimes(3); });
+    release();
+    await act(() => done);
+    expect(send.mock.calls.map((c) => c[3])).toEqual(["pets", "cats", "cats"]);
+    expect(stops).toEqual([]);
+  });
+
+  it("stop() stops after the batch in flight and says how many got in", async () => {
+    const { hook, stops } = setup("pets");
+    const { send, release } = gatedSend();
+    act(() => { void hook.result.current.start("cat", files(5), send); });
+    await waitFor(() => { expect(send).toHaveBeenCalledTimes(1); });
+    expect(hook.result.current.busy).toBe(true);
+    let added: number | null = null;
+    act(() => { void hook.result.current.stop().then((n) => { added = n; }); });
+    expect(hook.result.current.slots.cat?.progress?.stopping).toBe(true);
+    expect(added).toBeNull();
+    release();
+    await waitFor(() => { expect(added).toBe(2); });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(stops).toEqual([{ task: "pets", added: 2, total: 5, error: null }]);
+    expect(hook.result.current.busy).toBe(false);
+  });
+
+  it("keeps how many images were moved from other classes", async () => {
+    const { hook } = setup("pets");
+    const moving: SendBatch = (batch) => Promise.resolve({ added: batch, errors: [], task: taskDetail(), moved: 1 });
+    await act(async () => { await hook.result.current.start("cat", files(3), moving); });
+    expect(hook.result.current.slots.cat).toEqual({ skipped: [], moved: 2 });
   });
 
   it("Cancel stops the rest; a failure part-way is reported with its error", async () => {
@@ -72,7 +118,9 @@ describe("useUploads", () => {
     act(() => { void hook.result.current.start("cat", files(3), gated.send); });
     await waitFor(() => { expect(hook.result.current.slots.cat?.progress).toBeDefined(); });
     act(() => { hook.result.current.slots.cat?.progress?.cancel(); });
-    await waitFor(() => { expect(stops).toEqual([{ task: "pets", added: 0, total: 3, error: null }]); });
+    gated.release(); // the batch in flight lands, and is counted
+    await waitFor(() => { expect(stops).toEqual([{ task: "pets", added: 2, total: 3, error: null }]); });
+    expect(gated.send).toHaveBeenCalledTimes(1);
 
     let calls = 0;
     const failing: SendBatch = (batch) => (++calls === 1

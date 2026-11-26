@@ -35,6 +35,7 @@ export function splitBytes<T extends { size: number }>(files: T[], maxBytes: num
 
 export interface BatchOptions<R> {
   signal: AbortSignal; // stops before the next step (and aborts a request in flight, if ``send`` passes it on)
+  stop?: AbortSignal; // stops before the next step, letting a request in flight finish (and count)
   prepare?: (files: File[]) => Promise<File[]>; // e.g. scale images down, a batch at a time to bound memory
   onBatch: (result: R, files: File[]) => void; // each batch's result as it arrives
   onProgress?: (done: number, total: number) => void; // files sent so far
@@ -42,19 +43,21 @@ export interface BatchOptions<R> {
 }
 
 /** Send ``files`` with ``send`` in batches (see BATCH), one request at a time. Rejects with the
- * first failure, or an AbortError once ``signal`` is aborted; batches already sent stay sent. */
+ * first failure, or an AbortError once ``signal`` or ``stop`` is aborted; batches already sent stay sent. */
 export async function sendInBatches<R>(
   files: File[], send: (batch: File[], signal: AbortSignal) => Promise<R>,
-  { signal, prepare, onBatch, onProgress, limits = BATCH }: BatchOptions<R>,
+  { signal, stop, prepare, onBatch, onProgress, limits = BATCH }: BatchOptions<R>,
 ): Promise<void> {
   let done = 0;
   onProgress?.(0, files.length);
   for (let i = 0; i < files.length; i += limits.files) {
     signal.throwIfAborted();
+    stop?.throwIfAborted();
     const chunk = files.slice(i, i + limits.files);
     const ready = prepare ? await prepare(chunk) : chunk;
     for (const batch of splitBytes(ready, limits.bytes)) {
       signal.throwIfAborted();
+      stop?.throwIfAborted();
       const r = await send(batch, signal);
       done += batch.length;
       onBatch(r, batch);

@@ -3,7 +3,7 @@ import { api, type DuplicatePair, type ModelInfo, type TaskDetail } from "./api"
 import Compare from "./Compare";
 import { downloadCsv } from "./csv";
 import { pct } from "./format";
-import { Gate, type SetFor } from "./hooks";
+import { Gate, type SetFor } from "./state";
 import Lightbox from "./Lightbox";
 import { NO_EVAL, type CompareRun, type EvalRun } from "./runs";
 import Threshold from "./Threshold";
@@ -14,6 +14,10 @@ interface Props {
   state: EvalRun | null; setState: SetFor<EvalRun>;
   models: ModelInfo | null; compare: CompareRun | null; setCompare: SetFor<CompareRun>;
 }
+
+/** Mistakes (or a cell's examples) listed at first, and added by each "Show more": a big task can
+ * have thousands. */
+const LISTED = 60;
 
 const STAGES: Record<string, string> = { starting: "Starting", embedding: "Embedding images", evaluating: "Cross-validating" };
 
@@ -27,6 +31,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
   const [dupes, setDupes] = useState<{ task: string; pairs: DuplicatePair[] } | null>(null);
   const [finding, setFinding] = useState(false);
   const [viewing, setViewing] = useState<number | null>(null); // index into the listed examples, full size
+  const [shown, setShown] = useState({ of: "", n: LISTED }); // how many of the list ``of`` (a cell, or all mistakes) are shown
   // ``setState`` belongs to this task, so a response that arrives after switching task still
   // lands on the task it is for.
   const update = (p: Partial<EvalRun>) => { setState((s) => ({ ...(s ?? NO_EVAL), ...p })); };
@@ -52,9 +57,11 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
   };
   const filter = cell?.task === task.name ? cell : null;
   // A picked cell lists its examples (right or wrong), most confident first; otherwise all mistakes.
-  const listed = !report ? [] : filter
+  const listed = useMemo(() => (!report ? [] : filter
     ? report.predictions.filter((m) => m.true === filter.t && m.pred === filter.p).sort((a, b) => b.confidence - a.confidence)
-    : report.mistakes;
+    : report.mistakes), [report, filter?.t, filter?.p]); // eslint-disable-line react-hooks/exhaustive-deps -- the cell, not its object
+  const listId = filter ? `${filter.t}\u0000${filter.p}` : "";
+  const nShown = shown.of === listId ? shown.n : LISTED;
   const pairs = dupes?.task === task.name ? dupes.pairs : null;
   const findDupes = async () => {
     setFinding(true);
@@ -218,14 +225,14 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
                 </p>
               )}
               <div className="thumbs">
-                {listed.map((m) => {
+                {listed.slice(0, nShown).map((m, i) => {
                   const exists = examples.get(m.id);
                   return (
                     <figure key={m.id} className="thumb wide">
                       {/* 400 px: 2x the 200 px tile */}
                       <img src={api.imageUrl(task.name, m.id, 400)} alt={`${m.true} example${m.correct ? "" : `, predicted ${m.pred}`}`} loading="lazy" tabIndex={0} className="zoomable"
-                        onClick={() => { setViewing(listed.indexOf(m)); }}
-                        role="button" onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setViewing(listed.indexOf(m)); } }} />
+                        onClick={() => { setViewing(i); }}
+                        role="button" onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setViewing(i); } }} />
                       <figcaption className="col">
                         <span><b>{m.true}</b>{m.correct ? " ✓" : ` → ${m.pred}`} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (
@@ -239,6 +246,11 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
                   );
                 })}
               </div>
+              {listed.length > nShown && (
+                <button className="secondary more" onClick={() => { setShown({ of: listId, n: nShown + LISTED * 4 }); }}>
+                  Show more ({listed.length - nShown} hidden)
+                </button>
+              )}
             </>
           )}
         </>
