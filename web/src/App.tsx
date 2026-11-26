@@ -5,7 +5,7 @@ import Evaluate, { type EvalRun } from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { topModal, usePredictResults } from "./hooks";
+import { Gate, stepToast, taskUndoKey, typingAt, usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
@@ -91,7 +91,7 @@ export default function App() {
   useEffect(() => { // "?" shows the keyboard shortcuts
     const on = (e: KeyboardEvent) => {
       if (e.key !== "?" || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      if (typingAt(e.target)) return;
       e.preventDefault();
       setHelp(true);
     };
@@ -129,19 +129,17 @@ export default function App() {
     void refreshTasks();
   };
 
-  /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse. */
-  const step = async (which: "undo" | "redo") => {
+  /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse.
+   * One step at a time: presses while one is in flight are ignored, so a double press or a held
+   * key doesn't walk back several versions. */
+  const stepGate = useRef(new Gate()).current;
+  const step = (which: "undo" | "redo") => stepGate.run(async () => {
     if (!task || !(which === "undo" ? task.can_undo : task.can_redo)) return;
-    const what = which === "undo" ? task.undo_label : task.redo_label;
     const t = await run(which === "undo" ? api.undo(task.name) : api.redo(task.name));
     if (!t) return;
     updateTask(t);
-    setToast({
-      text: `${which === "undo" ? "Undid" : "Redid"} ${what || "the last change"}`,
-      then: which === "undo" ? (t.can_redo ? "redo" : null) : (t.can_undo ? "undo" : null),
-      key: Date.now(),
-    });
-  };
+    setToast({ ...stepToast(which, t, which === "undo" ? task.undo_label : task.redo_label), key: Date.now() });
+  });
   const undo = () => step("undo");
   useEffect(() => { // the toast goes after a few seconds
     if (!toast) return;
@@ -149,16 +147,15 @@ export default function App() {
     return () => { clearTimeout(timer); };
   }, [toast]);
   // Ctrl/Cmd+Z undoes the task's last change and Ctrl/Cmd+Shift+Z (or Ctrl+Y) redoes it, unless
-  // typing in a field (where they undo the typing).
+  // typing in a field (where they undo the typing); see taskUndoKey.
   const stepRef = useRef(step);
   stepRef.current = step;
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      if (!(e.ctrlKey || e.metaKey) || e.altKey || (key !== "z" && key !== "y") || topModal()) return;
-      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      const which = taskUndoKey(e);
+      if (!which) return;
       e.preventDefault();
-      void stepRef.current(key === "y" || e.shiftKey ? "redo" : "undo");
+      if (!e.repeat) void stepRef.current(which); // a held key steps once
     };
     window.addEventListener("keydown", on);
     return () => { window.removeEventListener("keydown", on); };
