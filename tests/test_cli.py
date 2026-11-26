@@ -250,6 +250,15 @@ def test_add(run, root, tmp_path):
     assert len(load(root).config.examples) == 3
 
 
+def test_add_says_how_many_moved(run, root, task, photos):
+    """Adding images that are examples of another class says they moved, and from where."""
+    r = run("add", task, "green", photos / "red" / "0.png", photos / "red" / "1.png", photos / "blue" / "20.png")
+    assert r.exit_code == 0
+    assert "3 of them moved from other classes (1 from blue, 2 from red)" in r.output
+    assert load(root).summary()["counts"] == {"blue": 3, "green": 7, "red": 2}
+    assert "moved" not in run("add", task, "green", photos / "green").output
+
+
 def test_import(run, root, photos):
     """`import` honours --shots, skips bad images and rejects a missing folder."""
     run("create", "colors", "--embedder", "fake:color")

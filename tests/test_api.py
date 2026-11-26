@@ -285,6 +285,19 @@ def test_bulk_relabel_and_delete(client, task, tmp_path, monkeypatch):
     assert client.post("/api/tasks/missing/examples/delete", json={"ids": ["a"]}).status_code == 404
 
 
+def test_add_reports_moved_examples(client, task):
+    """Re-adding images that are examples of another class moves them, and the response says so."""
+    r = _upload(client, task, "blue", RED, seeds=[0, 1, 99])
+    assert r.status_code == 201
+    body = r.json()
+    assert len(body["added"]) == 3
+    moved_ids = {m["id"] for m in body["moved"]}
+    assert len(moved_ids) == 2
+    assert all(m["previous_label"] == "red" for m in body["moved"])
+    assert moved_ids <= {e["id"] for e in body["added"]}
+    assert _upload(client, task, "blue", RED, seeds=[0]).json()["moved"] == []  # already blue
+
+
 def test_image_thumbnails(client, task, tmp_path):
     """``?size=`` serves a JPEG scaled down to fit; bad sizes, missing and corrupt files are errors."""
     big = io.BytesIO()

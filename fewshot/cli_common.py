@@ -6,6 +6,7 @@ import contextlib
 import csv
 import json
 import sys
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -135,9 +136,14 @@ def blobs(files: Sequence[Source], update: Callable[[int, int], None]) -> Iterat
 
 
 def report_skipped(result: Added) -> int:
-    """Print each image an add left out and why; returns how many were added."""
+    """Print each image an add left out and why, and how many it moved from other classes;
+    returns how many were added (moved ones included)."""
     for f, why in result.errors:
         typer.secho(f"skip {f}: {why}", fg="yellow", err=True)
+    if result.moved:
+        froms = Counter(was for _, was in result.moved)
+        typer.echo(f"{len(result.moved)} of them moved from other classes ("
+                   + ", ".join(f"{n} from {c}" for c, n in sorted(froms.items())) + ")", err=True)
     return len(result.added)
 
 
@@ -146,7 +152,6 @@ def add_files(task: Task, label: str, files: Sequence[Source]) -> int:
     how many were added."""
     with progress(f"Adding to {label}") as update:
         return report_skipped(services.add_examples(task, label, blobs(files, update)))
-
 
 
 def echo_json(obj: Any) -> None:

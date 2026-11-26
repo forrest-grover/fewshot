@@ -9,6 +9,7 @@ command line stays quick to start.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -120,26 +121,30 @@ def fetch_urls(urls: Sequence[str], max_bytes: int, *, public_only: bool = False
 
 @dataclass
 class Added:
-    """What adding images did: the examples (or inbox images) added, and each image left out."""
+    """What adding images did: the examples (or inbox images) stored, each image left out, and
+    which of the stored examples were already examples of another class, so adding them moved
+    them (``added`` includes those too)."""
 
     added: list[Any] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)  # (name, reason)
+    moved: list[tuple[Any, str]] = field(default_factory=list)  # (example, the class it was in)
 
 
-def _added(task_call: Callable[[Iterable[Any]], Sequence[Any]], blobs: Iterable[Blob],
-           item: Callable[[Blob], Any]) -> Added:
-    """Run ``task_call`` on the readable ``blobs`` (as ``item(blob)``), lazily, so only the batch
-    being stored is held in memory; unreadable blobs and refused images become ``errors``."""
+def _added(task_call: Callable[[Iterable[Any]], Sequence[Any]], blobs: Iterable[tuple[Blob, str | None]],
+           item: Callable[[Blob, str | None], Any]) -> Added:
+    """Run ``task_call`` on the readable ``blobs`` (each with its label, if any, as
+    ``item(blob, label)``), lazily, so only the batch being stored is held in memory; unreadable
+    blobs and refused images become ``errors``."""
     out = Added()
     names: list[str] = []
 
     def readable() -> Iterator[Any]:
-        for b in blobs:
+        for b, label in blobs:
             if b.data is None:
                 out.errors.append((b.name, b.error or "unreadable"))
             else:
                 names.append(b.name)
-                yield item(b)
+                yield item(b, label)
 
     for name, r in zip(names, task_call(readable()), strict=True):
         if isinstance(r, ValueError):
@@ -154,21 +159,36 @@ def _bytes(data: bytes | Path | None) -> bytes:
     return read_or_empty(data) if isinstance(data, Path) else data or b""
 
 
+def _add_labelled(task: Task, blobs: Iterable[tuple[Blob, str | None]], undo_group: str | None) -> Added:
+    """Add each readable blob as an example of its label, in one undo step, noting the examples
+    that were in another class before (re-adding an image moves it)."""
+    with contextlib.suppress(FileNotFoundError):  # deleted: adding raises KeyError
+        task.refresh()
+    was = {e.id: e.label for e in task.config.examples}
+    out = _added(lambda items: task.add_examples(items, undo_group=undo_group), blobs,
+                 lambda b, label: (_bytes(b.data), label, b.source or b.name))
+    for ex in out.added:  # in order, so an image given twice under two labels counts as moved once
+        if was.get(ex.id, ex.label) != ex.label:
+            out.moved.append((ex, was[ex.id]))
+        was[ex.id] = ex.label
+    return out
+
+
 def add_examples(task: Task, label: str, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:
     """Add the readable ``blobs`` as examples of ``label``, one undo step for all of them (and for
     the calls just before with the same ``undo_group``: see ``Task.add_examples``); ``ValueError``
-    for a bad label. Images that can't be added are reported, not raised."""
+    for a bad label. Images that can't be added are reported, not raised; images that were
+    examples of another class are moved to ``label`` and listed in ``moved``."""
     label = check_class_name(label)
-    return _added(lambda items: task.add_examples(items, undo_group=undo_group), blobs,
-                  lambda b: (_bytes(b.data), label, b.source or b.name))
+    return _add_labelled(task, ((b, label) for b in blobs), undo_group)
 
 
 def add_to_inbox(task: Task, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:
     """Put the readable ``blobs`` in the task's inbox, one undo step for all of them (and for the
     calls just before with the same ``undo_group``). Images that can't be added (unreadable, or
     labelled already) are reported, not raised."""
-    return _added(lambda items: task.add_to_inbox(items, undo_group=undo_group), blobs,
-                  lambda b: (_bytes(b.data), b.source or b.name))
+    return _added(lambda items: task.add_to_inbox(items, undo_group=undo_group), ((b, None) for b in blobs),
+                  lambda b, _: (_bytes(b.data), b.source or b.name))
 
 
 # ---- predictions and evaluation ---------------------------------------------

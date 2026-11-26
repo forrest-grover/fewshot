@@ -137,10 +137,19 @@ class FileError(BaseModel):
     error: str
 
 
+class MovedExample(BaseModel):
+    """An image added as an example that was already an example of another class: adding it moved it."""
+
+    id: str
+    previous_label: str
+
+
 class AddResult(BaseModel):
-    """POST .../examples."""
+    """POST .../examples. ``added`` is every example the request stored, including those that were
+    in another class before and are listed again in ``moved``."""
 
     added: list[ExampleOut]
+    moved: list[MovedExample]
     errors: list[FileError]
     task: TaskDetail
 
