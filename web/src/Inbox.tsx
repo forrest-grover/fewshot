@@ -237,8 +237,8 @@ export default function Inbox({ task, setTask, run }: Props) {
               const s = suggested(i);
               return (
                 <article key={i.id} className={`inbox-card ${cur?.id === i.id ? "current" : ""} ${picked.has(i.id) ? "picked" : ""}`}
-                  tabIndex={-1} ref={(el) => { if (el) cards.current.set(i.id, el); else cards.current.delete(i.id); }}
-                  onClick={() => { setCurrent(i.id); }}>
+                  tabIndex={cur?.id === i.id ? 0 : -1} ref={(el) => { if (el) cards.current.set(i.id, el); else cards.current.delete(i.id); }}
+                  onClick={() => { setCurrent(i.id); }} onFocus={() => { if (cur?.id !== i.id) setCurrent(i.id); }}>
                   <label className="inbox-pick" title="Tick to select">
                     <input type="checkbox" checked={picked.has(i.id)} aria-label={`Select ${i.source || i.id}`}
                       onChange={() => {

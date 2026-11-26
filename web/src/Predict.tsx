@@ -210,7 +210,8 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
               key={it.key}
               ref={(el) => { if (el) cardRefs.current.set(it.key, el); else cardRefs.current.delete(it.key); }}
               className={`result ${it === current ? "current" : ""}`}
-              tabIndex={-1}
+              tabIndex={it === current ? 0 : -1} // Tab reaches the highlighted result; arrows move between them
+              onFocus={() => { if (actionable(it) && it !== current) update((r) => ({ ...r, current: it.key })); }}
               onClick={() => { if (actionable(it)) update((r) => ({ ...r, current: it.key })); }}
             >
               <img src={it.url} alt={it.name} />

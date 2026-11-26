@@ -225,7 +225,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
                       {/* 400 px: 2x the 200 px tile */}
                       <img src={api.imageUrl(task.name, m.id, 400)} alt={`${m.true} example${m.correct ? "" : `, predicted ${m.pred}`}`} loading="lazy" tabIndex={0} className="zoomable"
                         onClick={() => { setViewing(listed.indexOf(m)); }}
-                        onKeyDown={(e) => { if (e.key === "Enter") setViewing(listed.indexOf(m)); }} />
+                        role="button" onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setViewing(listed.indexOf(m)); } }} />
                       <figcaption className="col">
                         <span><b>{m.true}</b>{m.correct ? " ✓" : ` → ${m.pred}`} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (
