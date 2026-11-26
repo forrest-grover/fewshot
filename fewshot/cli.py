@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from . import services
-from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source, report_skipped
+from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source, command_group, report_skipped
 from .cli_common import add_files as _add_files
 from .cli_common import echo_json as _echo_json
 from .cli_common import error_text as _error_text
@@ -39,10 +39,10 @@ from .text import check_class_name
 if TYPE_CHECKING:
     from .pipeline import Pipeline, Prediction
 
-app = typer.Typer(help="Embedding-based few-shot image classification.", no_args_is_help=True)
-cls_app = typer.Typer(help="Manage a task's classes.", no_args_is_help=True)
+app = command_group("Embedding-based few-shot image classification.")
+cls_app = command_group("Manage a task's classes.")
 app.add_typer(cls_app, name="class")
-cache_app = typer.Typer(help="Inspect and prune the embedding cache.", no_args_is_help=True)
+cache_app = command_group("Inspect and prune the embedding cache.")
 app.add_typer(cache_app, name="cache")
 app.add_typer(ex_app, name="example")
 app.add_typer(inbox_app, name="inbox")
@@ -376,7 +376,9 @@ def import_dir(
 PREDICT_CHUNK = 256  # images classified (and printed) at a time
 
 
-@app.command()
+@app.command(help=f"""Classify images (files, directories or http(s) URLs), {PREDICT_CHUNK} at a time: text, CSV
+    and JSON lines are printed as each batch finishes, and --from-file is read as it arrives, so a
+    long list can be piped through. A path in it that can't be read gets an error row.""")
 def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     paths: list[str] = typer.Argument(None, help="Image files, directories or http(s) URLs"),
@@ -390,9 +392,7 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     revision: int | None = typer.Option(None, help="Use this earlier version of the task (one kept for undo)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Classify images (files, directories or http(s) URLs), PREDICT_CHUNK at a time: text, CSV and
-    JSON lines are printed as each batch finishes, and --from-file is read as it arrives, so a long
-    list can be piped through. A path in it that can't be read gets an error row."""
+    """Classify images; the help text is in the decorator, to name PREDICT_CHUNK's value."""
     t = _task(root, name)
     if sum((as_json, as_jsonl, as_csv)) > 1:
         _usage("Give at most one of --json, --jsonl and --csv")
@@ -500,7 +500,17 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         typer.echo(f"To switch: fewshot config {name} --embedder {r['best']}")
 
 
-@app.command()
+WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
+WATCH_MAX_BACKOFF = 300.0  # longest wait before trying again to move a file that couldn't be moved
+
+
+@app.command(help=f"""Classify images as they arrive in FOLDER and sort them into OUT, logging each to
+    OUT/predictions.jsonl.
+
+    A file is handled once its size has stayed the same for one interval (so half-copied files
+    wait); one that can't be read yet is retried until it is {WATCH_SETTLE:g} seconds old, then goes to
+    _error. The task is re-read every time, so labelling more examples improves the sorting as it
+    runs.""")
 def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     folder: Path = typer.Argument(..., help="Folder new images arrive in"),
@@ -512,12 +522,7 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
     once: bool = typer.Option(False, "--once", help="Handle what is there now and stop"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Classify images as they arrive in FOLDER and sort them into OUT, logging each to OUT/predictions.jsonl.
-
-    A file is handled once its size has stayed the same for one interval (so half-copied files wait);
-    one that can't be read yet is retried until it is WATCH_SETTLE seconds old, then goes to _error.
-    The task is re-read every time, so labelling more examples improves the sorting as it runs.
-    """
+    """Sort arriving images; the help text is in the decorator, to name WATCH_SETTLE's value."""
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
     ws = _ws(root)
@@ -545,10 +550,6 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
             time.sleep(interval)
     except KeyboardInterrupt:
         typer.echo("Stopped")
-
-
-WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
-WATCH_MAX_BACKOFF = 300.0  # longest wait before trying again to move a file that couldn't be moved
 
 
 class Backoff:
@@ -804,7 +805,7 @@ def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | Non
 @app.command()
 def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     folder: Path,
-    embedder: list[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
+    embedder: list[str] = typer.Option(None, help=f"Embedder spec(s) to compare [default: {DEFAULT_SPEC}]"),
     classifier: list[str] = typer.Option(["gda"], help="Classifier(s) to compare"),
     way: int = typer.Option(5, min=0, help="Classes per episode; 0 for every class with enough images"),
     shot: list[int] = typer.Option([1, 5], min=0, help="Shot count(s)"),

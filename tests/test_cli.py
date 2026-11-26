@@ -45,6 +45,25 @@ def load(root, name="colors"):
     return Workspace(root).get(name)
 
 
+@pytest.mark.parametrize(("command", "shown"), [
+    (["import-task"], "[default: the exported name]"),
+    (["eval"], "[default: leave-one-out up to 100"),
+    (["compare"], "[default: as for eval]"),
+    (["class", "add"], "[default: keep an existing class's]"),
+    (["bench"], f"[default: {embedders.DEFAULT_SPEC}]"),
+    (["serve"], "[default: $FEWSHOT_ALLOWED_HOSTS"),
+    (["list"], "[default: ./fewshot_data]"),
+    (["predict"], f"{cli.PREDICT_CHUNK} at a time"),
+    (["watch"], f"until it is {cli.WATCH_SETTLE:g} seconds old"),
+])
+def test_help_shows_text_in_brackets_and_values(command, shown):
+    """Help prints hand-written [default: ...] text (Rich markup would drop it) and the values of
+    constants it mentions, not their names."""
+    r = CliRunner().invoke(cli.app, [*command, "--help"], env={"COLUMNS": "1000"})
+    assert r.exit_code == 0
+    assert shown in " ".join(r.output.split())
+
+
 def test_models_lists_presets():
     """`models` prints every preset spec and label."""
     r = CliRunner().invoke(cli.app, ["models"])

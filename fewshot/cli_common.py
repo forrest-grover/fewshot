@@ -29,6 +29,12 @@ JSON_OPT = typer.Option(False, "--json", help="Print JSON")
 ROOT_OPT = typer.Option(None, "--root", envvar="FEWSHOT_HOME", help="Workspace directory [default: ./fewshot_data]")
 
 
+def command_group(help_text: str) -> typer.Typer:
+    """A group of commands. Help is printed as written: with Rich markup on, Typer would take
+    ``[default: ...]`` and any other text in brackets for markup and drop it."""
+    return typer.Typer(help=help_text, no_args_is_help=True, rich_markup_mode=None)
+
+
 # Exit statuses: 1 when the command failed (or failed for some of its inputs), 2 for a usage error
 # (options that don't go together, missing arguments), as for the usage errors Typer reports itself.
 FAILED, USAGE = 1, 2

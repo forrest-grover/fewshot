@@ -11,6 +11,7 @@ from .cli_common import (
     JSON_OPT,
     ROOT_OPT,
     blobs,
+    command_group,
     echo_json,
     error_text,
     expand,
@@ -24,10 +25,10 @@ from .cli_common import (
 )
 from .store import Task
 
-ex_app = typer.Typer(help="List, move, tag and delete a task's examples (ids may be shortened to a unique "
-                          "prefix of 4+ characters).", no_args_is_help=True)
-inbox_app = typer.Typer(help="Unlabelled images waiting to be labelled, with the model's suggestions (ids may be "
-                             "shortened to a unique prefix of 4+ characters).", no_args_is_help=True)
+ex_app = command_group("List, move, tag and delete a task's examples (ids may be shortened to a unique "
+                       "prefix of 4+ characters).")
+inbox_app = command_group("Unlabelled images waiting to be labelled, with the model's suggestions (ids may be "
+                          "shortened to a unique prefix of 4+ characters).")
 
 
 # ---- examples -------------------------------------------------------------
