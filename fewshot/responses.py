@@ -49,6 +49,12 @@ def render(model: Any, content: Any) -> bytes:
     return adapter.dump_json(adapter.validate_python(content))
 
 
+class Problem(BaseModel):
+    """An error: what FastAPI's ``HTTPException`` and the server's access checks answer."""
+
+    detail: str
+
+
 def json_response(model: Any, content: Any, status: int = 200) -> Response:
     """``content`` as a JSON response validated as ``model`` (see ``render``), made in the
     calling thread. FastAPI would do this on the event loop, where a large task's response (10 MB

@@ -13,7 +13,7 @@ import fewshot.guard
 from fewshot.auth import Sessions, WrongTokens
 from fewshot.access import NO_TOKEN, exposure_problem
 from fewshot.guard import host_allowed
-from tests.conftest import RED, api_client, host_client, png
+from tests.conftest import RED, api_client, api_task, host_client, png
 
 
 # ---- tokens and sessions -------------------------------------------------
@@ -315,3 +315,53 @@ def test_exposure_problem():
         assert exposure_problem(host, None, False) is None, host
     assert exposure_problem("0.0.0.0", "0123456789abcdef0123", False) is None
     assert exposure_problem("0.0.0.0", None, True) is None
+
+
+# ---- reads from other sites, caching, and the shape of answers --------------
+def test_cross_site_reads_are_refused_but_images(client):
+    """A page on another site can't make the browser read /api (say, inbox suggestions running the
+    model, by <img src>), except example images; same-origin reads and clients without the
+    header go through."""
+    task = api_task(client, n=1)
+    eid = client.get(f"/api/tasks/{task}").json()["examples"][0]["id"]
+    for site in ("cross-site", "same-site"):
+        r = client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": site})
+        assert r.status_code == 403, site
+        assert r.json()["detail"] == f"Cross-site request refused: the browser sent it from another site (Sec-Fetch-Site: {site})"
+    assert client.get(f"/api/tasks/{task}/examples/{eid}/image", headers={"Sec-Fetch-Site": "cross-site"}).status_code == 200
+    assert client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+    assert client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": "none"}).status_code == 200
+    assert client.get(f"/api/tasks/{task}/inbox").status_code == 200
+
+
+def test_api_answers_are_not_cached_but_images_are(client):
+    """/api answers are "no-store" (they may need the token); images, whose ids are content
+    hashes, are kept by the browser only ("private")."""
+    task = api_task(client, n=1)
+    eid = client.get(f"/api/tasks/{task}").json()["examples"][0]["id"]
+    for path in (f"/api/tasks/{task}", "/api/tasks/nope", f"/api/tasks/{task}/export"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+    for size in ("", "?size=32"):
+        img = client.get(f"/api/tasks/{task}/examples/{eid}/image{size}")
+        assert img.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+
+def test_no_content_answers_have_no_content_type(tmp_path):
+    """204s (login, logout, deleting a task) have no body, so no Content-Type either; login still
+    sets its cookie."""
+    c = api_client(tmp_path, token=TOKEN)
+    r = c.post("/api/login", json={"token": TOKEN})
+    assert r.status_code == 204 and "content-type" not in r.headers and fewshot.access.SESSION_COOKIE in r.cookies
+    api_task(c, n=1)
+    r = c.delete("/api/tasks/c")
+    assert r.status_code == 204 and "content-type" not in r.headers
+    r = c.post("/api/logout")
+    assert r.status_code == 204 and "content-type" not in r.headers
+
+
+def test_schema_declares_the_access_errors(client):
+    """The OpenAPI schema lists what the access checks and size limits can answer anywhere."""
+    paths = client.get("/openapi.json").json()["paths"]
+    for op in (paths["/api/tasks"]["post"], paths["/api/tasks/{name}/examples"]["post"]):
+        assert {"401", "403", "413", "429"} <= set(op["responses"]), op["operationId"]
+        assert op["responses"]["403"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/Problem"}

@@ -36,6 +36,18 @@ def test_index_and_spa_fallback(ui):
         assert r.headers["content-type"].startswith("text/html")
 
 
+def test_ui_pages_cant_be_framed(ui):
+    """The UI's pages carry a CSP (no other site may frame them; only the UI's own scripts and
+    styles) and X-Frame-Options; index.html is revalidated, so a new build is picked up."""
+    for path in ["/", "/tasks/pets", "/favicon.svg"]:
+        r = ui.get(path)
+        csp = r.headers["content-security-policy"]
+        assert "frame-ancestors 'none'" in csp and "script-src 'self';" in csp, path
+        assert "img-src 'self' blob: data:" in csp, path  # thumbnails, and previews of picked files
+        assert (r.headers["x-frame-options"], r.headers["x-content-type-options"]) == ("DENY", "nosniff"), path
+    assert ui.get("/").headers["cache-control"] == "no-cache"
+
+
 def test_real_files(ui):
     """Files in dist and dist/assets are served as-is."""
     assert ui.get("/favicon.svg").text == "<svg/>"

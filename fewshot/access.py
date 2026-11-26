@@ -96,6 +96,19 @@ def _note_untrusted_proxy(srv: Server, request: Request) -> None:
                     "to the proxy's address.", client)
 
 
+def _refused_cross_site(request: Request) -> str | None:
+    """Why an /api request from another site is refused, or None: any write (CSRF), and reads
+    too, as a page could make a browser send those by ``<img src>`` or a link, and some run the
+    model (inbox suggestions, duplicates) on a server without a token. Reads are refused only by
+    Sec-Fetch-Site, which browsers send; example images may be shown anywhere."""
+    if request.method not in SAFE_METHODS:
+        return cross_site(request)
+    site = request.headers.get("sec-fetch-site", "same-origin")
+    if site in {"same-origin", "none"} or request.url.path.endswith("/image"):
+        return None
+    return f"Cross-site request refused: the browser sent it from another site (Sec-Fetch-Site: {site})"
+
+
 async def guard(request: Request, call_next: Any) -> Response:
     """Refuse every request to a server without a token that arrived on an address other than
     loopback (unless allowed), requests for another host name (DNS rebinding) and writes from
@@ -113,7 +126,7 @@ async def guard(request: Request, call_next: Any) -> Response:
     if not host_allowed(request.headers.get("host", ""), set(srv.settings.allowed_hosts)):
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path
-    if request.method not in SAFE_METHODS and path.startswith("/api/") and (why := cross_site(request)):
+    if path.startswith("/api/") and (why := _refused_cross_site(request)):
         return JSONResponse({"detail": why}, 403)
     if srv.sessions is not None:
         _note_untrusted_proxy(srv, request)
@@ -128,4 +141,6 @@ async def guard(request: Request, call_next: Any) -> Response:
         if refused:
             return JSONResponse({"detail": "Not signed in"}, 401, headers={"WWW-Authenticate": "Bearer"})
     response: Response = await call_next(request)
+    if path.startswith("/api/"):  # answers for one user (with the token): no cache may keep them
+        response.headers.setdefault("Cache-Control", "no-store")
     return response

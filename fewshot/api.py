@@ -55,7 +55,7 @@ from .images import thumbnail
 from .inbox import chunked
 from .jobs import Job, Jobs, TooManyJobs
 from .pipeline import Pipeline
-from .responses import json_response
+from .responses import Problem, json_response
 from .schemas import (
     AcceptConfident,
     AddResult,
@@ -243,7 +243,15 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-router = APIRouter()
+# What the access checks and body limits (``access``, ``guard``) answer on any route, for the schema.
+ERRORS: dict[int | str, dict[str, Any]] = {
+    401: {"model": Problem, "description": "Not signed in (a server with a token)"},
+    403: {"model": Problem, "description": "Cross-site request, or a server without a token reached from "
+                                           "another machine"},
+    413: {"model": Problem, "description": "Request body over its size limit"},
+    429: {"model": Problem, "description": "Too many wrong tokens from this address"},
+}
+router = APIRouter(responses=ERRORS)
 
 
 def _missing(e: KeyError) -> HTTPException:
@@ -298,7 +306,7 @@ async def health(srv: Srv) -> dict[str, Any]:
             "max_request_bytes": srv.settings.max_request_bytes, "max_upload_bytes": srv.settings.max_upload_bytes}
 
 
-@router.post("/api/login", status_code=204)
+@router.post("/api/login", status_code=204, response_class=Response)
 async def login(srv: Srv, body: Login, request: Request, response: Response) -> None:
     """Check the server token and start a session: an HttpOnly, SameSite=Strict cookie (Secure over
     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
@@ -318,7 +326,7 @@ async def login(srv: Srv, body: Login, request: Request, response: Response) -> 
                             samesite="strict", secure=https)
 
 
-@router.post("/api/logout", status_code=204)
+@router.post("/api/logout", status_code=204, response_class=Response)
 async def logout(srv: Srv, request: Request, response: Response) -> None:
     """End the session: the cookie is deleted, and its session refused from now on."""
     if srv.sessions is not None:
@@ -385,7 +393,7 @@ async def update_task(srv: Srv, name: str, body: TaskSettings) -> Response:
     return await srv.run(_update_task, srv, name, body)
 
 
-@router.delete("/api/tasks/{name}", status_code=204)
+@router.delete("/api/tasks/{name}", status_code=204, response_class=Response)
 def delete_task(srv: Srv, name: str) -> None:
     """Delete a task and its images."""
     srv.task(name)
@@ -699,7 +707,9 @@ def delete_examples(srv: Srv, name: str, body: ExampleIds) -> Response:
     return _task_json(t)
 
 
-CACHE_FOREVER = {"Cache-Control": "max-age=31536000, immutable"}  # image ids are content hashes
+# Image ids are content hashes, so an image never changes; "private": kept by the browser only, not by
+# shared caches (it may need the token). Other /api responses get "no-store" (see access.guard).
+CACHE_FOREVER = {"Cache-Control": "private, max-age=31536000, immutable"}
 IMAGE_HEADERS = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox"}
 
 
@@ -967,6 +977,14 @@ def cancel_job(srv: Srv, jid: str) -> Response:
 
 
 # ---- web UI -------------------------------------------------------------
+# The built UI loads only its own scripts and styles (no inline ones; React sets styles through
+# the DOM, which style-src allows), shows thumbnails from the API, and previews files picked for
+# prediction as blob: URLs. No other site may frame it (clickjacking).
+UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
+          "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+UI_HEADERS = {"Content-Security-Policy": UI_CSP, "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff"}
+
+
 def mount_ui(application: FastAPI, dist: Path) -> None:
     """Serve the built single-page app in ``dist`` at / (no-op if it hasn't been built)."""
     if not dist.is_dir():
@@ -980,5 +998,5 @@ def mount_ui(application: FastAPI, dist: Path) -> None:
             raise HTTPException(404, "Not Found")  # unknown API routes must not get the HTML page
         f = dist / path
         if path and f.is_file() and dist in f.resolve().parents:
-            return FileResponse(f)
-        return FileResponse(dist / "index.html")
+            return FileResponse(f, headers=UI_HEADERS)
+        return FileResponse(dist / "index.html", headers={**UI_HEADERS, "Cache-Control": "no-cache"})
