@@ -158,30 +158,37 @@ def _to_8bit(im: Image.Image, white: float | None = None) -> Image.Image:
 
 # Appended to the cache key of an image whose conversion to RGB changed since keys were first
 # used (see ``conversion_key``), so vectors cached from the old conversion aren't reused.
-CONVERSION_KEY = ":px2"
-_NEVER_CHANGED = {".jpg", ".jpeg", ".webp"}  # formats Pillow never decodes to a mode that changed
+CONVERSION_KEY = ":px2"  # grayscale of more than 8 bits, or a single transparent colour
+ALPHA_KEY = ":px3"  # an alpha band or transparent palette entries: composited on white, once black
+CONVERSION_KEYS = (CONVERSION_KEY, ALPHA_KEY)
+_NEVER_CHANGED = {".jpg", ".jpeg"}  # formats Pillow never decodes to a mode that changed
 
 
 def conversion_key(source: bytes | str | Path | Image.Image) -> str:
-    """``CONVERSION_KEY`` if ``source`` is an image whose conversion to RGB has changed: grayscale
-    of more than 8 bits (first rescaled at all, then as ``_to_8bit`` now does), or one with a
-    single transparent colour (``_keyed_out``); else "". Only the file's header is read; a file or
-    bytes that can't be opened get "" (decoding them will fail anyway)."""
+    """The suffix (one of ``CONVERSION_KEYS``) for the cache key of ``source`` if it is an image
+    whose conversion to RGB has changed, else "": ``CONVERSION_KEY`` for grayscale of more than
+    8 bits (first rescaled at all, then as ``_to_8bit`` now does) or one with a single transparent
+    colour (``_keyed_out``); ``ALPHA_KEY`` for one with an alpha band or a palette with transparent
+    entries, whose transparent pixels became white instead of whatever colour they hold (usually
+    black). Only the file's header is read; a file or bytes that can't be opened get "" (decoding
+    them will fail anyway)."""
     if isinstance(source, Image.Image):
-        return CONVERSION_KEY if _changed(source) else ""
+        return _changed(source)
     if isinstance(source, (str, Path)) and Path(source).suffix.lower() in _NEVER_CHANGED:
         return ""
     try:
         with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as im:
-            return CONVERSION_KEY if _changed(im) else ""
+            return _changed(im)
     except (OSError, ValueError, Image.DecompressionBombError):
         return ""
 
 
-def _changed(im: Image.Image) -> bool:
-    """Whether ``im``'s conversion to RGB is one that changed (see ``conversion_key``)."""
+def _changed(im: Image.Image) -> str:
+    """``conversion_key`` of the opened image ``im``."""
     alpha = "A" in im.getbands() or "a" in im.getbands()
-    return im.mode in HIGH_DEPTH_MODES or (im.mode != "P" and not alpha and "transparency" in im.info)
+    if alpha or (im.mode == "P" and "transparency" in im.info):
+        return ALPHA_KEY
+    return CONVERSION_KEY if im.mode in HIGH_DEPTH_MODES or "transparency" in im.info else ""
 
 
 def thumbnail(data: bytes, size: int) -> bytes:

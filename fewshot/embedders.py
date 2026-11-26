@@ -387,6 +387,13 @@ def cache_namespace(spec: str) -> str:
     replaced under the same spec, so its namespace adds its ``cache_version`` or, by default, a
     fingerprint of its output on a fixed image: a new model never gets the old one's vectors, and
     the same model gets them back in a later process.
+
+    Neither names the library versions or the device. A change to how images are turned into
+    pixels is marked per image instead (see ``images.conversion_key``), re-embedding only the
+    images it changes. Half precision on CUDA and full precision on the CPU agree to a cosine of
+    0.99996 or more (PE Core B/16, 96 DTD images; similarities differ by at most 0.002), so they
+    share vectors; versioning the namespace by device or by open_clip and timm releases would
+    re-embed every image after each switch or upgrade for differences no prediction shows.
     """
     with _load_lock:
         emb = _loaded.get(spec) if spec in _registered else None

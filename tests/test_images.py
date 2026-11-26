@@ -173,13 +173,29 @@ def test_conversion_key():
     keyed = _saved(np.zeros((2, 2), np.uint8), "PNG", transparency=0)
     assert images.conversion_key(deep) == images.conversion_key(keyed) == images.CONVERSION_KEY
     assert images.conversion_key(Image.new("F", (1, 1))) == images.CONVERSION_KEY
-    for plain in (_png_of("L", (2, 2)), _png_of("RGBA", (2, 2)), _jpeg_of((2, 2)), b"not an image"):
+    for plain in (_png_of("L", (2, 2)), _jpeg_of((2, 2)), b"not an image"):
         assert images.conversion_key(plain) == ""
     assert images.conversion_key(Image.new("RGB", (1, 1))) == ""
 
 
+def test_transparent_images_get_their_own_key():
+    """Images with an alpha band or transparent palette entries, whose transparent pixels became
+    white instead of black, get ``ALPHA_KEY``: vectors cached before that change aren't reused.
+    WebP files can have alpha too, so they are opened."""
+    for mode in ("RGBA", "LA", "PA"):
+        assert images.conversion_key(Image.new(mode, (1, 1))) == images.ALPHA_KEY
+    assert images.conversion_key(_png_of("RGBA", (2, 2))) == images.ALPHA_KEY
+    pal = Image.new("P", (2, 2))
+    pal.info["transparency"] = 0
+    assert images.conversion_key(pal) == images.ALPHA_KEY
+    assert images.conversion_key(Image.new("P", (2, 2))) == ""
+    buf = io.BytesIO()
+    Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(buf, "WEBP", lossless=True)
+    assert images.conversion_key(buf.getvalue()) == images.ALPHA_KEY
+
+
 def test_conversion_key_of_files(tmp_path):
-    """Files are judged from their header; JPEG and WebP files, which can't change, aren't opened."""
+    """Files are judged from their header; JPEG files, which can't change, aren't opened."""
     (tmp_path / "a.png").write_bytes(_saved(np.zeros((2, 2), np.uint16), "PNG"))
     (tmp_path / "b.jpg").write_bytes(b"not even a JPEG")
     assert images.conversion_key(tmp_path / "a.png") == images.CONVERSION_KEY

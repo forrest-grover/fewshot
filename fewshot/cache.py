@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .embedders import Vectors
-from .images import CONVERSION_KEY
+from .images import CONVERSION_KEYS
 
 if TYPE_CHECKING:
     from .store import Workspace
@@ -33,9 +33,10 @@ FLIP_KEY = ":flip"
 
 
 def image_keys(image_id: str) -> tuple[str, ...]:
-    """Every key an image's vectors may be cached under: its id, plus ``CONVERSION_KEY`` if its
-    conversion to RGB has changed (see ``images.conversion_key``), each plus ``FLIP_KEY`` too."""
-    return tuple(image_id + c + f for c in ("", CONVERSION_KEY) for f in ("", FLIP_KEY))
+    """Every key an image's vectors may be cached under: its id, plus one of ``CONVERSION_KEYS``
+    if its conversion to RGB has changed (see ``images.conversion_key``), each plus ``FLIP_KEY``
+    too."""
+    return tuple(image_id + c + f for c in ("", *CONVERSION_KEYS) for f in ("", FLIP_KEY))
 
 
 # SQLite's primary result codes for a file that isn't a sound database.

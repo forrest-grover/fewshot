@@ -14,7 +14,7 @@ from fewshot import embedders, pipeline
 from fewshot.cache import FLIP_KEY, prune_unused
 from fewshot.classifiers import KNNClassifier, binomial_tail, names_match, with_names
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
-from fewshot.images import CONVERSION_KEY, image_id
+from fewshot.images import ALPHA_KEY, CONVERSION_KEY, image_id
 from fewshot.pipeline import Pipeline, Prediction
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, red_blue_task
 
@@ -770,15 +770,27 @@ def test_predict_reads_files_a_chunk_at_a_time(ws, tmp_path, monkeypatch):
     assert all(total == 5 for _, total in seen)
 
 
-def test_vectors_of_an_old_conversion_are_not_reused(ws):
-    """An image whose conversion to RGB changed (16-bit grayscale here) is cached under a key
-    marking the new conversion, so a vector cached from the old one (nearly white, before 16-bit
-    images were rescaled) isn't reused for examples while queries get the new one; pruning the
-    cache keeps the new keys."""
-    a = np.linspace(0, 4095, 64).reshape(8, 8).astype(np.uint16)
+def _deep_png():
     buf = io.BytesIO()
-    Image.fromarray(a).save(buf, "PNG")
-    deep = buf.getvalue()
+    Image.fromarray(np.linspace(0, 4095, 64).reshape(8, 8).astype(np.uint16)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _transparent_png():
+    buf = io.BytesIO()
+    a = np.zeros((8, 8, 4), np.uint8)
+    a[:4, :, 0], a[:4, :, 3] = 200, 255  # top half opaque red, the rest transparent black
+    Image.fromarray(a, "RGBA").save(buf, "PNG")
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(("make", "suffix"), [(_deep_png, CONVERSION_KEY), (_transparent_png, ALPHA_KEY)])
+def test_vectors_of_an_old_conversion_are_not_reused(ws, make, suffix):
+    """An image whose conversion to RGB changed (16-bit grayscale, once nearly white before 16-bit
+    images were rescaled; transparency, once black before it was composited on white) is cached
+    under a key marking the new conversion, so a vector cached from the old one isn't reused for
+    examples while queries get the new one; pruning the cache keeps the new keys."""
+    deep = make()
     t = ws.create("t", embedder="fake:color")
     eid = t.add_example(deep, "gray").id
     t.add_example(png(RED), "red")
@@ -791,7 +803,7 @@ def test_vectors_of_an_old_conversion_are_not_reused(ws):
     assert np.allclose(X[0], pipe.embed_images("fake:color", [(None, deep)])[0])  # as a query sees it
     t.update_settings(flip=True)
     assert not np.allclose(pipe.example_embeddings(t)[0], stale)
-    new = [eid + CONVERSION_KEY, eid + CONVERSION_KEY + FLIP_KEY]
+    new = [eid + suffix, eid + suffix + FLIP_KEY]
     assert set(pipe.cache.get_many(ns, new)) == set(new)
     assert pipe.predict(t, [deep])[0].label == "gray"
     prune_unused(ws)

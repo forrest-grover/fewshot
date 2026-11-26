@@ -83,7 +83,7 @@ class Pipeline:
 
         With ``flip``, each vector is the normalised mean of the image's and its mirror image's
         embeddings (test-time augmentation), cached under the key plus ``FLIP_KEY``. An image whose
-        conversion to RGB has changed is cached under its key plus ``CONVERSION_KEY`` (before any
+        conversion to RGB has changed is cached under its key plus one of ``CONVERSION_KEYS`` (before any
         ``FLIP_KEY``), so vectors of the old conversion aren't reused (see ``conversion_key``).
 
         Uncached images are decoded, embedded and cached one batch at a time, so memory stays
