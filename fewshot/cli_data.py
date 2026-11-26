@@ -63,7 +63,10 @@ def example_ls(
 def example_rm(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
     """Delete examples (undo brings them back)."""
     t = get_task(root, name)
-    n = t.delete_examples(_ids(t, ids))
+    try:
+        n = t.delete_examples(_ids(t, ids))
+    except KeyError as e:  # the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Deleted {n} examples")
 
 
@@ -73,8 +76,8 @@ def example_relabel(name: str, label: str, ids: list[str], root: Path | None = R
     t = get_task(root, name)
     try:
         n = t.relabel_many(_ids(t, ids), label)
-    except ValueError as e:
-        fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Moved {n} examples to {label}")
 
 
@@ -92,8 +95,8 @@ def example_tag(
     t = get_task(root, name)
     try:
         n = t.annotate(_ids(t, ids), add_tags=add_tag, remove_tags=remove_tag)
-    except ValueError as e:
-        fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Tagged {n} examples")
 
 
@@ -103,8 +106,8 @@ def example_note(name: str, example_id: str, note: str, root: Path | None = ROOT
     t = get_task(root, name)
     try:
         t.annotate(_ids(t, [example_id]), note=note)
-    except ValueError as e:
-        fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo("Note saved")
 
 
@@ -178,5 +181,8 @@ def inbox_accept(
 def inbox_dismiss(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
     """Remove images from the inbox without labelling them (undo brings them back)."""
     t = get_task(root, name)
-    n = t.dismiss(_ids(t, ids, inbox=True))
+    try:
+        n = t.dismiss(_ids(t, ids, inbox=True))
+    except KeyError as e:  # the task was deleted meanwhile
+        fail(error_text(e))
     typer.echo(f"Dismissed {n} images; {len(t.config.inbox)} left")

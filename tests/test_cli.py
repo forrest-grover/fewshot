@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import os
+import shutil
 import socket
 from pathlib import Path
 from typing import get_args
@@ -17,6 +18,7 @@ from fewshot import cache as cache_module
 from fewshot import cli, cli_common, embedders
 from fewshot.classifiers import CLASSIFIERS
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
+from fewshot.images import image_id
 from fewshot.server_settings import ServerSettings, served_host
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, served, two_each, write_images
@@ -212,6 +214,31 @@ def test_config_errors(run, root, task, args, message):
     assert r.exit_code == (2 if message.startswith(("Bad --param", "'nope'")) else 1)  # 2: a usage error
     assert message in r.output
     assert load(root).config.classifier == "gda"
+
+
+def test_a_task_deleted_meanwhile_is_an_error_not_a_traceback(run, root, task, photos, monkeypatch):
+    """A task another process deletes between looking it up and changing it gives an error."""
+    real_get = cli_common.Workspace.get
+
+    def get_then_lose(ws, name):
+        t = real_get(ws, name)
+        shutil.rmtree(t.path)
+        return t
+
+    eid = load(root).config.examples[0].id
+    waiting = png((90, 90, 90))
+    monkeypatch.setattr(cli_common.Workspace, "get", get_then_lose)
+    for args in (["delete", task, "--yes"], ["example", "rm", task, eid], ["example", "relabel", task, "x", eid],
+                 ["example", "tag", task, eid, "--add", "x"], ["example", "note", task, eid, "n"],
+                 ["inbox", "dismiss", task, image_id(waiting)], ["class", "add", task, "x"],
+                 ["class", "describe", task]):
+        if not (root / "tasks" / task).exists():  # back again, to be lost once more
+            t = Workspace(root).create(task, embedder="fake:color")
+            t.add_examples_from_dir(photos)
+            t.add_to_inbox([(waiting, "w.png")])
+        r = run(*args)
+        assert r.exit_code == 1, (args, r.output)
+        assert "Error:" in r.output, args
 
 
 def test_delete(run, root, task):

@@ -199,7 +199,10 @@ def delete(name: str, yes: bool = typer.Option(False, "--yes", "-y"), root: Path
     _task(root, name)
     if not yes:
         typer.confirm(f"Delete task {name} and all its images?", abort=True)
-    _ws(root).delete(name)
+    try:
+        _ws(root).delete(name)
+    except KeyError as e:  # deleted by someone else meanwhile
+        _fail(_error_text(e))
     typer.echo(f"Deleted task {name}")
 
 
@@ -304,8 +307,8 @@ def class_add(
     """Add a class, or set an existing class's description."""
     try:
         _task(root, name).upsert_class(label, description)
-    except ValueError as e:
-        _fail(str(e))
+    except (KeyError, ValueError) as e:  # KeyError: the task was deleted meanwhile
+        _fail(_error_text(e))
 
 
 @cls_app.command("describe")
@@ -319,8 +322,8 @@ def class_describe(
     """Fill class descriptions from a template, e.g. 'a photo of a {}, a type of pet'."""
     try:
         n = _task(root, name).describe_classes(template, overwrite)
-    except ValueError as e:
-        _fail(str(e))
+    except (KeyError, ValueError) as e:
+        _fail(_error_text(e))
     typer.echo(f"Set {n} descriptions")
 
 
