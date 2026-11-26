@@ -33,27 +33,36 @@ jobs:
         run: pytest -q --cov --cov-report=term-missing
 
   real-models:
-    # The opt-in @pytest.mark.model tests: the smallest preset embeds an image and a text for real.
+    # The opt-in @pytest.mark.model tests: every preset loads and embeds an image and a text for
+    # real, with the pinned dependencies and with the newest ones (an open_clip, timm or
+    # transformers release that breaks loading a preset shows up here).
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        deps: [pinned, latest]
     env:
-      HF_HOME: ${{ github.workspace }}/../hf  # outside the checkout, where tests may not write
       FEWSHOT_TEST_MODELS: "1"
       FEWSHOT_DEVICE: cpu
+      FEWSHOT_MAX_MODELS: "1"
+      CONSTRAINTS: ${{ matrix.deps == 'pinned' && '-c constraints.txt' || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: constraints.txt
-      - name: Install (CPU-only torch)
+      - name: Install (CPU-only torch; the SigLIP preset needs transformers)
         run: |
-          pip install --no-deps -c constraints.txt torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -c constraints.txt -e ".[dev]"
+          pip install --no-deps $CONSTRAINTS torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install $CONSTRAINTS -e ".[dev,siglip]"
+          pip list
       - uses: actions/cache@v6
         with:
-          path: ${{ github.workspace }}/../hf
-          key: hf-${{ hashFiles('tests/test_real_models.py') }}
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('fewshot/embedders.py') }}
           restore-keys: hf-
-      - name: pytest -m model
-        run: pytest -q -m model -rs tests/test_real_models.py
+      - name: pytest -m model (fails if the model tests were skipped)
+        run: |
+          set -o pipefail
+          pytest -q -m model -rs tests/test_real_models.py | tee "$RUNNER_TEMP/pytest.log"
+          if grep -q "skipped" "$RUNNER_TEMP/pytest.log"; then echo "::error::model tests were skipped"; exit 1; fi
