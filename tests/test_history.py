@@ -36,9 +36,9 @@ def test_undo_steps_back_through_changes(ws):
     assert t.class_names() == ["red", "green"]
     assert t.config.classifier == "knn"
     assert t.undo() == rev
-    assert t.config.classifier == "prototype"
+    assert t.config.classifier == "gda"
     assert t.config.revision == rev + 4  # two changes and two undos
-    assert Workspace(ws.root).get("t").config.classifier == "prototype"  # saved
+    assert Workspace(ws.root).get("t").config.classifier == "gda"  # saved
 
 
 def test_undo_brings_back_deleted_images(ws):

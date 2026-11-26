@@ -310,7 +310,7 @@ class TaskCreate(_Body):
 
     name: str
     embedder: str | None = None
-    classifier: str = "prototype"
+    classifier: str = "gda"
 
 
 class TaskSettings(_Body):

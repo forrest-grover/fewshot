@@ -340,7 +340,9 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     """Cross-validate the task's current settings (or ``cfg``, a variant of them) on its own
     labelled examples.
 
-    Defaults to leave-one-out for up to 300 examples, otherwise 5-fold. Every
+    Defaults to leave-one-out for up to 300 examples with the prototype and kNN classifiers
+    (computed in closed form) or 100 with the others (one refit per example), then 10-fold up to
+    300 examples and 5-fold beyond. Every
     held-out example is predicted by a classifier that never saw it.
     ``progress(stage, done, total)`` is called with stage ``"embedding"`` (images) and then
     ``"evaluating"`` (folds); it may raise to cancel.
@@ -352,7 +354,7 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     n, C = len(data.y), len(data.classes)
     if n == 0:
         raise ValueError("Task has no examples to evaluate")
-    k = folds or (n if n <= 300 else 5)
+    k = folds or (n if n <= (300 if cfg.classifier in {"prototype", "knn"} else 100) else 10 if n <= 300 else 5)
     h = _cross_val_predict(data, cfg, k, seed, _stage(progress, "evaluating"))
 
     scored = h.pred >= 0
@@ -476,7 +478,7 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     pipe: Pipeline,
     folder: Path,
     embedder: str,
-    classifier: str = "prototype",
+    classifier: str = "gda",
     way: int = 5,
     shot: int = 5,
     query: int = 15,

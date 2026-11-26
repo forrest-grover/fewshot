@@ -167,9 +167,9 @@ def test_fast_leave_one_out_with_unused_descriptions(monkeypatch):
         return real(*args)
 
     monkeypatch.setattr(ev, "_fast_leave_one_out", counted)
-    ev._cross_val_predict(two_each, TaskConfig(name="t", text_weight=0.0), 4, 0)  # pylint: disable=protected-access
+    ev._cross_val_predict(two_each, TaskConfig(name="t", classifier="prototype", text_weight=0.0), 4, 0)  # pylint: disable=protected-access
     assert used == [1]
-    ev._cross_val_predict(two_each, TaskConfig(name="t", text_weight=1.0), 4, 0)  # pylint: disable=protected-access
+    ev._cross_val_predict(two_each, TaskConfig(name="t", classifier="prototype", text_weight=1.0), 4, 0)  # pylint: disable=protected-access
     single = ClassData(["a", "b", "c"], X, np.array([0, 0, 1, 1, 2]), text)
-    ev._cross_val_predict(single, TaskConfig(name="t", text_weight=0.0), 5, 0)  # pylint: disable=protected-access
+    ev._cross_val_predict(single, TaskConfig(name="t", classifier="prototype", text_weight=0.0), 5, 0)  # pylint: disable=protected-access
     assert used == [1]

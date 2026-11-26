@@ -94,7 +94,7 @@ def models(as_json: bool = JSON_OPT) -> None:
 def create(
     name: str,
     embedder: str | None = typer.Option(None, help="Embedder spec; see `fewshot models`"),
-    classifier: str = typer.Option("prototype", help="prototype | knn | logreg"),
+    classifier: str = typer.Option("gda", help="gda | prototype | knn | logreg"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Create a task."""
@@ -734,7 +734,8 @@ def _print_eval(r: dict[str, Any]) -> None:
 def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     name: str,
     folds: int | None = typer.Option(
-        None, help="Number of folds [default: leave-one-out up to 300 examples, else 5]"),
+        None, help="Number of folds [default: leave-one-out up to 100 examples (300 for prototype and "
+                   "knn), then 10, then 5 above 300]"),
     as_json: bool = JSON_OPT,
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: each example's held-out prediction"),
     apply_class_thresholds: bool = typer.Option(
@@ -822,7 +823,7 @@ def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | Non
 def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     folder: Path,
     embedder: list[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
-    classifier: list[str] = typer.Option(["prototype"], help="Classifier(s) to compare"),
+    classifier: list[str] = typer.Option(["gda"], help="Classifier(s) to compare"),
     way: int = typer.Option(5, min=2),
     shot: list[int] = typer.Option([1, 5], min=0, help="Shot count(s)"),
     query: int = typer.Option(15, min=1),

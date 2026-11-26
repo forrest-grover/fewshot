@@ -204,7 +204,7 @@ class TaskConfig(BaseModel):
 
     name: str
     embedder: str = DEFAULT_SPEC
-    classifier: str = "prototype"
+    classifier: str = "gda"
     classifier_params: dict[str, Any] = Field(default_factory=dict)
     text_weight: float = 1.0
     reject_below: float | None = None  # similarity under which predictions become "unknown"

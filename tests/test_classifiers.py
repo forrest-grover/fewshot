@@ -13,7 +13,7 @@ from fewshot.classifiers import (
     make_classifier,
 )
 
-ALL = ["prototype", "knn", "logreg"]
+ALL = ["prototype", "knn", "logreg", "gda"]
 
 
 def unit(v):
@@ -44,7 +44,8 @@ def test_registry_and_factory():
 
 def test_unknown_classifier_lists_choices():
     """An unknown name raises and lists the valid choices."""
-    with pytest.raises(ValueError, match=r"Unknown classifier 'svm'; choose from \['knn', 'logreg', 'prototype'\]"):
+    names = r"\['gda', 'knn', 'logreg', 'prototype'\]"
+    with pytest.raises(ValueError, match=r"Unknown classifier 'svm'; choose from " + names):
         make_classifier("svm")
 
 
@@ -268,6 +269,24 @@ def test_single_described_class_uses_names_for_the_gap():
 
     named = ClassData(["cat", "dog"], X, np.array([0, 0]), {1: dog_txt.astype(np.float32)},
                       {0: cat_txt.astype(np.float32)})
-    for name in ("prototype", "knn", "logreg"):
+    for name in ("prototype", "knn", "logreg", "gda"):
         probs, _ = make_classifier(name).fit(named).predict(q)
         assert probs.argmax(1).tolist() == [0, 1], name
+
+
+def test_gda_with_identical_examples():
+    """Examples without any spread within their classes still fit (the spread has a floor)."""
+    X = unit([[1, 0, 0], [1, 0, 0], [0, 1, 0], [0, 1, 0]])
+    clf = make_classifier("gda").fit(ClassData(["a", "b"], X, np.array([0, 0, 1, 1])))
+    probs, _ = clf.predict(unit([[0.9, 0.1, 0]]))
+    assert probs[0].argmax() == 0
+
+
+def test_gda_with_text_and_a_single_image():
+    """One image plus a text-only class: the image term gets the prior weight, the scale stays 1."""
+    X = unit([[1, 0.1, 0]])
+    text = {0: unit([0.9, 0, 0.3]), 1: unit([0, 1, 0])}
+    clf = make_classifier("gda").fit(ClassData(["a", "b"], X, np.array([0]), text))
+    assert clf.logit_scale == 1.0
+    probs, _ = clf.predict(unit([[0.1, 1, 0], [1, 0, 0.1]]))
+    assert list(probs.argmax(1)) == [1, 0]

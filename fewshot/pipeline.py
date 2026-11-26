@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import heapq
+import os
 import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -450,19 +452,31 @@ def _decode(todo: list[tuple[int, str | None, ImageInput]], errors: dict[int, st
             ) -> list[tuple[int, str | None, Image.Image]]:
     """Decode each ``(index, key, image)``; failures raise, or go to ``errors`` when it is given.
 
-    Items already in ``errors`` are skipped.
+    Items already in ``errors`` are skipped. Images are decoded on ``DECODE_THREADS`` threads
+    (Pillow releases the GIL while decoding), so the model isn't left waiting on one CPU core.
     """
-    decoded = []
-    for i, k, im in todo:
-        if errors is not None and i in errors:
-            continue
+    todo = [t for t in todo if errors is None or t[0] not in errors]
+
+    def one(im: ImageInput) -> Image.Image | Exception:
         try:
-            decoded.append((i, k, _to_pil(im)))
+            return _to_pil(im)
         except (ValueError, OSError) as e:
-            if errors is None:
-                raise
-            errors[i] = str(e) if isinstance(e, ValueError) else f"Not a readable image: {e}"
+            return e
+
+    with ThreadPoolExecutor(max_workers=max(1, min(DECODE_THREADS, len(todo)))) as pool:
+        results = list(pool.map(one, [im for _, _, im in todo]))
+    decoded = []
+    for (i, k, _), r in zip(todo, results, strict=True):
+        if isinstance(r, Image.Image):
+            decoded.append((i, k, r))
+            continue
+        if errors is None:
+            raise r
+        errors[i] = str(r) if isinstance(r, ValueError) else f"Not a readable image: {r}"
     return decoded
+
+
+DECODE_THREADS = min(8, os.cpu_count() or 1)
 
 
 EMBED_MAX_SIDE = 2048  # images are shrunk to this before embedding, so a batch stays small in memory

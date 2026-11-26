@@ -22,7 +22,7 @@ def make_task(ws, classifier="prototype", n=4):
     return t
 
 
-@pytest.mark.parametrize("clf", ["prototype", "knn", "logreg"])
+@pytest.mark.parametrize("clf", ["prototype", "knn", "logreg", "gda"])
 def test_predict_and_evaluate(ws, clf):
     """Each classifier predicts clear colours correctly and scores 100% in leave-one-out."""
     t = make_task(ws, clf)
@@ -102,7 +102,7 @@ def test_text_only_class_zero_shot_and_modality_shift():
     y = np.repeat([0, 1], 3)
     text = {i: unit(proto[i] + gap) for i in range(3)}  # class 2 has text only
     data = ClassData(["a", "b", "c"], X.astype(np.float32), y, {k: v.astype(np.float32) for k, v in text.items()})
-    for name in ["prototype", "knn", "logreg"]:
+    for name in ["prototype", "knn", "logreg", "gda"]:
         clf = make_classifier(name).fit(data)
         q = unit(proto + 0.05 * rng.normal(size=(3, d))).astype(np.float32)
         assert clf.predict(q)[0].argmax(1).tolist() == [0, 1, 2], name

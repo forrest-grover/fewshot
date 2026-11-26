@@ -315,15 +315,15 @@ def test_summary_counts_every_class(ws):
     s = t.summary()
     assert s["counts"] == {"red": 2, "empty": 0}
     assert (s["name"], s["embedder"], s["classifier"], s["n_classes"], s["n_examples"]) == (
-        "t", "fake:color", "prototype", 2, 2)
+        "t", "fake:color", "gda", 2, 2)
     assert s["created"] == t.config.created
 
 
 def test_task_config_defaults():
-    """A bare config uses the default embedder and the prototype classifier."""
+    """A bare config uses the default embedder and the GDA classifier."""
     cfg = TaskConfig(name="x")
     assert cfg.embedder == embedders.DEFAULT_SPEC
-    assert cfg.classifier == "prototype"
+    assert cfg.classifier == "gda"
     assert cfg.revision == 0
 
 

@@ -182,7 +182,7 @@ def test_benchmark_separable_colours(ws, tmp_path):
     r = benchmark(Pipeline(ws), folder, "fake:color", way=3, shot=2, query=3, episodes=5, progress=messages.append)
     assert r.pop("flip") is False
     assert r == {
-        "embedder": "fake:color", "classifier": "prototype", "way": 3, "shot": 2, "query": 3,
+        "embedder": "fake:color", "classifier": "gda", "way": 3, "shot": 2, "query": 3,
         "episodes": 5, "text_template": None, "accuracy": 1.0, "ci95": 0.0,
     }
     assert messages == ["Embedding 24 images with fake:color (cached after first run)"]
@@ -198,8 +198,8 @@ def test_benchmark_is_seeded_and_passes_classifier_params(ws, tmp_path):
     assert runs[0] == runs[1]
     assert runs[0]["classifier"] == "knn"
     assert len({r["accuracy"] for r in runs}) > 1  # different seeds draw different episodes
-    with pytest.raises(ValueError, match="Unknown parameter 'k' for prototype"):
-        benchmark(pipe, folder, "fake:color", way=2, shot=1, query=1, episodes=1, k=1)  # prototype has no k
+    with pytest.raises(ValueError, match="Unknown parameter 'k' for gda"):
+        benchmark(pipe, folder, "fake:color", way=2, shot=1, query=1, episodes=1, k=1)  # gda has no k
 
 
 def test_benchmark_single_episode_has_zero_ci(ws, tmp_path):
@@ -257,3 +257,15 @@ def test_benchmark_rejects_meaningless_arguments(ws, tmp_path, arg, value):
     kw = {"way": 2, "shot": 1, "query": 1, "episodes": 1, arg: value}
     with pytest.raises(ValueError, match=f"{arg} must be at least"):
         benchmark(Pipeline(ws), folder, "fake:color", **kw)
+
+
+@pytest.mark.parametrize(("classifier", "n", "method"), [
+    ("gda", 100, "leave-one-out"), ("gda", 102, "10-fold"), ("prototype", 102, "leave-one-out")])
+def test_default_folds_depend_on_the_classifier(ws, classifier, n, method):
+    """Refitting classifiers use leave-one-out up to 100 examples, then 10 folds; prototype and kNN
+    (closed form) up to 300."""
+    t = ws.create("t", embedder="fake:color", classifier=classifier)
+    for i in range(n // 2):
+        t.add_example(png((200, 30, 30), noise=10, seed=i), "red")
+        t.add_example(png((30, 30, 200), noise=10, seed=1000 + i), "blue")
+    assert evaluate_task(Pipeline(ws), t)["method"] == method

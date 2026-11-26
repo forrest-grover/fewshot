@@ -32,9 +32,12 @@ Each task has an embedder, a classifier, and classes. A class has example images
 
 | Classifier | Image score |
 |---|---|
-| `prototype` (default) | cosine similarity to the class's mean embedding |
+| `gda` (default) | Gaussian discriminant analysis: class means with a shared covariance shrunk towards a sphere, on centred features; its weight against the text and its confidence scale are fitted per task |
+| `prototype` | cosine similarity to the class's mean embedding |
 | `knn` | similarity-weighted vote of the k nearest examples |
 | `logreg` | logistic regression trained on the examples |
+
+`gda` shrinks its covariance by D/(D + dof) (D: embedding size, dof: images minus classes), so with one image per class it is a nearest-mean classifier and with many it uses how each class actually spreads. With descriptions, the image term's weight against `text_weight × 100 × cos` is chosen by leave-one-out cross-entropy on the examples, pulled towards 0.2·k^0.6 for k images per class (fully at k = 1, less as k grows), since how much to trust the images over the text differs a lot between tasks: flowers want five times the weight pets do. A last scale, fitted the same way with each example also taken out of the covariance, makes confidence match accuracy. Over six datasets (Pets, DTD and Flowers to develop it; Aircraft, EuroSAT and Food-101 held out) with CLIP ViT-B/32 and SigLIP 2, it beats `prototype` at every shot count; on the held-out datasets with descriptions, 1/2/4/8/16 shots go from 61.6/64.7/66.8/67.7/68.2% to 61.6/65.7/70.6/75.1/78.1%, and image-only from 45.1/55.0/63.6/68.9/71.7% to 46.6/58.4/67.5/73.8/77.6% (all classes of each dataset at once, 3 seeds). Fitting 101 classes × 16 images takes about 0.2 s.
 
 With a CLIP embedder, class descriptions add `text_weight × 100 × cos(image, description)` to the image log-probabilities. A class can then work from its description alone, and a task with no images at all is plain CLIP zero-shot. Combining text and images at the logit level, rather than averaging their vectors, is what makes adding images improve accuracy instead of diluting the text signal. Text-only classes still get an image-side anchor by shifting their text vector across CLIP's modality gap.
 

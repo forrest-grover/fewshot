@@ -52,7 +52,7 @@ def test_predict_reads_files_a_chunk_at_a_time(ws, tmp_path, monkeypatch):
     assert all(total == 5 for _, total in seen)
 
 
-@pytest.mark.parametrize("name", ["prototype", "knn", "logreg"])
+@pytest.mark.parametrize("name", ["prototype", "knn", "logreg", "gda"])
 def test_queries_are_scored_in_blocks(monkeypatch, name):
     """Scoring PREDICT_ROWS queries at a time gives the same results as all at once."""
     rng = np.random.default_rng(0)

@@ -201,7 +201,7 @@ def test_config_and_create_validate_embedders(run, root, task):
     (["--param", "k"], "Bad --param 'k'"),
     (["--param", "=3"], "Bad --param '=3'"),
     (["--param", "k=three"], "Bad --param 'k=three'"),
-    (["--param", "bogus=1"], "Unknown parameter 'bogus' for prototype"),
+    (["--param", "bogus=1"], "Unknown parameter 'bogus' for gda"),
     (["--classifier", "knn", "--param", 'k="x"'], "'k' must be an integer"),
     (["--reject-below", "2"], "reject_below must be between -1 and 1"),
 ])
@@ -210,7 +210,7 @@ def test_config_errors(run, root, task, args, message):
     r = run("config", task, *args)
     assert r.exit_code == 1
     assert message in r.output
-    assert load(root).config.classifier == "prototype"
+    assert load(root).config.classifier == "gda"
 
 
 def test_delete(run, root, task):

@@ -374,7 +374,7 @@ def test_predict_ignores_empty_class(client, task):
 
 
 @pytest.mark.parametrize(("settings", "message"), [
-    ({"classifier_params": {"bogus": 1}}, "Unknown parameter 'bogus' for prototype"),
+    ({"classifier_params": {"bogus": 1}}, "Unknown parameter 'bogus' for gda"),
     ({"classifier": "knn", "classifier_params": {"k": "abc"}}, "'k' must be an integer"),
     ({"text_weight": -1}, "'text_weight' must be >= 0"),
     ({"reject_below": 99}, "reject_below must be between -1 and 1"),

@@ -81,7 +81,7 @@ def test_task_temperature_changes_confidence(ws):
 
 
 def _noisy_task(ws, scale):
-    t = ws.create("t", embedder="fake:color", classifier_params={"scale": scale})
+    t = ws.create("t", embedder="fake:color", classifier="prototype", classifier_params={"scale": scale})
     rng = np.random.default_rng(0)
     for label, rgb in (("red", (200, 60, 60)), ("orange", (200, 90, 60)), ("pink", (200, 60, 90))):  # overlapping
         for i in range(30):
