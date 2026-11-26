@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from .classifiers import PARAM_MAX
+from .classifiers import SETTING_MAX
 from .embedders import check_embedder
 from .fetch import fetch_url
 from .folders import class_folders, read_or_empty
@@ -86,9 +86,9 @@ def apply_settings(task: Task, change: SettingsChange, *, embedder_ok: SpecCheck
         if kw.get(key) is not None:
             raise SettingConflict(key)
         kw[key] = None
-    if (w := kw.get("text_weight")) is not None and not 0 <= w <= PARAM_MAX["text_weight"]:
+    if (w := kw.get("text_weight")) is not None and not 0 <= w <= SETTING_MAX["text_weight"]:
         # checked here too so the message names the setting, not a classifier parameter
-        raise ValueError(f"text_weight must be between 0 and {PARAM_MAX['text_weight']:g}, got {w}")
+        raise ValueError(f"text_weight must be between 0 and {SETTING_MAX['text_weight']:g}, got {w}")
     if "embedder" in kw:
         if kw["embedder"] == task.config.embedder:
             del kw["embedder"]
