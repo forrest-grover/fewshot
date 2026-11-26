@@ -165,7 +165,14 @@ class Pipeline:
         return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
 
     def embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
-        """Embed strings (rows in input order), using and filling the cache."""
+        """Embed strings (rows in input order), using and filling the cache. The model is held
+        (see ``hold``) throughout, so it can't be unloaded between checking the cache's vector
+        lengths against it and embedding the texts it misses."""
+        with hold(spec):
+            return self._embed_texts(spec, texts)
+
+    def _embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
+        """``embed_texts`` with the model held."""
         ns = cache_namespace(spec)
         keys = ["text:" + t for t in texts]
         hit = self.cache.get_many(ns, keys)

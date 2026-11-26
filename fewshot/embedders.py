@@ -124,11 +124,12 @@ def _autocast(device: str) -> AbstractContextManager[Any]:
 
 
 def _is_oom(e: BaseException) -> bool:
-    """Whether ``e`` is the GPU running out of memory (CUDA's own error, or MPS's RuntimeError)."""
+    """Whether ``e`` is the device running out of memory: CUDA's own error, or a RuntimeError
+    from MPS ("out of memory") or the CPU's allocator ("can't allocate memory")."""
     import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
     return isinstance(e, torch.cuda.OutOfMemoryError) or (
-        isinstance(e, RuntimeError) and "out of memory" in str(e).lower())
+        isinstance(e, RuntimeError) and any(m in str(e).lower() for m in ("out of memory", "can't allocate memory")))
 
 
 def _l2(x: torch.Tensor) -> Vectors:

@@ -132,6 +132,19 @@ def test_embed_texts_caches_and_dedupes(ws, emb):
     assert pipe.embed_texts(TEXT_SPEC, []).shape == (0, 0)
 
 
+def test_embed_texts_holds_the_model(ws, emb, monkeypatch):  # pylint: disable=unused-argument  # emb registers TEXT_SPEC
+    """The model stays held while texts are embedded, so it can't be unloaded halfway."""
+    held = []
+    real = embedders.get_embedder
+
+    def spy(spec):
+        held.append(embedders._held.get(spec, 0))  # pylint: disable=protected-access
+        return real(spec)
+    monkeypatch.setattr(pipeline, "get_embedder", spy)
+    Pipeline(ws).embed_texts(TEXT_SPEC, ["a red thing"])
+    assert held == [1]
+
+
 # ---- training data -----------------------------------------------------
 def test_class_data_and_exclude(ws, emb):
     """Rows follow the examples; excluded indices are dropped; image-only specs ignore text."""

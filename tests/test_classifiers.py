@@ -232,6 +232,17 @@ def test_knn_low_similarities_still_decide():
     assert probs[0, 0] > 0.99
 
 
+def test_text_weight_errors_name_a_task_setting():
+    """text_weight is a task setting every classifier takes; its errors say so instead of calling
+    it the classifier's parameter. The classifier's own parameters are still named as such."""
+    with pytest.raises(ValueError, match=r"^task setting 'text_weight' must be >= 0.0 and <= 100, got -5$"):
+        make_classifier("gda", text_weight=-5)
+    with pytest.raises(ValueError, match=r"^task setting 'text_weight' must be a number"):
+        make_classifier("gda", text_weight="x")
+    with pytest.raises(ValueError, match=r"^knn parameter 'k' must be > 0"):
+        make_classifier("knn", k=0)
+
+
 @pytest.mark.parametrize(("name", "params", "message"), [
     ("nope", {}, "Unknown classifier 'nope'"),
     ("knn", {"bogus": 1}, "Unknown parameter 'bogus' for knn"),
