@@ -102,6 +102,34 @@ def test_transparent_pixels_become_white():
     assert pipeline._to_pil(Image.open(io.BytesIO(buf.getvalue()))).size == (8, 4)  # pylint: disable=protected-access
 
 
+def _saved(a, fmt):
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, fmt)
+    return buf.getvalue()
+
+
+def test_high_bit_depth_grayscale_is_rescaled():
+    """16-bit PNG and TIFF gradients load as gradients, not clipped to white at 255; 12-bit data
+    stored in 16 bits fills the 8-bit range; 32-bit and float images are scaled to their range."""
+    full = np.linspace(0, 65535, 256 * 16).reshape(16, 256).astype(np.uint16)
+    for fmt in ("PNG", "TIFF"):
+        g = np.asarray(load_image(_saved(full, fmt)))[..., 0].astype(float)
+        assert (g == 255).mean() < 0.01
+        assert g[0, 0] == 0 and g[-1, -1] == 255 and abs(g.mean() - 127.5) < 1
+    twelve = np.asarray(load_image(_saved((full >> 4).astype(np.uint16), "PNG")))[..., 0]
+    assert twelve.max() == 255 and abs(twelve.mean() - 127.5) < 1
+    dark = np.asarray(load_image(_saved(np.full((4, 4), 3000, np.uint16), "PNG")))  # 3000 of 12 bits
+    assert (dark == round(3000 * 255 / 4095)).all()
+    big = np.asarray(to_rgb(Image.fromarray(np.array([[-100, 100_000]], np.int32))))[..., 0]
+    assert big.tolist() == [[0, 255]]
+    unit = Image.fromarray(np.array([[0, 0.5, 1]], np.float32))
+    assert np.asarray(to_rgb(unit))[0, :, 0].tolist() == [0, 128, 255]
+    hdr = Image.fromarray(np.array([[2.0, 2.0]], np.float32))  # no range: one level, black
+    assert np.asarray(to_rgb(hdr)).max() == 0
+    eight = np.asarray(to_rgb(Image.fromarray(np.array([[0, 200]], np.uint16))))[0, :, 0]
+    assert eight.tolist() == [0, 200]  # 8-bit values stored in 16 bits are kept
+
+
 def test_job_limit_is_checked_with_the_start():
     """Jobs.start refuses past ``limit``, even when many starts race."""
     jobs = Jobs()
