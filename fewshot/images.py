@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -46,49 +48,140 @@ def load_image(data: bytes, draft: int | None = None, max_side: int | None = Non
         raise ValueError(f"Not a readable image: {e}") from e
     except OSError as e:
         raise ValueError(f"Not a readable image: {e}") from e
-    out = to_rgb(ImageOps.exif_transpose(im))
+    out = to_rgb(ImageOps.exif_transpose(im), white_level(im, data))
     if max_side and max(out.size) > max_side:
         out.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     return out
 
 
-def to_rgb(im: Image.Image) -> Image.Image:
+def to_rgb(im: Image.Image, white: float | None = None) -> Image.Image:
     """``im`` as RGB, with any transparency composited onto white: converting directly would show
-    whatever colour transparent pixels happen to hold, usually black. Grayscale with more than 8
-    bits per pixel is rescaled first (see ``_to_8bit``)."""
+    whatever colour transparent pixels happen to hold, usually black. That covers an alpha band,
+    a palette's transparent entries and a single transparent colour (PNG's tRNS chunk on
+    grayscale or RGB). Grayscale with more than 8 bits per pixel is rescaled first: ``white`` is
+    the pixel value shown as white, if known (see ``white_level``), else see ``_to_8bit``."""
     if "A" in im.getbands() or "a" in im.getbands() or (im.mode == "P" and "transparency" in im.info):
         rgba = im.convert("RGBA")
         return Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
-    if im.mode in HIGH_DEPTH_MODES:
-        im = _to_8bit(im)
-    return im.convert("RGB")
+    clear = _keyed_out(im)
+    out = (_to_8bit(im, white) if im.mode in HIGH_DEPTH_MODES else im).convert("RGB")
+    if clear is not None:
+        out.paste((255, 255, 255), mask=Image.fromarray(clear))
+    return out
+
+
+def _keyed_out(im: Image.Image) -> np.ndarray | None:
+    """Mask (255 where transparent) of the pixels of ``im`` in its one transparent colour, if it
+    has one (PNG's tRNS chunk on a grayscale or RGB image), else None."""
+    t = im.info.get("transparency")
+    if t is None or im.mode == "P" or not isinstance(t, (int, tuple)):
+        return None
+    a = np.asarray(im)
+    hit: np.ndarray = (a == np.array(t)).all(axis=-1) if a.ndim == 3 else a == t
+    return hit.astype(np.uint8) * 255
 
 
 HIGH_DEPTH_MODES = {"I;16", "I;16B", "I;16L", "I;16N", "I", "F"}
-SENSOR_DEPTHS = (8, 10, 12, 14, 16)  # bits per pixel that integer grayscale is assumed to use
+STRETCH_PERCENTILE = 99.9  # without a known white level, this percentile of the pixels is white
+STRETCH_SAMPLE = 1_000_000  # the percentile is taken over about this many evenly spaced pixels
 
 
-def _to_8bit(im: Image.Image) -> Image.Image:
+def white_level(im: Image.Image, data: bytes | None = None) -> float | None:
+    """The pixel value that is white in ``im``, a grayscale image of more than 8 bits, if its file
+    says: a TIFF's MaxSampleValue tag (which writers of 10- to 14-bit data stored in 16 bits may
+    set), else its BitsPerSample if under 16; a PNG (``data``, the file's bytes) with an sBIT
+    chunk, which Pillow doesn't read, says its samples were scaled to the full 16 bits, as the PNG
+    standard requires. None if the file doesn't say, or ``im`` isn't such an image."""
+    if im.mode not in HIGH_DEPTH_MODES or im.mode == "F":
+        return None
+    if data is not None and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return 65535.0 if _has_sbit(data) else None
+    tags = getattr(im, "tag_v2", None)  # MaxSampleValue, BitsPerSample:
+    peak, bits = (_tag(tags, 281), _tag(tags, 258)) if tags is not None else (None, None)
+    if peak:
+        return float(peak)
+    return float(2**bits - 1) if bits and bits < 16 else None
+
+
+def _tag(tags: Any, tag: int) -> int | None:
+    """A TIFF tag's (first) value, if it is a positive integer."""
+    v = tags.get(tag)
+    v = v[0] if isinstance(v, tuple) and v else v
+    return v if isinstance(v, int) and v > 0 else None
+
+
+def _has_sbit(data: bytes) -> bool:
+    """Whether a PNG has an sBIT chunk (which precedes its pixels)."""
+    at = 8
+    while at + 8 <= len(data):
+        kind = data[at + 4 : at + 8]
+        if kind == b"sBIT":
+            return True
+        if kind in (b"IDAT", b"IEND"):
+            return False
+        at += 12 + int.from_bytes(data[at : at + 4], "big")
+    return False
+
+
+def _to_8bit(im: Image.Image, white: float | None = None) -> Image.Image:
     """16-bit, 32-bit integer or float grayscale as 8-bit ("L"). Pillow's own conversion clips at
     255, so a 16-bit image comes out almost all white.
 
-    Integer pixels from 0 to 65535 are scaled linearly from the smallest of ``SENSOR_DEPTHS`` that
-    holds the brightest pixel: a full-range 16-bit image is divided by 257, as a browser shows it,
-    while 10-, 12- or 14-bit data stored in 16 bits (as medical and industrial cameras write it)
-    fills the 8-bit range instead of coming out nearly black. Rounding up to a standard depth keeps
-    the scale the same for most images from one sensor (only one darker than a quarter of its range
-    is brightened), and 0 stays black. Floats from 0 to 1 are scaled by 255. Anything else has no
-    known range, so it is stretched from its own minimum to its maximum."""
-    a = np.nan_to_num(np.asarray(im, dtype=np.float64))
-    lo, hi = (float(a.min()), float(a.max())) if a.size else (0.0, 0.0)
-    if im.mode != "F" and lo >= 0 and hi <= 65535:
-        depth = next(d for d in SENSOR_DEPTHS if hi < 2**d)
-        a = a * (255 / (2**depth - 1))
-    elif im.mode == "F" and lo >= 0 and hi <= 1:
-        a = a * 255
+    Integers are scaled so that 0 stays black and ``white`` (the file's own white level, see
+    ``white_level``) is white. Most files don't record one: 10-, 12- or 14-bit data from medical
+    and industrial cameras is usually stored in 16 bits as it is, so dividing by 257 as a browser
+    does would leave it nearly black. Then the image's ``STRETCH_PERCENTILE``-th percentile is
+    white, as an automatic exposure (or ImageJ's auto contrast) would show it: every image is well
+    exposed, as embedders trained on photos expect, and a few hot pixels or a slightly brighter
+    scene change the result only slightly. Absolute brightness isn't kept across images, though.
+    Floats from 0 to 2 are taken as the usual 0 to 1 range, any overshoot clipped; other floats
+    are treated as integers are. Images with negative values have no known black either: they are
+    stretched from their ``100 - STRETCH_PERCENTILE``-th to their ``STRETCH_PERCENTILE``-th
+    percentile."""
+    a = np.asarray(im, dtype=np.float64)
+    values = a[np.isfinite(a)]
+    values = values if values.size else np.zeros(1)
+    lo, hi = float(values.min()), float(values.max())
+    if im.mode == "F" and lo >= 0 and hi <= 2:
+        lo, hi = 0.0, 1.0
+    elif white and im.mode != "F":
+        lo, hi = 0.0, white
     else:
-        a = (a - lo) * (255 / (hi - lo)) if hi > lo else np.zeros_like(a)
-    return Image.fromarray(np.rint(a).clip(0, 255).astype(np.uint8))
+        sample = values[:: max(1, values.size // STRETCH_SAMPLE)]
+        lo = float(np.percentile(sample, 100 - STRETCH_PERCENTILE)) if lo < 0 else 0.0
+        top = float(np.percentile(sample, STRETCH_PERCENTILE))
+        hi = top if top > lo else hi  # (almost) one level: the brightest pixel is white
+    a = np.nan_to_num(a, nan=lo, posinf=hi, neginf=lo)
+    scaled = (a - lo) * (255 / (hi - lo)) if hi > lo else np.zeros_like(a)
+    return Image.fromarray(np.rint(scaled).clip(0, 255).astype(np.uint8))
+
+
+# Appended to the cache key of an image whose conversion to RGB changed since keys were first
+# used (see ``conversion_key``), so vectors cached from the old conversion aren't reused.
+CONVERSION_KEY = ":px2"
+_NEVER_CHANGED = {".jpg", ".jpeg", ".webp"}  # formats Pillow never decodes to a mode that changed
+
+
+def conversion_key(source: bytes | str | Path | Image.Image) -> str:
+    """``CONVERSION_KEY`` if ``source`` is an image whose conversion to RGB has changed: grayscale
+    of more than 8 bits (first rescaled at all, then as ``_to_8bit`` now does), or one with a
+    single transparent colour (``_keyed_out``); else "". Only the file's header is read; a file or
+    bytes that can't be opened get "" (decoding them will fail anyway)."""
+    if isinstance(source, Image.Image):
+        return CONVERSION_KEY if _changed(source) else ""
+    if isinstance(source, (str, Path)) and Path(source).suffix.lower() in _NEVER_CHANGED:
+        return ""
+    try:
+        with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as im:
+            return CONVERSION_KEY if _changed(im) else ""
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return ""
+
+
+def _changed(im: Image.Image) -> bool:
+    """Whether ``im``'s conversion to RGB is one that changed (see ``conversion_key``)."""
+    alpha = "A" in im.getbands() or "a" in im.getbands()
+    return im.mode in HIGH_DEPTH_MODES or (im.mode != "P" and not alpha and "transparency" in im.info)
 
 
 def thumbnail(data: bytes, size: int) -> bytes:

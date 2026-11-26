@@ -554,6 +554,14 @@ def test_top_k_breaks_ties_by_column():
     assert top_k(S, 5).tolist() == [[0, 1, 2, 3, 4]] * 3
 
 
+def test_top_k_refuses_nan():
+    """A NaN similarity (from an embedding that isn't finite) is a clear error, not a crash in
+    reshaping; -inf (an example kept out of its own vote) is fine."""
+    with pytest.raises(ValueError, match="NaN"):
+        top_k(np.array([[0.5, np.nan, 0.2, 0.1]]), 2)
+    assert top_k(np.array([[0.5, -np.inf, 0.2]]), 2).tolist() == [[0, 2]]
+
+
 @pytest.mark.parametrize("name", ["prototype", "knn", "logreg", "gda"])
 def test_queries_are_scored_in_blocks(monkeypatch, name):
     """Scoring queries a block at a time gives the same results as all at once; the block holds
@@ -584,13 +592,13 @@ def test_knn_compares_with_examples_once(monkeypatch):
     X = np.eye(3, dtype=np.float32)
     clf = make_classifier("knn", k=2).fit(ClassData(["a", "b", "c"], X, np.arange(3)))
     calls = []
-    real = classifiers.Classifier._support_similarity  # pylint: disable=protected-access
+    real = classifiers.KNNClassifier._support_similarity  # pylint: disable=protected-access
 
     def counted(self, Q):
         calls.append(len(Q))
         return real(self, Q)
 
-    monkeypatch.setattr(classifiers.Classifier, "_support_similarity", counted)
+    monkeypatch.setattr(classifiers.KNNClassifier, "_support_similarity", counted)
     clf.predict_full(X)
     assert calls == [3]
     clf._image_logprobs(X)  # pylint: disable=protected-access  # without S, the hook computes it

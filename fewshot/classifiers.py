@@ -349,6 +349,9 @@ class KNNClassifier(Classifier):
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         self.y, self.w = y, w
 
+    def _support_similarity(self, Q: Vectors) -> Scores:
+        return knn_similarity(Q, _fitted(self._X))
+
     def _image_logprobs(self, Q: Vectors, S: Scores | None = None) -> Scores:
         S = self._support_similarity(Q) if S is None else S
         y, w = _fitted(self.y), _fitted(self.w)
@@ -364,10 +367,22 @@ class KNNClassifier(Classifier):
         return np.log(scores / scores.sum(axis=1, keepdims=True))
 
 
+def knn_similarity(Q: npt.NDArray[np.floating[Any]], X: npt.NDArray[np.floating[Any]]) -> Scores:
+    """``Q @ X.T`` as kNN ranks neighbours by it, the same in a fit and in leave-one-out: worked out
+    in float64 and rounded to float32. In float32, BLAS rounds a product differently depending on
+    where its column falls in the matrix, so exact duplicates could score 1.0 and 0.99999994 and
+    which of them is among the k nearest would depend on what else is in the matrix."""
+    out: Scores = (Q.astype(np.float64) @ X.astype(np.float64).T).astype(np.float32)
+    return out
+
+
 def top_k(S: Scores, k: int) -> npt.NDArray[np.int_]:
     """(m, k) columns of the ``k`` largest entries of each row of ``S`` (1 <= k <= columns), in
     column order. Ties go to the lower column, so the choice among tied columns doesn't change
-    when another column is taken out: leave-one-out in closed form then matches refitting."""
+    when another column is taken out: leave-one-out in closed form then matches refitting. Raises
+    ``ValueError`` if ``S`` holds NaN (from an embedding that isn't finite), which has no rank."""
+    if np.isnan(S).any():
+        raise ValueError("Similarities include NaN: an image or text embedding is not finite")
     kth = np.partition(S, S.shape[1] - k, axis=1)[:, S.shape[1] - k, None]
     above, tied = kth < S, kth == S
     need = k - above.sum(1)

@@ -11,10 +11,10 @@ from PIL import Image
 
 import fewshot.evaluate as ev
 from fewshot import embedders, pipeline
-from fewshot.cache import FLIP_KEY
+from fewshot.cache import FLIP_KEY, prune_unused
 from fewshot.classifiers import KNNClassifier, binomial_tail, names_match, with_names
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
-from fewshot.images import image_id
+from fewshot.images import CONVERSION_KEY, image_id
 from fewshot.pipeline import Pipeline, Prediction
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, red_blue_task
 
@@ -592,6 +592,65 @@ def test_concurrent_cold_requests_fit_once(ws, monkeypatch):
     assert not pipe._fitting  # pylint: disable=protected-access
 
 
+def test_a_newcomer_after_a_failed_fit_waits_with_the_others(ws, monkeypatch):
+    """When a fit fails while other requests wait for it, a request arriving then queues behind
+    them instead of fitting at the same time as the waiter that tries again."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_example(png(RED), "red")
+    t.add_example(png(BLUE), "blue")
+    pipe = Pipeline(ws)
+    real = pipeline.new_classifier
+    n = {"fits": 0, "active": 0, "most": 0}
+    second = threading.Event()
+
+    def watched(cfg):
+        clf = real(cfg)
+        fit = clf.fit
+
+        def counted(data):
+            n["fits"] += 1
+            n["active"] += 1
+            n["most"] = max(n["most"], n["active"])
+            try:
+                if n["fits"] == 1:
+                    deadline = time.monotonic() + 5
+                    while sum(g.users for g in pipe._fitting.values()) < 2 and time.monotonic() < deadline:  # pylint: disable=protected-access
+                        time.sleep(0.01)  # until a second request waits
+                    raise RuntimeError("first fit fails")
+                second.set()
+                time.sleep(0.3)
+                return fit(data)
+            finally:
+                n["active"] -= 1
+
+        clf.fit = counted  # type: ignore[method-assign]
+        return clf
+
+    monkeypatch.setattr(pipeline, "new_classifier", watched)
+    errors, out = [], []
+
+    def request():
+        try:
+            out.append(pipe.fitted(t))
+        except RuntimeError as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=request) for _ in range(2)]
+    for th in threads:
+        th.start()
+    assert second.wait(5)
+    late = threading.Thread(target=request)  # arrives while the waiter fits again
+    late.start()
+    for th in [*threads, late]:
+        th.join()
+    assert n["most"] == 1
+    assert n["fits"] == 2
+    assert len(errors) == 1
+    assert len(out) == 2
+    assert out[0] is out[1]
+    assert not pipe._fitting  # pylint: disable=protected-access
+
+
 # ---- flip averaging, prompt ensembles, repeated and chunked input --------
 class LeftRight(Embedder):  # pylint: disable=abstract-method
     """Mean colour of the left half, then of the right half: sensitive to mirroring."""
@@ -709,3 +768,31 @@ def test_predict_reads_files_a_chunk_at_a_time(ws, tmp_path, monkeypatch):
     assert "Could not read" in (preds[3].error or "")
     assert seen[-1] == (5, 5)
     assert all(total == 5 for _, total in seen)
+
+
+def test_vectors_of_an_old_conversion_are_not_reused(ws):
+    """An image whose conversion to RGB changed (16-bit grayscale here) is cached under a key
+    marking the new conversion, so a vector cached from the old one (nearly white, before 16-bit
+    images were rescaled) isn't reused for examples while queries get the new one; pruning the
+    cache keeps the new keys."""
+    a = np.linspace(0, 4095, 64).reshape(8, 8).astype(np.uint16)
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, "PNG")
+    deep = buf.getvalue()
+    t = ws.create("t", embedder="fake:color")
+    eid = t.add_example(deep, "gray").id
+    t.add_example(png(RED), "red")
+    pipe = Pipeline(ws)
+    ns = cache_namespace("fake:color")
+    stale = np.array([1.0, 0.0, 0.0], np.float32)
+    pipe.cache.put_many(ns, {eid: stale, eid + FLIP_KEY: stale})
+    X = pipe.example_embeddings(t)
+    assert not np.allclose(X[0], stale)
+    assert np.allclose(X[0], pipe.embed_images("fake:color", [(None, deep)])[0])  # as a query sees it
+    t.update_settings(flip=True)
+    assert not np.allclose(pipe.example_embeddings(t)[0], stale)
+    new = [eid + CONVERSION_KEY, eid + CONVERSION_KEY + FLIP_KEY]
+    assert set(pipe.cache.get_many(ns, new)) == set(new)
+    assert pipe.predict(t, [deep])[0].label == "gray"
+    prune_unused(ws)
+    assert set(pipe.cache.get_many(ns, new)) == set(new)
