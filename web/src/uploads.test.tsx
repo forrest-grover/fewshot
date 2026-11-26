@@ -107,7 +107,7 @@ describe("useUploads", () => {
 
   it("keeps how many images were moved from other classes", async () => {
     const { hook } = setup("pets");
-    const moving: SendBatch = (batch) => Promise.resolve({ added: batch, errors: [], task: taskDetail(), moved: 1 });
+    const moving: SendBatch = (batch) => Promise.resolve({ added: batch, errors: [], task: taskDetail(), moved: [{ id: "a", previous_label: "dog" }] });
     await act(async () => { await hook.result.current.start("cat", files(3), moving); });
     expect(hook.result.current.slots.cat).toEqual({ skipped: [], moved: 2 });
   });

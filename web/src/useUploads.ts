@@ -15,8 +15,8 @@ export interface UploadSlot { progress?: UploadProgress; skipped: Skip[]; moved?
  * the images the server confirmed adding. */
 export interface UploadStop { task: string; added: number; total: number; error: Error | null }
 /** What the server answers each upload batch with. ``moved``: images that were already examples
- * of another class, and were moved to this one (newer servers say so). */
-interface Uploaded { added: unknown[]; errors: Skip[]; task: TaskDetail; moved?: number }
+ * of another class, and were moved to this one (example uploads only; the inbox has none). */
+interface Uploaded { added: unknown[]; errors: Skip[]; task: TaskDetail; moved?: readonly unknown[] }
 /** Sends one batch to task ``task`` (its current name), all of whose requests carry ``undoGroup``,
  * so the drop is one undo step. */
 export type SendBatch = (batch: File[], signal: AbortSignal, undoGroup: string, task: string) => Promise<Uploaded>;
@@ -114,7 +114,7 @@ export function useUploads(task: string | null, options: UploadOptions) {
         onBatch: (b) => {
           if (!b) return;
           r.added += b.added.length;
-          moved += b.moved ?? 0;
+          moved += b.moved?.length ?? 0;
           skips.push(...b.errors);
           opts.current.onTask(b.task);
         },
