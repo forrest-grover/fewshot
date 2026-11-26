@@ -15,7 +15,7 @@ from PIL import Image, ImageOps
 from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
-from .images import image_id, load_image
+from .images import image_id, load_image, to_rgb
 from .store import Task, TaskConfig, Workspace
 from .text import prompts
 
@@ -257,7 +257,7 @@ class Pipeline:
         if not images:
             return []
         errors: dict[int, str] = {}
-        Q = self.embed_images(cfg.embedder, _keyed(images, errors), errors, progress, cfg.flip)
+        Q = self._embed_queries(cfg, images, errors, progress)
         probs, sims, per_class = clf.predict_full(Q)
         thr = threshold_for(cfg, clf)
         preds = [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)
@@ -265,6 +265,22 @@ class Pipeline:
         if evidence > 0:
             _attach_evidence(clf, cfg, Q, preds, evidence)
         return [replace(p, revision=cfg.revision) for p in preds]
+
+    def _embed_queries(self, cfg: TaskConfig, images: Sequence[ImageInput], errors: dict[int, str],
+                       progress: Progress | None) -> Vectors:
+        """Embed images to predict, reading files ``READ_CHUNK`` at a time so only that many are
+        held in memory; unreadable ones get a message in ``errors`` (by index) and a zero row."""
+        parts = []
+        report = None if progress is None else _deduplicated(progress)
+        for start in range(0, len(images), READ_CHUNK):
+            part = images[start : start + READ_CHUNK]
+            errs: dict[int, str] = {}
+            step = None if report is None else _scaled(report, start, len(part), len(images))
+            parts.append(self.embed_images(cfg.embedder, _keyed(part, errs), errs, step, cfg.flip))
+            errors.update({start + i: m for i, m in errs.items()})
+            if report:  # also when the whole chunk was cached
+                report(start + len(part), len(images))
+        return np.concatenate(parts)
 
     # ---- inbox ---------------------------------------------------------
     def inbox_suggestions(self, task: Task, sort: str = "uncertain") -> list[dict[str, Any]]:
@@ -350,6 +366,27 @@ def threshold_for(cfg: TaskConfig, clf: Classifier) -> np.ndarray | None:
     return None if np.isnan(out).all() else out
 
 
+READ_CHUNK = 256  # image files read into memory at once by predict
+
+
+def _deduplicated(progress: Progress) -> Progress:
+    """``progress``, skipping a call that repeats the last count."""
+    last = [-1]
+
+    def report(done: int, total: int) -> None:
+        if done != last[0]:
+            last[0] = done
+            progress(done, total)
+
+    return report
+
+
+def _scaled(progress: Progress, start: int, n: int, total: int) -> Progress:
+    """A progress callback for ``n`` images from ``start`` of ``total``, reporting to ``progress``
+    in images of the whole (a chunk's own counts cover only the images that needed the model)."""
+    return lambda done, of: progress(start + (n * done) // max(of, 1), total)
+
+
 def _keyed(images: Sequence[ImageInput], errors: dict[int, str]) -> list[tuple[str | None, ImageInput]]:
     """``(cache key, image)`` per image. Files are read here, once, for both the key and decoding;
     one that can't be read gets a message in ``errors``. PIL images aren't cached."""
@@ -433,7 +470,7 @@ EMBED_MAX_SIDE = 2048  # images are shrunk to this before embedding, so a batch 
 
 def _to_pil(im: ImageInput) -> Image.Image:
     if isinstance(im, Image.Image):
-        im = im.convert("RGB")
+        im = to_rgb(ImageOps.exif_transpose(im))
         if max(im.size) > EMBED_MAX_SIDE:
             im.thumbnail((EMBED_MAX_SIDE, EMBED_MAX_SIDE), Image.Resampling.LANCZOS)
         return im

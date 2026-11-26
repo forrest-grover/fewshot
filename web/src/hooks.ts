@@ -26,6 +26,29 @@ export function topModal(): Element | null {
   return all.length ? all[all.length - 1] : null;
 }
 
+const FOCUSABLE = "button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), "
+  + "textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+
+/** Keep Tab and Shift+Tab inside dialog ``root`` while it is the dialog in front, so keyboard
+ * focus can't wander to the page behind it. */
+export function useFocusTrap(root: React.RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const on = (e: KeyboardEvent) => {
+      const box = root.current;
+      if (e.key !== "Tab" || !box || topModal() !== box) return;
+      const els = Array.from(box.querySelectorAll<HTMLElement>(FOCUSABLE));
+      const active = document.activeElement;
+      const first = els[0] as HTMLElement | undefined, last = els[els.length - 1] as HTMLElement | undefined;
+      if (!first || !last) { e.preventDefault(); box.focus(); return; }
+      const outside = !(active instanceof Node && box.contains(active)) || active === box;
+      if (e.shiftKey && (outside || active === first)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (outside || active === last)) { e.preventDefault(); first.focus(); }
+    };
+    window.addEventListener("keydown", on, true);
+    return () => { window.removeEventListener("keydown", on, true); };
+  }, [root]);
+}
+
 /** Controls whose own keys (Enter, Space, arrows) must keep working. */
 const CONTROL = "button, a[href], summary, [role=tab], [role=button], [role=option], [role=menuitem]";
 const CONTROL_KEYS = new Set(["Enter", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);

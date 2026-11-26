@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
 import socket
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +58,7 @@ from .cli_common import (
 )
 from .cli_data import ex_app, inbox_app
 from .embedders import DEFAULT_SPEC, PRESETS, check_embedder, spec_supports_text
+from .fetch import is_url
 from .store import Workspace
 from .text import check_class_name
 
@@ -426,28 +428,26 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Classify images (files, directories or http(s) URLs), PREDICT_CHUNK at a time: text, CSV and
-    JSON lines are printed as each batch finishes."""
+    JSON lines are printed as each batch finishes, and --from-file is read as it arrives, so a long
+    list can be piped through. A path in it that can't be read gets an error row."""
     t = _task(root, name)
     if sum((as_json, as_jsonl, as_csv)) > 1:
         _fail("Give at most one of --json, --jsonl and --csv")
-    args = list(paths or [])
-    if from_file is not None:
-        text = sys.stdin.read() if str(from_file) == "-" else from_file.read_text()
-        args += [line.strip() for line in text.splitlines() if line.strip()]
-    if not args:
+    if not paths and from_file is None:
         _fail("Give images to classify, or --from-file")
-    files = _expand(args)
+    named = _expand(paths) if paths else []
     fmt = "json" if as_json else "jsonl" if as_jsonl else "csv" if as_csv else "text"
     try:
         cfg = None if revision is None else t.version(revision)
     except KeyError as e:
         _fail(_error_text(e))
     pipe = _pipe(_ws(root))
+    files: list[Source] = []  # every file so far (all of them for --json, else the last batch)
     collected: list[Prediction] = []
-    failed = 0
+    done = failed = 0
+    sources = itertools.chain(named, _listed(from_file) if from_file is not None else [])
     with _progress("Classifying") as update:
-        for start in range(0, len(files), PREDICT_CHUNK):
-            part = files[start : start + PREDICT_CHUNK]
+        while part := list(itertools.islice(sources, PREDICT_CHUNK)):
             images, fetch_errors = _download(part)
             try:
                 preds = pipe.predict(t, images, top_k=top if fmt in {"json", "jsonl"} else None, evidence=evidence,
@@ -457,15 +457,46 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
             preds = _with_fetch_errors(preds, fetch_errors)
             failed += sum(p.error is not None for p in preds)
             if fmt == "json":
+                files += part
                 collected += preds
             else:
-                _output_predictions(part, preds, fmt, top, header=start == 0)
-            update(start + len(part), len(files))
+                _output_predictions(part, preds, fmt, top, header=done == 0)
+            done += len(part)
+            update(done, len(named) if from_file is None else done)
+    if not done:
+        _fail("No images to classify")
     if fmt == "json":
         _output_predictions(files, collected, fmt, top)
     if failed:
-        typer.secho(f"{failed} of {len(files)} images could not be read", fg="red", err=True)
+        typer.secho(f"{failed} of {done} images could not be read", fg="red", err=True)
         raise typer.Exit(1)
+
+
+def _listed(from_file: Path) -> Iterator[Source]:
+    """The images a --from-file list names, read line by line as it arrives (``-``: stdin): URLs,
+    files (a missing one too, so it gets an error row) and the images in folders."""
+    if str(from_file) == "-":
+        yield from _named_in(sys.stdin)
+        return
+    try:
+        f = from_file.open(encoding="utf-8")
+    except OSError as e:
+        _fail(f"Can't read {from_file}: {e.strerror or e}")
+    with f:
+        yield from _named_in(f)
+
+
+def _named_in(lines: Iterable[str]) -> Iterator[Source]:
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if is_url(line):
+            yield line
+        elif Path(line).is_dir():
+            yield from _images_in(Path(line))
+        else:
+            yield Path(line)
 
 
 @app.command()

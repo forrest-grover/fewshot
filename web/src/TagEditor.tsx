@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { useFocusTrap } from "./hooks";
 
 /** What the editor saves: one example's tags and note, or tags added to and removed from several. */
 export type TagEdit = { tags: string[]; note: string } | { add: string[]; remove: string[] };
@@ -21,6 +22,8 @@ export default function TagEditor({ title, allTags, tags, note, onSave, onClose 
   const [text, setText] = useState("");
   const [noteText, setNoteText] = useState(note ?? "");
   const input = useRef<HTMLInputElement>(null);
+  const form = useRef<HTMLFormElement>(null);
+  useFocusTrap(form);
   const id = useId();
 
   useEffect(() => {
@@ -47,7 +50,7 @@ export default function TagEditor({ title, allTags, tags, note, onSave, onClose 
 
   return (
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <form className="modal" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`}
+      <form ref={form} className="modal" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`}
         onSubmit={(e) => { e.preventDefault(); save(); }}>
         <h3 className="modal-title" id={`${id}-title`}>{title}</h3>
         <div className="chips" aria-label="Tags">

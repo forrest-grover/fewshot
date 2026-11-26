@@ -7,7 +7,7 @@ import TagEditor, { type TagEdit } from "./TagEditor";
 import { DropZone } from "./ui";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
-interface Skipped { file: string; error: string }
+interface Skipped { file: string | null; error: string }
 
 /** Thumbnails shown per class at first, and added by each "Show more", so a class with thousands of
  * examples doesn't render thousands of images and class menus at once. */
@@ -420,7 +420,7 @@ export default function Examples({ task, setTask, run }: Props) {
               <div className="error skipped" role="alert">
                 <div>
                   Skipped {skip.length} file{skip.length === 1 ? "" : "s"}:
-                  <ul>{skip.map((e, i) => <li key={i}><b>{e.file}</b>: {e.error}</li>)}</ul>
+                  <ul>{skip.map((e, i) => <li key={i}>{e.file && <><b>{e.file}</b>: </>}{e.error}</li>)}</ul>
                 </div>
                 <button className="ghost" aria-label="Dismiss" onClick={() => { setSkipped((s) => ({ ...s, [c.name]: [] })); }}>×</button>
               </div>

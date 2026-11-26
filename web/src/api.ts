@@ -16,16 +16,16 @@ export interface TaskDetail {
   revision: number; classes: ClassInfo[]; examples: Example[];
 }
 export interface Prediction {
-  file: string; label: string | null; top_label: string; confidence: number;
+  file?: string | null; label: string | null; top_label: string; confidence: number;
   similarity: number; rejected: boolean; scores: Record<string, number>; // scores: highest first
-  labels: string[]; // every class the image matches (with a reject threshold), label first
+  labels: string[]; // every class the image matches (with a reject threshold), label first unless rejected
   evidence: { id: string; label: string; similarity: number }[]; // most similar labelled examples, if asked for
   error: string | null; // set when the image could not be read; the other fields are then empty
 }
 /** An example's prediction by a classifier fitted without it. */
 export interface HeldOut { id: string; true: string; pred: string; confidence: number; similarity: number; correct: boolean }
 export interface EvalReport {
-  method: string; n_scored: number; n_examples: number; accuracy: number | null; macro_f1: number | null;
+  revision: number; method: string; n_scored: number; n_examples: number; accuracy: number | null; macro_f1: number | null;
   top_k_accuracy: Record<string, number>; classes: string[]; confusion: number[][];
   per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
   mistakes: HeldOut[]; predictions: HeldOut[]; suggested_reject_below: number | null;
@@ -45,7 +45,9 @@ export interface InboxEntry {
 export type InboxSort = "uncertain" | "confident" | "novel" | "added";
 export interface DuplicatePair { a: string; b: string; similarity: number; labels: string[]; same_label: boolean }
 export interface Health { status: string; auth_required: boolean; models_loaded: string[]; jobs_running: number; url_fetch: boolean }
-export interface AddResult { added: Example[]; errors: { file: string; error: string }[]; task: TaskDetail }
+/** An upload that couldn't be used: its file name (or URL, when known) and why. */
+export interface FileError { file: string | null; error: string }
+export interface AddResult { added: Example[]; errors: FileError[]; task: TaskDetail }
 export interface Job<T> {
   id: string; task: string; kind: string; status: "running" | "done" | "failed" | "cancelled";
   stage: string; done: number; total: number; result: T | null; error: string | null;
@@ -148,7 +150,7 @@ export const api = {
   health: () => req<Health>("GET", "/api/health"),
   inbox: (n: string, sort: InboxSort) => req<{ total: number; items: InboxEntry[] }>("GET", `${t(n)}/inbox?sort=${sort}&limit=1000`),
   addToInbox: (n: string, fs: File[]) =>
-    req<{ added: InboxEntry[]; errors: { file: string; error: string }[]; task: TaskDetail }>("POST", `${t(n)}/inbox`, files(fs)),
+    req<{ added: InboxEntry[]; errors: FileError[]; task: TaskDetail }>("POST", `${t(n)}/inbox`, files(fs)),
   acceptInbox: (n: string, labels: Record<string, string>) => req<TaskDetail>("POST", `${t(n)}/inbox/accept`, { labels }),
   dismissInbox: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/inbox/dismiss`, { ids }),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),

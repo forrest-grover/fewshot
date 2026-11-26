@@ -17,6 +17,10 @@ class Cancelled(Exception):
     """Raised by ``Job.progress`` once the job was asked to stop."""
 
 
+class TooManyJobs(Exception):
+    """Raised by ``Jobs.start`` when ``limit`` jobs are already running."""
+
+
 @dataclass
 class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job's state, one field each
     """A long-running operation in a background thread, polled through /api/jobs/{id}."""
@@ -54,8 +58,10 @@ class Jobs:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
 
-    def start(self, job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> Job:
-        """Run ``work(progress)`` in a thread; its return value becomes ``job.result``. A
+    def start(self, job: Job, work: Callable[[Callable[[str, int, int], None]], Any], limit: int | None = None) -> Job:
+        """Run ``work(progress)`` in a thread; its return value becomes ``job.result``, unless
+        ``limit`` jobs are running already: then raise ``TooManyJobs`` (checked and started under
+        one lock, so concurrent starts can't pass the limit together). A
         ``ValueError`` or ``KeyError`` fails the job with its message; anything else with
         "Internal error" (details go to the log only: they can hold server paths)."""
         def run() -> None:
@@ -72,6 +78,8 @@ class Jobs:
             job.finished = time.time()
 
         with self._lock:
+            if limit is not None and sum(j.status == "running" for j in self._jobs.values()) >= limit:
+                raise TooManyJobs
             finished = sorted((j for j in self._jobs.values() if j.finished), key=lambda j: j.finished or 0)
             for old in finished[: max(0, len(finished) - self.kept + 1)]:
                 del self._jobs[old.id]

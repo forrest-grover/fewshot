@@ -45,7 +45,7 @@ def test_client_round_trip(server, tmp_path):
     f.write_bytes(png(RED, noise=15, seed=1))
     fs.add_examples("my-pets", "red", [f, ("r2.png", png(RED, noise=15, seed=2))])
     added = fs.add_examples("my-pets", "blue", [(f'b"{i}.png', png(BLUE, noise=15, seed=i)) for i in range(2)])
-    assert [x["source"] for x in added["added"]] == ["b%220.png", "b%221.png"]  # quotes escaped as browsers do
+    assert [x["source"] for x in added["added"]] == ['b"0.png', 'b"1.png']  # sent as %22, like browsers do
     rev = fs.task("my-pets")["revision"]
     [p] = fs.predict("my-pets", [("q.png", png(BLUE, seed=9))], top_k=1, evidence=1)
     assert (p["label"], list(p["scores"]), len(p["evidence"]), p["revision"]) == ("blue", ["blue"], 1, rev)
@@ -89,3 +89,21 @@ def test_operation_ids_are_function_names():
     ids = [op["operationId"] for op in ops]
     assert len(ids) == len(set(ids))
     assert {"predict", "add_examples", "list_tasks", "health"} <= set(ids)
+
+
+def test_client_sends_many_images_in_batches(server, monkeypatch):
+    """Uploads and predictions go BATCH images per request; the results are combined."""
+    monkeypatch.setattr("fewshot.client.BATCH", 2)
+    fs = Client(server, token="secret")
+    fs.create_task("batched", embedder="fake:color")
+    r = fs.add_examples("batched", "red", [(f"r{i}.png", png(RED, noise=15, seed=i)) for i in range(3)]
+                        + [("bad.png", b"not an image")])
+    assert (len(r["added"]), [e["file"] for e in r["errors"]], len(r["task"]["examples"])) == (3, ["bad.png"], 3)
+    fs.add_examples("batched", "blue", [(f"b{i}.png", png(BLUE, noise=15, seed=i)) for i in range(2)])
+    preds = fs.predict("batched", (("q.png", png(c, seed=9)) for c in (RED, BLUE, RED, BLUE, RED)))
+    assert [p["label"] for p in preds] == ["red", "blue", "red", "blue", "red"]
+    assert fs.predict("batched", []) == []
+    assert len(fs.add_to_inbox("batched", [(f"u{i}.png", png(RED, seed=20 + i)) for i in range(3)])["added"]) == 3
+    with pytest.raises(ValueError, match="No images given"):
+        fs.add_to_inbox("batched", [])
+    fs.delete_task("batched")

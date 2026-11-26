@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef } from "react";
-import { topModal } from "./hooks";
+import { topModal, useFocusTrap } from "./hooks";
 
 export interface LightboxItem {
   url: string; // the image (large)
@@ -21,6 +21,7 @@ interface Props {
 export default function Lightbox({ items, index, onIndex, onClose, onKey, footer }: Props) {
   const id = useId();
   const box = useRef<HTMLDivElement>(null);
+  useFocusTrap(box);
   const item = items[index] as LightboxItem | undefined;
   const latest = useRef({ index, items, onIndex, onClose, onKey });
   latest.current = { index, items, onIndex, onClose, onKey };

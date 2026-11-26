@@ -55,6 +55,8 @@ body {
 h1 {
   font-size: 22px;
   margin: 0;
+  overflow-wrap: anywhere; /* a long task name without spaces must not widen the page */
+  min-width: 0;
 }
 
 h3 {

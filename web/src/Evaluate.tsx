@@ -238,7 +238,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
                   return (
                     <figure key={m.id} className="thumb wide">
                       {/* 400 px: 2x the 200 px tile */}
-                      <img src={api.imageUrl(task.name, m.id, 400)} alt="" loading="lazy" tabIndex={0} className="zoomable"
+                      <img src={api.imageUrl(task.name, m.id, 400)} alt={`${m.true} example${m.correct ? "" : `, predicted ${m.pred}`}`} loading="lazy" tabIndex={0} className="zoomable"
                         onClick={() => { setViewing(listed.indexOf(m)); }}
                         onKeyDown={(e) => { if (e.key === "Enter") setViewing(listed.indexOf(m)); }} />
                       <figcaption className="col">
@@ -290,7 +290,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
               <div key={`${d.a}-${d.b}`} className={`dupe ${same ? "" : "conflict"}`}>
                 {[d.a, d.b].map((id, i) => (
                   <figure key={id} className="thumb">
-                    <img src={api.imageUrl(task.name, id, 240)} alt="" loading="lazy" />
+                    <img src={api.imageUrl(task.name, id, 240)} alt={`${i === 0 ? la : lb} example`} loading="lazy" />
                     <figcaption className="col">
                       <span>{i === 0 ? la : lb}</span>
                       {exists(id)

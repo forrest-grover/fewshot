@@ -108,6 +108,9 @@ def _modality_gap(data: ClassData) -> Vectors:
     return (np.mean(list(data.text.values()), axis=0) - data.X.mean(0)).astype(np.float32)
 
 
+PREDICT_ROWS = 2048  # queries scored at once
+
+
 class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted state plus settings
     """Base class: handles text fusion and modality-gap anchors; subclasses score images."""
 
@@ -127,23 +130,30 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         raise NotImplementedError
 
-    def _image_logprobs(self, Q: Vectors) -> Scores:
+    # ``S`` is the queries' similarity to every support point (``Q @ X.T``) when the caller has it,
+    # so a classifier that needs it in both hooks computes it once.
+    needs_support = True  # whether the hooks use ``S``; if not, it isn't computed for them
+
+    def _image_logprobs(self, Q: Vectors, S: Scores | None = None) -> Scores:
         raise NotImplementedError
 
-    def _class_similarity_image(self, Q: Vectors) -> Scores:
+    def _support_similarity(self, Q: Vectors) -> Scores:
+        return Q @ _fitted(self._X).T
+
+    def _class_similarity_image(self, Q: Vectors, S: Scores | None = None) -> Scores:
         """(m, C) cosine similarity of each query to each class's nearest support point."""
-        S = Q @ _fitted(self._X).T
+        S = self._support_similarity(Q) if S is None else S
         y = _fitted(self._y)
         return np.stack([S[:, y == c].max(axis=1) for c in range(len(self.classes))], axis=1)
 
-    def class_similarity(self, Q: Vectors) -> Scores:
+    def class_similarity(self, Q: Vectors, S: Scores | None = None) -> Scores:
         """(m, C) similarity of each query to each class: to its nearest example (its prototype, for
         the prototype classifier), or to its text for zero-shot tasks. Unlike the probabilities,
         each class's score doesn't depend on the others, so several classes can pass a threshold
         (multi-label prediction)."""
         if self.zero_shot:
             return Q @ _fitted(self.Pt).T
-        return self._class_similarity_image(Q)
+        return self._class_similarity_image(Q, S)
 
     def fit(self, data: ClassData) -> Classifier:
         """Fit on ``data``; every class needs at least one image or a text embedding."""
@@ -211,14 +221,25 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         image-to-image cosine, except for zero-shot tasks where it is image-to-text cosine
         (typically 0.2-0.35 for CLIP), so reject thresholds are not interchangeable between the
         two. Raises RuntimeError if called before ``fit``.
+
+        Queries are scored ``PREDICT_ROWS`` at a time, so the (queries x examples) similarity
+        matrix stays small however many of both there are.
         """
-        per_class = self.class_similarity(Q)
+        if len(Q) > PREDICT_ROWS:
+            parts = [self._predict_rows(Q[i : i + PREDICT_ROWS]) for i in range(0, len(Q), PREDICT_ROWS)]
+            return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
+                    np.concatenate([p[2] for p in parts]))
+        return self._predict_rows(Q)
+
+    def _predict_rows(self, Q: Vectors) -> tuple[Scores, Scores, Scores]:
+        S = self._support_similarity(Q) if self.needs_support and not self.zero_shot else None
+        per_class = self.class_similarity(Q, S)
         if self.zero_shot:
             probs = _softmax(CLIP_LOGIT_SCALE * per_class)
         elif len(self.classes) == 1:
             probs = np.ones((len(Q), 1))
         else:
-            logits = self._image_logprobs(Q)
+            logits = self._image_logprobs(Q, S)
             if self.Pt is not None and self.text_weight > 0:
                 logits = logits + self.text_weight * CLIP_LOGIT_SCALE * (Q @ self.Pt.T)
             probs = _softmax(logits)
@@ -241,12 +262,14 @@ class PrototypeClassifier(Classifier):
         np.add.at(P, y, X * w[:, None])
         self.P = _unit(P)
 
-    def _image_logprobs(self, Q: Vectors) -> Scores:
+    needs_support = False  # it compares with class means instead
+
+    def _image_logprobs(self, Q: Vectors, S: Scores | None = None) -> Scores:
         z = self.scale * (Q @ _fitted(self.P).T)
         z = z - z.max(1, keepdims=True)
         return z - np.log(np.exp(z).sum(1, keepdims=True))
 
-    def _class_similarity_image(self, Q: Vectors) -> Scores:
+    def _class_similarity_image(self, Q: Vectors, S: Scores | None = None) -> Scores:
         return Q @ _fitted(self.P).T
 
 
@@ -264,8 +287,8 @@ class KNNClassifier(Classifier):
     def _fit_image(self, X: Vectors, y: Labels, w: Vectors) -> None:
         self.y, self.w = y, w
 
-    def _image_logprobs(self, Q: Vectors) -> Scores:
-        S = Q @ _fitted(self._X).T
+    def _image_logprobs(self, Q: Vectors, S: Scores | None = None) -> Scores:
+        S = self._support_similarity(Q) if S is None else S
         y, w = _fitted(self.y), _fitted(self.w)
         k = min(self.k, S.shape[1])
         top = np.argpartition(-S, k - 1, axis=1)[:, :k]
@@ -297,7 +320,7 @@ class LogRegClassifier(Classifier):
             return
         self.model = LogisticRegression(C=self.C, max_iter=2000).fit(X, y, sample_weight=w)
 
-    def _image_logprobs(self, Q: Vectors) -> Scores:
+    def _image_logprobs(self, Q: Vectors, S: Scores | None = None) -> Scores:
         model = _fitted(self.model)
         lp = np.full((len(Q), len(self.classes)), -1e9, np.float64)
         lp[:, model.classes_] = model.predict_log_proba(Q)

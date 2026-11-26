@@ -22,7 +22,8 @@ export default function Inbox({ task, setTask, run }: Props) {
   const [items, setItems] = useState<{ key: string; list: InboxEntry[] } | null>(null);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const [current, setCurrent] = useState<string | null>(null);
-  const [minConf, setMinConf] = useState(0.9);
+  const [minConfText, setMinConfText] = useState("0.9");
+  const minConf = minConfText.trim() === "" ? NaN : Number(minConfText); // NaN (empty or not a number): accept none
   const [shown, setShown] = useState(PAGE);
   const [busy, setBusy] = useState(false);
   const [viewing, setViewing] = useState<number | null>(null); // index into the list, full size
@@ -57,7 +58,7 @@ export default function Inbox({ task, setTask, run }: Props) {
       const r = await run(shrinkImages(files).then((fs) => api.addToInbox(task.name, fs)));
       if (r) {
         setTask(r.task);
-        if (r.errors.length) void run(Promise.reject(new Error(`Skipped ${String(r.errors.length)}: ${r.errors.map((e) => `${e.file}: ${e.error}`).join("; ")}`)));
+        if (r.errors.length) void run(Promise.reject(new Error(`Skipped ${String(r.errors.length)}: ${r.errors.map((e) => (e.file ? `${e.file}: ${e.error}` : e.error)).join("; ")}`)));
       }
     } finally {
       setBusy(false);
@@ -82,6 +83,10 @@ export default function Inbox({ task, setTask, run }: Props) {
     } else if (e.key === "Delete" || e.key === "Backspace") {
       void dismiss([cur.id]);
       move = 1;
+    } else if (e.key === " ") {
+      e.preventDefault();
+      setViewing(at);
+      return;
     } else if (e.key === "ArrowDown" || e.key === "j" || e.key === "ArrowRight") move = 1;
     else if (e.key === "ArrowUp" || e.key === "k" || e.key === "ArrowLeft") move = -1;
     else return;
@@ -141,8 +146,8 @@ export default function Inbox({ task, setTask, run }: Props) {
             <span className="spacer" />
             <label className="inline">
               <span>Confidence at least</span>
-              <input type="number" min={0} max={1} step={0.05} value={minConf} className="threshold-input"
-                onChange={(e) => { setMinConf(Number(e.target.value)); }} />
+              <input type="number" min={0} max={1} step={0.05} value={minConfText} className="threshold-input"
+                onChange={(e) => { setMinConfText(e.target.value); }} />
             </label>
             <button disabled={busy || stale || sure.length === 0}
               onClick={() => { void label(Object.fromEntries(sure.map((i) => [i.id, suggested(i) ?? ""]))); }}>
@@ -190,7 +195,7 @@ export default function Inbox({ task, setTask, run }: Props) {
                       }} />
                   </label>
                   <img className="inbox-img zoomable" src={api.imageUrl(task.name, i.id, THUMB_SIZE)} alt={i.source || i.id}
-                    loading={n < 12 ? "eager" : "lazy"} onDoubleClick={() => { setViewing(n); }} title="Double-click to view full size" />
+                    loading={n < 12 ? "eager" : "lazy"} onDoubleClick={() => { setViewing(n); }} title="Double-click (or Space) to view full size" />
                   <div className="inbox-body">
                     {p ? (
                       <span className={s ? "" : "unknown"}>

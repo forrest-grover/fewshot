@@ -8,15 +8,18 @@
         print(p["file"], p["label"], p["confidence"])
 
 Images are file paths or ``(filename, bytes)`` pairs. Every method returns the API's JSON; an error
-response raises ``ApiError`` with the HTTP status and the server's ``detail``.
+response raises ``ApiError`` with the HTTP status and the server's ``detail``. Many images are sent
+``BATCH`` per request (the server takes at most 1000 files per request), reading only one batch of
+files at a time; the results are combined.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import mimetypes
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -24,6 +27,13 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 Image = str | Path | tuple[str, bytes]
+BATCH = 256  # images per upload request
+
+
+def _batches(images: Iterable[Image]) -> Iterator[list[Image]]:
+    it = iter(images)
+    while batch := list(itertools.islice(it, BATCH)):
+        yield batch
 
 
 class ApiError(Exception):
@@ -94,13 +104,23 @@ class Client:
 
     # ---- data ----------------------------------------------------------
     def add_examples(self, task: str, label: str, images: Iterable[Image]) -> dict[str, Any]:
-        """Add labelled examples (the class is created if needed)."""
-        return self.request("POST", f"/tasks/{_seg(task)}/examples", fields={"label": label},  # type: ignore[no-any-return]
-                            files=list(images))
+        """Add labelled examples (the class is created if needed). Raises ``ApiError`` (400) if a
+        batch has no image that could be added; earlier batches stay added."""
+        return self._upload(f"/tasks/{_seg(task)}/examples", images, {"label": label})
 
     def add_to_inbox(self, task: str, images: Iterable[Image]) -> dict[str, Any]:
         """Add unlabelled images to the task's inbox."""
-        return self.request("POST", f"/tasks/{_seg(task)}/inbox", files=list(images))  # type: ignore[no-any-return]
+        return self._upload(f"/tasks/{_seg(task)}/inbox", images, {})
+
+    def _upload(self, path: str, images: Iterable[Image], fields: dict[str, str]) -> dict[str, Any]:
+        """POST ``images`` a batch at a time; ``added`` and ``errors`` are combined, ``task`` is the last."""
+        out: dict[str, Any] = {"added": [], "errors": [], "task": None}
+        for batch in _batches(images):
+            r = self.request("POST", path, fields=fields, files=batch)
+            out = {"added": out["added"] + r["added"], "errors": out["errors"] + r["errors"], "task": r["task"]}
+        if out["task"] is None:
+            raise ValueError("No images given")
+        return out
 
     def inbox(self, task: str, sort: str = "uncertain") -> dict[str, Any]:
         """The inbox with the model's suggestion for each image (``sort``: uncertain, confident, novel, added)."""
@@ -119,8 +139,10 @@ class Client:
         ``revision`` predicts with an earlier version of the task that the server still keeps.
         """
         params = {"top_k": top_k, "evidence": evidence or None, "revision": revision}
-        return self.request("POST", f"/tasks/{_seg(task)}/predict", params=params,  # type: ignore[no-any-return]
-                            files=list(images))
+        out: list[dict[str, Any]] = []
+        for batch in _batches(images):
+            out += self.request("POST", f"/tasks/{_seg(task)}/predict", params=params, files=batch)
+        return out
 
     def evaluate(self, task: str) -> dict[str, Any]:
         """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...)."""

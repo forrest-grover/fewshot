@@ -486,7 +486,10 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
 
     def set_class_thresholds(self, thresholds: dict[str, float | None]) -> None:
         """Set (or, with None, clear) per-class reject thresholds in one change. Raises ``KeyError``
-        for an unknown class and ``ValueError`` for a value outside -1..1; then nothing changes."""
+        for an unknown class and ``ValueError`` for a value outside -1..1; then nothing changes.
+        An empty dict changes nothing (and adds no undo step)."""
+        if not thresholds:
+            return
         for k, v in thresholds.items():
             if v is not None and not -1.0 <= v <= 1.0:
                 raise ValueError(f"The threshold of {k!r} must be between -1 and 1, got {v}")

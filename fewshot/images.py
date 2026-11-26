@@ -45,10 +45,19 @@ def load_image(data: bytes, draft: int | None = None, max_side: int | None = Non
         raise ValueError(f"Not a readable image: {e}") from e
     except OSError as e:
         raise ValueError(f"Not a readable image: {e}") from e
-    out = ImageOps.exif_transpose(im).convert("RGB")
+    out = to_rgb(ImageOps.exif_transpose(im))
     if max_side and max(out.size) > max_side:
         out.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     return out
+
+
+def to_rgb(im: Image.Image) -> Image.Image:
+    """``im`` as RGB, with any transparency composited onto white: converting directly would show
+    whatever colour transparent pixels happen to hold, usually black."""
+    if "A" in im.getbands() or "a" in im.getbands() or (im.mode == "P" and "transparency" in im.info):
+        rgba = im.convert("RGBA")
+        return Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
+    return im.convert("RGB")
 
 
 def thumbnail(data: bytes, size: int) -> bytes:

@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
+import { useFocusTrap } from "./hooks";
 
 const KEYS: [string, [string, string][]][] = [
   ["Everywhere", [
@@ -19,6 +20,7 @@ const KEYS: [string, [string, string][]][] = [
     ["1–9", "Label the highlighted image as that class"],
     ["Delete", "Dismiss it"],
     ["←  →  /  j  k", "Move"],
+    ["Space", "View it full size"],
   ]],
   ["Predict", [
     ["Enter", "Add the highlighted image as its prediction"],
@@ -36,6 +38,8 @@ const KEYS: [string, [string, string][]][] = [
 
 /** The keyboard shortcuts, opened with "?". */
 export default function Shortcuts({ onClose }: { onClose: () => void }) {
+  const box = useRef<HTMLDivElement>(null);
+  useFocusTrap(box);
   useEffect(() => {
     const on = (e: KeyboardEvent) => { if (e.key === "Escape" || e.key === "?") { e.preventDefault(); e.stopPropagation(); onClose(); } };
     window.addEventListener("keydown", on, true);
@@ -43,7 +47,7 @@ export default function Shortcuts({ onClose }: { onClose: () => void }) {
   }, [onClose]);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="modal shortcuts" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+      <div ref={box} className="modal shortcuts" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
         <div className="row"><h3 className="modal-title">Keyboard shortcuts</h3><span className="spacer" />
           <button className="ghost small" aria-label="Close" onClick={onClose} autoFocus>×</button></div>
         {KEYS.map(([group, keys]) => (

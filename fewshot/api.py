@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -60,7 +60,7 @@ from .evaluate import compare_embedders, evaluate_task
 from .fetch import fetch_url
 from .guard import LimitBody, cross_site, host_allowed, host_name
 from .images import thumbnail
-from .jobs import Job, Jobs
+from .jobs import Job, Jobs, TooManyJobs
 from .pipeline import Pipeline, Prediction
 from .schemas import (
     AddResult,
@@ -555,7 +555,10 @@ def _uploads(files: list[UploadFile]) -> list[Blob]:
     out: list[Blob] = []
     for f in files:
         data = _read_upload(f)
-        out.append((f.filename, data, None if data is not None else _too_large()))
+        # Browsers (and fewshot.client) send a '"' in a file name as %22, per the HTML standard;
+        # the multipart parser leaves it encoded.
+        name = f.filename.replace("%22", '"') if f.filename else f.filename
+        out.append((name, data, None if data is not None else _too_large()))
     return out
 
 
@@ -857,10 +860,16 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
     same = next((j for j in running if (j.task, j.kind) == (name, kind) and j.revision == t.config.revision), None)
     if same is not None:  # the same evaluation is already running: share it
         return same.to_dict()
-    if len(running) >= MAX_JOBS:
-        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
     job = Job(task=name, kind=kind, revision=t.config.revision)
-    return jobs.start(job, lambda progress: _evaluated(t, evaluate_task(pipe, t, folds, progress=progress))).to_dict()
+    return _start(job, lambda progress: _evaluated(t, evaluate_task(pipe, t, folds, progress=progress)))
+
+
+def _start(job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> dict[str, Any]:
+    """Start ``job``; 429 if ``MAX_JOBS`` are running."""
+    try:
+        return jobs.start(job, work, limit=MAX_JOBS).to_dict()
+    except TooManyJobs:
+        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished") from None
 
 
 MAX_COMPARED = 8  # embedders per comparison
@@ -881,10 +890,8 @@ def start_comparison(name: str, body: Compare) -> dict[str, Any]:
         raise HTTPException(400, "Task has no examples to evaluate")
     for s in specs:
         _allowed_embedder(s)  # loaded by the job: a model that fails is reported in its result
-    if len(jobs.running()) >= MAX_JOBS:
-        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
     job = Job(task=name, kind="compare", revision=t.config.revision)
-    return jobs.start(job, lambda progress: compare_embedders(pipe, t, specs, body.folds, progress=progress)).to_dict()
+    return _start(job, lambda progress: compare_embedders(pipe, t, specs, body.folds, progress=progress))
 
 
 @app.get("/api/jobs/{jid}", response_model=JobOut)
