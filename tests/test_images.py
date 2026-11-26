@@ -126,9 +126,9 @@ def test_white_level_from_metadata():
     assert (_gray(_saved(dark, "PNG")) == 255).all()  # no metadata: auto exposure
     assert (_gray(_with_sbit(_saved(dark, "PNG"), 12)) == round(3000 / 257)).all()
     twelve = Image.fromarray(dark)
-    twelve.tag_v2 = {258: (12,)}  # as Pillow reads a 12-bit TIFF
+    twelve.tag_v2 = {258: (12,)}  # type: ignore[attr-defined]  # as Pillow reads a 12-bit TIFF
     assert images.white_level(twelve) == 4095
-    twelve.tag_v2 = {258: (16,)}
+    twelve.tag_v2 = {258: (16,)}  # type: ignore[attr-defined]
     assert images.white_level(twelve) is None
     assert images.white_level(Image.new("L", (1, 1))) is None
     assert images.white_level(Image.fromarray(dark), _png_of("L", (1, 1))) is None  # no sBIT before IDAT
