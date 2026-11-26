@@ -780,3 +780,38 @@ def test_gda_fused_scale_can_go_below_a_tenth():
     loo = rng.normal(size=(n, C))
     _, scale = classifiers._fusion(zt, loo, lambda: loo, y, 8.0, 1.0, np.ones(n, bool))  # pylint: disable=protected-access
     assert scale < 0.05
+
+
+def test_knn_casts_its_examples_once(monkeypatch):
+    """kNN keeps a float64 copy of its examples from the fit, instead of casting them again for
+    every block of queries (which made 1000 queries against 100k examples take 8 s, not 2)."""
+    rng = np.random.default_rng(0)
+    X = unit(rng.normal(size=(30, 8)))
+    clf = make_classifier("knn").fit(ClassData(["a", "b", "c"], X, np.arange(30) % 3))
+    seen = []
+    real = classifiers.knn_similarity
+
+    def spy(Q, S):
+        seen.append(S.dtype)
+        return real(Q, S)
+    monkeypatch.setattr(classifiers, "knn_similarity", spy)
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 60)  # blocks of 2 queries
+    probs, _ = clf.predict(X[:6])
+    assert seen == [np.float64] * 3
+    np.testing.assert_array_equal(probs.argmax(1), np.arange(6) % 3)
+
+
+@pytest.mark.parametrize("name", ["knn", "logreg", "gda"])
+def test_class_similarity_with_classes_in_any_order(name):
+    """Each class's similarity is that of its nearest support point however the examples (and the
+    text-only classes' anchors after them) are ordered."""
+    rng = np.random.default_rng(1)
+    X = unit(rng.normal(size=(40, 6)))
+    y = rng.permutation(np.arange(40) % 4)
+    text = {4: unit(rng.normal(size=6))}
+    clf = make_classifier(name).fit(ClassData(list("abcde"), X, y, text))
+    Q = unit(rng.normal(size=(5, 6)))
+    assert clf._X is not None  # pylint: disable=protected-access
+    S = Q @ clf._X.T  # pylint: disable=protected-access
+    expected = np.stack([S[:, clf._y == c].max(1) for c in range(5)], axis=1)  # pylint: disable=protected-access
+    np.testing.assert_allclose(clf.class_similarity(Q), expected, atol=1e-6)
