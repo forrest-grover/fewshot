@@ -475,8 +475,8 @@ class GDAClassifier(Classifier):
         y = loo.y
         imgs = np.bincount(y, minlength=len(self.classes))
         # Each class's text moved across the gap into this space: where the text says its images are.
-        gap = (_fitted(self.Pt)[imgs > 0] - raw_mu[imgs > 0]).mean(0)
-        anchors = self._centred((_fitted(self.Pt) - gap).astype(np.float32)).astype(np.float64)
+        # (The same gap as text-only classes' anchors and image-only classes' text sides.)
+        anchors = self._centred((_fitted(self.Pt) - _fitted(self.gap)).astype(np.float32)).astype(np.float64)
         # text_weight scales the text's pull on the means as it does its scores, so 0 is no text.
         lam = self.text_weight * self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None)
         loo.pull_towards(anchors, lam)

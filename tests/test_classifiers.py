@@ -489,3 +489,22 @@ def test_refitting_forgets_the_previous_fit(name):
     assert clf.gap is None
     assert clf.logit_scale == fresh.logit_scale
     np.testing.assert_allclose(clf.predict(Q)[0], fresh.predict(Q)[0], rtol=1e-6)
+
+
+def test_gda_pulls_means_with_the_classifiers_one_gap(monkeypatch):
+    """GDA moves the descriptions across the same modality gap as the rest of the fit (one
+    estimate, from ``_modality_gap``), not a second estimate of its own."""
+    rng = np.random.default_rng(1)
+    centres = noise(rng, 4, 16)
+    y = np.repeat(np.arange(4), 3)
+    X = unit(centres[y] + 0.3 * rng.normal(size=(12, 16)))
+    data = ClassData(list("abcd"), X, y, dict(enumerate(unit(centres + 0.2))))
+    real = GDAClassifier()
+    real.fit(data)
+    assert real.gap is not None
+    monkeypatch.setattr(classifiers, "_modality_gap", lambda d: np.zeros(16, np.float32))
+    zero = GDAClassifier()
+    zero.fit(data)
+    assert zero.W is not None
+    assert real.W is not None
+    assert not np.allclose(zero.W, real.W)
