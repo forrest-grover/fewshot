@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from . import services
-from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source
+from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source, report_skipped
 from .cli_common import add_files as _add_files
 from .cli_common import echo_json as _echo_json
 from .cli_common import error_text as _error_text
@@ -33,7 +33,6 @@ from .cli_common import write_csv as _write_csv
 from .cli_data import ex_app, inbox_app
 from .embedders import DEFAULT_SPEC, PRESETS, spec_supports_text
 from .fetch import is_url
-from .folders import class_folders
 from .store import Workspace
 from .text import check_class_name
 
@@ -363,13 +362,12 @@ def import_dir(
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Import FOLDER/<class>/<image> into a task (hidden and system folders such as __MACOSX are
-    skipped); exits 1 if no image could be imported."""
+    skipped), as one undo step; exits 1 if no image could be imported."""
     t = _task(root, name)
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
-    n = 0
-    for label, files in class_folders(folder, shots).items():
-        n += _add_files(t, label, files)
+    with _progress("Importing") as update:
+        n = report_skipped(services.import_folder(t, folder, shots, update))
     typer.echo(f"Imported {n} images into {name}")
     if n == 0:
         _fail(f"No images were imported; expected {folder}/<class>/<image>")

@@ -1,5 +1,5 @@
 """Operations the command line and the REST API share, so both follow the same rules and report
-problems the same way: creating tasks, changing settings, fetching and adding images, predicting,
+problems the same way: creating tasks, changing settings, fetching and adding images, importing folders, predicting,
 evaluating and labelling from the inbox.
 
 Errors are raised as ``ValueError`` (bad input) and ``KeyError`` (unknown task, class or id), for
@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .embedders import check_embedder
 from .fetch import fetch_url
-from .folders import read_or_empty
+from .folders import class_folders, read_or_empty
 from .text import check_class_name
 
 if TYPE_CHECKING:
@@ -181,6 +181,24 @@ def add_examples(task: Task, label: str, blobs: Iterable[Blob], undo_group: str 
     examples of another class are moved to ``label`` and listed in ``moved``."""
     label = check_class_name(label)
     return _add_labelled(task, ((b, label) for b in blobs), undo_group)
+
+
+def import_folder(task: Task, folder: Path, shots: int | None = None,
+                  update: Callable[[int, int], None] | None = None, undo_group: str | None = None) -> Added:
+    """Add the images of a folder laid out as ``folder/<class>/<image>`` (at most ``shots`` per
+    class; hidden and system folders and files are skipped, see ``folders``) as examples of their
+    folder's class, all in one undo step, however many classes there are. Images that can't be
+    added (unreadable, or in a folder whose name can't be a class name) are reported by path, not
+    raised. ``update(done, total)`` is called as images are read."""
+    files = [(f, label) for label, fs in class_folders(folder, shots).items() for f in fs]
+
+    def blobs() -> Iterator[tuple[Blob, str | None]]:
+        for i, (f, label) in enumerate(files):
+            if update:
+                update(i, len(files))
+            yield Blob(str(f), f, source=f.name), label
+
+    return _add_labelled(task, blobs(), undo_group)
 
 
 def add_to_inbox(task: Task, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:

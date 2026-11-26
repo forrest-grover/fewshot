@@ -259,6 +259,26 @@ def test_add_says_how_many_moved(run, root, task, photos):
     assert "moved" not in run("add", task, "green", photos / "green").output
 
 
+def test_import_is_one_undo_step(run, root, tmp_path):
+    """Importing a folder of more classes than undo keeps versions is still one undo step, which
+    leaves the earlier history alone; images that can't be added are reported by path."""
+    folder = tmp_path / "many"
+    for i in range(25):
+        (folder / f"c{i:02}").mkdir(parents=True)
+        (folder / f"c{i:02}" / "a.png").write_bytes(png((i * 10, 0, 0)))
+    (folder / "c00" / "bad.png").write_bytes(b"junk")
+    run("create", "many", "--embedder", "fake:color")
+    run("class", "add", "many", "first")
+    r = run("import", "many", folder)
+    assert r.exit_code == 0
+    assert "Imported 25 images" in r.output
+    assert f"skip {folder / 'c00' / 'bad.png'}" in r.output
+    assert len(load(root, "many").config.examples) == 25
+    assert run("undo", "many").exit_code == 0
+    t = load(root, "many")
+    assert (len(t.config.examples), t.class_names()) == (0, ["first"])
+
+
 def test_import(run, root, photos):
     """`import` honours --shots, skips bad images and rejects a missing folder."""
     run("create", "colors", "--embedder", "fake:color")
