@@ -69,6 +69,49 @@ def test_the_body_limit_comes_from_the_route_not_the_content_type(tmp_path):
     assert root == ServerSettings().max_request_bytes
 
 
+# Every route in the API's schema, by the body it may send: an upload (multipart: the request
+# limit), a JSON list of ids (16 MB) or anything else (1 MB). A new route must be added here.
+UPLOAD, BULK, SMALL = "upload", "bulk", "small"
+ROUTE_BODIES = {
+    ("GET", "/api/health"): SMALL, ("POST", "/api/login"): SMALL, ("POST", "/api/logout"): SMALL,
+    ("GET", "/api/models"): SMALL, ("GET", "/api/tasks"): SMALL, ("POST", "/api/tasks"): SMALL,
+    ("GET", "/api/tasks/{name}"): SMALL, ("PATCH", "/api/tasks/{name}"): SMALL,
+    ("DELETE", "/api/tasks/{name}"): SMALL, ("POST", "/api/tasks/{name}/rename"): SMALL,
+    ("POST", "/api/tasks/{name}/duplicate"): SMALL, ("POST", "/api/tasks/{name}/undo"): SMALL,
+    ("POST", "/api/tasks/{name}/redo"): SMALL, ("GET", "/api/tasks/{name}/export"): SMALL,
+    ("POST", "/api/tasks/import"): UPLOAD, ("POST", "/api/tasks/{name}/classes"): SMALL,
+    ("PATCH", "/api/tasks/{name}/classes/{label}"): SMALL, ("DELETE", "/api/tasks/{name}/classes/{label}"): SMALL,
+    ("POST", "/api/tasks/{name}/describe"): SMALL, ("PUT", "/api/tasks/{name}/class-thresholds"): SMALL,
+    ("GET", "/api/tasks/{name}/examples"): SMALL, ("POST", "/api/tasks/{name}/examples"): UPLOAD,
+    ("PATCH", "/api/tasks/{name}/examples"): BULK, ("POST", "/api/tasks/{name}/examples/urls"): SMALL,
+    ("PATCH", "/api/tasks/{name}/examples/{eid}"): SMALL, ("DELETE", "/api/tasks/{name}/examples/{eid}"): SMALL,
+    ("POST", "/api/tasks/{name}/examples/delete"): BULK, ("GET", "/api/tasks/{name}/examples/{eid}/image"): SMALL,
+    ("POST", "/api/tasks/{name}/inbox"): UPLOAD, ("GET", "/api/tasks/{name}/inbox"): SMALL,
+    ("POST", "/api/tasks/{name}/inbox/urls"): SMALL, ("POST", "/api/tasks/{name}/inbox/accept"): BULK,
+    ("POST", "/api/tasks/{name}/inbox/accept-confident"): BULK, ("POST", "/api/tasks/{name}/inbox/dismiss"): BULK,
+    ("POST", "/api/tasks/{name}/predict"): UPLOAD, ("POST", "/api/tasks/{name}/predict/urls"): SMALL,
+    ("GET", "/api/tasks/{name}/duplicates"): SMALL, ("POST", "/api/tasks/{name}/evaluate"): SMALL,
+    ("POST", "/api/tasks/{name}/evaluate/jobs"): SMALL, ("POST", "/api/tasks/{name}/compare/jobs"): SMALL,
+    ("GET", "/api/jobs/{jid}"): SMALL, ("DELETE", "/api/jobs/{jid}"): SMALL,
+}
+
+
+def test_every_route_has_the_body_limit_of_its_kind(client):
+    """Each route in the OpenAPI schema is classified above, and gets its kind's limit for a
+    multipart and for a JSON body (path parameters filled in with ordinary values)."""
+    schema = client.app.openapi()
+    routes = {(m.upper(), p) for p, ops in schema["paths"].items() for m in ops}
+    assert routes == set(ROUTE_BODIES)
+    big = ServerSettings().max_request_bytes
+    for (method, template), kind in ROUTE_BODIES.items():
+        path = template.format(name="t", label="red", eid="e1", jid="j1")
+        for ctype in (b"multipart/form-data; boundary=x", b"application/json"):
+            scope = {"path": path, "method": method, "headers": [(b"content-type", ctype)]}
+            want = {UPLOAD: big if ctype.startswith(b"multipart") else MAX_JSON_BYTES,
+                    BULK: MAX_BULK_JSON_BYTES, SMALL: MAX_JSON_BYTES}[kind]
+            assert fewshot.guard.body_limit(big, scope) == want, (method, template, ctype)
+
+
 @pytest.mark.usefixtures("task_t")
 def test_lists_of_ids_have_a_larger_limit(client):
     """Bulk edits, deletes and inbox decisions may list tens of thousands of ids (16 MB)."""
