@@ -312,6 +312,34 @@ def test_gda_confidence_when_only_one_class_can_be_left_out():
     assert np.mean(confs) < 0.9
 
 
+@pytest.mark.parametrize("k", [2, 4])
+def test_gda_image_only_confidence_matches_accuracy(k):
+    """Image-only GDA on Gaussian classes with k images each: the mean confidence is about the
+    accuracy. Leaving one of 2 images out leaves a mean of one, a harder problem than the fit's,
+    so a scale fit to it without allowing for that made 2-image confidence 0.06 at 0.57 accuracy."""
+    accs, confs = [], []
+    for seed in range(3):
+        rng = np.random.default_rng(seed)
+        centres = rng.normal(size=(20, 64)) / 8
+        y, yq = np.repeat(np.arange(20), k), np.repeat(np.arange(20), 40)
+        X, Q = (unit(centres[t] + 0.25 * rng.normal(size=(len(t), 64))) for t in (y, yq))
+        probs = GDAClassifier().fit(ClassData([str(i) for i in range(20)], X, y)).predict(Q)[0]
+        accs.append((probs.argmax(1) == yq).mean())
+        confs.append(probs.max(1).mean())
+    assert 0.4 < np.mean(accs) < 0.8
+    assert np.mean(confs) == pytest.approx(np.mean(accs), abs=0.06)
+
+
+def test_gda_confidence_with_too_few_images_for_a_spread():
+    """With 3 images in 2 classes (one degree of freedom) the covariance is nu * I, and the scale
+    is still fit from the class with two images; a nearer query gets the higher confidence."""
+    X = unit([[1, 0.2, 0], [1, -0.2, 0], [0, 1, 0]])
+    clf = GDAClassifier().fit(ClassData(["a", "b"], X, np.array([0, 0, 1])))
+    probs, _ = clf.predict(unit([[1, 0, 0], [1, 0.6, 0]]))
+    assert probs.argmax(1).tolist() == [0, 0]
+    assert probs[0, 0] > probs[1, 0]
+
+
 def test_gda_leaves_an_image_only_examples_own_text_side_out(monkeypatch):
     """With some classes described, an image-only class's text side is its centroid moved across
     the gap. Choosing the fusion weight, an example's own class is scored by the centroid without

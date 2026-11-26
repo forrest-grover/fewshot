@@ -544,7 +544,15 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
         mean, or NaN in its row without anchors. ``W`` and ``b`` are the full fit's, used when
         there is no downdate. ``exact=False`` keeps the full covariance (only the mean is left
         out), which overrates the image term a little; choosing the text fusion weight with it
-        measured best (the prior on the weight was tuned together with it)."""
+        measured best (the prior on the weight was tuned together with it).
+
+        ``exact=True`` scores are for fitting the scale, so they should be as hard to tell apart
+        as a new example's. But a mean of N - 1 examples (N counting a text prior's weight) is
+        further from a new member of its class than one of N: by (1 + 1/(N-1)) vs (1 + 1/N)
+        times the spread, in expected squared Mahalanobis distance. So an example's distance to
+        its own left-out mean is scaled by the ratio, (N+1)(N-1)/N^2 (3/4 at 2 images per
+        class). Without it, the scale fit to 2 images per class came out a third to a half of the
+        right one, and image-only confidence far too low (14% at 56% accuracy on DTD)."""
         Z, y, n, mu = self.Z, self.y, self.n, self.mu
         rows = np.arange(len(y))
         alone = n[y] <= 1
@@ -556,6 +564,9 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
             L: Scores = Z @ W.T.astype(np.float64) + b
             Wm = M @ self.prec
             L[rows, y] = (Z * Wm).sum(1) - 0.5 * (M * Wm).sum(1)
+            if not exact:
+                return self._mark_alone(L, anchors)
+            zpz = ((Z @ self.prec) * Z).sum(1)
         else:
             P, U = self.downdate
             ZP, UP, mu_p = Z @ P, U @ P, mu @ P
@@ -567,8 +578,17 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
             MP = M @ P
             up_m = (UP * M).sum(1)
             L[rows, y] = ((ZP * M).sum(1) + zu * up_m / den) - 0.5 * ((MP * M).sum(1) + up_m**2 / den)
+            zpz = (ZP * Z).sum(1) + zu**2 / den
+        # A score is (zPz - distance) / 2, so scaling the distance by f makes it f L + (1 - f) zPz / 2.
+        N = n[y] + self.lam[y]
+        f = np.where(alone, 1.0, (N + 1) * (N - 1) / N**2)
+        L[rows, y] = f * L[rows, y] + 0.5 * (1 - f) * zpz
+        return self._mark_alone(L, anchors)
+
+    def _mark_alone(self, L: Scores, anchors: Scores | None) -> Scores:
+        """``L`` with NaN rows for the examples alone in their class, unless anchors stand in."""
         if anchors is None:
-            L[alone] = np.nan
+            L[self.n[self.y] <= 1] = np.nan
         return L
 
     def scale(self, W: Vectors, b: Vectors, default: float) -> float:
