@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, HttpError, type InboxAdded, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
+import { api, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
 import { pct } from "./format";
-import { useAbortOnLeave, useShortcuts } from "./hooks";
-import { shrinkImages, THUMB_SIZE } from "./images";
+import { useShortcuts, type Uploads } from "./hooks";
+import { THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import { ClassSelect, DropZone } from "./ui";
-import { progressText, sendInBatches } from "./upload";
+import { progressText } from "./upload";
 
-interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
+interface Props {
+  task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
+  uploads: Uploads; // uploads to the inbox (slot INBOX), kept by the App so they go on in other tabs
+}
 
 const SORTS: Record<InboxSort, string> = {
   uncertain: "Most useful to label first (the model is least sure)",
@@ -17,9 +20,11 @@ const SORTS: Record<InboxSort, string> = {
 };
 const PAGE = 60; // cards rendered at first, and added by each "Show more"
 const INBOX_PAGE = 1000; // images fetched per request (the server's most)
+/** The upload slot (see useUploads) of the inbox. */
+const INBOX = "inbox";
 
 /** Unlabelled images waiting in the task's inbox, with the model's suggestion for each. */
-export default function Inbox({ task, setTask, run }: Props) {
+export default function Inbox({ task, setTask, run, uploads }: Props) {
   const [sort, setSort] = useState<InboxSort>("uncertain");
   // The images loaded so far (a page at a time, in the chosen order), of ``total`` waiting.
   const [items, setItems] = useState<{ key: string; list: InboxEntry[]; total: number } | null>(null);
@@ -55,7 +60,9 @@ export default function Inbox({ task, setTask, run }: Props) {
     setLoadingMore(false);
     if (r) setItems((cur) => (cur?.key === key ? { ...cur, list: [...cur.list, ...r.items], total: r.total } : cur));
   };
-  const locked = busy || stale; // a change is being saved, or the list is reloading after one
+  const uploading = uploads.slots[INBOX]?.progress ?? null;
+  const working = busy || uploading !== null; // a change is being saved, or images added
+  const locked = working || stale; // ... or the list is reloading after one
   if (viewing !== null && list.length === 0) setViewing(null); // emptied: don't reopen when the list refills
 
   const cur = list.find((i) => i.id === current) ?? list.find((i) => !picked.has(i.id)) ?? null;
@@ -80,35 +87,14 @@ export default function Inbox({ task, setTask, run }: Props) {
   const sure = list.filter((i) => suggested(i) && (i.prediction?.confidence ?? 0) >= minConf);
   const selection = list.filter((i) => picked.has(i.id));
 
-  const [uploading, setUploading] = useState<{ done: number; total: number; cancel: () => void } | null>(null);
-  const newUpload = useAbortOnLeave(task.name); // uploads stop when the task is closed
-  /** Add images to the inbox in batches (see sendInBatches); Cancel (or leaving) stops the rest. */
+  /** Add images to the inbox in batches (see useUploads), as one undo step; Cancel (or opening
+   * another task) stops the rest. */
   const upload = async (files: File[]) => {
-    const req = newUpload();
-    const skips: string[] = [];
-    /** One batch; one whose images were all unusable (400) is skipped, not the end of the upload. */
-    const send = async (fs: File[], signal: AbortSignal): Promise<InboxAdded | null> => {
-      try {
-        return await api.addToInbox(task.name, fs, signal);
-      } catch (e) {
-        if (!(e instanceof HttpError && e.status === 400)) throw e;
-        skips.push(e.message);
-        return null;
-      }
-    };
-    setBusy(true);
-    try {
-      await run(sendInBatches(files, send, {
-        signal: req.signal, prepare: shrinkImages,
-        onProgress: (done, total) => { setUploading({ done, total, cancel: req.cancel }); },
-        onBatch: (r) => { if (r) { setTask(r.task); skips.push(...r.errors.map((e) => (e.file ? `${e.file}: ${e.error}` : e.error))); } },
-      }));
-    } finally {
-      req.done();
-      setBusy(false);
-      setUploading(null);
+    const name = task.name;
+    const skips = await uploads.start(INBOX, files, (fs, signal, group) => api.addToInbox(name, fs, signal, group));
+    if (skips?.length) {
+      void run(Promise.reject(new Error(`Skipped: ${skips.map((e) => (e.file ? `${e.file}: ${e.error}` : e.error)).join("; ")}`)));
     }
-    if (skips.length) void run(Promise.reject(new Error(`Skipped: ${skips.join("; ")}`)));
   };
 
   // Keys for the highlighted image: Enter accepts the suggestion, 1-9 label it, Delete dismisses, arrows move.
@@ -159,7 +145,7 @@ export default function Inbox({ task, setTask, run }: Props) {
 
   return (
     <div className="inbox">
-      <DropZone disabled={busy} onFiles={(fs) => { void upload(fs); }}>
+      <DropZone disabled={working} onFiles={(fs) => { void upload(fs); }}>
         {uploading ? `Uploading ${progressText(uploading)}…` : busy ? "Working…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
       </DropZone>
       {uploading && <div className="row"><button className="ghost small" onClick={uploading.cancel}>Cancel upload</button></div>}

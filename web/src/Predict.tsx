@@ -4,13 +4,13 @@ import { downloadCsv } from "./csv";
 import { usePasteImages, usePredictResults, useShortcuts, type Item, type Results } from "./hooks";
 import { shrinkImages } from "./images";
 import { Bar, ClassSelect, DropZone } from "./ui";
-import { progressText, sendInBatches } from "./upload";
+import { BATCH, progressText, sendInBatches, type BatchLimits } from "./upload";
 
 type ResultsState = ReturnType<typeof usePredictResults>;
 
 interface Props {
   task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
-  state: ResultsState; urlFetch: boolean;
+  state: ResultsState; urlFetch: boolean; limits?: BatchLimits; // batch sizes the server takes
 }
 
 let nextKey = 0;
@@ -18,7 +18,7 @@ let nextKey = 0;
 /** The http(s) URLs in text separated by whitespace. */
 const urlsIn = (text: string) => text.split(/\s+/).filter((u) => /^https?:\/\/\S+/i.test(u));
 
-export default function Predict({ task, setTask, run, state, urlFetch }: Props) {
+export default function Predict({ task, setTask, run, state, urlFetch, limits = BATCH }: Props) {
   const [urlText, setUrlText] = useState("");
   const { setResults, urls } = state;
   // Results for another task (e.g. a classify that finished after switching) are never shown.
@@ -70,7 +70,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     let sent = 0;
     try {
       await run(sendInBatches(originals, (fs, signal) => api.predict(task.name, fs, signal), {
-        signal: req.signal, prepare: shrinkImages,
+        signal: req.signal, prepare: shrinkImages, limits,
         onProgress: (done, total) => { finish(batch, (r) => ({ ...r, progress: { done, total } })); },
         onBatch: (preds, files) => {
           const added = files.map((f, i) => ({

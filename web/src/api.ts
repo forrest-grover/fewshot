@@ -85,10 +85,14 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
 }
 
 const t = (name: string) => `/api/tasks/${encodeURIComponent(name)}`;
-const files = (fs: File[], extra: Record<string, string> = {}) => {
+/** The multipart fields of upload ``B`` besides its files. ``undo_group`` (uploads with the same
+ * one become one undo step) is added by hand until the schema is regenerated from a server that
+ * has it; the intersection stays correct once it is there too. */
+type UploadFields<B> = Omit<B, "files"> & { undo_group?: string | null };
+const files = (fs: File[], extra: Partial<Record<string, string | null>> = {}) => {
   const fd = new FormData();
   fs.forEach((f) => { fd.append("files", f); });
-  Object.entries(extra).forEach(([k, v]) => { fd.append(k, v); });
+  Object.entries(extra).forEach(([k, v]) => { if (v != null) fd.append(k, v); });
   return fd;
 };
 
@@ -108,8 +112,10 @@ export const api = {
   describe: (n: string, template: string, overwrite: boolean) =>
     req<TaskDetail>("POST", `${t(n)}/describe`, { template, overwrite }),
   deleteClass: (n: string, c: string) => req<TaskDetail>("DELETE", `${t(n)}/classes/${encodeURIComponent(c)}`),
-  addExamples: (n: string, label: string, fs: File[], signal?: AbortSignal) =>
-    req<AddResult>("POST", `${t(n)}/examples`, files(fs, { label }), signal),
+  /** Add ``fs`` to class ``label``; uploads given the same ``undoGroup`` are undone as one step. */
+  addExamples: (n: string, label: string, fs: File[], signal?: AbortSignal, undoGroup?: string) =>
+    req<AddResult>("POST", `${t(n)}/examples`,
+      files(fs, { label, undo_group: undoGroup } satisfies UploadFields<S["Body_add_examples"]>), signal),
   addExampleUrls: (n: string, label: string, urls: string[]) => req<AddResult>("POST", `${t(n)}/examples/urls`, { label, urls }),
   relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, { label }),
   annotate: (n: string, id: string, p: { tags?: string[]; note?: string }) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, p),
@@ -136,8 +142,8 @@ export const api = {
   health: () => req<Health>("GET", "/api/health"),
   inbox: (n: string, sort: InboxSort, offset = 0, limit = 1000) =>
     req<InboxPage>("GET", `${t(n)}/inbox?sort=${sort}&offset=${String(offset)}&limit=${String(limit)}`),
-  addToInbox: (n: string, fs: File[], signal?: AbortSignal) =>
-    req<InboxAdded>("POST", `${t(n)}/inbox`, files(fs), signal),
+  addToInbox: (n: string, fs: File[], signal?: AbortSignal, undoGroup?: string) =>
+    req<InboxAdded>("POST", `${t(n)}/inbox`, files(fs, { undo_group: undoGroup } satisfies UploadFields<S["Body_add_to_inbox"]>), signal),
   acceptInbox: (n: string, labels: Record<string, string>) => req<TaskDetail>("POST", `${t(n)}/inbox/accept`, { labels }),
   dismissInbox: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/inbox/dismiss`, { ids }),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),

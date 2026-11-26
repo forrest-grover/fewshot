@@ -4,13 +4,13 @@ import Evaluate from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { Gate, Latest, stepToast, taskUndoKey, typingAt, useByTask, usePredictResults } from "./hooks";
+import { Gate, Latest, stepToast, taskUndoKey, typingAt, useByTask, usePredictResults, useUploads, type UploadStop } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
 import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
 import { ErrorBox, JobPoller } from "./ui";
-import { isAbort } from "./upload";
+import { BATCH, batchLimits, isAbort } from "./upload";
 
 const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -42,6 +42,7 @@ export default function App() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [signIn, setSignIn] = useState(false); // the server wants its token
   const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
+  const [limits, setLimits] = useState(BATCH); // upload batch sizes the server takes
   const [toast, setToast] = useState<{ text: string; then: "undo" | "redo" | null; key: number } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
   const [help, setHelp] = useState(false); // the keyboard shortcuts
@@ -104,7 +105,10 @@ export default function App() {
     window.addEventListener("hashchange", on);
     void refreshTasks();
     void run(api.models()).then((m) => { if (m) setModels(m); });
-    void api.health().then((h) => { setUrlFetch(h.url_fetch); }, () => { /* an old server: no URL fetching */ });
+    void api.health().then((h) => {
+      setUrlFetch(h.url_fetch);
+      setLimits(batchLimits(h.max_request_bytes));
+    }, () => { /* an old server: no URL fetching, default batches */ });
     // Tasks made or changed elsewhere (the CLI, another tab) show up when the window comes back.
     const back = () => { if (document.visibilityState === "visible") void refreshTasks(); };
     window.addEventListener("focus", back);
@@ -163,6 +167,16 @@ export default function App() {
     }
     void refreshTasks();
   };
+
+  /** An upload stopped part-way: say how much of it got in (of a task the user has left, too). */
+  const uploadStopped = ({ task: name, added, total, error }: UploadStop) => {
+    const text = `Upload${name === currentTask.current ? "" : ` to “${name}”`} stopped: ${String(added)} of ${String(total)} added`;
+    if (error) setError(`${error.message}. ${text}`);
+    else setToast({ text, then: null, key: Date.now() });
+  };
+  // Uploads live here so they go on while tabs are switched; opening another task stops them.
+  const exampleUploads = useUploads(route.task, { onTask: updateTask, onStop: uploadStopped, limits });
+  const inboxUploads = useUploads(route.task, { onTask: updateTask, onStop: uploadStopped, limits });
 
   /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse.
    * One step at a time: presses while one is in flight are ignored, so a double press or a held
@@ -267,9 +281,9 @@ export default function App() {
               ))}
             </div>
             <div id="tab-panel" role="tabpanel" aria-labelledby={`tab-${route.tab}`}>
-              {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
-              {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} />}
-              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
+              {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} uploads={exampleUploads} />}
+              {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} uploads={inboxUploads} />}
+              {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} limits={limits} />}
               {route.tab === "evaluate" && <Evaluate key={task.name} task={task} setTask={updateTask} run={run}
                 state={evals.map[task.name] ?? null} setState={evals.setFor(task.name)}
                 models={models} compare={compares.map[task.name] ?? null} setCompare={compares.setFor(task.name)} />}
