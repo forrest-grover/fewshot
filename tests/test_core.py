@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import fewshot
-from fewshot import ClassData, Pipeline, Workspace, evaluate_task, history, make_classifier, store
+from fewshot import ClassData, Pipeline, Workspace, embedders, evaluate_task, history, make_classifier, store
 from tests.conftest import BLUE, GREEN, RED, png
 
 
@@ -119,7 +119,11 @@ def test_class_without_data_is_an_error():
 def test_package_exports_are_lazy():
     """Top-level names resolve to their submodule objects without importing torch or the pipeline."""
     assert fewshot.Workspace is store.Workspace
-    assert set(fewshot.__all__) >= {"Pipeline", "Workspace", "register_embedder"}
+    assert set(fewshot.__all__) >= {"Pipeline", "Workspace", "register_embedder", "unregister_embedder"}
+    assert set(fewshot.__all__) == set(fewshot._EXPORTS)  # pylint: disable=protected-access
+    assert set(dir(fewshot)) >= set(fewshot.__all__)  # lazy names too, for completion
+    from fewshot import unregister_embedder  # pylint: disable=import-outside-toplevel  # as the README shows
+    assert unregister_embedder is embedders.unregister_embedder
     with pytest.raises(AttributeError, match="has no attribute 'nope'"):
         _ = fewshot.nope
     code = "import sys, fewshot; fewshot.Workspace; print('torch' in sys.modules, 'fewshot.pipeline' in sys.modules)"

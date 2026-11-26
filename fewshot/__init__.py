@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # Static view of the lazy exports below, for type checkers and linters.
     from .classifiers import CLASSIFIERS, ClassData, make_classifier
-    from .embedders import DEFAULT_SPEC, PRESETS, get_embedder, register_embedder
+    from .embedders import DEFAULT_SPEC, PRESETS, get_embedder, register_embedder, unregister_embedder
     from .evaluate import benchmark, evaluate_task
     from .pipeline import Pipeline, Prediction
     from .store import Task, Workspace
@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # Static view of the lazy exports below, for type checkers an
 _EXPORTS = {
     "CLASSIFIERS": "classifiers", "ClassData": "classifiers", "make_classifier": "classifiers",
     "DEFAULT_SPEC": "embedders", "PRESETS": "embedders", "get_embedder": "embedders", "register_embedder": "embedders",
+    "unregister_embedder": "embedders",
     "benchmark": "evaluate", "evaluate_task": "evaluate",
     "Pipeline": "pipeline", "Prediction": "pipeline",
     "Task": "store", "Workspace": "store",
@@ -42,6 +43,7 @@ __all__ = [
     "get_embedder",
     "make_classifier",
     "register_embedder",
+    "unregister_embedder",
 ]
 
 
@@ -50,3 +52,8 @@ def __getattr__(name: str) -> Any:
     if name in _EXPORTS:
         return getattr(importlib.import_module(f".{_EXPORTS[name]}", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """The module's names, the lazy exports among them (for ``dir()`` and completion)."""
+    return sorted({*globals(), *__all__})
