@@ -59,7 +59,8 @@ def test_model_is_held_between_batches(ws, monkeypatch):
 
     items = [(None, Image.new("RGB", (2, 2), (i * 50, 0, 0))) for i in range(3)]
     Pipeline(ws).embed_images("m:a", items, progress=load_another)
-    assert "m:a" not in evicted and evicted == ["m:other1", "m:other2"]
+    assert "m:a" not in evicted
+    assert evicted == ["m:other1", "m:other2"]
     assert not embedders._held  # pylint: disable=protected-access
     with embedders._load_lock:  # pylint: disable=protected-access
         assert embedders._evict_locked(keep="m:other3") == ["m:a"]  # pylint: disable=protected-access
@@ -177,7 +178,7 @@ def test_concurrent_cold_requests_fit_once(ws, monkeypatch):
                 raise RuntimeError("first fit fails")
             return fit(data)
 
-        clf.fit = counted
+        clf.fit = counted  # type: ignore[method-assign]
         return clf
 
     monkeypatch.setattr(pipeline, "new_classifier", slow)
@@ -189,7 +190,9 @@ def test_concurrent_cold_requests_fit_once(ws, monkeypatch):
         th.start()
     for th in threads:
         th.join()
-    assert len(fits) == 2 and len(out) == 6 and all(c is out[0] for c in out)
+    assert len(fits) == 2
+    assert len(out) == 6
+    assert all(c is out[0] for c in out)
     assert not pipe._fitting  # pylint: disable=protected-access
 
 
@@ -218,7 +221,8 @@ def test_batch_size_changes_under_the_model_lock(monkeypatch):
     emb = Guarded()
     emb.armed = True
     emb.embed_images([Image.new("RGB", (2, 2))] * 8)
-    assert emb._full_batch == 4 and emb.batch_size == 4  # pylint: disable=protected-access  # halved, grown back
+    assert emb._full_batch == 4
+    assert emb.batch_size == 4
 
 
 def test_repeated_images_are_embedded_once(ws):

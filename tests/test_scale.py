@@ -54,7 +54,8 @@ def test_predict_reads_files_a_chunk_at_a_time(ws, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("name", ["prototype", "knn", "logreg", "gda"])
 def test_queries_are_scored_in_blocks(monkeypatch, name):
-    """Scoring PREDICT_ROWS queries at a time gives the same results as all at once."""
+    """Scoring queries a block at a time gives the same results as all at once; the block holds
+    about PREDICT_CELLS similarities, so it shrinks as the examples grow."""
     rng = np.random.default_rng(0)
     X = rng.normal(size=(12, 4)).astype(np.float32)
     X /= np.linalg.norm(X, axis=1, keepdims=True)
@@ -62,9 +63,18 @@ def test_queries_are_scored_in_blocks(monkeypatch, name):
     Q = rng.normal(size=(7, 4)).astype(np.float32)
     Q /= np.linalg.norm(Q, axis=1, keepdims=True)
     whole = clf.predict_full(Q)
-    monkeypatch.setattr(classifiers, "PREDICT_ROWS", 3)
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 36)  # 12 examples: 3 queries at a time
+    blocks = []
+    real = type(clf)._predict_rows  # pylint: disable=protected-access
+
+    def counted(self, rows):
+        blocks.append(len(rows))
+        return real(self, rows)
+
+    monkeypatch.setattr(type(clf), "_predict_rows", counted)
     for a, b in zip(whole, clf.predict_full(Q), strict=True):
         np.testing.assert_allclose(a, b, rtol=1e-6)
+    assert blocks == [3, 3, 1]
 
 
 def test_knn_compares_with_examples_once(monkeypatch):
@@ -115,9 +125,12 @@ def test_high_bit_depth_grayscale_is_rescaled():
     for fmt in ("PNG", "TIFF"):
         g = np.asarray(load_image(_saved(full, fmt)))[..., 0].astype(float)
         assert (g == 255).mean() < 0.01
-        assert g[0, 0] == 0 and g[-1, -1] == 255 and abs(g.mean() - 127.5) < 1
+        assert g[0, 0] == 0
+        assert g[-1, -1] == 255
+        assert abs(g.mean() - 127.5) < 1
     twelve = np.asarray(load_image(_saved((full >> 4).astype(np.uint16), "PNG")))[..., 0]
-    assert twelve.max() == 255 and abs(twelve.mean() - 127.5) < 1
+    assert twelve.max() == 255
+    assert abs(twelve.mean() - 127.5) < 1
     dark = np.asarray(load_image(_saved(np.full((4, 4), 3000, np.uint16), "PNG")))  # 3000 of 12 bits
     assert (dark == round(3000 * 255 / 4095)).all()
     big = np.asarray(to_rgb(Image.fromarray(np.array([[-100, 100_000]], np.int32))))[..., 0]

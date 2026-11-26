@@ -110,7 +110,9 @@ def _modality_gap(data: ClassData) -> Vectors:
     return (np.mean(list(data.text.values()), axis=0) - data.X.mean(0)).astype(np.float32)
 
 
-PREDICT_ROWS = 2048  # queries scored at once
+# Queries are scored in blocks of about this many (query x support point) similarities, or (query x
+# dimension) values where that is more: about 16 MB per float32 array a block makes.
+PREDICT_CELLS = 4_000_000
 
 
 class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted state plus settings
@@ -231,11 +233,14 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         (typically 0.2-0.35 for CLIP), so reject thresholds are not interchangeable between the
         two. Raises RuntimeError if called before ``fit``.
 
-        Queries are scored ``PREDICT_ROWS`` at a time, so the (queries x examples) similarity
-        matrix stays small however many of both there are.
+        Queries are scored in blocks of ``PREDICT_CELLS`` / (support points, classes or dimensions,
+        whichever is most) at a time, so the (queries x examples) similarity matrix and the other
+        per-block arrays stay small however many of both there are.
         """
-        if len(Q) > PREDICT_ROWS:
-            parts = [self._predict_rows(Q[i : i + PREDICT_ROWS]) for i in range(0, len(Q), PREDICT_ROWS)]
+        width = max(len(self._X) if self._X is not None else 0, len(self.classes), Q.shape[1])
+        rows = max(1, PREDICT_CELLS // width)
+        if len(Q) > rows:
+            parts = [self._predict_rows(Q[i : i + rows]) for i in range(0, len(Q), rows)]
             return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
                     np.concatenate([p[2] for p in parts]))
         return self._predict_rows(Q)
@@ -316,7 +321,7 @@ def top_k(S: Scores, k: int) -> npt.NDArray[np.int_]:
     column order. Ties go to the lower column, so the choice among tied columns doesn't change
     when another column is taken out: leave-one-out in closed form then matches refitting."""
     kth = np.partition(S, S.shape[1] - k, axis=1)[:, S.shape[1] - k, None]
-    above, tied = S > kth, S == kth
+    above, tied = kth < S, kth == S
     need = k - above.sum(1)
     crowded = np.flatnonzero(tied.sum(1) > need)  # rows where more columns tie than fit
     tied[crowded] &= np.cumsum(tied[crowded], axis=1) <= need[crowded, None]
