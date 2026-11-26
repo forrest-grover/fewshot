@@ -17,8 +17,12 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
+import sys
+import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -34,6 +38,68 @@ log = logging.getLogger(__name__)
 
 HISTORY_KEPT = 20  # earlier task.json versions kept for undo
 GROUP_NAMES = 4  # class names an undo group keeps for its description
+MEMO_FILES = 2_000_000  # file names of kept versions remembered per process (see ``_SnapshotFiles``)
+
+# How ``model_dump_json`` writes an example's or inbox image's file (see ``models.EXAMPLE_FILE_RE``).
+_FILE_RE = re.compile(rb'"file"\s*:\s*"(images/[0-9a-f]+\.[a-z0-9]+)"')
+
+
+def _parse_files(data: bytes) -> frozenset[str]:
+    """The image files a task.json names, examples' and inbox's (read without full validation).
+
+    A scan for the ``"file"`` fields is several times faster than parsing the JSON; if any
+    ``"file"`` key isn't in the form the scan expects (a hand edit, say), the JSON is parsed."""
+    found = _FILE_RE.findall(data)
+    if len(found) == data.count(b'"file"'):
+        # Interned, so the memo's sets of a task's versions (mostly the same files) share strings.
+        return frozenset(map(sys.intern, map(bytes.decode, found)))
+    try:
+        cfg = json.loads(data)
+        names = [e["file"] for e in [*cfg.get("examples", []), *cfg.get("inbox", [])]]
+        return frozenset(sys.intern(f) for f in names if isinstance(f, str))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return frozenset()
+
+
+class _SnapshotFiles:  # pylint: disable=too-few-public-methods  # a memo
+    """The image files each kept version names, read once per process: kept versions never change
+    once written, so a file's set is reused while it is the same file (device, inode, size and
+    modification time; a hand edit changes those). Thread-safe, and bounded to about ``limit``
+    names in all (least recently used versions are forgotten first)."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._sets: OrderedDict[tuple[str, int, int, int, int], frozenset[str]] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def files(self, snap: Path) -> frozenset[str]:
+        """The files named by kept version ``snap`` (none if it can't be read)."""
+        try:
+            with open(snap, "rb") as f:
+                st = os.fstat(f.fileno())
+                key = (str(snap), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+                with self._lock:
+                    hit = self._sets.get(key)
+                    if hit is not None:
+                        self._sets.move_to_end(key)
+                        return hit
+                data = f.read()
+        except OSError:
+            return frozenset()
+        files = _parse_files(data)
+        with self._lock:
+            # Consecutive versions often name the same files: keep one set for them all.
+            same = next((s for s in reversed(self._sets.values()) if len(s) == len(files) and s == files), None)
+            files = same if same is not None else files
+            self._sets[key] = files
+            self._size += len(files)
+            while self._size > self._limit and len(self._sets) > 1:
+                self._size -= len(self._sets.popitem(last=False)[1])
+        return files
+
+
+_snapshot_files = _SnapshotFiles(MEMO_FILES)
 
 
 class TaskHistory:
@@ -42,6 +108,8 @@ class TaskHistory:
     path: Path
     config: TaskConfig
     _commits: int
+    # The kept version ``version`` parsed last, keyed by its file, for repeated predictions at it.
+    _version_memo: tuple[tuple[str, int, int, int], TaskConfig] | None = None
 
     def _committed_since(self, commits: int) -> bool:  # pragma: no cover  # Task's
         raise NotImplementedError
@@ -197,10 +265,16 @@ class TaskHistory:
         gone = set().union(*(self._gone(p) for _, p in old))
         for _, p in old:
             self._forget(p)
-        # A file dropped again later is deleted when that later version goes.
-        gone -= self.config.files()
-        gone -= set().union(*(self._gone(p) | self._files_in(p) for _, p in kept))
-        gone -= self._redo_files()
+        # A file dropped again later is deleted when that later version goes. Most changes drop
+        # no file, so the kept versions are only read while some file may still be deleted.
+        if gone:
+            gone -= self.config.files()
+        for _, p in kept:
+            if not gone:
+                break
+            gone -= self._gone(p) | self._files_in(p)
+        if gone:
+            gone -= self._redo_files()
         for f in gone:
             self._drop_file(f)
 
@@ -231,8 +305,16 @@ class TaskHistory:
         for rev, snap in self._history():
             if rev == revision:
                 try:
-                    cfg = type(self.config).stored(snap.read_bytes())
-                except ValidationError:
+                    with open(snap, "rb") as f:
+                        st = os.fstat(f.fileno())
+                        key = (str(snap), st.st_ino, st.st_size, st.st_mtime_ns)
+                        memo = self._version_memo
+                        if memo is not None and memo[0] == key:  # predicting at it again: parsed already
+                            cfg = memo[1]
+                        else:
+                            cfg = type(self.config).stored(f.read())
+                            self._version_memo = (key, cfg)
+                except (OSError, ValidationError):
                     break
                 return cfg.model_copy(update={"name": self.config.name})
         raise KeyError(f"Revision {revision} of {self.config.name!r} is not kept (the last {HISTORY_KEPT} are)")
@@ -318,10 +400,7 @@ class TaskHistory:
         self._save(gone=gone, record=label is not None, label=label or "", keep_redo=True)
 
     @staticmethod
-    def _files_in(snap: Path) -> set[str]:
-        """Image files named by a kept version, examples' and inbox's (read without full validation)."""
-        try:
-            cfg = json.loads(snap.read_bytes())
-            return {e["file"] for e in [*cfg.get("examples", []), *cfg.get("inbox", [])]}
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            return set()
+    def _files_in(snap: Path) -> frozenset[str]:
+        """Image files named by a kept version, examples' and inbox's (read without full
+        validation, and once per process: see ``_SnapshotFiles``)."""
+        return _snapshot_files.files(snap)

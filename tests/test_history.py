@@ -384,3 +384,82 @@ def test_a_damaged_or_unwritable_group_note_just_ends_the_group(ws, monkeypatch,
     monkeypatch.setattr(history, "HISTORY_KEPT", 0)
     t.add_examples(_items(GREEN, "green", 1), undo_group="i")
     assert not list((t.path / "history").glob("*.group"))
+
+
+# ---- reading kept versions cheaply ------------------------------------------
+def _count_parses(monkeypatch):
+    """Patch ``history._parse_files`` to count its calls; returns the counter (a list of one int)."""
+    calls = [0]
+    real = history._parse_files  # pylint: disable=protected-access
+
+    def counting(data):
+        calls[0] += 1
+        return real(data)
+
+    monkeypatch.setattr(history, "_parse_files", counting)
+    return calls
+
+
+def test_saves_with_full_history_read_no_kept_version_unless_a_file_may_go(ws, monkeypatch):
+    """Once history is full every recorded save prunes it; a change that dropped no file reads
+    none of the kept versions (they were parsed on every save, seconds for a large task)."""
+    monkeypatch.setattr(history, "_snapshot_files", history._SnapshotFiles(10**6))  # pylint: disable=protected-access
+    t = red_task(ws, n=1)
+    for i in range(history.HISTORY_KEPT + 2):
+        t.upsert_class(f"c{i}")
+    calls = _count_parses(monkeypatch)
+    t.upsert_class("more")
+    assert calls == [0]
+    gone = t.config.examples[0]
+    t.delete_example(gone.id)
+    for i in range(history.HISTORY_KEPT):
+        t.upsert_class(f"d{i}")
+    assert calls[0] >= 1  # the step that dropped a file was pruned: the kept versions were read
+    assert not (t.path / gone.file).exists()
+
+
+def test_kept_versions_are_parsed_once_per_process(ws, monkeypatch):
+    """The files a kept version names are remembered while it is the same file; a changed file is
+    read again, and the memo stays within its bound. Versions naming the same files share a set."""
+    monkeypatch.setattr(history, "_snapshot_files", history._SnapshotFiles(100))  # pylint: disable=protected-access
+    t = red_green_task(ws, n=1)
+    t.upsert_class("a")
+    t.upsert_class("b")
+    calls = _count_parses(monkeypatch)
+    first = t.kept_files()
+    assert t.kept_files() == first
+    assert calls[0] == len(t._history())  # pylint: disable=protected-access  # each once, then remembered
+    snaps = [p for _, p in t._history()]  # pylint: disable=protected-access
+    assert t._files_in(snaps[-1]) is t._files_in(snaps[-2])  # pylint: disable=protected-access  # same files: one set
+    newest = snaps[-1]
+    newest.unlink()
+    newest.write_text('{"examples": [{"file": "images\\/0123456789abcdef.png"}]}')  # escaped: parsed as JSON
+    assert t._files_in(newest) == {"images/0123456789abcdef.png"}  # pylint: disable=protected-access
+    newest.write_text('{"examples": [{"file": 3}], "inbox": 5}')
+    assert t._files_in(newest) == set()  # pylint: disable=protected-access
+    small = history._SnapshotFiles(1)  # pylint: disable=protected-access
+    for p in snaps[:-1]:
+        small.files(p)
+    assert len(small._sets) == 1  # pylint: disable=protected-access  # the older ones were forgotten
+    assert t._files_in(t.path / "history" / "missing.json") == set()  # pylint: disable=protected-access
+
+
+def test_version_is_parsed_once_for_repeated_use(ws, monkeypatch):
+    """``version`` of the same kept revision (say, predicting at it again) parses it once."""
+    t = red_green_task(ws, n=1)
+    rev = t.config.revision
+    t.upsert_class("x")
+    first = t.version(rev)
+    parsed = []
+    real = type(t.config).stored
+
+    def counting(cls, data):  # pylint: disable=unused-argument
+        parsed.append(1)
+        return real(data)
+
+    monkeypatch.setattr(type(t.config), "stored", classmethod(counting))
+    assert t.version(rev) == first
+    assert not parsed
+    t.upsert_class("y")
+    t.version(rev + 1)
+    assert parsed == [1]
