@@ -13,7 +13,8 @@ from typing import IO, Any
 from pydantic import ValidationError
 
 from .images import image_ext, image_id
-from .store import ClassDef, Task, TaskConfig, Workspace, check_settings
+from .settings import check_settings, for_new_embedder
+from .store import ClassDef, Task, TaskConfig, Workspace
 from .text import check_class_name
 
 # Limits on what an export zip may unpack to (guards against zip bombs): per image, for task.json,
@@ -61,8 +62,9 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
     try:
         with zipfile.ZipFile(src) as z:
             cfg, images = _read_export(z)
-            if embedder:
+            if embedder and embedder != cfg.embedder:
                 cfg = cfg.model_copy(update={"embedder": embedder})
+                for_new_embedder(cfg)
             if embedder_ok is not None:
                 embedder_ok(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})

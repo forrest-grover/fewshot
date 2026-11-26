@@ -152,6 +152,10 @@ def run_fixture(tmp_path):
 def test_cli_class_threshold(run):
     """`class threshold` sets or clears; show lists it; mistakes are errors."""
     assert run("class", "threshold", "t", "red", "0.85").exit_code == 0
+    assert run("class", "threshold", "t", "red", "-0.5").exit_code == 0  # a negative value isn't an option
+    assert "reject_below -0.5" in run("show", "t").output
+    assert run("class", "threshold", "t", "red", "-1.5").exit_code == 2  # out of range
+    assert run("class", "threshold", "t", "red", "0.85").exit_code == 0
     assert "reject_below 0.85" in run("show", "t").output
     assert json.loads(run("show", "t", "--json").output)["classes"][0]["reject_below"] == 0.85
     assert run("class", "threshold", "t", "red", "--clear").exit_code == 0
@@ -172,3 +176,36 @@ def test_cli_eval_applies_class_thresholds(run):
     suggested = json.loads(r.stdout)["suggested_class_thresholds"]
     classes = json.loads(run("show", "t", "--json").output)["classes"]
     assert {c["name"]: c["reject_below"] for c in classes} == suggested
+    assert json.loads(r.stdout)["revision"] == json.loads(run("show", "t", "--json").output)["revision"]
+    assert "*" not in run("list").output  # the evaluation still counts as current
+
+
+def test_cli_eval_apply_with_a_class_gone(run, monkeypatch):
+    """A class renamed while the evaluation ran is an error, not a traceback."""
+    def gone(_self, _thresholds):
+        raise KeyError("No class 'red'")
+
+    monkeypatch.setattr("fewshot.store.Task.set_class_thresholds", gone)
+    r = run("eval", "t", "--apply-class-thresholds")
+    assert (r.exit_code, "Thresholds not set: No class 'red'" in r.output) == (1, True)
+
+
+def test_cli_config_says_what_switching_embedder_cleared(run, monkeypatch):
+    """`config --embedder` reports the thresholds it cleared, and how to get them back."""
+    monkeypatch.setattr("fewshot.cli.check_embedder", lambda spec: None)
+    run("class", "threshold", "t", "red", "0.8")
+    r = run("config", "t", "--embedder", "fake:other")
+    assert "Cleared class thresholds: fitted to the previous embedder (`fewshot undo t` restores them)" in r.output
+
+
+def test_cli_eval_apply_keeps_an_old_report_old(run, monkeypatch):
+    """An evaluation of an older revision isn't moved to the new one by applying its thresholds."""
+    real = evaluate_task
+
+    def older(*a, **k):
+        r = real(*a, **k)
+        return {**r, "revision": r["revision"] - 1}
+
+    monkeypatch.setattr("fewshot.evaluate.evaluate_task", older)
+    r = run("eval", "t", "--apply-class-thresholds", "--json")
+    assert json.loads(r.stdout)["revision"] < json.loads(run("show", "t", "--json").output)["revision"] - 1

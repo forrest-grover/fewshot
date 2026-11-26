@@ -494,7 +494,7 @@ def test_threshold_applies_to_the_predicted_class():
     assert probs[0].argmax() == 1  # ...but b's description wins
     assert sims[0] == pytest.approx(per_class[1])
     p = _to_pred(clf, np.array([0.7, 0.7]), (probs[0], float(sims[0]), per_class), None)
-    assert (p.rejected, p.label, p.labels) == (True, None, [])
+    assert (p.rejected, p.label, p.labels) == (True, None, ["a"])  # rejected as b, but a clears its threshold
 
 
 def test_top_k_must_be_positive(ws):

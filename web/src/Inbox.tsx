@@ -86,10 +86,16 @@ export default function Inbox({ task, setTask, run }: Props) {
     else if (e.key === "ArrowUp" || e.key === "k" || e.key === "ArrowLeft") move = -1;
     else return;
     e.preventDefault();
-    const next = list[Math.max(0, Math.min(list.length - 1, at + move))] as InboxEntry | undefined;
+    const to = Math.max(0, Math.min(list.length - 1, at + move));
+    const next = list[to] as InboxEntry | undefined;
     if (next && next !== cur) {
       setCurrent(next.id);
-      cards.current.get(next.id)?.focus();
+      if (to >= shown) { // moving past the cards shown so far: show more, then focus it once rendered
+        setShown((v) => Math.max(v, to + 1) + PAGE);
+        requestAnimationFrame(() => { cards.current.get(next.id)?.focus(); });
+      } else {
+        cards.current.get(next.id)?.focus();
+      }
     }
   });
 

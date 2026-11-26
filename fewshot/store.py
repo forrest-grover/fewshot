@@ -47,7 +47,7 @@ from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .classifiers import CLASSIFIERS, check_params
+from .classifiers import CLASSIFIERS
 from .embedders import DEFAULT_SPEC
 from .fsutil import FileStamp
 from .fsutil import create_exclusive as _create_exclusive
@@ -57,6 +57,7 @@ from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
 from .images import IMAGE_EXTS, image_ext, image_id
 from .inbox import TaskInbox
+from .settings import THRESHOLDS, check_settings, for_new_embedder
 from .text import check_class_name, check_tag, check_template, fill_template, prompts
 
 log = logging.getLogger(__name__)
@@ -222,22 +223,6 @@ class TaskConfig(BaseModel):
     def files(self) -> set[str]:
         """Every image file this version uses: examples' and the inbox's."""
         return {e.file for e in self.examples} | {i.file for i in self.inbox}
-
-
-def check_settings(cfg: TaskConfig) -> None:
-    """Raise ``ValueError`` unless ``cfg``'s classifier settings and thresholds are usable."""
-    for key in ("reject_below", "reject_below_zero_shot"):
-        v = getattr(cfg, key)
-        if v is not None and not -1.0 <= v <= 1.0:
-            raise ValueError(f"{key} must be between -1 and 1, got {v}")
-    for c in cfg.classes:
-        if c.reject_below is not None and not -1.0 <= c.reject_below <= 1.0:
-            raise ValueError(f"The threshold of {c.name!r} must be between -1 and 1, got {c.reject_below}")
-    if cfg.temperature is not None and not 0.01 <= cfg.temperature <= 100:
-        raise ValueError(f"temperature must be between 0.01 and 100, got {cfg.temperature}")
-    if "text_weight" in cfg.classifier_params:
-        raise ValueError("text_weight is a task setting, not a classifier parameter")
-    check_params(cfg.classifier, {"text_weight": cfg.text_weight, **cfg.classifier_params})
 
 
 class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  # the whole editing API of a task
@@ -413,8 +398,11 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
                         blob.unlink()
 
     # ---- settings ----------------------------------------------------
-    def update_settings(self, **kw: Any) -> None:
-        """Change embedder/classifier settings (see ``SETTINGS``); unknown keys raise ``ValueError``."""
+    def update_settings(self, **kw: Any) -> list[str]:
+        """Change embedder/classifier settings (see ``SETTINGS``); unknown keys raise ``ValueError``.
+
+        Changing the embedder also clears the temperature and reject thresholds (task and per
+        class) fitted to the old one, unless given in ``kw``; returns the names of those cleared."""
         bad = set(kw) - SETTINGS
         if bad:
             raise ValueError(f"Unknown settings: {sorted(bad)}")
@@ -425,9 +413,14 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
                 err = e.errors()[0]
                 raise ValueError(f"{'.'.join(map(str, err['loc']))}: {err['msg']}") from None
             check_settings(new)
+            cleared = for_new_embedder(self.config, keep=kw) if new.embedder != self.config.embedder else []
             for k in kw:
                 setattr(self.config, k, getattr(new, k))
+            before = self.config.revision
             self._save(label="change settings")
+            if set(kw) <= THRESHOLDS:
+                self._carry_evaluation(before)
+        return cleared
 
     # ---- classes -----------------------------------------------------
     def class_names(self) -> list[str]:
@@ -504,8 +497,10 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
             cfg.classes = [c.model_copy(update={"reject_below": thresholds[c.name]}) if c.name in thresholds else c
                            for c in cfg.classes]
             n = len(thresholds)
+            before = cfg.revision
             self._save(label=f"set the threshold of {next(iter(thresholds))}" if n == 1
                        else f"set thresholds of {n} classes")
+            self._carry_evaluation(before)
 
     def _class(self, name: str) -> ClassDef:
         for c in self.config.classes:
@@ -715,9 +710,27 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
 
     def record_evaluation(self, report: dict[str, Any]) -> None:
         """Remember the headline of an evaluation (in ``eval.json``, outside undo history) for the
-        dashboard: when, at which revision, and how well."""
+        dashboard: when, at which revision, and how well.
+
+        Does nothing if the task was deleted, or deleted and made again, since this object read it:
+        an evaluation that finishes late must not land on a different task of the same name."""
         keep = ("revision", "method", "accuracy", "macro_f1", "n_scored", "n_examples")
-        _write_atomic(self.path / "eval.json", json.dumps({"at": _now(), **{k: report.get(k) for k in keep}}).encode())
+        uid = self.config.uid
+        try:
+            with self._writing():
+                if self.config.uid == uid:
+                    _write_atomic(self.path / "eval.json",
+                                  json.dumps({"at": _now(), **{k: report.get(k) for k in keep}}).encode())
+        except KeyError:  # deleted
+            pass
+
+    def _carry_evaluation(self, before: int) -> None:
+        """After a change that evaluation doesn't measure (reject thresholds), an evaluation of
+        revision ``before`` still describes the task: move it to the new revision, so it doesn't
+        show as out of date. Call inside ``_writing``, after ``_save``."""
+        ev = self.last_evaluation()
+        if ev is not None and ev.get("revision") == before:
+            _write_atomic(self.path / "eval.json", json.dumps({**ev, "revision": self.config.revision}).encode())
 
     def last_evaluation(self) -> dict[str, Any] | None:
         """What ``record_evaluation`` last stored, or None."""

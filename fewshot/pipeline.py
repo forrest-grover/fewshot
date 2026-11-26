@@ -35,7 +35,7 @@ class Prediction:  # pylint: disable=too-many-instance-attributes  # one field p
     rejected: bool
     scores: dict[str, float]  # probability per class, highest first
     # Every class the image matches (multi-label): with a reject threshold, each class whose own
-    # similarity reaches it, ``label`` first; without one, just ``label``.
+    # similarity reaches it, ``label`` first (when not rejected); without one, just ``label``.
     labels: list[str] = field(default_factory=list)
     # The labelled examples most like the image ({id, label, similarity}), when asked for.
     evidence: list[dict[str, Any]] = field(default_factory=list)
@@ -276,14 +276,15 @@ class Pipeline:
         which finds new kinds of image. ``added``: oldest first.
 
         Each entry is the inbox item plus ``prediction`` (as from ``predict``, top 3 scores) and
-        ``margin``; with no classes yet there is no prediction.
+        ``margin``; with no class to predict yet (none with examples or a usable description),
+        there is no prediction.
         """
         orders = {"uncertain", "confident", "novel", "added"}
         if sort not in orders:
             raise ValueError(f"sort must be one of {sorted(orders)}, got {sort!r}")
         cfg = task.config
         items = [x.model_dump() for x in cfg.inbox]
-        if not items or not cfg.classes:
+        if not items or not _predictable(cfg):
             return items
         preds = self.predict(task, [task.path / x.file for x in cfg.inbox], top_k=3)
         for item, p in zip(items, preds, strict=True):
@@ -367,6 +368,12 @@ def _keyed(images: Sequence[ImageInput], errors: dict[int, str]) -> list[tuple[s
     return items
 
 
+def _predictable(cfg: TaskConfig) -> bool:
+    """Whether ``cfg`` has a class a classifier can be fitted on: one with examples, or with a
+    description that the embedder can read as text."""
+    return bool(cfg.examples) or (spec_supports_text(cfg.embedder) and any(prompts(c.description) for c in cfg.classes))
+
+
 def _to_pred(clf: Classifier, thr: np.ndarray | None, row: tuple[np.ndarray, float, np.ndarray],
              top_k: int | None) -> Prediction:
     """The prediction from one image's (probabilities, similarity to the predicted class,
@@ -377,7 +384,7 @@ def _to_pred(clf: Classifier, thr: np.ndarray | None, row: tuple[np.ndarray, flo
     rejected = thr is not None and bool(float(s) < thr[j])  # NaN (no threshold) never rejects
     label = None if rejected else clf.classes[j]
     labels = [] if label is None else [label]
-    if thr is not None and label is not None:
+    if thr is not None:  # with per-class thresholds, others can match though the top class is rejected
         order = np.argsort(-per_class, kind="stable")
         labels += [clf.classes[i] for i in order if i != j and per_class[i] >= thr[i]]
     ranked = sorted(zip(clf.classes, p.tolist(), strict=True), key=lambda cv: -cv[1])

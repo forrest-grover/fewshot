@@ -59,6 +59,15 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
   });
 
   const fix = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
+  /** Like ``fix``, for a threshold change: evaluation doesn't depend on thresholds, so a report
+   * that was current stays current. */
+  const setThreshold = async (p: Promise<TaskDetail>) => {
+    const current = rev === task.revision;
+    const t = await run(p);
+    if (!t) return;
+    setTask(t);
+    if (current) update({ rev: t.revision });
+  };
   const filter = cell?.task === task.name ? cell : null;
   // A picked cell lists its examples (right or wrong), most confident first; otherwise all mistakes.
   const listed = !report ? [] : filter
@@ -144,7 +153,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
             while keeping real members; the suggestion keeps 95% of the correct ones.
           </p>
           <Threshold key={`${task.name}\u0000${String(rev)}`} predictions={report.predictions} current={task.reject_below} suggested={report.suggested_reject_below}
-            onSet={(v) => { void fix(api.updateTask(task.name, { reject_below: v })); }} />
+            onSet={(v) => { void setThreshold(api.updateTask(task.name, { reject_below: v })); }} />
 
           <h3>Per class</h3>
           <p className="muted">
@@ -166,14 +175,14 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
                         ? <span className="muted" title="The task's reject threshold applies">{task.reject_below?.toFixed(3) ?? "none"}</span>
                         : <span className="row">{own.toFixed(3)}
                             <button className="ghost small" title="Use the task's threshold for this class"
-                              onClick={() => { void fix(api.setClassThresholds(task.name, { [c]: null })); }}>Clear</button>
+                              onClick={() => { void setThreshold(api.setClassThresholds(task.name, { [c]: null })); }}>Clear</button>
                           </span>}
                     </td>
                     <td>
                       {suggested === undefined ? <span className="muted">–</span> : (
                         <span className="row">{suggested.toFixed(3)}
                           {own !== suggested && exists(c) && (
-                            <button className="ghost small" onClick={() => { void fix(api.setClassThresholds(task.name, { [c]: suggested })); }}>Apply</button>
+                            <button className="ghost small" onClick={() => { void setThreshold(api.setClassThresholds(task.name, { [c]: suggested })); }}>Apply</button>
                           )}
                         </span>
                       )}
@@ -187,7 +196,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
           {applicable.length > 0 && (
             <p className="row">
               <button className="small" onClick={() => {
-                void fix(api.setClassThresholds(task.name, Object.fromEntries(applicable.map((c) => [c, report.suggested_class_thresholds[c]]))));
+                void setThreshold(api.setClassThresholds(task.name, Object.fromEntries(applicable.map((c) => [c, report.suggested_class_thresholds[c]]))));
               }}>Apply {applicable.length === 1 ? "the suggested class threshold" : `${String(applicable.length)} suggested class thresholds`}</button>
             </p>
           )}

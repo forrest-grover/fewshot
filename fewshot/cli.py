@@ -202,10 +202,17 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     if temperature is not None:
         kw["temperature"] = None if temperature == 1 else temperature
     try:
-        t.update_settings(**kw)
+        _say_cleared(name, t.update_settings(**kw))
     except ValueError as e:
         _fail(str(e))
     show(name, False, root)
+
+
+def _say_cleared(name: str, cleared: list[str]) -> None:
+    """Tell the user which settings switching embedder cleared, if any."""
+    if cleared:
+        typer.echo(f"Cleared {', '.join(cleared)}: fitted to the previous embedder "
+                   f"(`fewshot undo {name}` restores them)", err=True)
 
 
 @app.command()
@@ -340,7 +347,7 @@ def class_describe(
     typer.echo(f"Set {n} descriptions")
 
 
-@cls_app.command("threshold")
+@cls_app.command("threshold", context_settings={"ignore_unknown_options": True})  # takes "-0.5"
 def class_threshold(
     name: str,
     label: str,
@@ -515,7 +522,8 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
 ) -> None:
     """Classify images as they arrive in FOLDER and sort them into OUT, logging each to OUT/predictions.jsonl.
 
-    A file is handled once its size has stayed the same for one interval (so half-copied files wait).
+    A file is handled once its size has stayed the same for one interval (so half-copied files wait);
+    one that can't be read yet is retried until it is WATCH_SETTLE seconds old, then goes to _error.
     The task is re-read every time, so labelling more examples improves the sorting as it runs.
     """
     if not folder.is_dir():
@@ -523,20 +531,20 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     ws = _ws(root)
     _task(root, name)
     pipe = _pipe(ws)
-    sizes: dict[Path, int] = {}
+    last: dict[Path, int] = {}  # files seen in the last look, and their sizes
     done: set[Path] = set()  # with --copy, files already copied
     try:
         while True:
-            ready = []
-            for f in _images_in(folder, recursive=False):
-                size = f.stat().st_size
-                if f not in done and size > 0 and (once or sizes.get(f) == size):
-                    ready.append(f)
-                sizes[f] = size
-            if ready:
-                _sort_files(ws, pipe, name, ready, out, copy, min_confidence)
-                if copy:
-                    done.update(ready)
+            sizes = _sizes(folder)
+            ready = [f for f, n in sizes.items() if f not in done and n > 0 and (once or last.get(f) == n)]
+            last, done = sizes, done & sizes.keys()  # forget files that went away
+            try:
+                done |= _sort_files(ws, pipe, name, ready, out, copy, min_confidence,
+                                    settle=0 if once else WATCH_SETTLE) if ready else set()
+            except ValueError as e:  # the task can't predict yet (no examples): wait for some
+                if once:
+                    _fail(str(e))
+                typer.secho(f"Waiting: {e}", fg="yellow", err=True)
             if once:
                 return
             time.sleep(interval)
@@ -544,23 +552,60 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
         typer.echo("Stopped")
 
 
+WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
+
+
+def _sizes(folder: Path) -> dict[Path, int]:
+    """The images in ``folder`` and their sizes, skipping any gone since they were listed."""
+    out = {}
+    for f in _images_in(folder, recursive=False):
+        try:
+            out[f] = f.stat().st_size
+        except OSError:
+            continue
+    return out
+
+
 def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out: Path,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                copy: bool, min_confidence: float | None) -> None:
+                copy: bool, min_confidence: float | None, settle: float = 0) -> set[Path]:
     """Classify ``files`` with the task's current version and move (or copy) each into its folder
-    under ``out``, appending a JSON line per file to ``out/predictions.jsonl``."""
-    t = ws.get(name)
-    preds = pipe.predict(t, files)
+    under ``out``, appending a JSON line per file to ``out/predictions.jsonl``. Returns the files
+    handled. An unreadable file changed less than ``settle`` seconds ago may still be arriving and
+    is left for next time. Raises ``ValueError`` if the task can't predict yet (no examples)."""
+    try:
+        preds = pipe.predict(ws.get(name), files)
+    except KeyError:
+        _fail(f"Task {name!r} is gone (renamed or deleted); stopping")
+    handled = set()
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "predictions.jsonl", "a", encoding="utf-8") as log:
         for f, p in zip(files, preds, strict=True):
-            unsure = p.rejected or (min_confidence is not None and p.confidence < min_confidence)
-            folder = "_error" if p.error else "_unknown" if unsure or not p.label else p.label
-            dest = _free_name(out / folder / f.name)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            (shutil.copy2 if copy else shutil.move)(str(f), str(dest))
+            try:
+                if p.error and time.time() - f.stat().st_mtime < settle:
+                    continue
+                dest = _place(f, out / _folder_for(p, min_confidence), copy)
+            except OSError as e:  # removed meanwhile, or the destination can't be written
+                typer.secho(f"{f.name}: {e}", fg="yellow", err=True)
+                continue
+            handled.add(f)
             log.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "file": str(f), "to": str(dest),
                                   "task": name, **p.to_dict()}) + "\n")
-            typer.echo(f"{f.name} -> {folder}")
+            typer.echo(f"{f.name} -> {dest.parent.name}")
+    return handled
+
+
+def _folder_for(p: Prediction, min_confidence: float | None) -> str:
+    """The folder under OUT a prediction sends its image to."""
+    unsure = p.rejected or (min_confidence is not None and p.confidence < min_confidence)
+    return "_error" if p.error else "_unknown" if unsure or not p.label else p.label
+
+
+def _place(f: Path, folder: Path, copy: bool) -> Path:
+    """Move (or copy) ``f`` into ``folder`` under a free name; returns where it went."""
+    dest = _free_name(folder / f.name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    (shutil.copy2 if copy else shutil.move)(str(f), str(dest))
+    return dest
 
 
 def _free_name(path: Path) -> Path:
@@ -617,7 +662,8 @@ def _print_predictions(files: list[Source], preds: list[Prediction], top: int) -
             typer.secho(f"{f}: error: {p.error}", fg="yellow", err=True)
             continue
         best = list(p.scores.items())[:top]
-        label = ", ".join(p.labels) if p.label is not None else f"unknown (closest: {p.top_label})"
+        label = ", ".join(p.labels) if p.label is not None else f"unknown (closest: {p.top_label})" + (
+            f"; matches {', '.join(p.labels)}" if p.labels else "")
         scores = "  ".join(f"{c}={v:.2f}" for c, v in best)
         typer.echo(f"{f}: {label}  sim={p.similarity:.3f}  {scores}")
         for e in p.evidence:
@@ -674,10 +720,16 @@ def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-argument
             r = evaluate_task(_pipe(_ws(root)), t, folds, progress=lambda _stage, done, total: update(done, total))
     except ValueError as e:
         _fail(str(e))
-    t.record_evaluation(r)
     if apply_class_thresholds and r["suggested_class_thresholds"]:
-        t.set_class_thresholds(r["suggested_class_thresholds"])
+        current = r["revision"] == t.config.revision
+        try:
+            t.set_class_thresholds(r["suggested_class_thresholds"])
+        except KeyError as e:  # a class was renamed or deleted meanwhile
+            _fail(f"Thresholds not set: {e.args[0]}")
         typer.echo(f"Set the thresholds of {len(r['suggested_class_thresholds'])} classes", err=True)
+        if current:  # thresholds don't change what evaluation measures, so the result still holds
+            r = {**r, "revision": t.config.revision}
+    t.record_evaluation(r)
     if as_json:
         _echo_json(r)
     elif as_csv:

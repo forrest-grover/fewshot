@@ -165,7 +165,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
             );
           }
           const top = Object.entries(it.pred.scores).sort((a, b) => b[1] - a[1]).slice(0, 3);
-          const also = it.pred.labels.slice(1);
+          const also = it.pred.rejected ? it.pred.labels : it.pred.labels.slice(1);
           return (
             <article
               key={it.key}
@@ -187,7 +187,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
                 <div className="muted file">{it.name}</div>
                 {also.length > 0 && (
                   <div className="also" title="Other classes whose similarity also reaches the reject threshold">
-                    Also matches: {also.join(", ")}
+                    {it.pred.rejected ? "Matches" : "Also matches"}: {also.join(", ")}
                   </div>
                 )}
                 {top.map(([c, v], i) => <Bar key={c} label={c} value={v} strong={i === 0} />)}

@@ -5,7 +5,7 @@ import Evaluate, { type EvalRun } from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { usePredictResults } from "./hooks";
+import { topModal, usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
@@ -155,7 +155,7 @@ export default function App() {
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
-      if (!(e.ctrlKey || e.metaKey) || e.altKey || (key !== "z" && key !== "y")) return;
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || (key !== "z" && key !== "y") || topModal()) return;
       if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
       e.preventDefault();
       void stepRef.current(key === "y" || e.shiftKey ? "redo" : "undo");

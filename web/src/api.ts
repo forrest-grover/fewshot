@@ -58,6 +58,20 @@ export interface ModelInfo {
 /** Fired on window when a request is refused for want of the server's token. */
 export const AUTH_EVENT = "fewshot:auth-required";
 
+/** A request the server answered with an error status. */
+export class HttpError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
+/** A FastAPI error ``detail``: a message, or (422) a list of {loc, msg} problems. */
+function detailText(d: unknown): string {
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) {
+    return d.map((p: { loc?: unknown[]; msg?: string }) => [p.loc?.filter((x) => x !== "body").join("."), p.msg].filter(Boolean).join(": ")).join("; ");
+  }
+  return JSON.stringify(d);
+}
+
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method };
   if (body instanceof FormData) init.body = body;
@@ -78,7 +92,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
       const body = (await r.json()) as { detail?: unknown } | null;
       msg = body?.detail ?? msg;
     } catch { /* not JSON */ }
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    throw new HttpError(r.status, detailText(msg));
   }
   // The server's response schemas are mirrored by the interfaces above; this is the one untyped boundary.
   return r.status === 204 ? (undefined as T) : ((await r.json()) as T);

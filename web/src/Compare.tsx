@@ -20,6 +20,7 @@ export default function Compare({ task, models, setTask, run, state, setState }:
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const label = (spec: string) => models?.embedders.find((e) => e.spec === spec)?.label ?? spec;
   const others = (models?.embedders ?? []).filter((e) => e.spec !== task.embedder);
+  const chosen = others.map((e) => e.spec).filter((s) => picked.has(s)); // not the current model, if it was picked before
 
   const jobId = job?.id;
   usePollJob<CompareReport>(jobId, (j) => {
@@ -35,7 +36,7 @@ export default function Compare({ task, models, setTask, run, state, setState }:
   });
 
   const go = async () => {
-    const j = await run(api.startComparison(task.name, [task.embedder, ...others.map((e) => e.spec).filter((s) => picked.has(s))]));
+    const j = await run(api.startComparison(task.name, [task.embedder, ...chosen]));
     if (j) setState((s) => ({ task: task.name, report: s?.task === task.name ? s.report : null, job: j }));
   };
   const toggle = (spec: string) => {
@@ -46,7 +47,7 @@ export default function Compare({ task, models, setTask, run, state, setState }:
     if (t) setTask(t);
   };
   const stale = report && report.revision !== task.revision;
-  const [n, stage] = job?.stage.split(" ") ?? ["", ""]; // "2/3 embedding"
+  const [n, stage] = job?.stage.includes(" ") ? job.stage.split(" ") : ["", job?.stage ?? ""]; // "2/3 embedding", "starting"
 
   return (
     <section aria-labelledby="compare-h">
@@ -67,7 +68,7 @@ export default function Compare({ task, models, setTask, run, state, setState }:
         </fieldset>
       )}
       <div className="row">
-        <button className="secondary" disabled={job !== null || picked.size === 0 || task.examples.length < 2}
+        <button className="secondary" disabled={job !== null || chosen.length === 0 || task.examples.length < 2}
           onClick={() => { void go(); }}>
           {job ? "Comparing…" : "Compare"}
         </button>

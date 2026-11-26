@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef } from "react";
+import { topModal } from "./hooks";
 
 export interface LightboxItem {
   url: string; // the image (large)
@@ -31,10 +32,11 @@ export default function Lightbox({ items, index, onIndex, onClose, onKey, footer
     const on = (e: KeyboardEvent) => {
       const { index: i, items: list } = latest.current;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
-      if (e.target instanceof Element && e.target.closest("input, select, textarea, button")) {
-        if (e.key === "Escape") latest.current.onClose();
-        return;
-      }
+      const top = topModal();
+      if (top && top !== box.current) return; // a dialog opened over the viewer has the keys
+      const t = e.target instanceof Element ? e.target : null;
+      if (e.key !== "Escape" && t?.closest("input, select, textarea")) return; // typing
+      if ((e.key === "Enter" || e.key === " ") && t?.closest("button")) return; // pressing the button
       let handled = true;
       if (e.key === "Escape") latest.current.onClose();
       else if (e.key === "ArrowRight" || e.key === "j") latest.current.onIndex(Math.min(list.length - 1, i + 1));

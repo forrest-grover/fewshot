@@ -154,7 +154,7 @@ class PredictionOut(BaseModel):
 
     file: str | None = None  # the uploaded file's name or URL (not given for inbox suggestions)
     label: str | None  # None when rejected as unknown, or on error
-    labels: list[str]  # every class the image matches (multi-label), ``label`` first
+    labels: list[str]  # every class the image matches (multi-label), ``label`` first unless rejected
     top_label: str  # the most probable class, even if rejected
     scores: dict[str, float]  # probability per class, highest first
     confidence: float

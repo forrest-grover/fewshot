@@ -4,6 +4,7 @@ import csv
 import importlib
 import io
 import json
+import shutil
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from typer.testing import CliRunner
 
 import fewshot.api
 from fewshot import cli
+from fewshot.cli_common import images_in
 from fewshot.store import Workspace
 from tests.conftest import png
 from tests.test_cli import PlainResult
@@ -164,6 +166,87 @@ def test_watch_waits_for_stable_size_until_interrupted(run, task, tmp_path, monk
     assert r.exit_code == 0, r.output
     assert looks == [[], ["r.png"], ["r.png"]]  # first look only notes the size; copied once
     assert r.output.strip().endswith("Stopped")
+
+
+def _watch_looks(monkeypatch, n, each=None):
+    """Make watch stop (as by Ctrl+C) at its ``n``-th sleep, calling ``each(look)`` at every one."""
+    looks: list[int] = []
+
+    def sleep(_seconds):
+        looks.append(len(looks))
+        if each:
+            each(len(looks))
+        if len(looks) == n:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("fewshot.cli.time.sleep", sleep)
+
+
+def test_watch_waits_for_a_task_that_can_predict(run, root, tmp_path, monkeypatch):
+    """With no examples yet, --once fails and a watch waits (and sorts once there are some)."""
+    t = Workspace(root).create("empty", embedder="fake:color")
+    t.upsert_class("red")
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "r.png").write_bytes(png(RED, seed=9))
+    r = run("watch", "empty", inbox, "--out", out, "--once")
+    assert (r.exit_code, "Need at least 1 class" in r.output) == (1, True)
+    _watch_looks(monkeypatch, 4, lambda look: look == 2 and t.add_example(png(RED), "red"))
+    r = run("watch", "empty", inbox, "--out", out)
+    assert (r.exit_code, "Waiting: Need at least 1 class" in r.output) == (0, True)
+    assert (out / "red" / "r.png").exists()
+
+
+def test_watch_survives_files_that_vanish(run, task, tmp_path, monkeypatch):
+    """A file gone before its size is read, or before it is moved, is skipped with a message."""
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "r.png").write_bytes(png(RED, seed=9))
+    (inbox / "b.png").write_bytes(png(BLUE, seed=9))
+    real_move = shutil.move
+    monkeypatch.setattr("fewshot.cli._images_in",
+                        lambda folder, recursive: [folder / "gone.png", *images_in(folder, recursive)])
+
+    def move(src, dest):
+        if src.endswith("b.png"):
+            raise FileNotFoundError(f"No such file: {src}")
+        return real_move(src, dest)
+
+    monkeypatch.setattr("fewshot.cli.shutil.move", move)
+    r = run("watch", task, inbox, "--out", out, "--once")
+    assert r.exit_code == 0, r.output
+    assert "b.png: No such file" in r.output
+    assert (out / "red" / "r.png").exists()
+    assert len((out / "predictions.jsonl").read_text().splitlines()) == 1
+
+
+def test_watch_retries_unreadable_files_until_settled(run, task, tmp_path, monkeypatch):
+    """An unreadable file that just changed is left in place (it may still be arriving); once it is
+    older than WATCH_SETTLE it goes to _error."""
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "half.png").write_bytes(b"not yet an image")
+    _watch_looks(monkeypatch, 3)
+    assert run("watch", task, inbox, "--out", out).exit_code == 0
+    assert (inbox / "half.png").exists()
+    monkeypatch.setattr(cli, "WATCH_SETTLE", 0.0)
+    _watch_looks(monkeypatch, 3)
+    assert run("watch", task, inbox, "--out", out).exit_code == 0
+    assert (out / "_error" / "half.png").exists()
+
+
+def test_watch_stops_when_the_task_goes(run, task, root, tmp_path, monkeypatch):
+    """A task deleted while watching stops the watch with a message."""
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "r.png").write_bytes(png(RED, seed=9))
+    def delete(look):
+        if look == 1:
+            Workspace(root).delete(task)
+
+    _watch_looks(monkeypatch, 5, delete)
+    r = run("watch", task, inbox, "--out", out)
+    assert (r.exit_code, "is gone (renamed or deleted)" in r.output) == (1, True)
 
 
 def test_watch_needs_a_folder(run, task, tmp_path):

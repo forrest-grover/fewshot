@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type Job, type Prediction } from "./api";
+import { api, HttpError, type Job, type Prediction } from "./api";
 
 const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
 
@@ -19,6 +19,13 @@ function typing(e: Event): boolean {
     && !!e.target.closest(TYPING);
 }
 
+/** The dialog in front, if one is open: the last modal in the document (a nested or later one
+ * opened over an earlier one). While one is open, page shortcuts must not act behind it. */
+export function topModal(): Element | null {
+  const all = document.querySelectorAll("[aria-modal='true']");
+  return all.length ? all[all.length - 1] : null;
+}
+
 /** Controls whose own keys (Enter, Space, arrows) must keep working. */
 const CONTROL = "button, a[href], summary, [role=tab], [role=button], [role=option], [role=menuitem]";
 const CONTROL_KEYS = new Set(["Enter", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
@@ -29,13 +36,15 @@ function forControl(e: KeyboardEvent): boolean {
 }
 
 /** Call ``onKey`` for key presses without Ctrl/Alt/Meta that aren't typed into a form field, nor
- * Enter/Space/arrows meant for a focused button, link or tab. */
+ * Enter/Space/arrows meant for a focused button, link or tab, while no dialog is open. */
 export function useShortcuts(onKey: (e: KeyboardEvent) => void) {
   const latest = useRef(onKey);
   latest.current = onKey;
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      if (!e.ctrlKey && !e.altKey && !e.metaKey && !e.defaultPrevented && !typing(e) && !forControl(e)) latest.current(e);
+      if (!e.ctrlKey && !e.altKey && !e.metaKey && !e.defaultPrevented && !typing(e) && !forControl(e) && !topModal()) {
+        latest.current(e);
+      }
     };
     window.addEventListener("keydown", on);
     return () => { window.removeEventListener("keydown", on); };
@@ -88,6 +97,9 @@ export function usePredictResults(task: string | null) {
   const name = task ?? "";
   const renamed = useRef<{ from: string; to: string } | null>(null);
   // Results already moved to the task's new name, while the route still shows the old one, stay.
+  // Once the route reaches the new name the rename is over, so a later task reusing the old name
+  // (say, a duplicate) starts with fresh results.
+  if (renamed.current?.to === name) renamed.current = null;
   const moving = renamed.current?.from === name && renamed.current.to === results.task;
   if (results.task !== name && !moving) { // another task: adjust during render, as React recommends
     revoke(urls.current);
@@ -134,26 +146,38 @@ export async function filesFromDrop(dt: DataTransfer): Promise<File[]> {
 }
 
 const POLL_MS = 500;
+const POLL_TRIES = 5; // failed requests in a row before giving up on a job
 
 /** Poll job ``jobId`` (if any) every half second, passing each state to ``onJob`` (the last one is
- * finished); a failed request goes to ``onError`` and stops polling. Unmounting stops polling too. */
+ * finished). A failed request is retried (with growing pauses) up to POLL_TRIES times in a row,
+ * since the job keeps running on the server; then, or at once if the server no longer knows the
+ * job, it goes to ``onError`` and polling stops. Each request waits for the one before. Unmounting
+ * stops polling too. */
 export function usePollJob<T>(jobId: string | undefined, onJob: (j: Job<T>) => void, onError: (e: Error) => void) {
   const latest = useRef({ onJob, onError });
   latest.current = { onJob, onError };
   useEffect(() => {
     if (!jobId) return;
     let live = true;
-    const timer = setInterval(() => {
-      void api.job<T>(jobId).then((j) => {
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = () => {
+      api.job<T>(jobId).then((j) => {
         if (!live) return;
-        if (j.status !== "running") { live = false; clearInterval(timer); }
+        failures = 0;
         latest.current.onJob(j);
+        if (j.status === "running") timer = setTimeout(poll, POLL_MS);
       }, (e: unknown) => {
         if (!live) return;
-        live = false; clearInterval(timer);
+        failures += 1;
+        if (failures < POLL_TRIES && !(e instanceof HttpError && e.status === 404)) {
+          timer = setTimeout(poll, POLL_MS * 2 ** failures);
+          return;
+        }
         latest.current.onError(e instanceof Error ? e : new Error(String(e)));
       });
-    }, POLL_MS);
-    return () => { live = false; clearInterval(timer); };
+    };
+    timer = setTimeout(poll, POLL_MS);
+    return () => { live = false; clearTimeout(timer); };
   }, [jobId]);
 }
