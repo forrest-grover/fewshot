@@ -5,10 +5,12 @@
 it. ``uvicorn fewshot.api:app`` gets the same server, built from the environment when ``app`` is
 first used. The built web UI (web/dist) is served at / when present.
 
-Requests are answered from two pools of threads: cheap ones (task details, settings, edits) from
+Requests are answered from two pools of threads: cheap ones (task details, edits) from
 Starlette's, and heavy ones (predictions, evaluations, uploads, imports, exports, thumbnails,
-inbox suggestions) from the server's own ``workers`` threads, so heavy work queues there and can't
-keep the server from answering anything else; ``/healthz`` needs no thread at all.
+inbox suggestions, and creating a task or changing its settings, which may load a model) from the
+server's own ``workers`` threads, so heavy work queues there and can't keep the server from
+answering anything else; ``/healthz`` needs no thread at all. Responses are validated and
+serialised in those threads too (``_json``), not on the event loop as FastAPI would.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ import functools
 import logging
 import mimetypes
 import os
-import secrets
 import tempfile
 import threading
 from collections import Counter
@@ -29,10 +30,12 @@ from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import services
+from .access import SESSION_COOKIE, TOO_MANY_TOKENS, check_token, client_address, guard
 from .archive import export_task as write_export
 from .archive import import_task as read_export
 from .auth import SESSION_DAYS, Sessions, WrongTokens
@@ -47,11 +50,12 @@ from .embedders import (
     max_models,
     spec_supports_text,
 )
-from .guard import LimitBody, cross_site, host_allowed
+from .guard import LimitBody, body_limit, without_input
 from .images import thumbnail
 from .inbox import chunked
 from .jobs import Job, Jobs, TooManyJobs
 from .pipeline import Pipeline
+from .responses import json_response
 from .schemas import (
     AcceptConfident,
     AddResult,
@@ -83,7 +87,7 @@ from .schemas import (
     TaskSummary,
     Urls,
 )
-from .server_settings import MAX_JSON_BYTES, ServerSettings
+from .server_settings import ServerSettings, requested_processes
 from .store import Task, Workspace
 from .text import check_class_name
 
@@ -107,11 +111,33 @@ class Server:  # pylint: disable=too-many-instance-attributes  # the server's pa
         self.jobs = Jobs()
         self.wrong_tokens = WrongTokens()
         self.sessions = Sessions(settings.token) if settings.token else None
-        self.heavy = ThreadPoolExecutor(settings.workers, thread_name_prefix="fewshot-work")
+        self.warned_proxy = False  # see access._note_untrusted_proxy
+        self._heavy: ThreadPoolExecutor | None = None  # made when first needed, after each shutdown too
+        self._heavy_lock = threading.Lock()
+
+    @property
+    def heavy(self) -> ThreadPoolExecutor:
+        """The threads for heavy work (``settings.workers`` of them)."""
+        with self._heavy_lock:
+            if self._heavy is None:
+                self._heavy = ThreadPoolExecutor(self.settings.workers, thread_name_prefix="fewshot-work")
+            return self._heavy
+
+    def stop_heavy(self) -> None:
+        """Stop the heavy-work threads, dropping work not started yet (the app is shutting down); the
+        next heavy request, if the app is started again, gets new ones."""
+        with self._heavy_lock:
+            pool, self._heavy = self._heavy, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """``fn(*args)`` on the heavy-work threads, so it waits there, not in Starlette's pool."""
         return await asyncio.get_running_loop().run_in_executor(self.heavy, functools.partial(fn, *args))
+
+    async def render(self, model: Any, fn: Callable[..., Any], *args: Any, status: int = 200) -> Response:
+        """``fn(*args)`` on the heavy-work threads, as JSON validated as ``model`` (see ``_json``)."""
+        return await self.run(lambda: json_response(model, fn(*args), status))
 
     def task(self, name: str) -> Task:
         """Task ``name``; 404 if there is none."""
@@ -171,19 +197,25 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if (n := requested_processes()) > 1:
+            log.warning("This server was started with %d processes, which isn't supported: logged-out sessions, "
+                        "wrong-token limits and background jobs are kept in each process's memory, so a request "
+                        "can miss what another process knows (a job's progress, a logout). Run one process; "
+                        "FEWSHOT_WORKERS sets its threads for heavy work.", n)
         if server.settings.warm:
             threading.Thread(target=server.warm_models, name="fewshot-warm", daemon=True).start()
         yield
-        server.heavy.shutdown(wait=False, cancel_futures=True)
+        server.stop_heavy()
 
     # Operation ids are the function names (predict, add_examples...), which make tidy generated clients.
     app = FastAPI(title="fewshot", version="0.1.0", lifespan=lifespan,
                   generate_unique_id_function=lambda route: route.name)
     app.state.server = server
     app.include_router(router)
-    app.middleware("http")(_guard)
+    app.middleware("http")(guard)
+    app.add_exception_handler(RequestValidationError, without_input)
     # Added last, so it runs first.
-    app.add_middleware(LimitBody, limit=server.settings.max_request_bytes, other_limit=MAX_JSON_BYTES)
+    app.add_middleware(LimitBody, limit=functools.partial(body_limit, server.settings.max_request_bytes))
     mount_ui(app, Path(__file__).resolve().parent.parent / "web" / "dist")
     return app
 
@@ -208,64 +240,17 @@ def __getattr__(name: str) -> Any:
 router = APIRouter()
 
 
-# ---- access control -----------------------------------------------------
-SESSION_COOKIE = "fewshot_session"
-OPEN_PATHS = {"/api/login", "/api/health"}  # reachable without the token
-TOO_MANY_TOKENS = "Too many wrong tokens; try again in a minute"
-SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-
-
-def _client(request: Request) -> str:
-    """The client's address: behind a trusted proxy (``forwarded_allow_ips``), the one it reports."""
-    return request.client.host if request.client else "?"
-
-
-def _check_token(srv: Server, client: str, given: str) -> int | None:
-    """Check a token from ``client`` (at login, or as a Bearer header): None if right, 401 if
-    wrong, 429 once the client gave ``LOGIN_FAILURES`` wrong tokens within ``LOGIN_WINDOW``
-    seconds, so a token can't be guessed quickly. Only wrong tokens count. A session cookie is
-    checked without this: it can't be guessed, so a client signed in keeps working while others
-    behind the same address are refused."""
-    token = srv.settings.token
-    if token is None:
-        return None
-    if srv.wrong_tokens.blocked(client):
-        return 429
-    if secrets.compare_digest(given.encode(), token.encode()):
-        return None
-    srv.wrong_tokens.wrong(client)
-    return 401
-
-
-async def _guard(request: Request, call_next: Any) -> Response:
-    """Refuse requests for another host name (DNS rebinding) and writes from other sites (CSRF),
-    then check the token or session."""
-    srv: Server = request.app.state.server
-    if not host_allowed(request.headers.get("host", ""), set(srv.settings.allowed_hosts)):
-        return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
-    path = request.url.path
-    if request.method not in SAFE_METHODS and path.startswith("/api/") and cross_site(request):
-        return JSONResponse({"detail": "Cross-site requests are not allowed"}, 403)
-    if srv.sessions is not None and path.startswith("/api/") and path not in OPEN_PATHS:
-        auth = request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
-            refused = _check_token(srv, _client(request), auth[7:])
-        else:
-            refused = None if srv.sessions.valid(request.cookies.get(SESSION_COOKIE)) else 401
-        if refused == 429:
-            return JSONResponse({"detail": TOO_MANY_TOKENS}, 429)
-        if refused:
-            return JSONResponse({"detail": "Not signed in"}, 401, headers={"WWW-Authenticate": "Bearer"})
-    response: Response = await call_next(request)
-    return response
-
-
 def _missing(e: KeyError) -> HTTPException:
     return HTTPException(404, str(e.args[0]))
 
 
 def _bad(e: Exception) -> HTTPException:
     return HTTPException(400, str(e.args[0]) if e.args else str(e))
+
+
+def _task_json(t: Task, status: int = 200) -> Response:
+    """The task's detail as a response (see ``_json``)."""
+    return json_response(TaskDetail, _detail(t), status)
 
 
 def _detail(t: Task) -> dict[str, Any]:
@@ -312,10 +297,10 @@ async def login(srv: Srv, body: Login, request: Request, response: Response) -> 
     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
 
     After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds (here or as
-    Bearer headers), token checks from it get 429 until the window has passed, so the token
-    can't be guessed quickly.
+    Bearer headers), further wrong ones from it get 429 until it has sent none for that long; the
+    right token is always accepted.
     """
-    refused = _check_token(srv, _client(request), body.token)
+    refused = check_token(srv, client_address(request), body.token)
     if refused == 429:
         raise HTTPException(429, TOO_MANY_TOKENS)
     if refused:
@@ -345,31 +330,32 @@ async def models() -> dict[str, Any]:
 
 # ---- tasks --------------------------------------------------------------
 @router.get("/api/tasks", response_model=list[TaskSummary])
-def list_tasks(srv: Srv) -> list[dict[str, Any]]:
+def list_tasks(srv: Srv) -> Response:
     """Summaries of all tasks."""
-    return [t.summary() for t in srv.ws.list_tasks()]
+    return json_response(list[TaskSummary], [t.summary() for t in srv.ws.list_tasks()])
 
 
-@router.post("/api/tasks", status_code=201, response_model=TaskDetail)
-def create_task(srv: Srv, body: TaskCreate) -> dict[str, Any]:
-    """Create a task, validating the embedder spec first."""
+def _create_task(srv: Server, body: TaskCreate) -> Response:
     try:
-        return _detail(services.create_task(srv.ws, body.name, body.embedder, body.classifier,
-                                            embedder_ok=srv.check_embedder))
+        return _task_json(services.create_task(srv.ws, body.name, body.embedder, body.classifier,
+                                               embedder_ok=srv.check_embedder), 201)
     except ValueError as e:
         raise _bad(e) from e
 
 
+@router.post("/api/tasks", status_code=201, response_model=TaskDetail)
+async def create_task(srv: Srv, body: TaskCreate) -> Response:
+    """Create a task, validating the embedder spec (which loads the model) first."""
+    return await srv.run(_create_task, srv, body)
+
+
 @router.get("/api/tasks/{name}", response_model=TaskDetail)
-def get_task(srv: Srv, name: str) -> dict[str, Any]:
+def get_task(srv: Srv, name: str) -> Response:
     """Full detail of one task."""
-    return _detail(srv.task(name))
+    return _task_json(srv.task(name))
 
 
-@router.patch("/api/tasks/{name}", response_model=TaskDetail)
-def update_task(srv: Srv, name: str, body: TaskSettings) -> dict[str, Any]:
-    """Change task settings. ``classifier_params`` replaces the params; switching classifier starts
-    its params afresh unless they are given. A temperature of 1 means none."""
+def _update_task(srv: Server, name: str, body: TaskSettings) -> Response:
     t = srv.task(name)
     flags = {"reject_below": "clear_reject", "reject_below_zero_shot": "clear_reject_zero_shot",
              "temperature": "clear_temperature"}
@@ -381,7 +367,15 @@ def update_task(srv: Srv, name: str, body: TaskSettings) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
+
+
+@router.patch("/api/tasks/{name}", response_model=TaskDetail)
+async def update_task(srv: Srv, name: str, body: TaskSettings) -> Response:
+    """Change task settings. ``classifier_params`` replaces the params; switching classifier starts
+    its params afresh unless they are given. A temperature of 1 means none. A new embedder is
+    loaded first, on the heavy-work threads."""
+    return await srv.run(_update_task, srv, name, body)
 
 
 @router.delete("/api/tasks/{name}", status_code=204)
@@ -395,11 +389,11 @@ def delete_task(srv: Srv, name: str) -> None:
 
 
 @router.post("/api/tasks/{name}/rename", response_model=TaskDetail)
-def rename_task(srv: Srv, name: str, body: Rename) -> dict[str, Any]:
+def rename_task(srv: Srv, name: str, body: Rename) -> Response:
     """Rename a task (400 if the new name is bad or taken)."""
     srv.task(name)
     try:
-        return _detail(srv.ws.rename(name, body.name))
+        return _task_json(srv.ws.rename(name, body.name))
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -407,12 +401,12 @@ def rename_task(srv: Srv, name: str, body: Rename) -> dict[str, Any]:
 
 
 @router.post("/api/tasks/{name}/duplicate", status_code=201, response_model=TaskDetail)
-def duplicate_task(srv: Srv, name: str, body: Duplicate) -> dict[str, Any]:
+def duplicate_task(srv: Srv, name: str, body: Duplicate) -> Response:
     """Copy a task under a new name, e.g. to try other settings without touching it (400 if the
     name is bad or taken)."""
     srv.task(name)
     try:
-        return _detail(srv.ws.duplicate(name, body.name, body.examples, body.inbox))
+        return _task_json(srv.ws.duplicate(name, body.name, body.examples, body.inbox), 201)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -420,7 +414,7 @@ def duplicate_task(srv: Srv, name: str, body: Duplicate) -> dict[str, Any]:
 
 
 @router.post("/api/tasks/{name}/undo", response_model=TaskDetail)
-def undo(srv: Srv, name: str) -> dict[str, Any]:
+def undo(srv: Srv, name: str) -> Response:
     """Undo the task's last change (400 if there is nothing to undo); ``undo_label`` in the task
     says what it was before the call."""
     t = srv.task(name)
@@ -430,11 +424,11 @@ def undo(srv: Srv, name: str) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.post("/api/tasks/{name}/redo", response_model=TaskDetail)
-def redo(srv: Srv, name: str) -> dict[str, Any]:
+def redo(srv: Srv, name: str) -> Response:
     """Make the last undone change again (400 if there is nothing to redo, as after any new change)."""
     t = srv.task(name)
     try:
@@ -443,7 +437,7 @@ def redo(srv: Srv, name: str) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 def _export(srv: Server, name: str) -> StreamingResponse:
@@ -483,15 +477,15 @@ def _import(srv: Server, file: UploadFile, name: str | None, embedder: str | Non
 
 @router.post("/api/tasks/import", status_code=201, response_model=TaskDetail)
 async def import_task(srv: Srv, file: UploadFile = File(...), name: str | None = Form(None),
-                      embedder: str | None = Form(None)) -> dict[str, Any]:
+                      embedder: str | None = Form(None)) -> Response:
     """Create a task from a zip made by .../export, named ``name`` or as exported, optionally
     with another ``embedder`` (say, a preset, when the exported one isn't allowed here)."""
-    return await srv.run(_import, srv, file, name or None, embedder or None)
+    return await srv.render(TaskDetail, _import, srv, file, name or None, embedder or None, status=201)
 
 
 # ---- classes ------------------------------------------------------------
 @router.post("/api/tasks/{name}/classes", status_code=201, response_model=TaskDetail)
-def add_class(srv: Srv, name: str, body: ClassBody) -> dict[str, Any]:
+def add_class(srv: Srv, name: str, body: ClassBody) -> Response:
     """Add a class, or update the description of an existing one."""
     t = srv.task(name)
     try:
@@ -500,11 +494,11 @@ def add_class(srv: Srv, name: str, body: ClassBody) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t, 201)
 
 
 @router.patch("/api/tasks/{name}/classes/{label}", response_model=TaskDetail)
-def patch_class(srv: Srv, name: str, label: str, body: ClassPatch) -> dict[str, Any]:
+def patch_class(srv: Srv, name: str, label: str, body: ClassPatch) -> Response:
     """Rename a class (relabelling its examples) and/or set its description, as one change (one
     undo step)."""
     t = srv.task(name)
@@ -514,11 +508,11 @@ def patch_class(srv: Srv, name: str, label: str, body: ClassPatch) -> dict[str, 
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.post("/api/tasks/{name}/describe", response_model=TaskDetail)
-def describe_classes(srv: Srv, name: str, body: Describe) -> dict[str, Any]:
+def describe_classes(srv: Srv, name: str, body: Describe) -> Response:
     """Fill class descriptions from a template such as 'a photo of a {}'."""
     t = srv.task(name)
     try:
@@ -527,11 +521,11 @@ def describe_classes(srv: Srv, name: str, body: Describe) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.put("/api/tasks/{name}/class-thresholds", response_model=TaskDetail)
-def set_class_thresholds(srv: Srv, name: str, body: ClassThresholds) -> dict[str, Any]:
+def set_class_thresholds(srv: Srv, name: str, body: ClassThresholds) -> Response:
     """Set or clear the reject thresholds of the named classes (one undoable change); classes not
     named keep theirs. An unknown class (404) or a value outside -1..1 (400) changes nothing."""
     t = srv.task(name)
@@ -543,28 +537,28 @@ def set_class_thresholds(srv: Srv, name: str, body: ClassThresholds) -> dict[str
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.delete("/api/tasks/{name}/classes/{label}", response_model=TaskDetail)
-def delete_class(srv: Srv, name: str, label: str) -> dict[str, Any]:
+def delete_class(srv: Srv, name: str, label: str) -> Response:
     """Delete a class and all of its examples."""
     t = srv.task(name)
     try:
         t.delete_class(label)
     except KeyError as e:
         raise _missing(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 # ---- examples -----------------------------------------------------------
 @router.get("/api/tasks/{name}/examples", response_model=ExamplePage)
 def list_examples(srv: Srv, name: str, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000),  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                  label: str | None = None, tag: str | None = None) -> dict[str, Any]:
+                  label: str | None = None, tag: str | None = None) -> Response:
     """One page of the task's examples, optionally only those with ``label`` and/or ``tag``."""
     found = srv.task(name).find_examples(label, tag)
-    return {"total": len(found), "offset": offset,
-            "examples": [e.model_dump() for e in found[offset : offset + limit]]}
+    return json_response(ExamplePage, {"total": len(found), "offset": offset,
+                               "examples": [e.model_dump() for e in found[offset : offset + limit]]})
 
 
 def _uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
@@ -593,16 +587,21 @@ def _downloads(srv: Server, urls: list[str]) -> list[services.Blob]:
                                max_total=srv.settings.max_request_bytes, workers=URL_FETCH_WORKERS)
 
 
+UNDO_GROUP = Form(None, max_length=64, description=(
+    "Any id the client chooses for one upload it sends in several requests: consecutive uploads "
+    "to the task with the same id, with no other change in between, are one undo step"))
+
+
 def _errors(r: services.Added) -> list[dict[str, str]]:
     return [{"file": f, "error": why} for f, why in r.errors]
 
 
-def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.Blob] | list[services.Blob]
-                  ) -> dict[str, Any]:
+def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.Blob] | list[services.Blob],
+                  undo_group: str | None = None) -> dict[str, Any]:
     """Add the readable ``blobs`` as examples of ``label``; 400 if none could be added."""
     t = srv.task(name)
     try:
-        r = services.add_examples(t, label, blobs)
+        r = services.add_examples(t, label, blobs, undo_group)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -613,13 +612,14 @@ def _add_examples(srv: Server, name: str, label: str, blobs: Iterator[services.B
 
 
 @router.post("/api/tasks/{name}/examples", status_code=201, response_model=AddResult)
-async def add_examples(srv: Srv, name: str, label: str = Form(...), files: list[UploadFile] = File(...)
-                       ) -> dict[str, Any]:
+async def add_examples(srv: Srv, name: str, label: str = Form(...), files: list[UploadFile] = File(...),
+                       undo_group: str | None = UNDO_GROUP) -> Response:
     """Upload images as examples of ``label``; unreadable files are reported in ``errors``.
 
     Returns 400 when the label is blank or no file could be added.
     """
-    return await srv.run(_add_examples, srv, name, label, _uploads(srv, files))
+    return await srv.render(AddResult, _add_examples, srv, name, label, _uploads(srv, files), undo_group or None,
+                            status=201)
 
 
 def _add_examples_by_url(srv: Server, name: str, body: LabelledUrls) -> dict[str, Any]:
@@ -632,13 +632,13 @@ def _add_examples_by_url(srv: Server, name: str, body: LabelledUrls) -> dict[str
 
 
 @router.post("/api/tasks/{name}/examples/urls", status_code=201, response_model=AddResult)
-async def add_examples_by_url(srv: Srv, name: str, body: LabelledUrls) -> dict[str, Any]:
+async def add_examples_by_url(srv: Srv, name: str, body: LabelledUrls) -> Response:
     """Download images (server started with --allow-urls) and add them as examples of ``label``."""
-    return await srv.run(_add_examples_by_url, srv, name, body)
+    return await srv.render(AddResult, _add_examples_by_url, srv, name, body, status=201)
 
 
 @router.patch("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail)
-def edit_example(srv: Srv, name: str, eid: str, body: ExampleEdit) -> dict[str, Any]:
+def edit_example(srv: Srv, name: str, eid: str, body: ExampleEdit) -> Response:
     """Move an example to another (possibly new) class, and/or set its tags or note, as one change
     (one undo step)."""
     t = srv.task(name)
@@ -650,22 +650,22 @@ def edit_example(srv: Srv, name: str, eid: str, body: ExampleEdit) -> dict[str, 
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.delete("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail)
-def delete_example(srv: Srv, name: str, eid: str) -> dict[str, Any]:
+def delete_example(srv: Srv, name: str, eid: str) -> Response:
     """Delete one example."""
     t = srv.task(name)
     try:
         t.delete_example(eid)
     except KeyError as e:
         raise _missing(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.patch("/api/tasks/{name}/examples", response_model=TaskDetail)
-def edit_examples(srv: Srv, name: str, body: BulkEdit) -> dict[str, Any]:
+def edit_examples(srv: Srv, name: str, body: BulkEdit) -> Response:
     """Move several examples to another (possibly new) class and/or tag them, as one change (one
     undo step); an unknown id changes nothing (404)."""
     t = srv.task(name)
@@ -678,18 +678,18 @@ def edit_examples(srv: Srv, name: str, body: BulkEdit) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 @router.post("/api/tasks/{name}/examples/delete", response_model=TaskDetail)
-def delete_examples(srv: Srv, name: str, body: ExampleIds) -> dict[str, Any]:
+def delete_examples(srv: Srv, name: str, body: ExampleIds) -> Response:
     """Delete several examples; an unknown id deletes nothing (404)."""
     t = srv.task(name)
     try:
         t.delete_examples(body.ids)
     except KeyError as e:
         raise _missing(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 CACHE_FOREVER = {"Cache-Control": "max-age=31536000, immutable"}  # image ids are content hashes
@@ -723,11 +723,12 @@ async def example_image(srv: Srv, name: str, eid: str,
 
 
 # ---- inbox --------------------------------------------------------------
-def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[services.Blob]) -> dict[str, Any]:
+def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[services.Blob],
+               undo_group: str | None = None) -> dict[str, Any]:
     """Put the readable ``blobs`` in the inbox; 400 if none could be added."""
     t = srv.task(name)
     try:
-        r = services.add_to_inbox(t, blobs)
+        r = services.add_to_inbox(t, blobs, undo_group)
     except KeyError as e:
         raise _missing(e) from e
     if not r.added:
@@ -737,9 +738,11 @@ def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[ser
 
 
 @router.post("/api/tasks/{name}/inbox", status_code=201, response_model=InboxAdded)
-async def add_to_inbox(srv: Srv, name: str, files: list[UploadFile] = File(...)) -> dict[str, Any]:
+async def add_to_inbox(srv: Srv, name: str, files: list[UploadFile] = File(...),
+                       undo_group: str | None = UNDO_GROUP) -> Response:
     """Upload unlabelled images to the task's inbox, to label later with the model's suggestions."""
-    return await srv.run(_add_inbox, srv, name, _uploads(srv, files))
+    return await srv.render(InboxAdded, _add_inbox, srv, name, _uploads(srv, files), undo_group or None,
+                            status=201)
 
 
 def _add_inbox_by_url(srv: Server, name: str, urls: list[str]) -> dict[str, Any]:
@@ -748,9 +751,9 @@ def _add_inbox_by_url(srv: Server, name: str, urls: list[str]) -> dict[str, Any]
 
 
 @router.post("/api/tasks/{name}/inbox/urls", status_code=201, response_model=InboxAdded)
-async def add_urls_to_inbox(srv: Srv, name: str, body: Urls) -> dict[str, Any]:
+async def add_urls_to_inbox(srv: Srv, name: str, body: Urls) -> Response:
     """Download images (server started with --allow-urls) into the task's inbox."""
-    return await srv.run(_add_inbox_by_url, srv, name, body.urls)
+    return await srv.render(InboxAdded, _add_inbox_by_url, srv, name, body.urls, status=201)
 
 
 def _inbox_page(srv: Server, name: str, sort: str, offset: int, limit: int) -> dict[str, Any]:
@@ -763,14 +766,14 @@ def _inbox_page(srv: Server, name: str, sort: str, offset: int, limit: int) -> d
 
 @router.get("/api/tasks/{name}/inbox", response_model=InboxPage)
 async def list_inbox(srv: Srv, name: str, sort: str = Query("uncertain", pattern="^(uncertain|confident|novel|added)$"),
-                     offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+                     offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)) -> Response:
     """The inbox with suggestions: ``uncertain`` first (the most useful to label), ``confident``
     first (to accept in bulk), ``novel`` first (unlike any example), or as ``added``."""
-    return await srv.run(_inbox_page, srv, name, sort, offset, limit)
+    return await srv.render(InboxPage, _inbox_page, srv, name, sort, offset, limit)
 
 
 @router.post("/api/tasks/{name}/inbox/accept", response_model=TaskDetail)
-def accept_inbox(srv: Srv, name: str, body: InboxLabels) -> dict[str, Any]:
+def accept_inbox(srv: Srv, name: str, body: InboxLabels) -> Response:
     """Label inbox images, moving them to the examples (one undo step); 404 if an id isn't waiting."""
     t = srv.task(name)
     try:
@@ -779,7 +782,7 @@ def accept_inbox(srv: Srv, name: str, body: InboxLabels) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 def _accept_confident(srv: Server, name: str, body: AcceptConfident) -> dict[str, Any]:
@@ -792,21 +795,21 @@ def _accept_confident(srv: Server, name: str, body: AcceptConfident) -> dict[str
 
 
 @router.post("/api/tasks/{name}/inbox/accept-confident", response_model=TaskDetail)
-async def accept_confident(srv: Srv, name: str, body: AcceptConfident) -> dict[str, Any]:
+async def accept_confident(srv: Srv, name: str, body: AcceptConfident) -> Response:
     """Label as the model suggests every inbox image (of ``ids``, if given) it is at least
     ``min_confidence`` sure of and doesn't reject, in one undo step."""
-    return await srv.run(_accept_confident, srv, name, body)
+    return await srv.render(TaskDetail, _accept_confident, srv, name, body)
 
 
 @router.post("/api/tasks/{name}/inbox/dismiss", response_model=TaskDetail)
-def dismiss_inbox(srv: Srv, name: str, body: ExampleIds) -> dict[str, Any]:
+def dismiss_inbox(srv: Srv, name: str, body: ExampleIds) -> Response:
     """Remove images from the inbox without labelling them (undo brings them back)."""
     t = srv.task(name)
     try:
         t.dismiss(body.ids)
     except KeyError as e:
         raise _missing(e) from e
-    return _detail(t)
+    return _task_json(t)
 
 
 # ---- inference ----------------------------------------------------------
@@ -836,10 +839,10 @@ def _predict(srv: Server, name: str, blobs: Iterator[services.Blob] | list[servi
 @router.post("/api/tasks/{name}/predict", response_model=list[PredictionOut])
 async def predict(srv: Srv, name: str, files: list[UploadFile] = File(...),  # pylint: disable=too-many-arguments,too-many-positional-arguments
                   top_k: int | None = TOP_K, evidence: int = EVIDENCE,
-                  revision: int | None = REVISION) -> list[dict[str, Any]]:
+                  revision: int | None = REVISION) -> Response:
     """Classify uploaded images; an unreadable file gets ``error`` set instead of a label. Each
     prediction says which ``revision`` of the task made it."""
-    return await srv.run(_predict, srv, name, _uploads(srv, files), top_k, evidence, revision)
+    return await srv.render(list[PredictionOut], _predict, srv, name, _uploads(srv, files), top_k, evidence, revision)
 
 
 def _predict_urls(srv: Server, name: str, urls: list[str], top_k: int | None, evidence: int,  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -850,9 +853,9 @@ def _predict_urls(srv: Server, name: str, urls: list[str], top_k: int | None, ev
 
 @router.post("/api/tasks/{name}/predict/urls", response_model=list[PredictionOut])
 async def predict_urls(srv: Srv, name: str, body: Urls, top_k: int | None = TOP_K,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                       evidence: int = EVIDENCE, revision: int | None = REVISION) -> list[dict[str, Any]]:
+                       evidence: int = EVIDENCE, revision: int | None = REVISION) -> Response:
     """Download images (server started with --allow-urls) and classify them; ``file`` is the URL."""
-    return await srv.run(_predict_urls, srv, name, body.urls, top_k, evidence, revision)
+    return await srv.render(list[PredictionOut], _predict_urls, srv, name, body.urls, top_k, evidence, revision)
 
 
 def _duplicates(srv: Server, name: str, threshold: float, limit: int) -> list[dict[str, Any]]:
@@ -864,9 +867,9 @@ def _duplicates(srv: Server, name: str, threshold: float, limit: int) -> list[di
 
 @router.get("/api/tasks/{name}/duplicates", response_model=list[DuplicatePair])
 async def duplicates(srv: Srv, name: str, threshold: float = Query(0.95, ge=0.5, le=1.0),
-                     limit: int = Query(200, ge=1, le=5000)) -> list[dict[str, Any]]:
+                     limit: int = Query(200, ge=1, le=5000)) -> Response:
     """Pairs of near-identical examples (cosine similarity >= ``threshold``), most similar first."""
-    return await srv.run(_duplicates, srv, name, threshold, limit)
+    return await srv.render(list[DuplicatePair], _duplicates, srv, name, threshold, limit)
 
 
 def _evaluate(srv: Server, name: str, folds: int | None) -> dict[str, Any]:
@@ -878,10 +881,10 @@ def _evaluate(srv: Server, name: str, folds: int | None) -> dict[str, Any]:
 
 
 @router.post("/api/tasks/{name}/evaluate", response_model=EvalReport)
-async def evaluate(srv: Srv, name: str, folds: int | None = None) -> dict[str, Any]:
+async def evaluate(srv: Srv, name: str, folds: int | None = None) -> Response:
     """Cross-validate the task (leave-one-out unless ``folds`` is given). For a large task, prefer
     POST .../evaluate/jobs, which reports progress and can be cancelled."""
-    return await srv.run(_evaluate, srv, name, folds)
+    return await srv.render(EvalReport, _evaluate, srv, name, folds)
 
 
 # ---- background jobs ----------------------------------------------------
@@ -892,23 +895,24 @@ def _job(srv: Server, jid: str) -> Job:
     return job
 
 
-def _start(srv: Server, job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> dict[str, Any]:
+def _start(srv: Server, job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> Response:
     """Start ``job``, or return the same one already running; 429 if ``MAX_JOBS`` are running."""
     try:
-        return srv.jobs.start(job, work, limit=MAX_JOBS).to_dict()
+        return json_response(JobOut, srv.jobs.start(job, work, limit=MAX_JOBS).to_dict(), 202)
     except TooManyJobs:
         raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished") from None
 
 
 @router.post("/api/tasks/{name}/evaluate/jobs", status_code=202, response_model=JobOut)
-def start_evaluation(srv: Srv, name: str, folds: int | None = None) -> dict[str, Any]:
+def start_evaluation(srv: Srv, name: str, folds: int | None = None) -> Response:
     """Start cross-validating the task in the background; poll GET /api/jobs/{id} for progress
     (stage "embedding" counts images, "evaluating" counts folds) and the report. The same
     evaluation of the same version already running is shared rather than started again."""
     t = srv.task(name)
     if folds is not None and folds < 2:
         raise HTTPException(400, f"folds must be at least 2, got {folds}")
-    job = Job(task=name, kind="evaluate" if folds is None else f"evaluate:{folds}", revision=t.config.revision)
+    job = Job(task=name, kind="evaluate" if folds is None else f"evaluate:{folds}", revision=t.config.revision,
+              uid=t.config.uid)
     return _start(srv, job, lambda progress: services.evaluate(srv.pipe, t, folds, progress))
 
 
@@ -916,7 +920,7 @@ MAX_COMPARED = 8  # embedders per comparison
 
 
 @router.post("/api/tasks/{name}/compare/jobs", status_code=202, response_model=JobOut)
-def start_comparison(srv: Srv, name: str, body: Compare) -> dict[str, Any]:
+def start_comparison(srv: Srv, name: str, body: Compare) -> Response:
     """Start cross-validating the task with each of ``embedders`` in the background (the same
     allowlist as choosing a task's embedder applies); the job's result compares their accuracy.
     Stages are like "2/3 embedding"."""
@@ -933,23 +937,24 @@ def start_comparison(srv: Srv, name: str, body: Compare) -> dict[str, Any]:
         raise HTTPException(400, "Task has no examples to evaluate")
     for s in specs:
         srv.allowed_embedder(s)  # loaded by the job: a model that fails is reported in its result
-    job = Job(task=name, kind="compare", revision=t.config.revision, key=f"{body.folds}:" + "\n".join(specs))
+    job = Job(task=name, kind="compare", revision=t.config.revision, uid=t.config.uid,
+              key=f"{body.folds}:" + "\n".join(specs))
     return _start(srv, job, lambda progress: compare_embedders(srv.pipe, t, specs, body.folds, progress=progress))
 
 
 @router.get("/api/jobs/{jid}", response_model=JobOut)
-async def get_job(srv: Srv, jid: str) -> dict[str, Any]:
+def get_job(srv: Srv, jid: str) -> Response:
     """A job's status, progress and (once done) result."""
-    return _job(srv, jid).to_dict()
+    return json_response(JobOut, _job(srv, jid).to_dict())
 
 
 @router.delete("/api/jobs/{jid}", response_model=JobOut)
-async def cancel_job(srv: Srv, jid: str) -> dict[str, Any]:
+def cancel_job(srv: Srv, jid: str) -> Response:
     """Ask a running job to stop: its status becomes "cancelling" (no longer counted against the
     job limit), then "cancelled" at its next progress step."""
     job = _job(srv, jid)
     job.request_cancel()
-    return job.to_dict()
+    return json_response(JobOut, job.to_dict())
 
 
 # ---- web UI -------------------------------------------------------------

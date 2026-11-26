@@ -154,11 +154,12 @@ class Client:
         return self._upload(f"/tasks/{_seg(task)}/inbox", images, {})
 
     def _upload(self, path: str, images: Iterable[Image], fields: dict[str, str]) -> dict[str, Any]:
-        """POST ``images`` a batch at a time; ``added`` and ``errors`` are combined, ``task`` is the
-        last. A batch refused with 400 (nothing in it added) adds its reason to ``errors``; if every
-        batch was refused, the first refusal is raised."""
+        """POST ``images`` a batch at a time, all one undo step; ``added`` and ``errors`` are
+        combined, ``task`` is the last. A batch refused with 400 (nothing in it added) adds its
+        reason to ``errors``; if every batch was refused, the first refusal is raised."""
         out: dict[str, Any] = {"added": [], "errors": [], "task": None}
         refused: ApiError | None = None
+        fields = {**fields, "undo_group": uuid.uuid4().hex}  # the batches are one undo step
         for batch in _batches(images, self.batch_bytes()):
             try:
                 r = self.request("POST", path, fields=fields, files=batch)
@@ -199,13 +200,17 @@ class Client:
         """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...).
 
         Runs as a background job on the server, polled every ``poll`` seconds, so a long evaluation
-        isn't cut off by the request timeout. A failed or cancelled job raises ``ApiError``."""
+        isn't cut off by the request timeout. A failed or cancelled job raises ``ApiError``, as
+        does (410) one whose report the server dropped before it was fetched."""
         job = self.request("POST", f"/tasks/{_seg(task)}/evaluate/jobs", params={"folds": folds})
         while job["status"] in {"running", "cancelling"}:
             time.sleep(poll)
             job = self.request("GET", f"/jobs/{_seg(job['id'])}")
         if job["status"] != "done":
             raise ApiError(409 if job["status"] == "cancelled" else 400, job["error"] or f"Evaluation {job['status']}")
+        if job["result"] is None:  # finished, but the server has dropped the report since
+            raise ApiError(410, "The evaluation finished, but the server no longer keeps its report (it keeps "
+                                "only the most recent ones); evaluate again")
         return job["result"]  # type: ignore[no-any-return]
 
 

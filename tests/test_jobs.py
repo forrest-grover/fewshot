@@ -97,6 +97,32 @@ def test_jobs_are_capped_and_shared(client, monkeypatch):
     wait_for_job(client, first["id"])
 
 
+def test_a_recreated_task_doesnt_get_the_old_tasks_job(client, monkeypatch):
+    """Jobs are shared by the task's uid, not its name: a task deleted and made again under the
+    same name, at the same revision, gets its own evaluation."""
+    task = api_task(client, n=1)
+    release = threading.Event()
+    seen = []
+    real = fewshot.evaluate.evaluate_task
+
+    def slow(pipe, t, folds, progress):
+        seen.append(t.config.uid)
+        release.wait(5)
+        return real(pipe, t, folds, progress=progress)
+
+    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", slow)
+    first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()
+    revision = client.get(f"/api/tasks/{task}").json()["revision"]
+    assert client.delete(f"/api/tasks/{task}").status_code == 204
+    assert api_task(client, n=1) == task
+    assert client.get(f"/api/tasks/{task}").json()["revision"] == revision
+    second = client.post(f"/api/tasks/{task}/evaluate/jobs").json()
+    assert second["id"] != first["id"]
+    release.set()
+    assert [wait_for_job(client, j["id"])["status"] for j in (first, second)] == ["done", "done"]
+    assert len(set(seen)) == 2
+
+
 def test_a_cancelled_evaluation_is_not_shared(client, monkeypatch):
     """An evaluation asked to stop, though still running, isn't handed to the next request."""
     task = api_task(client, n=1)

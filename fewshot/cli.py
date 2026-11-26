@@ -872,9 +872,13 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
     hosts = allowed_host or from_env or list(LOCAL_HOSTS)
     if not (allowed_host or from_env or local):
         hosts += sorted({socket.gethostname().lower(), socket.getfqdn().lower()} - {""})
-    settings = ServerSettings(home=root, token=token, allow_any_model=allow_any_model, warm=warm,
-                              allow_urls=allow_urls, allowed_hosts=frozenset(hosts), max_upload_mb=max_upload_mb,
-                              max_request_mb=max_request_mb, forwarded_allow_ips=forwarded_allow_ips, workers=workers)
+    try:
+        settings = ServerSettings(home=root, token=token, allow_any_model=allow_any_model, warm=warm,
+                                  allow_urls=allow_urls, allowed_hosts=frozenset(hosts), max_upload_mb=max_upload_mb,
+                                  max_request_mb=max_request_mb, forwarded_allow_ips=forwarded_allow_ips,
+                                  workers=workers)
+    except ValueError as e:  # a token too weak; the other options are checked by their types
+        _fail(f"{e} (--token / FEWSHOT_TOKEN)")
     if not token and not local:
         typer.secho(f"Warning: serving on {host} without --token: anyone who can reach this port can read and "
                     "change every task.", fg="yellow", err=True)

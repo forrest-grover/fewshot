@@ -467,9 +467,9 @@ def test_serve_settings(monkeypatch):
     r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--no-warm", "--allow-any-model")
     assert "Warning: serving on 0.0.0.0 without --token" in r.output
     assert (srv.settings.allow_any_model, srv.settings.warm) == (True, False)
-    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--token", "t0k")
+    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--token", "t0ken-for-the-cli")
     assert "Warning" not in r.output
-    assert srv.settings.token == "t0k"
+    assert srv.settings.token == "t0ken-for-the-cli"
     names = srv.settings.allowed_hosts  # local names and this machine's, never any
     assert {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()} <= names
     assert "*" not in names
@@ -480,6 +480,16 @@ def test_serve_settings(monkeypatch):
     assert served(monkeypatch, "--host", "0.0.0.0")[1].settings.allowed_hosts == {"box.lan", "10.0.0.5"}
     # The option wins.
     assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "a.lan")[1].settings.allowed_hosts == {"a.lan"}
+
+
+def test_serve_refuses_a_weak_token(monkeypatch):
+    """A token that could be guessed stops serve before it starts, saying why."""
+    monkeypatch.setattr("uvicorn.run", lambda *a, **kw: pytest.fail("started"))
+    monkeypatch.setenv("FEWSHOT_TOKEN", "hunter2")
+    r = CliRunner().invoke(cli.app, ["serve"])
+    assert r.exit_code == 1
+    assert "The token is too weak to be safe: it has 7 characters" in r.output
+    assert "(--token / FEWSHOT_TOKEN)" in r.output
 
 
 def test_folders_and_broken_links_with_image_names_are_skipped(run, task, photos, tmp_path):

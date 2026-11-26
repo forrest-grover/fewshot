@@ -15,8 +15,8 @@ from tests.conftest import BLUE, RED, png
 
 
 def _serve(tmp_path, **settings):
-    """The API served by uvicorn on a free local port, with token 'secret'; yields its URL."""
-    app = create_app(ServerSettings(home=tmp_path / "ws", token="secret", warm=False, **settings))
+    """The API served by uvicorn on a free local port, with token 'secret-0123456789'; yields its URL."""
+    app = create_app(ServerSettings(home=tmp_path / "ws", token="secret-0123456789", warm=False, **settings))
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -33,7 +33,7 @@ def _serve(tmp_path, **settings):
 
 @pytest.fixture(name="server")
 def server_fixture(tmp_path):
-    """A server with token 'secret'; yields its URL."""
+    """A server with token 'secret-0123456789'; yields its URL."""
     yield from _serve(tmp_path)
 
 
@@ -45,7 +45,7 @@ def small_server_fixture(tmp_path):
 
 def test_client_round_trip(server, tmp_path):
     """Create, add, predict (at a revision), inbox, evaluate and delete through the client."""
-    fs = Client(server, token="secret")
+    fs = Client(server, token="secret-0123456789")
     assert fs.health()["auth_required"] is True
     fs.create_task("my-pets", embedder="fake:color")
     f = tmp_path / "r.png"
@@ -73,7 +73,7 @@ def test_client_errors(server):
         Client(server, token="wrong").tasks()
     assert e.value.status == 401
     with pytest.raises(ApiError, match="HTTP 404") as e:
-        Client(server, token="secret").task("nope")
+        Client(server, token="secret-0123456789").task("nope")
     assert "nope" in e.value.detail
 
 
@@ -101,7 +101,7 @@ def test_operation_ids_are_function_names():
 def test_client_sends_many_images_in_batches(server, monkeypatch):
     """Uploads and predictions go BATCH images per request; the results are combined."""
     monkeypatch.setattr("fewshot.client.BATCH", 2)
-    fs = Client(server, token="secret")
+    fs = Client(server, token="secret-0123456789")
     fs.create_task("batched", embedder="fake:color")
     r = fs.add_examples("batched", "red", [(f"r{i}.png", png(RED, noise=15, seed=i)) for i in range(3)]
                         + [("bad.png", b"not an image")])
@@ -120,7 +120,7 @@ def test_a_refused_batch_doesnt_lose_the_others(server, monkeypatch):
     """A batch the server refuses (nothing in it could be added) becomes an error; only if every
     batch is refused does the call raise, and other errors still raise at once."""
     monkeypatch.setattr("fewshot.client.BATCH", 2)
-    fs = Client(server, token="secret")
+    fs = Client(server, token="secret-0123456789")
     fs.create_task("refused", embedder="fake:color")
     bad = [("x.png", b"junk"), ("y.png", b"junk")]
     r = fs.add_examples("refused", "red", [*bad, ("r.png", png(RED))])
@@ -139,7 +139,7 @@ def test_a_refused_batch_doesnt_lose_the_others(server, monkeypatch):
 def test_uploads_are_batched_by_size(small_server, monkeypatch):
     """Images are sent in batches of at most half the server's request limit, so many large
     images don't make one request the server refuses."""
-    fs = Client(small_server, token="secret")
+    fs = Client(small_server, token="secret-0123456789")
     assert fs.batch_bytes() == 32 * 1024
     fs.create_task("t", embedder="fake:color")
     images = [(f"{i}.png", png(RED, size=64, noise=40, seed=i)) for i in range(8)]
@@ -152,8 +152,10 @@ def test_uploads_are_batched_by_size(small_server, monkeypatch):
         return real(self, method, path, **kw)
 
     monkeypatch.setattr(Client, "request", spy)
-    assert len(fs.add_examples("t", "red", images)["added"]) == 8
+    r = fs.add_examples("t", "red", images)
+    assert len(r["added"]) == 8
     assert len([n for n in sent if n]) > 1
+    assert r["task"]["undo_label"] == "add 8 examples to red"  # the batches are one undo step
     assert len(fs.predict("t", images)) == 8
 
 
@@ -190,7 +192,7 @@ def test_a_reset_upload_hints_at_the_size_limit(monkeypatch):
 
 def test_evaluate_runs_as_a_job(server, monkeypatch):
     """evaluate polls a background job; a failed or cancelled one raises ApiError."""
-    fs = Client(server, token="secret")
+    fs = Client(server, token="secret-0123456789")
     fs.create_task("empty", embedder="fake:color")
     with pytest.raises(ApiError, match="no examples") as e:
         fs.evaluate("empty", poll=0.01)
@@ -200,3 +202,7 @@ def test_evaluate_runs_as_a_job(server, monkeypatch):
     with pytest.raises(ApiError, match="Evaluation cancelled") as e:
         fs.evaluate("empty", poll=0)
     assert e.value.status == 409
+    replies = iter([{"id": "j", "status": "done", "error": None, "result": None, "expired": True}])
+    with pytest.raises(ApiError, match="no longer keeps its report") as e:
+        fs.evaluate("empty", poll=0)
+    assert e.value.status == 410

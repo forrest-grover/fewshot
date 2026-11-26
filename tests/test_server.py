@@ -3,20 +3,24 @@ upload limits, the model allowlist and warm-up."""
 
 import asyncio
 import importlib
+import secrets
 import subprocess
 import sys
 import threading
 import time
 
 import anyio.to_thread
+import pydantic
 import pytest
 
 import fewshot.api
 import fewshot.guard
+import fewshot.responses
+import fewshot.server_settings
 import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
 from fewshot.pipeline import Prediction
-from fewshot.server_settings import MAX_JSON_BYTES, ServerSettings
+from fewshot.server_settings import MAX_BULK_JSON_BYTES, MAX_JSON_BYTES, ServerSettings
 from fewshot.store import Task
 from tests.conftest import RED, api_client, api_task, png, query_files, set_settings
 
@@ -42,6 +46,51 @@ def test_request_size_limit_by_content_length(tmp_path):
     r = client.post("/api/tasks/c/examples", data={"label": "red"}, files=big)
     assert r.status_code == 413
     assert r.json()["detail"] == "Request is larger than the 0.5 MB limit"
+
+
+def test_the_body_limit_comes_from_the_route_not_the_content_type(tmp_path):
+    """Only an upload route takes a large multipart body: a body labelled as an upload gets the
+    JSON limit anywhere else (as on /api/login, which needs no token), and so does a body to an
+    upload route that isn't multipart."""
+    client = api_client(tmp_path, token="0123456789abcdef-token")
+    multipart = {"Content-Type": "multipart/form-data; boundary=x"}
+    body = b"x" * (MAX_JSON_BYTES + 10)
+    for path in ("/api/login", "/api/tasks", "/api/tasks/t/examples/urls", "/api/nowhere", "/"):
+        r = client.post(path, content=body, headers=multipart)
+        assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 1 MB limit"), path
+    for path in ("/api/tasks/t/examples", "/api/tasks/t/inbox", "/api/tasks/t/predict", "/api/tasks/import"):
+        r = client.post(path, content=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        assert r.status_code == 413, path
+        assert client.post(path, content=body, headers=multipart).status_code == 401, path  # past the limit
+    assert client.request("GET", "/api/tasks/t/examples", content=body, headers=multipart).status_code == 413
+    scope = {"path": "/app/api/tasks/import", "root_path": "/app", "method": "POST",
+             "headers": [(b"content-type", b"multipart/form-data")]}
+    root = fewshot.guard.body_limit(ServerSettings().max_request_bytes, scope)
+    assert root == ServerSettings().max_request_bytes
+
+
+@pytest.mark.usefixtures("task_t")
+def test_lists_of_ids_have_a_larger_limit(client):
+    """Bulk edits, deletes and inbox decisions may list tens of thousands of ids (16 MB)."""
+    ids = {"ids": [f"{i:032x}" for i in range(60_000)]}  # about 2.6 MB
+    assert client.patch("/api/tasks/t/examples", json={**ids, "label": "red"}).status_code == 404
+    for path in ("examples/delete", "inbox/dismiss"):
+        assert client.post(f"/api/tasks/t/{path}", json=ids).status_code == 404, path
+    accept = {"labels": {i: "red" for i in ids["ids"]}}
+    assert client.post("/api/tasks/t/inbox/accept", json=accept).status_code == 404
+    assert client.post("/api/tasks/t/inbox/accept-confident", json={**ids, "min_confidence": 0.5}).status_code == 200
+    r = client.post("/api/tasks/t/examples/delete", content=b" " * (MAX_BULK_JSON_BYTES + 1),
+                    headers={"Content-Type": "application/json"})
+    assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 16 MB limit")
+
+
+def test_validation_errors_dont_echo_the_body(client):
+    """A 422 says what is wrong without sending the bad input back."""
+    r = client.post("/api/tasks", json={"name": "x", "junk": "y" * 500_000})
+    assert r.status_code == 422
+    assert len(r.content) < 1000
+    assert r.json()["detail"] == [{"type": "extra_forbidden", "loc": ["body", "junk"],
+                                   "msg": "Extra inputs are not permitted"}]
 
 
 def _asgi(chunks, inner):
@@ -207,11 +256,12 @@ def test_export_headers_and_import_with_another_embedder(client):
 # ---- settings and the app factory ----------------------------------------
 def test_settings_from_the_environment_are_checked():
     """Every setting is read and checked in one place, with a message naming the bad variable."""
-    s = ServerSettings.from_env({"FEWSHOT_TOKEN": "x", "FEWSHOT_WARM": "0", "FEWSHOT_ALLOW_URLS": "yes",
+    s = ServerSettings.from_env({"FEWSHOT_TOKEN": "0123456789abcdef", "FEWSHOT_WARM": "0", "FEWSHOT_ALLOW_URLS": "yes",
                                  "FEWSHOT_ALLOWED_HOSTS": "a.lan, B.lan:8000", "FEWSHOT_MAX_UPLOAD_MB": "2",
                                  "FEWSHOT_WORKERS": "3", "FEWSHOT_HOME": "/w",
                                  "FEWSHOT_FORWARDED_ALLOW_IPS": "10.0.0.1"})
-    assert (s.token, s.warm, s.allow_urls, s.allowed_hosts) == ("x", False, True, frozenset({"a.lan", "b.lan"}))
+    assert (s.token, s.warm, s.allow_urls) == ("0123456789abcdef", False, True)
+    assert s.allowed_hosts == {"a.lan", "b.lan"}
     assert (s.max_upload_bytes, s.workers, str(s.home), s.forwarded_allow_ips) == (2 * 2**20, 3, "/w", "10.0.0.1")
     d = ServerSettings.from_env({})
     assert (d.token, d.warm, d.max_request_mb) == (None, True, 1024)
@@ -219,7 +269,10 @@ def test_settings_from_the_environment_are_checked():
     for env, message in [({"FEWSHOT_MAX_UPLOAD_MB": "abc"}, "FEWSHOT_MAX_UPLOAD_MB must be a number"),
                          ({"FEWSHOT_MAX_REQUEST_MB": "-5"}, "FEWSHOT_MAX_REQUEST_MB must be a positive number"),
                          ({"FEWSHOT_MAX_UPLOAD_MB": "inf"}, "must be a positive number"),
-                         ({"FEWSHOT_WARM": "maybe"}, "FEWSHOT_WARM must be 1 or 0")]:
+                         ({"FEWSHOT_WARM": "maybe"}, "FEWSHOT_WARM must be 1 or 0"),
+                         ({"FEWSHOT_WORKERS": "0.5"}, "FEWSHOT_WORKERS must be a whole number from 1 to 256"),
+                         ({"FEWSHOT_WORKERS": "300"}, "FEWSHOT_WORKERS must be a whole number"),
+                         ({"FEWSHOT_TOKEN": "s3cret"}, "FEWSHOT_TOKEN is too weak to be safe: it has 6 characters")]:
         with pytest.raises(ValueError, match=message):
             ServerSettings.from_env(env)
     with pytest.raises(ValueError, match="max_upload_mb must be a positive"):
@@ -227,6 +280,17 @@ def test_settings_from_the_environment_are_checked():
     with pytest.raises(ValueError, match="workers must be between"):
         ServerSettings(workers=0)
     assert ServerSettings(token="  ").token is None
+    assert ServerSettings.from_env({"FEWSHOT_TOKEN": " "}).token is None
+
+
+def test_tokens_that_could_be_guessed_are_refused():
+    """A token must have at least 16 characters, of at least 5 different ones; random ones pass."""
+    for weak, why in [("short-token", "it has 11 characters"), ("a" * 40, "it repeats 1 different characters"),
+                      ("1234" * 8, "it repeats 4 different characters")]:
+        with pytest.raises(ValueError, match=f"The token is too weak to be safe: {why}"):
+            ServerSettings(token=weak)
+    for good in ("0123456789abcdef", secrets.token_hex(16), secrets.token_urlsafe(12), "correct horse battery"):
+        assert ServerSettings(token=good).token == good
 
 
 def test_importing_the_api_reads_no_settings_and_makes_no_workspace(tmp_path, monkeypatch):
@@ -302,6 +366,19 @@ def test_heavy_work_waits_on_its_own_threads(tmp_path, monkeypatch):
     assert done == [200]
 
 
+def test_the_app_can_be_started_again(tmp_path):
+    """Stopping the app stops its heavy-work threads, and starting it again makes new ones, so an
+    app can be served (or tested) more than once."""
+    c = api_client(tmp_path)
+    c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
+    c.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(1))
+    for _ in range(2):
+        with c:
+            assert c.post("/api/tasks/t/predict", files=query_files(1)).status_code == 200
+    c.srv.stop_heavy()  # stopping twice is harmless
+    assert c.post("/api/tasks/t/predict", files=query_files(1)).status_code == 200
+
+
 # ---- uploads -------------------------------------------------------------
 @pytest.mark.usefixtures("task_t")
 def test_uploads_are_read_and_classified_a_chunk_at_a_time(client, monkeypatch):
@@ -327,9 +404,9 @@ def test_added_images_are_handed_over_lazily(client, monkeypatch):
     kinds = []
     real = Task.add_examples
 
-    def spy(self, items, chunk=256):
+    def spy(self, items, chunk=256, **kw):
         kinds.append(isinstance(items, list))
-        return real(self, items, chunk)
+        return real(self, items, chunk, **kw)
 
     monkeypatch.setattr(Task, "add_examples", spy)
     assert client.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(3)).status_code == 201
@@ -344,3 +421,84 @@ def test_json_bodies_have_a_small_limit(client):
     assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 1 MB limit")
     assert client.post("/api/tasks/t/examples", data={"label": "red"},
                        files=[("files", ("big.png", png(RED, size=800, noise=60), "image/png"))]).status_code == 201
+
+
+# ---- responses -------------------------------------------------------------
+@pytest.mark.usefixtures("task_t")
+def test_responses_are_built_off_the_event_loop(client, monkeypatch):
+    """Validating and serialising a response (which for a large task takes long enough to stall
+    every other request) happens in the request's thread, never on the event loop."""
+    loops = []
+    real = fewshot.responses.render
+
+    def spy(model, content):
+        try:
+            asyncio.get_running_loop()
+            loops.append(model)
+        except RuntimeError:
+            pass
+        return real(model, content)
+
+    monkeypatch.setattr(fewshot.responses, "render", spy)
+    with client:
+        assert client.get("/api/tasks/t").status_code == 200
+        assert client.get("/api/tasks").status_code == 200
+        assert client.post("/api/tasks/t/predict", files=query_files(1)).status_code == 200
+        assert client.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(1)).status_code == 201
+        jid = client.post("/api/tasks/t/evaluate/jobs").json()["id"]
+        assert client.get(f"/api/jobs/{jid}").status_code == 200
+    assert not loops
+
+
+@pytest.mark.usefixtures("task_t")
+def test_long_lists_are_rendered_in_chunks_with_the_same_result(client, monkeypatch):
+    """A response with a long list is validated and serialised a chunk at a time (so the GIL is
+    let go in between), giving the same JSON as rendering it whole."""
+    client.post("/api/tasks/t/examples", data={"label": "blue"}, files=query_files(5, rgb=(0, 0, 255)))
+    whole = client.get("/api/tasks/t").content
+    preds = client.post("/api/tasks/t/predict", files=query_files(5)).content
+    monkeypatch.setattr(fewshot.responses, "RENDER_CHUNK", 2)
+    assert client.get("/api/tasks/t").content == whole
+    assert client.post("/api/tasks/t/predict", files=query_files(5)).content == preds
+
+    class Listing(pydantic.BaseModel):  # pylint: disable=missing-class-docstring
+        xs: list[int]
+        note: str = "none"
+
+    class Strict(pydantic.BaseModel):  # pylint: disable=missing-class-docstring
+        xs: list[int]
+        note: str
+
+    assert fewshot.responses.render(Listing, {"xs": [1, 2, 3]}) == b'{"xs":[1,2,3],"note":"none"}'
+    with pytest.raises(pydantic.ValidationError, match="note"):
+        fewshot.responses.render(Strict, {"xs": [1, 2, 3]})
+
+
+def test_choosing_a_model_loads_it_on_the_heavy_work_threads(client, monkeypatch):
+    """Creating a task or switching its embedder, which loads the model, waits on the server's
+    own threads, like other heavy work."""
+    threads = []
+    monkeypatch.setattr(client.srv, "check_embedder", lambda _spec: threads.append(threading.current_thread().name))
+    assert client.post("/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 201
+    assert client.patch("/api/tasks/t", json={"embedder": "fake:other"}).status_code == 200
+    assert len(threads) == 2
+    assert all(name.startswith("fewshot-work") for name in threads)
+
+
+def test_several_processes_are_noticed_and_warned_about(client, monkeypatch, caplog):
+    """uvicorn's or gunicorn's --workers (or WEB_CONCURRENCY) count as processes, fewshot serve's
+    --workers (threads) doesn't; a server started with several warns, as its state is per process."""
+    count = fewshot.server_settings.requested_processes
+    uvicorn = ["/venv/bin/uvicorn", "fewshot.api:app"]
+    assert count([*uvicorn, "--workers", "4"], {}) == 4
+    assert count([*uvicorn, "--workers=3"], {}) == 3
+    assert count(["/venv/lib/uvicorn/__main__.py", "fewshot.api:app", "--workers", "x"], {}) == 1
+    assert count(["/venv/bin/python", "/venv/bin/gunicorn", "-w", "2"], {}) == 2
+    assert count([*uvicorn, "--workers"], {"WEB_CONCURRENCY": "5"}) == 5
+    assert count(["/venv/bin/fewshot", "serve", "--workers", "8"], {}) == 1
+    assert count([], {}) == 1
+    assert count() == 1  # these tests
+    monkeypatch.setattr(fewshot.api, "requested_processes", lambda: 2)
+    with caplog.at_level("WARNING", logger="fewshot.api"), client:
+        pass
+    assert "started with 2 processes, which isn't supported" in caplog.text

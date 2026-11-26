@@ -478,27 +478,26 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         return result
 
     def add_examples(self, items: Iterable[tuple[bytes, str, str]],
-                     chunk: int = ADD_CHUNK) -> list[Example | ValueError]:
+                     chunk: int = ADD_CHUNK, undo_group: str | None = None) -> list[Example | ValueError]:
         """Store ``(image bytes, label, source)`` items, like ``add_example`` but with one save per
-        ``chunk`` items instead of one per image.
+        ``chunk`` items instead of one per image, and one undo step for the whole call. Calls with
+        the same ``undo_group`` (any string the caller chooses, e.g. for one upload sent in several
+        requests) that follow each other, with no other change in between, share one undo step too.
 
         Returns one entry per item: its ``Example``, or the ``ValueError`` that kept it out (an
         unreadable image or a bad class name). Images are decoded to check them before the task is
         locked, so a long import doesn't block other writers for its whole length; ``items`` may be
         a generator, and only one chunk of image bytes is held at a time.
         """
+        group = ("examples", undo_group or f"call:{uuid.uuid4().hex}")
         results: list[Example | ValueError] = []
-        recorded = False
         for batch in chunked(items, chunk):
-            part = self._add_batch(batch, record=not recorded)
-            results += part
-            recorded = recorded or any(not isinstance(r, ValueError) for r in part)
+            results += self._add_batch(batch, group)
         return results
 
-    def _add_batch(self, batch: list[tuple[bytes, str, str]], record: bool = True) -> list[Example | ValueError]:
-        """Add one chunk (saving unless every item failed). Only the first chunk of an
-        ``add_examples`` call that saves keeps the version before it for undo (``record``), so one
-        undo takes back the whole call."""
+    def _add_batch(self, batch: list[tuple[bytes, str, str]], group: tuple[str, str]) -> list[Example | ValueError]:
+        """Add one chunk (saving unless every item failed), in undo group ``group`` (see
+        ``_save_in_group``), so one undo takes back the whole call or group."""
         checked = [_check_item(*item) for item in batch]  # decoding happens here, before locking
         out: list[Example | ValueError] = []
         created: list[str] = []
@@ -527,7 +526,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                 out.append(ex)
             added = [r.label for r in out if not isinstance(r, ValueError)]
             if added:
-                self._save_new(created, record, f"add {_n(len(added))} to {listed(added)}")
+                self._save_in_group(created, group, len(added), list(dict.fromkeys(added)),
+                                    lambda n, names: f"add {_n(n)} to {listed(names)}")
         return out
 
     def _save_new(self, created: list[str], record: bool, label: str) -> None:

@@ -9,9 +9,12 @@ services:
     environment:
       FEWSHOT_TOKEN: ${FEWSHOT_TOKEN:?set FEWSHOT_TOKEN, e.g. FEWSHOT_TOKEN=$(openssl rand -hex 16)}
       # FEWSHOT_ALLOWED_HOSTS: fewshot.example.com   # the names clients use; IP addresses always work
-      # The proxy's address as the container sees it (Docker's gateway, e.g. 172.17.0.1), so that
-      # wrong tokens are limited per client rather than for everyone behind the proxy:
-      # FEWSHOT_FORWARDED_ALLOW_IPS: 172.17.0.1
+      # Whose X-Forwarded-For to trust: the reverse proxy's address as the container sees it, so
+      # wrong tokens are counted per client rather than for everyone behind the proxy. A proxy on
+      # this machine connects from a Docker gateway address, which is in 172.16.0.0/12 by default;
+      # set it to the proxy's own address if other containers can reach this one, since anything
+      # trusted can claim to forward for any address.
+      FEWSHOT_FORWARDED_ALLOW_IPS: ${FEWSHOT_FORWARDED_ALLOW_IPS:-172.16.0.0/12}
     volumes:
       - fewshot-data:/data      # tasks, images and the embedding cache
       - fewshot-models:/models  # downloaded model weights

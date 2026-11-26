@@ -6,37 +6,40 @@ Module-level limits are read at call time, so a test can change them.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import hmac
 import secrets
 import threading
 import time
 from collections import OrderedDict, deque
 
-LOGIN_FAILURES = 10  # wrong tokens per client within LOGIN_WINDOW before token checks answer 429
+LOGIN_FAILURES = 10  # wrong tokens per client within LOGIN_WINDOW before further wrong ones get 429
 LOGIN_WINDOW = 60.0
 LOGIN_CLIENTS = 10_000  # clients with recent wrong tokens remembered at once (the oldest are forgotten)
 SESSION_DAYS = 30  # how long a login lasts
+REVOKED_KEPT = 100_000  # logged-out sessions remembered at once (those expiring soonest go first)
 
 
 class WrongTokens:
     """Recent wrong tokens per client address, to answer 429 to a client guessing tokens.
 
-    Only wrong tokens make an entry; entries expire after ``LOGIN_WINDOW`` and at most
-    ``LOGIN_CLIENTS`` are kept (the least recently wrong go first), so the map stays small however
-    many addresses guess."""
+    Only wrong tokens make an entry, and each keeps the times of its last ``LOGIN_FAILURES``;
+    they expire after ``LOGIN_WINDOW`` and at most ``LOGIN_CLIENTS`` are kept (the least recently
+    wrong go first), so the map stays small however many addresses guess, however fast."""
 
     def __init__(self) -> None:
         self._seen: OrderedDict[str, deque[float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def _recent(self, client: str, now: float) -> deque[float]:
-        recent = self._seen.get(client, deque())
+        recent = self._seen.get(client, deque(maxlen=LOGIN_FAILURES))
         while recent and now - recent[0] > LOGIN_WINDOW:
             recent.popleft()
         return recent
 
     def blocked(self, client: str) -> bool:
-        """Whether ``client`` gave ``LOGIN_FAILURES`` wrong tokens within the last ``LOGIN_WINDOW``."""
+        """Whether ``client``'s last ``LOGIN_FAILURES`` wrong tokens all came within the last
+        ``LOGIN_WINDOW`` seconds."""
         with self._lock:
             recent = self._recent(client, time.monotonic())
             if not recent:
@@ -60,11 +63,12 @@ class Sessions:
 
     The signature is an HMAC with a key derived from the server token, so the cookie never holds
     the token itself, sessions expire, changing the token ends them all, and logging out revokes
-    that one session (for as long as this server runs)."""
+    that one session (for as long as this server runs; at most ``REVOKED_KEPT`` at once)."""
 
     def __init__(self, token: str) -> None:
         self._key = hmac.new(token.encode(), b"fewshot session key v1", hashlib.sha256).digest()
         self._revoked: dict[str, float] = {}  # nonce -> its session's expiry
+        self._expiring: list[tuple[float, str]] = []  # the same, as a heap: soonest expiry first
         self._lock = threading.Lock()
 
     def _sign(self, payload: str) -> str:
@@ -96,10 +100,14 @@ class Sessions:
             return parsed[0] not in self._revoked
 
     def revoke(self, value: str | None) -> None:
-        """End the session ``value`` (if it is one), forgetting revoked sessions once expired."""
+        """End the session ``value`` (if it is one). Revoked sessions are forgotten once expired,
+        and beyond ``REVOKED_KEPT`` the soonest to expire are forgotten early; either way taking
+        time for the sessions forgotten, not for all of them."""
         parsed = None if value is None else self._parse(value)
         now = time.time()
         with self._lock:
-            self._revoked = {n: exp for n, exp in self._revoked.items() if exp >= now}
-            if parsed is not None:
+            if parsed is not None and parsed[1] >= now and parsed[0] not in self._revoked:
                 self._revoked[parsed[0]] = parsed[1]
+                heapq.heappush(self._expiring, (parsed[1], parsed[0]))
+            while self._expiring and (self._expiring[0][0] < now or len(self._expiring) > REVOKED_KEPT):
+                self._revoked.pop(heapq.heappop(self._expiring)[1], None)

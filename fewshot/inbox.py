@@ -9,7 +9,8 @@ Labelling one moves it to the examples; the model's suggestions for the inbox co
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator, Mapping
+import uuid
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 from .images import image_ext, image_id
@@ -70,7 +71,8 @@ class TaskInbox:
     def _store_image(self, file: str, data: bytes) -> bool:  # pragma: no cover  # Task's
         raise NotImplementedError
 
-    def _save_new(self, created: list[str], record: bool, label: str) -> None:  # pragma: no cover  # Task's
+    def _save_in_group(self, created: list[str], group: tuple[str, str], count: int, names: list[str],  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                       describe: Callable[[int, list[str]], str]) -> None:  # pragma: no cover  # TaskHistory's
         raise NotImplementedError
 
     def _drop_file(self, file: str) -> None:  # pragma: no cover  # Task's
@@ -79,22 +81,20 @@ class TaskInbox:
     def _ensure_class(self, label: str) -> None:  # pragma: no cover  # Task's
         raise NotImplementedError
 
-    def add_to_inbox(self, items: Iterable[tuple[bytes, str]],
-                     chunk: int = INBOX_CHUNK) -> list[InboxItem | ValueError]:
+    def add_to_inbox(self, items: Iterable[tuple[bytes, str]], chunk: int = INBOX_CHUNK,
+                     undo_group: str | None = None) -> list[InboxItem | ValueError]:
         """Store ``(image bytes, source)`` items in the inbox, one save per ``chunk`` and one undo
-        step for the whole call. Returns per item its ``InboxItem`` (the existing one if it is
+        step for the whole call, or for consecutive calls with the same ``undo_group`` (as
+        ``Task.add_examples``). Returns per item its ``InboxItem`` (the existing one if it is
         already waiting) or the ``ValueError`` that kept it out: unreadable, or already labelled."""
+        group = ("inbox", undo_group or f"call:{uuid.uuid4().hex}")
         out: list[InboxItem | ValueError] = []
-        recorded = False  # once a chunk has saved, the version before the call is kept for undo
         for batch in chunked(items, chunk):
-            part, saved = self._inbox_batch(batch, record=not recorded)
-            out += part
-            recorded = recorded or saved
+            out += self._inbox_batch(batch, group)
         return out
 
-    def _inbox_batch(self, batch: list[tuple[bytes, str]],
-                     record: bool) -> tuple[list[InboxItem | ValueError], bool]:
-        """Add one chunk; returns its results and whether it saved (it added an image)."""
+    def _inbox_batch(self, batch: list[tuple[bytes, str]], group: tuple[str, str]) -> list[InboxItem | ValueError]:
+        """Add one chunk, in undo group ``group``."""
         checked = [_decoded(data, source) for data, source in batch]  # before locking, like examples
         out: list[InboxItem | ValueError] = []
         created: list[str] = []  # files this call wrote (an image kept for undo may be there already)
@@ -119,8 +119,8 @@ class TaskInbox:
                     out.append(item)
                     new += 1
             if new:
-                self._save_new(created, record, f"add {plural(new)} to the inbox")
-        return out, new > 0
+                self._save_in_group(created, group, new, [], lambda n, _: f"add {plural(n)} to the inbox")
+        return out
 
     def inbox_item(self, iid: str) -> InboxItem:
         """The inbox image with id ``iid``; ``KeyError`` if it isn't waiting there."""

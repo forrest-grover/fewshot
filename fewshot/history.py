@@ -4,6 +4,11 @@
 task.json, so keeping it is free), ``<rev>.gone`` lists the image files the following change
 stopped using, and ``<rev>.label`` describes that change. ``history/redo/`` holds undone versions
 until another change is made. Image files stay while any kept version names them.
+
+Saves that add images can share one undo step (an *undo group*: the chunks of one call, or the
+requests of one upload a client sent in several): ``<rev>.group`` records the group, what it
+added so far and the revision its last save made. A later save in the same group, while that
+step is still the newest and nothing was saved since, adds to that step instead of making one.
 """
 
 from __future__ import annotations
@@ -14,9 +19,9 @@ import logging
 import os
 import shutil
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -28,6 +33,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 HISTORY_KEPT = 20  # earlier task.json versions kept for undo
+GROUP_NAMES = 4  # class names an undo group keeps for its description
 
 
 class TaskHistory:
@@ -77,7 +83,7 @@ class TaskHistory:
     @staticmethod
     def _forget(snap: Path) -> None:
         """Delete a kept version and its side files."""
-        for suffix in (".json", ".gone", ".label"):
+        for suffix in (".json", ".gone", ".label", ".group"):
             snap.with_suffix(suffix).unlink(missing_ok=True)
 
     @staticmethod
@@ -87,6 +93,49 @@ class TaskHistory:
             return snap.with_suffix(".label").read_text().strip()
         except (OSError, UnicodeDecodeError):
             return ""
+
+    def _save_new(self, created: list[str], record: bool, label: str) -> None:  # pragma: no cover  # Task's
+        raise NotImplementedError
+
+    def _save_in_group(self, created: list[str], group: tuple[str, str], count: int, names: list[str],  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                       describe: Callable[[int, list[str]], str]) -> None:
+        """``_save_new`` for a change adding ``count`` images (to classes ``names``) in undo group
+        ``group``, ``(kind, id)``. If the newest undo step is that group's and nothing was saved
+        since, the change joins it: nothing new is kept for undo, and the step's description
+        (``describe(count, names)``) covers the whole group. Call inside ``_writing``."""
+        kind, gid = group
+        snaps = self._history()
+        info = self._group_of(snaps[-1][1]) if snaps else None
+        joined = info is not None and (info["kind"], info["group"], info["revision"]) == (
+            kind, gid, self.config.revision)
+        if joined and info is not None:
+            count += info["count"]
+            names = list(dict.fromkeys([*info["names"], *names]))
+        before = self.config.revision
+        label = describe(count, names)
+        self._save_new(created, not joined, label)
+        snap = snaps[-1][1] if joined else self.path / "history" / f"{before:010d}.json"
+        record = {"kind": kind, "group": gid, "revision": self.config.revision, "count": count,
+                  "names": names[:GROUP_NAMES]}
+        try:  # the change is saved: failing to note the group only ends it
+            if joined:
+                _write_atomic(snap.with_suffix(".label"), label.encode())
+            if snap.exists():
+                _write_atomic(snap.with_suffix(".group"), json.dumps(record).encode())
+        except OSError:
+            log.exception("%s: the change was saved, but its undo group was not noted", self.path)
+
+    @staticmethod
+    def _group_of(snap: Path) -> dict[str, Any] | None:
+        """The undo group noted for the change after version ``snap``, if any (and readable)."""
+        try:
+            info = json.loads(snap.with_suffix(".group").read_text())
+        except (OSError, ValueError):
+            return None
+        keys = {"kind": str, "group": str, "revision": int, "count": int, "names": list}
+        if not isinstance(info, dict) or not all(isinstance(info.get(k), t) for k, t in keys.items()):
+            return None
+        return info
 
     def _redo_list(self) -> list[tuple[int, Path]]:
         """Undone versions that can be redone, oldest first (the last is redone next)."""

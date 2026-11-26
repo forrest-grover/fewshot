@@ -6,6 +6,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+import fewshot.access
 import fewshot.api
 import fewshot.auth
 import fewshot.guard
@@ -17,18 +18,18 @@ from tests.conftest import RED, api_client, host_client, png
 # ---- tokens and sessions -------------------------------------------------
 def test_token_auth(tmp_path):
     """With a token set, /api needs it as a Bearer header or the login cookie."""
-    client = api_client(tmp_path, token="s3cret")
+    client = api_client(tmp_path, token="s3cret-s3cret-s3cret")
     assert client.get("/api/tasks").status_code == 401
     assert client.get("/api/tasks").headers["www-authenticate"] == "Bearer"
     assert client.get("/api/tasks", headers={"Authorization": "Bearer nope"}).status_code == 401
-    assert client.get("/api/tasks", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    assert client.get("/api/tasks", headers={"Authorization": "Bearer s3cret-s3cret-s3cret"}).status_code == 200
     health = client.get("/api/health")
     assert health.status_code == 200
     assert health.json()["auth_required"] is True
     assert client.get("/docs").status_code == 200  # only /api is protected
 
     assert client.post("/api/login", json={"token": "nope"}).status_code == 401
-    r = client.post("/api/login", json={"token": "s3cret"})
+    r = client.post("/api/login", json={"token": "s3cret-s3cret-s3cret"})
     assert r.status_code == 204
     assert "httponly" in r.headers["set-cookie"].lower()
     assert client.get("/api/tasks").status_code == 200  # the cookie now signs requests in
@@ -50,26 +51,26 @@ def test_logout_without_a_token_configured(client):
 
 
 def _cookie(value):
-    return {"Cookie": f"{fewshot.api.SESSION_COOKIE}={value}"}
+    return {"Cookie": f"{fewshot.access.SESSION_COOKIE}={value}"}
 
 
 def test_the_session_cookie_is_signed_not_the_token(tmp_path):
     """The cookie holds a signed session id that expires and that logout ends; tampering, the
     raw token, or a cookie from a server with another token is refused."""
-    c = api_client(tmp_path, token="s3cret")
-    r = c.post("/api/login", json={"token": "s3cret"})
-    cookie = r.cookies[fewshot.api.SESSION_COOKIE]
-    assert "s3cret" not in r.headers["set-cookie"]
+    c = api_client(tmp_path, token="s3cret-s3cret-s3cret")
+    r = c.post("/api/login", json={"token": "s3cret-s3cret-s3cret"})
+    cookie = r.cookies[fewshot.access.SESSION_COOKIE]
+    assert "s3cret-s3cret-s3cret" not in r.headers["set-cookie"]
     assert "samesite=strict" in r.headers["set-cookie"].lower()
     fresh = TestClient(c.app)
     assert fresh.get("/api/tasks", headers=_cookie(cookie)).status_code == 200
-    for bad in ("s3cret", cookie[:-1] + ("0" if cookie[-1] != "0" else "1"), "v1.1.2.3", "junk"):
+    for bad in ("s3cret-s3cret-s3cret", cookie[:-1] + ("0" if cookie[-1] != "0" else "1"), "v1.1.2.3", "junk"):
         assert fresh.get("/api/tasks", headers=_cookie(bad)).status_code == 401
-    other = api_client(tmp_path / "other", token="changed")
+    other = api_client(tmp_path / "other", token="changed-0123456789")
     assert other.get("/api/tasks", headers=_cookie(cookie)).status_code == 401
     assert c.post("/api/logout").status_code == 204
     assert fresh.get("/api/tasks", headers=_cookie(cookie)).status_code == 401  # revoked
-    sessions = Sessions("s3cret")
+    sessions = Sessions("s3cret-s3cret-s3cret")
     expired = sessions.issue(seconds=-1)
     assert not sessions.valid(expired)
     sessions.revoke(expired)  # forgotten at once: it has expired anyway
@@ -77,43 +78,69 @@ def test_the_session_cookie_is_signed_not_the_token(tmp_path):
     assert not sessions._revoked  # pylint: disable=protected-access
 
 
+def test_revoked_sessions_are_bounded(monkeypatch):
+    """Logged-out sessions are remembered until they expire, at most REVOKED_KEPT at once (those
+    expiring soonest are forgotten first), so logging out stays cheap however many do."""
+    monkeypatch.setattr(fewshot.auth, "REVOKED_KEPT", 2)
+    sessions = Sessions("s3cret-s3cret-s3cret")
+    values = [sessions.issue(seconds=100 + i) for i in range(3)]
+    for v in values:
+        sessions.revoke(v)
+    sessions.revoke(values[2])  # again: no second entry
+    assert [sessions.valid(v) for v in values] == [True, False, False]  # the soonest to expire went
+    assert len(sessions._expiring) == len(sessions._revoked) == 2  # pylint: disable=protected-access
+    monkeypatch.setattr(time, "time", lambda: 10**12)  # long after they all expired
+    sessions.revoke(None)
+    assert not sessions._revoked  # pylint: disable=protected-access
+
+
 # ---- wrong tokens --------------------------------------------------------
-def test_login_is_rate_limited_and_secure_over_https(tmp_path, monkeypatch):
-    """Too many wrong tokens get 429 for a while; over HTTPS the cookie is Secure."""
+# These changed on purpose: wrong tokens past the limit get 429, but the right token is always
+# accepted (it used to get 429 too, which let one stranger behind a shared address lock out
+# everyone there). Guessing it is ruled out by refusing weak tokens instead (test_server.py).
+TOKEN = "s3cret-s3cret-s3cret"
+
+
+def test_wrong_logins_are_limited_and_the_cookie_is_secure_over_https(tmp_path, monkeypatch):
+    """Past the limit wrong tokens get 429 while the right one still signs in; the limit lasts
+    until wrong tokens have stopped for a window. Over HTTPS the cookie is Secure."""
     monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
-    c = api_client(tmp_path, token="s3cret")
+    c = api_client(tmp_path, token=TOKEN)
     assert c.post("/api/login", json={"token": "a"}).status_code == 401
     assert c.post("/api/login", json={"token": "b"}).status_code == 401
-    r = c.post("/api/login", json={"token": "s3cret"})
-    assert (r.status_code, r.json()["detail"]) == (429, "Too many wrong tokens; try again in a minute")
-    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)  # the window has passed
-    r = c.post("/api/login", json={"token": "s3cret"})
+    r = c.post("/api/login", json={"token": "c"})
+    assert (r.status_code, r.json()["detail"]) == (429, "Too many wrong tokens from this address; try again in a "
+                                                        "minute")
+    r = c.post("/api/login", json={"token": TOKEN})
     assert r.status_code == 204
     assert "secure" not in r.headers["set-cookie"].lower()
+    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)  # the window has passed
+    assert c.post("/api/login", json={"token": "d"}).status_code == 401
     https = TestClient(c.app, base_url="https://testserver")
-    assert "secure" in https.post("/api/login", json={"token": "s3cret"}).headers["set-cookie"].lower()
+    assert "secure" in https.post("/api/login", json={"token": TOKEN}).headers["set-cookie"].lower()
 
 
 def test_wrong_tokens_on_any_request_count_towards_the_limit(tmp_path, monkeypatch):
     """Guessing with Bearer tokens is limited like /api/login (no token at all isn't a guess, and
-    a session cookie can't be guessed), and the limit then covers login too."""
-    api = fewshot.api
+    a session cookie can't be guessed), and the limit then covers login too; the right token
+    works throughout."""
     monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
-    c = api_client(tmp_path, token="s3cret")
+    c = api_client(tmp_path, token=TOKEN)
     for _ in range(3):
         assert c.get("/api/tasks").status_code == 401
-        assert c.get("/api/tasks", headers={"Cookie": f"{api.SESSION_COOKIE}=b"}).status_code == 401
+        assert c.get("/api/tasks", headers={"Cookie": f"{fewshot.access.SESSION_COOKIE}=b"}).status_code == 401
     assert c.get("/api/tasks", headers={"Authorization": "Bearer a"}).status_code == 401
     assert c.get("/api/tasks", headers={"Authorization": "Bearer b"}).status_code == 401
-    r = c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"})
-    assert (r.status_code, r.json()["detail"]) == (429, api.TOO_MANY_TOKENS)
-    assert c.post("/api/login", json={"token": "s3cret"}).status_code == 429
-    monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)
-    assert c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    r = c.get("/api/tasks", headers={"Authorization": "Bearer c"})
+    assert (r.status_code, r.json()["detail"]) == (429, fewshot.access.TOO_MANY_TOKENS)
+    assert c.post("/api/login", json={"token": "d"}).status_code == 429
+    assert c.get("/api/tasks", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
+    assert c.post("/api/login", json={"token": TOKEN}).status_code == 204
 
 
 def test_wrong_tokens_are_bounded_and_expire(monkeypatch):
-    """Only wrong tokens make entries; old ones expire and the map has a size limit."""
+    """Only wrong tokens make entries, each keeping its last few; old ones expire and the map
+    has a size limit."""
     monkeypatch.setattr(fewshot.auth, "LOGIN_CLIENTS", 3)
     monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
     w = WrongTokens()
@@ -122,25 +149,51 @@ def test_wrong_tokens_are_bounded_and_expire(monkeypatch):
     for client in "abcd":
         w.wrong(client)
     assert list(w._seen) == ["b", "c", "d"]  # pylint: disable=protected-access
-    w.wrong("d")
+    for _ in range(5):
+        w.wrong("d")
     assert w.blocked("d")
+    assert len(w._seen["d"]) == 2  # pylint: disable=protected-access  # however many came
     monkeypatch.setattr(fewshot.auth, "LOGIN_WINDOW", 0.0)
     time.sleep(0.01)
     assert not w.blocked("d")
     assert "d" not in w._seen  # pylint: disable=protected-access  # expired entries go
 
 
-def test_a_signed_in_browser_keeps_working_while_its_address_is_blocked(tmp_path, monkeypatch):
-    """Someone guessing tokens from the same address (say, behind the same proxy) gets 429 for
-    token checks, but a session cookie, which can't be guessed, still works."""
+def test_a_stranger_guessing_from_a_shared_address_locks_nobody_out(tmp_path, monkeypatch):
+    """Someone guessing tokens from the same address (say, behind a proxy that isn't trusted)
+    gets 429, but clients there that know the token still sign in and use it, as does a browser
+    signed in already."""
     monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
-    c = api_client(tmp_path, token="s3cret")
-    assert c.post("/api/login", json={"token": "s3cret"}).status_code == 204
+    c = api_client(tmp_path, token=TOKEN)
+    assert c.post("/api/login", json={"token": TOKEN}).status_code == 204
     other = TestClient(c.app)
-    for guess in ("a", "b"):
-        assert other.get("/api/tasks", headers={"Authorization": f"Bearer {guess}"}).status_code == 401
-    assert other.post("/api/login", json={"token": "s3cret"}).status_code == 429
+    for guess in ("a", "b", "c", "d"):
+        assert other.get("/api/tasks", headers={"Authorization": f"Bearer {guess}"}).status_code in {401, 429}
+    assert other.get("/api/tasks", headers={"Authorization": "Bearer e"}).status_code == 429
+    assert other.get("/api/tasks", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
+    assert other.post("/api/login", json={"token": TOKEN}).status_code == 204
     assert c.get("/api/tasks").status_code == 200
+
+
+def test_a_proxy_that_isnt_trusted_is_reported_once(tmp_path, caplog):
+    """Requests forwarded by a proxy whose X-Forwarded-For isn't trusted log a warning, once;
+    a trusted proxy (the client address is the forwarded one) or no token logs none."""
+    c = api_client(tmp_path, token=TOKEN)
+    with caplog.at_level("WARNING", logger="fewshot.api"):
+        assert c.get("/api/health").status_code == 200
+        assert not caplog.records
+        for _ in range(2):
+            c.get("/api/health", headers={"X-Forwarded-For": "203.0.113.5, 10.0.0.1"})
+        c.get("/api/health", headers={"X-Forwarded-For": "testclient"})  # what uvicorn makes of a trusted one
+        open_server = api_client(tmp_path / "open")
+        open_server.get("/api/health", headers={"X-Forwarded-For": "203.0.113.5"})
+    assert [r.getMessage()[:56] for r in caplog.records] == [
+        "Requests come through a proxy at testclient whose X-Forw"]
+    trusted = api_client(tmp_path / "trusted", token=TOKEN)
+    with caplog.at_level("WARNING", logger="fewshot.api"):
+        caplog.clear()
+        trusted.get("/api/health", headers={"X-Forwarded-For": "1.2.3.4, testclient"})
+    assert not caplog.records
 
 
 # ---- host names (DNS rebinding) ------------------------------------------
