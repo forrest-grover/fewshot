@@ -3,7 +3,9 @@ the token or session. The limits and sessions themselves are in ``auth``."""
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import os
 import secrets
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +23,41 @@ SESSION_COOKIE = "fewshot_session"
 OPEN_PATHS = {"/api/login", "/api/health"}  # reachable without the token
 TOO_MANY_TOKENS = "Too many wrong tokens from this address; try again in a minute"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+ALLOW_NO_TOKEN_ENV = "FEWSHOT_ALLOW_NO_TOKEN"
+NO_TOKEN = ("This server has no token, so anyone who can reach it could read and change every task, and it "
+            "was reached at {addr}, which isn't this machine's loopback address. Set FEWSHOT_TOKEN (e.g. to "
+            "the output of `openssl rand -hex 16`), or set FEWSHOT_ALLOW_NO_TOKEN=1 to serve without one.")
+
+
+def allow_no_token_from_env() -> bool:
+    """Whether ``FEWSHOT_ALLOW_NO_TOKEN`` says to serve other machines without a token."""
+    return os.environ.get(ALLOW_NO_TOKEN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_loopback(host: str) -> bool | None:
+    """Whether ``host`` (an address, or ``localhost``) is this machine's loopback; None if it
+    isn't an address at all (a Unix socket's path, a test client's made-up name)."""
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(host.strip().strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr.is_loopback
+
+
+def exposure_problem(host: str, token: str | None, allow_no_token: bool) -> str | None:
+    """Why serving on ``host`` (a bind address) with ``token`` is unsafe, or None: a server
+    without a token may listen on loopback only, unless ``allow_no_token``. For ``fewshot serve``
+    to refuse before starting; ``guard`` refuses the requests of a server started otherwise. A
+    host name other than localhost counts as exposed."""
+    if token is not None or allow_no_token or is_loopback(host):
+        return None
+    return NO_TOKEN.format(addr=host)
 
 
 def client_address(request: Request) -> str:
@@ -60,9 +97,19 @@ def _note_untrusted_proxy(srv: Server, request: Request) -> None:
 
 
 async def guard(request: Request, call_next: Any) -> Response:
-    """Refuse requests for another host name (DNS rebinding) and writes from other sites (CSRF),
-    then check the token or session."""
+    """Refuse every request to a server without a token that arrived on an address other than
+    loopback (unless allowed), requests for another host name (DNS rebinding) and writes from
+    other sites (CSRF), then check the token or session."""
     srv: Server = request.app.state.server
+    local = request.scope.get("server") or ("", None)
+    if srv.sessions is None and not srv.allow_no_token and is_loopback(str(local[0])) is False:
+        # Reached on another interface without a token: a container serving on 0.0.0.0 (or
+        # ``uvicorn --host 0.0.0.0``) with FEWSHOT_TOKEN unset. Only the liveness check answers.
+        if not srv.warned_exposed:
+            srv.warned_exposed = True
+            log.error("%s", NO_TOKEN.format(addr=local[0]))
+        if request.url.path != "/healthz":
+            return JSONResponse({"detail": NO_TOKEN.format(addr=local[0])}, 403)
     if not host_allowed(request.headers.get("host", ""), set(srv.settings.allowed_hosts)):
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path

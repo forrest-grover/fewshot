@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import services
-from .access import SESSION_COOKIE, TOO_MANY_TOKENS, check_token, client_address, guard
+from .access import SESSION_COOKIE, TOO_MANY_TOKENS, allow_no_token_from_env, check_token, client_address, guard
 from .archive import export_task as write_export
 from .archive import import_task as read_export
 from .auth import SESSION_DAYS, Sessions, WrongTokens
@@ -104,14 +104,17 @@ T = TypeVar("T")
 class Server:  # pylint: disable=too-many-instance-attributes  # the server's parts, one each
     """Everything one app serves: its settings, workspace, pipeline, jobs and access control."""
 
-    def __init__(self, settings: ServerSettings, workspace: Workspace | None = None) -> None:
+    def __init__(self, settings: ServerSettings, workspace: Workspace | None = None,
+                 allow_no_token: bool = False) -> None:
         self.settings = settings
+        self.allow_no_token = allow_no_token  # see access.guard
         self.ws = workspace or Workspace(settings.home)
         self.pipe = Pipeline(self.ws)
         self.jobs = Jobs()
         self.wrong_tokens = WrongTokens()
         self.sessions = Sessions(settings.token) if settings.token else None
         self.warned_proxy = False  # see access._note_untrusted_proxy
+        self.warned_exposed = False  # see access.guard
         self._heavy: ThreadPoolExecutor | None = None  # made when first needed, after each shutdown too
         self._heavy_lock = threading.Lock()
 
@@ -190,10 +193,13 @@ Srv = Annotated[Server, Depends(_server)]  # async, so resolving it takes no thr
 
 
 # ---- the app -------------------------------------------------------------
-def create_app(settings: ServerSettings | None = None, workspace: Workspace | None = None) -> FastAPI:
+def create_app(settings: ServerSettings | None = None, workspace: Workspace | None = None,
+               allow_no_token: bool | None = None) -> FastAPI:
     """The server for ``settings`` (default: from the environment), on ``workspace`` (default:
-    ``settings.home``)."""
-    server = Server(settings or ServerSettings.from_env(), workspace)
+    ``settings.home``). Without a token, it refuses requests that reach it on an address other
+    than loopback, unless ``allow_no_token`` (default: ``FEWSHOT_ALLOW_NO_TOKEN``)."""
+    allow = allow_no_token_from_env() if allow_no_token is None else allow_no_token
+    server = Server(settings or ServerSettings.from_env(), workspace, allow)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

@@ -11,6 +11,7 @@ import fewshot.api
 import fewshot.auth
 import fewshot.guard
 from fewshot.auth import Sessions, WrongTokens
+from fewshot.access import NO_TOKEN, exposure_problem
 from fewshot.guard import host_allowed
 from tests.conftest import RED, api_client, host_client, png
 
@@ -277,3 +278,40 @@ def test_cross_site_check_behind_a_proxy_that_rewrites_host(tmp_path, monkeypatc
     r = c.post("/api/tasks", json={**body, "name": "u"}, headers={"Sec-Fetch-Site": "same-site"})
     assert r.json()["detail"] == ("Cross-site request refused: the browser sent it from another site "
                                   "(Sec-Fetch-Site: same-site)")
+
+
+# ---- no token on another interface ---------------------------------------
+def test_a_server_without_token_refuses_other_interfaces(tmp_path, monkeypatch, caplog):
+    """A server without a token reached on an address other than loopback (a container serving on
+    0.0.0.0 with FEWSHOT_TOKEN unset) refuses everything but /healthz, and logs why once; on
+    loopback, with a token, or with FEWSHOT_ALLOW_NO_TOKEN=1 it serves."""
+    app = api_client(tmp_path).app
+    outside = TestClient(app, base_url="http://172.17.0.2:8000")  # the address the request arrived at
+    refused = NO_TOKEN.format(addr="172.17.0.2")
+    for path in ("/api/tasks", "/api/health", "/"):
+        r = outside.get(path)
+        assert (r.status_code, r.json()["detail"]) == (403, refused), path
+    assert outside.post("/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 403
+    assert outside.get("/healthz").status_code == 200
+    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == [refused]
+    for local in ("http://127.0.0.1:8000", "http://[::1]:8000", "http://[::ffff:127.0.0.1]:8000"):
+        assert TestClient(app, base_url=local).get("/api/tasks").status_code == 200, local
+    tokened = api_client(tmp_path / "b", base_url="http://172.17.0.2", token="0123456789abcdef0123")
+    assert tokened.get("/api/tasks").status_code == 401  # the token protects it
+    allowed = TestClient(fewshot.api.create_app(app.state.server.settings, allow_no_token=True),
+                         base_url="http://172.17.0.2")
+    assert allowed.get("/api/tasks").status_code == 200
+    monkeypatch.setenv("FEWSHOT_ALLOW_NO_TOKEN", "1")
+    from_env = TestClient(fewshot.api.create_app(app.state.server.settings), base_url="http://172.17.0.2")
+    assert from_env.get("/api/tasks").status_code == 200
+
+
+def test_exposure_problem():
+    """For ``fewshot serve`` to refuse before starting: no token on a non-loopback bind address."""
+    assert exposure_problem("0.0.0.0", None, False) == NO_TOKEN.format(addr="0.0.0.0")
+    assert exposure_problem("::", None, False) is not None
+    assert exposure_problem("box.lan", None, False) is not None  # a name: whichever interface it is
+    for host in ("127.0.0.1", "127.0.0.2", "::1", "localhost"):
+        assert exposure_problem(host, None, False) is None, host
+    assert exposure_problem("0.0.0.0", "0123456789abcdef0123", False) is None
+    assert exposure_problem("0.0.0.0", None, True) is None
