@@ -5,7 +5,7 @@ import { api, type InboxEntry, type TaskDetail } from "./api";
 import type { Uploads } from "./useUploads";
 import Inbox from "./Inbox";
 import { fetchInbox, stillGone } from "./inboxPages";
-import { taskDetail } from "./test-data";
+import { idleUploads, taskDetail } from "./test-data";
 
 afterEach(cleanup);
 
@@ -44,7 +44,7 @@ describe("Inbox", () => {
   it("keeps the pages loaded with Load more when the task changes", async () => {
     const page = server(1500);
     const inbox = vi.spyOn(api, "inbox").mockImplementation((_n, _s, offset = 0, limit = 1000) => page(offset, limit));
-    const uploads: Uploads = { slots: {}, start: () => Promise.resolve([]), dismiss: vi.fn() };
+    const uploads = idleUploads();
     const props = { setTask: vi.fn(), run: <T,>(p: Promise<T>) => p, uploads };
     const { rerender } = render(<Inbox task={taskDetail({ inbox_count: 1500 })} {...props} />);
     await screen.findByText(/1000 loaded/);
@@ -103,7 +103,7 @@ function labelling(n: number, ms: number, uploads: Uploads) {
 }
 
 describe("Inbox keys", () => {
-  const idle: Uploads = { slots: {}, start: () => Promise.resolve([]), dismiss: vi.fn() };
+  const idle = idleUploads();
 
   it.each([[0, 0], [5, 30], [40, 10]])("label one image per key press, in order (%i ms apart, server %i ms)", async (gap, ms) => {
     const { accepted } = labelling(12, ms, idle);
@@ -119,7 +119,7 @@ describe("Inbox keys", () => {
   });
 
   it("keep labelling while images are being uploaded to the inbox", async () => {
-    const uploading: Uploads = { ...idle, slots: { inbox: { skipped: [], progress: { done: 100, total: 300, cancel: vi.fn() } } } };
+    const uploading = idleUploads({ inbox: { skipped: [], progress: { done: 100, total: 300, cancel: vi.fn() } } });
     const { accepted } = labelling(3, 0, uploading);
     await screen.findByAltText("0.jpg");
     fireEvent.keyDown(document.body, { key: "Enter" });

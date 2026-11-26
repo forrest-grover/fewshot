@@ -37,8 +37,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
    * upload at a time. */
   const upload = async (label: string, files: File[]) => {
     if (uploads.slots[label]?.progress) { fail(`Still adding images to ${label}: wait for it or cancel it first.`); return; }
-    const name = task.name;
-    await uploads.start(label, files, (fs, signal, group) => api.addExamples(name, label, fs, signal, group));
+    await uploads.start(label, files, (fs, signal, group, t) => api.addExamples(t, label, fs, signal, group));
   };
   /** Run a mutation and show its result; resolves to whether it succeeded. */
   const save = async (p: Promise<TaskDetail>) => {
@@ -332,6 +331,7 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
       {task.classes.map((c, ci) => {
         const limit = shown[c.name] ?? PAGE;
         const skip = uploads.slots[c.name]?.skipped ?? [];
+        const moved = uploads.slots[c.name]?.moved ?? 0; // of the last upload: images that were examples of other classes
         const up = uploads.slots[c.name]?.progress; // an upload in progress
         const list = byClass.get(c.name) ?? [];
         const allPicked = list.length > 0 && list.every((e) => picked.has(e.id));
@@ -400,10 +400,16 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
                 </button>
               )}
               <DropZone compact disabled={!!up} onFiles={(fs) => { void upload(c.name, fs); }}>
-                {up ? `Uploading ${progressText(up)}…` : "+ Add images"}
+                {up ? `${up.stopping ? "Stopping" : "Uploading"} ${progressText(up)}…` : "+ Add images"}
               </DropZone>
-              {up && <button className="ghost small" onClick={up.cancel}>Cancel upload</button>}
+              {up && <button className="ghost small" disabled={up.stopping} onClick={up.cancel}>Cancel upload</button>}
             </div>}
+            {moved > 0 && (
+              <div className="row note-moved" role="status">
+                <span>{moved} moved from other classes</span>
+                <button className="ghost small" aria-label="Dismiss" onClick={() => { uploads.dismiss(c.name); }}>×</button>
+              </div>
+            )}
             {skip.length > 0 && (
               <div className="error skipped" role="alert">
                 <div>

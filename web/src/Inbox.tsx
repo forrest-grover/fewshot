@@ -133,8 +133,7 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
   /** Add images to the inbox in batches (see useUploads), as one undo step; Cancel (or opening
    * another task) stops the rest. Labelling goes on meanwhile. */
   const upload = async (files: File[]) => {
-    const name = task.name;
-    const skips = await uploads.start(INBOX, files, (fs, signal, group) => api.addToInbox(name, fs, signal, group));
+    const skips = await uploads.start(INBOX, files, (fs, signal, group, t) => api.addToInbox(t, fs, signal, group));
     if (skips?.length) {
       void run(Promise.reject(new Error(`Skipped: ${skips.map((e) => (e.file ? `${e.file}: ${e.error}` : e.error)).join("; ")}`)));
     }
@@ -195,9 +194,9 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
   return (
     <div className="inbox">
       <DropZone disabled={uploading !== null} onFiles={(fs) => { void upload(fs); }}>
-        {uploading ? `Uploading ${progressText(uploading)}…` : saving ? "Saving…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
+        {uploading ? `${uploading.stopping ? "Stopping" : "Uploading"} ${progressText(uploading)}…` : saving ? "Saving…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
       </DropZone>
-      {uploading && <div className="row"><button className="ghost small" onClick={uploading.cancel}>Cancel upload</button></div>}
+      {uploading && <div className="row"><button className="ghost small" disabled={uploading.stopping} onClick={uploading.cancel}>Cancel upload</button></div>}
       {viewing !== null && list.length > 0 && (
         <Lightbox
           items={list.map((i) => ({

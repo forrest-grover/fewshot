@@ -2,8 +2,7 @@ import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, type Example, type TaskDetail } from "./api";
 import Examples from "./Examples";
-import type { Uploads } from "./useUploads";
-import { taskDetail } from "./test-data";
+import { idleUploads, taskDetail } from "./test-data";
 
 afterEach(cleanup);
 
@@ -20,7 +19,7 @@ const pets = (rev: number, tags: string[] = []): TaskDetail => taskDetail({
 describe("Examples thumbnails", () => {
   it("re-render only when what they show changes, not on every response", () => {
     const urls = vi.spyOn(api, "imageUrl");
-    const uploads: Uploads = { slots: {}, start: () => Promise.resolve([]), dismiss: vi.fn() };
+    const uploads = idleUploads();
     const props = { setTask: vi.fn(), run: <T,>(p: Promise<T>) => p, uploads };
     const { rerender } = render(<Examples task={pets(1)} {...props} />);
     expect(urls).toHaveBeenCalledTimes(3);

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Prediction, TaskDetail } from "./api";
 import App from "./App";
@@ -42,10 +42,26 @@ function serve(route: Route = () => undefined) {
     return Promise.resolve(json({ detail: `unexpected ${c.method} ${c.url}` }, 500));
   });
 }
-/** A response that waits until the request is aborted, like a slow upload. */
-const pending = (c: Call): Promise<Response> => new Promise((_res, rej) => {
-  c.signal?.addEventListener("abort", () => { rej(new DOMException("aborted", "AbortError")); });
-});
+/** Uploads that the server answers only when ``release`` is called, a batch at a time. */
+function holdUploads() {
+  const waiting: (() => void)[] = [];
+  let n = 0;
+  const route: Route = (c) => {
+    if (!(c.method === "POST" && c.url.endsWith("/examples"))) return undefined;
+    const files = (c.body as FormData).getAll("files").length;
+    return new Promise<Response>((res) => {
+      waiting.push(() => { n += files; res(json({ added: Array.from({ length: files }, () => ({})), errors: [], task: { ...pets, revision: 3 + n } }, 201)); });
+    });
+  };
+  return { route, release: () => { waiting.shift()?.(); } };
+}
+/** Drop ``n`` images on the first class. */
+function drop(container: HTMLElement, n: number) {
+  const input = container.querySelector<HTMLInputElement>(".class-card input[type=file]");
+  if (!input) throw new Error("no file input");
+  const files = Array.from({ length: n }, (_, i) => new File(["x"], `${String(i)}.png`, { type: "image/png" }));
+  fireEvent.change(input, { target: { files } });
+}
 const taskLoads = (name: string) => calls.filter((c) => c.method === "GET" && c.url === `/api/tasks/${name}`).length;
 
 async function open(hash: string) {
@@ -103,25 +119,61 @@ describe("App", () => {
   });
 
   it("an upload goes on while tabs are switched, and stops (saying so) when another task opens", async () => {
-    serve((c) => (c.method === "POST" && c.url.endsWith("/examples") ? pending(c) : undefined));
+    const held = holdUploads();
+    serve(held.route);
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: "cat" });
-    const card = container.querySelectorAll(".class-card")[0] as HTMLElement;
-    const input = card.querySelector<HTMLInputElement>("input[type=file]");
-    if (!input) throw new Error("no file input");
-    fireEvent.change(input, { target: { files: [new File(["x"], "a.png", { type: "image/png" })] } });
-    await within(card).findByText(/Uploading 0 \/ 1/);
+    drop(container, 150); // two batches
+    await screen.findByText(/Uploading 0 \/ 150/);
     const upload = calls.find((c) => c.method === "POST");
     expect((upload?.body as FormData).get("undo_group")).toBeTruthy();
 
     await open("#/pets/predict");
     await screen.findByText(/Drop images to classify/);
     await open("#/pets/examples");
-    await screen.findByText(/Uploading 0 \/ 1/); // still going, shown again
+    await screen.findByText(/Uploading 0 \/ 150/); // still going, shown again
     expect(upload?.signal?.aborted).toBe(false);
 
     await open("#/birds/examples");
-    expect(upload?.signal?.aborted).toBe(true);
-    expect(await screen.findByText("Upload to “pets” stopped: 0 of 1 added")).toBeDefined();
+    expect(upload?.signal?.aborted).toBe(false); // the server may store it: it is waited for and counted
+    act(() => { held.release(); });
+    expect(await screen.findByText("Upload to “pets” stopped: 100 of 150 added")).toBeDefined();
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("Ctrl+Z during an upload stops it after the batch in flight, then undoes all of it", async () => {
+    const held = holdUploads();
+    serve((c) => held.route(c) ?? (c.url === "/api/tasks/pets/undo" ? json({ ...pets, revision: 1000, can_redo: true, redo_label: "add 200 examples to cat" }) : undefined));
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "cat" });
+    drop(container, 250);
+    await screen.findByText(/Uploading 0 \/ 250/);
+    act(() => { held.release(); });
+    await screen.findByText(/Uploading 100 \/ 250/);
+    expect(screen.getByRole("button", { name: "↶ Undo" }).title).toBe("Stop the upload and undo it (Ctrl+Z)");
+    fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
+    await screen.findByText(/Stopping 100 \/ 250/);
+    expect(calls.some((c) => c.url.endsWith("/undo"))).toBe(false); // not before the batch in flight lands
+    act(() => { held.release(); });
+    expect(await screen.findByText("Stopped the upload. Undid add 200 examples to cat")).toBeDefined();
+    const posts = calls.filter((c) => c.method === "POST").map((c) => c.url);
+    expect(posts).toEqual(["/api/tasks/pets/examples", "/api/tasks/pets/examples", "/api/tasks/pets/undo"]);
+    // The toast offers Redo, until the task changes again (then it would redo nothing).
+    expect(screen.getByRole("button", { name: "Redo" })).toBeDefined();
+  });
+
+  it("drops the toast's Redo once the task changed", async () => {
+    serve((c) => {
+      if (c.url === "/api/tasks/pets/undo") return json({ ...pets, revision: 4, can_redo: true, redo_label: "x" });
+      if (c.method === "DELETE") return json({ ...pets, revision: 5, examples: [], can_redo: false });
+      return undefined;
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "cat" });
+    fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
+    await screen.findByRole("button", { name: "Redo" });
+    fireEvent.click(screen.getByRole("button", { name: "Delete example" }));
+    await waitFor(() => { expect(screen.queryByRole("button", { name: "Redo" })).toBeNull(); });
+    expect(screen.getByText(/Undid/)).toBeDefined();
   });
 });

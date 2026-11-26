@@ -29,7 +29,9 @@ export type DuplicatePair = S["DuplicatePair"];
 export type Health = S["Health"];
 /** An upload that couldn't be used: its file name (or URL, when known) and why. */
 export type FileError = S["FileError"];
-export type AddResult = S["AddResult"];
+/** ``moved``: images that were already examples of another class, and were moved to this one
+ * (optional: servers before it was added don't send it). */
+export type AddResult = S["AddResult"] & { moved?: number };
 export type ModelInfo = S["ModelsOut"];
 /** PATCH /api/tasks/{name}: every field is optional (the schema marks the clear_* flags required
  * only because they have defaults). */

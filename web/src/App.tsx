@@ -48,7 +48,9 @@ export default function App() {
   const [signIn, setSignIn] = useState(false); // the server wants its token
   const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
   const [limits, setLimits] = useState(BATCH); // upload batch sizes the server takes
-  const [toast, setToast] = useState<{ text: string; then: "undo" | "redo" | null; key: number } | null>(null);
+  // A message for a few seconds. ``then`` offers the reverse of an undo or redo, while the task is
+  // still ``task`` at revision ``rev`` (after another change it would undo something else).
+  const [toast, setToast] = useState<{ text: string; then?: "undo" | "redo" | null; task?: string; rev?: number; key: number } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
   const [help, setHelp] = useState(false); // the keyboard shortcuts
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
@@ -177,7 +179,7 @@ export default function App() {
   const uploadStopped = ({ task: name, added, total, error }: UploadStop) => {
     const text = `Upload${name === currentTask.current ? "" : ` to “${name}”`} stopped: ${String(added)} of ${String(total)} added`;
     if (error) setError(`${error.message}. ${text}`);
-    else setToast({ text, then: null, key: Date.now() });
+    else setToast({ text, key: Date.now() });
   };
   // Uploads live here so they go on while tabs are switched; opening another task stops them.
   const exampleUploads = useUploads(route.task, { onTask: updateTask, onStop: uploadStopped, limits });
@@ -185,14 +187,29 @@ export default function App() {
 
   /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse.
    * One step at a time: presses while one is in flight are ignored, so a double press or a held
-   * key doesn't walk back several versions. */
+   * key doesn't walk back several versions. Undo while images are being uploaded to the task
+   * stops the upload first (after its batch in flight, so none lands after the undo) and then
+   * undoes all of it, as one step; if none of it had landed, nothing is undone. */
   const stepGate = useRef(new Gate()).current;
   const step = (which: "undo" | "redo") => stepGate.run(async () => {
-    if (!task || !(which === "undo" ? task.can_undo : task.can_redo)) return;
-    const t = await run(which === "undo" ? api.undo(task.name) : api.redo(task.name));
+    if (!task) return;
+    let shown = task;
+    const stopping = which === "undo" && (exampleUploads.busy || inboxUploads.busy);
+    if (stopping) {
+      const added = (await Promise.all([exampleUploads.stop(), inboxUploads.stop()])).reduce((a, b) => a + b, 0);
+      if (currentTask.current !== shown.name) return;
+      if (!added) { setToast({ text: "Stopped the upload; none of it had been added", key: Date.now() }); return; }
+      const fresh = await run(api.task(shown.name)); // with every batch that landed
+      if (!fresh) return;
+      updateTask(fresh);
+      shown = fresh;
+    }
+    if (!(which === "undo" ? shown.can_undo : shown.can_redo)) return;
+    const t = await run(which === "undo" ? api.undo(shown.name) : api.redo(shown.name));
     if (!t) return;
     updateTask(t);
-    setToast({ ...stepToast(which, t, which === "undo" ? task.undo_label : task.redo_label), key: Date.now() });
+    const said = stepToast(which, t, which === "undo" ? shown.undo_label : shown.redo_label);
+    setToast({ ...said, text: stopping ? `Stopped the upload. ${said.text}` : said.text, task: t.name, rev: t.revision, key: Date.now() });
   });
   const undo = () => step("undo");
   useEffect(() => { // the toast goes after a few seconds
@@ -254,10 +271,11 @@ export default function App() {
                 {models?.embedders.find((e) => e.spec === task.embedder)?.label ?? task.embedder} · {task.classifier}
               </span>
               <span className="spacer" />
-              <button className="ghost small" disabled={!task.can_undo} onClick={() => { void undo(); }}
-                title={`Undo ${task.undo_label || "the last change"} (Ctrl+Z)`}>↶ Undo</button>
+              <button className="ghost small" disabled={!task.can_undo && !exampleUploads.busy && !inboxUploads.busy} onClick={() => { void undo(); }}
+                title={exampleUploads.busy || inboxUploads.busy ? "Stop the upload and undo it (Ctrl+Z)" : `Undo ${task.undo_label || "the last change"} (Ctrl+Z)`}
+                onMouseEnter={reloadTask} onFocus={reloadTask}>↶ Undo</button>
               <button className="ghost small" disabled={!task.can_redo} onClick={() => { void step("redo"); }}
-                title={`Redo ${task.redo_label || "the last undone change"} (Ctrl+Shift+Z)`}>↷ Redo</button>
+                title={`Redo ${task.redo_label || "the last undone change"} (Ctrl+Shift+Z)`} onMouseEnter={reloadTask} onFocus={reloadTask}>↷ Redo</button>
             </header>
             <div className="tabs" role="tablist" aria-label="Task views" onKeyDown={(e) => {
               // Arrow keys, Home and End move between tabs (the WAI-ARIA tabs pattern).
@@ -296,8 +314,10 @@ export default function App() {
                 <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { evals.setFor(task.name)(null); compares.setFor(task.name)(null); void refreshTasks(); go(null); }}
                   onDuplicated={(t) => { void refreshTasks(); go(t.name); }}
                   onRenamed={(t) => {
-                    // Results move with the task to its new name.
+                    // Results, and uploads in progress, move with the task to its new name.
                     predictState.rename(t.name);
+                    exampleUploads.rename(t.name);
+                    inboxUploads.rename(t.name);
                     evals.rename(task.name, t.name);
                     compares.rename(task.name, t.name);
                     void refreshTasks();
@@ -322,7 +342,7 @@ export default function App() {
       {toast && (
         <div className="toast" role="status" key={toast.key}>
           <span>{toast.text}</span>
-          {toast.then && (
+          {toast.then && task && task.name === toast.task && task.revision === toast.rev && (
             <button className="small secondary" onClick={() => { const then = toast.then; setToast(null); if (then) void step(then); }}>
               {toast.then === "redo" ? "Redo" : "Undo"}
             </button>
