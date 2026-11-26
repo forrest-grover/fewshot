@@ -1,10 +1,11 @@
 import { useRef, useState, type DragEvent } from "react";
-import { api, type Example, type TaskDetail } from "./api";
-import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts } from "./hooks";
+import { api, HttpError, type AddResult, type Example, type TaskDetail } from "./api";
+import { EXAMPLE_DRAG, filesFromDrop, isImage, useAbortOnLeave, usePasteImages, useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import TagEditor, { type TagEdit } from "./TagEditor";
 import { DropZone } from "./ui";
+import { progressText, sendInBatches } from "./upload";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
 interface Skipped { file: string | null; error: string }
@@ -15,7 +16,8 @@ const PAGE = 60;
 
 export default function Examples({ task, setTask, run }: Props) {
   const [newClass, setNewClass] = useState("");
-  const [uploading, setUploading] = useState<Partial<Record<string, number>>>({}); // class -> uploads in flight
+  // class -> the upload in progress: images sent so far, and how to stop it
+  const [uploading, setUploading] = useState<Partial<Record<string, { done: number; total: number; cancel: () => void }>>>({});
   const [skipped, setSkipped] = useState<Partial<Record<string, Skipped[]>>>({}); // class -> files the last upload skipped
   const [shown, setShown] = useState<Partial<Record<string, number>>>({}); // class -> thumbnails shown
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set()); // selected example ids
@@ -29,19 +31,34 @@ export default function Examples({ task, setTask, run }: Props) {
   const pointed = useRef<string | null>(null); // class card last hovered or focused: where a paste goes
   const anchor = useRef<string | null>(null); // last ticked example, for Shift+click ranges
 
-  const busy = (label: string, delta: number) => {
-    setUploading((u) => ({ ...u, [label]: (u[label] ?? 0) + delta }));
-  };
+  const newUpload = useAbortOnLeave(task.name); // uploads stop when the task is closed
+  /** Add images to class ``label``, in batches (see sendInBatches): each shows as it lands, and
+   * Cancel (or leaving the task) stops the rest. A class takes one upload at a time. */
   const upload = async (label: string, files: File[]) => {
-    busy(label, 1);
-    try {
-      const r = await run(shrinkImages(files).then((fs) => api.addExamples(task.name, label, fs)));
-      if (r) {
-        setTask(r.task);
-        setSkipped((s) => ({ ...s, [label]: r.errors }));
+    if (uploading[label]) { fail(`Still adding images to ${label}: wait for it or cancel it first.`); return; }
+    const req = newUpload();
+    const skips: Skipped[] = [];
+    setSkipped((s) => ({ ...s, [label]: [] }));
+    /** One batch; one whose images were all unusable (400) is skipped, not the end of the upload. */
+    const send = async (fs: File[], signal: AbortSignal): Promise<AddResult | null> => {
+      try {
+        return await api.addExamples(task.name, label, fs, signal);
+      } catch (e) {
+        if (!(e instanceof HttpError && e.status === 400)) throw e;
+        skips.push({ file: null, error: e.message });
+        return null;
       }
+    };
+    try {
+      await run(sendInBatches(files, send, {
+        signal: req.signal, prepare: shrinkImages,
+        onProgress: (done, total) => { setUploading((u) => ({ ...u, [label]: { done, total, cancel: req.cancel } })); },
+        onBatch: (r) => { if (r) { setTask(r.task); skips.push(...r.errors); } },
+      }));
     } finally {
-      busy(label, -1);
+      req.done();
+      setUploading((u) => ({ ...u, [label]: undefined }));
+      setSkipped((s) => ({ ...s, [label]: skips }));
     }
   };
   /** Run a mutation and show its result; resolves to whether it succeeded. */
@@ -302,6 +319,7 @@ export default function Examples({ task, setTask, run }: Props) {
       {task.classes.map((c, ci) => {
         const limit = shown[c.name] ?? PAGE;
         const skip = skipped[c.name] ?? [];
+        const up = uploading[c.name]; // an upload in progress
         const list = byClass.get(c.name) ?? [];
         const allPicked = list.length > 0 && list.every((e) => picked.has(e.id));
         return (
@@ -414,9 +432,10 @@ export default function Examples({ task, setTask, run }: Props) {
                   Show more ({list.length - limit} hidden)
                 </button>
               )}
-              <DropZone compact onFiles={(fs) => { void upload(c.name, fs); }}>
-                {uploading[c.name] ? "Uploading…" : "+ Add images"}
+              <DropZone compact disabled={!!up} onFiles={(fs) => { void upload(c.name, fs); }}>
+                {up ? `Uploading ${progressText(up)}…` : "+ Add images"}
               </DropZone>
+              {up && <button className="ghost small" onClick={up.cancel}>Cancel upload</button>}
             </div>}
             {skip.length > 0 && (
               <div className="error skipped" role="alert">

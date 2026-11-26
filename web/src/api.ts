@@ -55,8 +55,8 @@ function detailText(d: unknown): string {
   return JSON.stringify(d);
 }
 
-async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { method };
+async function req<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  const init: RequestInit = { method, signal };
   if (body instanceof FormData) init.body = body;
   else if (body !== undefined) {
     init.body = JSON.stringify(body);
@@ -105,7 +105,8 @@ export const api = {
   describe: (n: string, template: string, overwrite: boolean) =>
     req<TaskDetail>("POST", `${t(n)}/describe`, { template, overwrite }),
   deleteClass: (n: string, c: string) => req<TaskDetail>("DELETE", `${t(n)}/classes/${encodeURIComponent(c)}`),
-  addExamples: (n: string, label: string, fs: File[]) => req<AddResult>("POST", `${t(n)}/examples`, files(fs, { label })),
+  addExamples: (n: string, label: string, fs: File[], signal?: AbortSignal) =>
+    req<AddResult>("POST", `${t(n)}/examples`, files(fs, { label }), signal),
   addExampleUrls: (n: string, label: string, urls: string[]) => req<AddResult>("POST", `${t(n)}/examples/urls`, { label, urls }),
   relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, { label }),
   annotate: (n: string, id: string, p: { tags?: string[]; note?: string }) => req<TaskDetail>("PATCH", `${t(n)}/examples/${id}`, p),
@@ -114,7 +115,8 @@ export const api = {
   deleteExample: (n: string, id: string) => req<TaskDetail>("DELETE", `${t(n)}/examples/${id}`),
   relabelMany: (n: string, ids: string[], label: string) => req<TaskDetail>("PATCH", `${t(n)}/examples`, { ids, label }),
   deleteExamples: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/examples/delete`, { ids }),
-  predict: (n: string, fs: File[]) => req<Prediction[]>("POST", `${t(n)}/predict?evidence=3`, files(fs)),
+  predict: (n: string, fs: File[], signal?: AbortSignal) =>
+    req<Prediction[]>("POST", `${t(n)}/predict?evidence=3`, files(fs), signal),
   predictUrls: (n: string, urls: string[]) => req<Prediction[]>("POST", `${t(n)}/predict/urls?evidence=3`, { urls }),
   duplicates: (n: string, threshold: number) => req<DuplicatePair[]>("GET", `${t(n)}/duplicates?threshold=${String(threshold)}`),
   undo: (n: string) => req<TaskDetail>("POST", `${t(n)}/undo`),
@@ -131,8 +133,8 @@ export const api = {
   health: () => req<Health>("GET", "/api/health"),
   inbox: (n: string, sort: InboxSort, offset = 0, limit = 1000) =>
     req<InboxPage>("GET", `${t(n)}/inbox?sort=${sort}&offset=${String(offset)}&limit=${String(limit)}`),
-  addToInbox: (n: string, fs: File[]) =>
-    req<InboxAdded>("POST", `${t(n)}/inbox`, files(fs)),
+  addToInbox: (n: string, fs: File[], signal?: AbortSignal) =>
+    req<InboxAdded>("POST", `${t(n)}/inbox`, files(fs), signal),
   acceptInbox: (n: string, labels: Record<string, string>) => req<TaskDetail>("POST", `${t(n)}/inbox/accept`, { labels }),
   dismissInbox: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/inbox/dismiss`, { ids }),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),

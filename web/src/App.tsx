@@ -10,6 +10,7 @@ import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
 import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
 import { ErrorBox, JobPoller } from "./ui";
+import { isAbort } from "./upload";
 
 const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -75,8 +76,9 @@ export default function App() {
     try {
       return await p;
     } catch (e) {
-      // An error from a task the user has since left would only confuse the one now shown.
-      if (currentTask.current !== from) return undefined;
+      // An error from a task the user has since left would only confuse the one now shown, and
+      // a cancelled request was meant to stop.
+      if (currentTask.current !== from || isAbort(e)) return undefined;
       setError(e instanceof Error ? e.message : String(e));
       // Refused (say, an example or class that is gone): the task may have changed elsewhere.
       if (e instanceof HttpError && [400, 404, 409].includes(e.status)) reloadTask();

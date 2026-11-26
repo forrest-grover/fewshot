@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
+import { api, HttpError, type InboxAdded, type InboxEntry, type InboxSort, type TaskDetail } from "./api";
 import { pct } from "./format";
-import { useShortcuts } from "./hooks";
+import { useAbortOnLeave, useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import { DropZone } from "./ui";
+import { progressText, sendInBatches } from "./upload";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
 
@@ -66,17 +67,35 @@ export default function Inbox({ task, setTask, run }: Props) {
   const sure = list.filter((i) => suggested(i) && (i.prediction?.confidence ?? 0) >= minConf);
   const selection = list.filter((i) => picked.has(i.id));
 
+  const [uploading, setUploading] = useState<{ done: number; total: number; cancel: () => void } | null>(null);
+  const newUpload = useAbortOnLeave(task.name); // uploads stop when the task is closed
+  /** Add images to the inbox in batches (see sendInBatches); Cancel (or leaving) stops the rest. */
   const upload = async (files: File[]) => {
+    const req = newUpload();
+    const skips: string[] = [];
+    /** One batch; one whose images were all unusable (400) is skipped, not the end of the upload. */
+    const send = async (fs: File[], signal: AbortSignal): Promise<InboxAdded | null> => {
+      try {
+        return await api.addToInbox(task.name, fs, signal);
+      } catch (e) {
+        if (!(e instanceof HttpError && e.status === 400)) throw e;
+        skips.push(e.message);
+        return null;
+      }
+    };
     setBusy(true);
     try {
-      const r = await run(shrinkImages(files).then((fs) => api.addToInbox(task.name, fs)));
-      if (r) {
-        setTask(r.task);
-        if (r.errors.length) void run(Promise.reject(new Error(`Skipped ${String(r.errors.length)}: ${r.errors.map((e) => (e.file ? `${e.file}: ${e.error}` : e.error)).join("; ")}`)));
-      }
+      await run(sendInBatches(files, send, {
+        signal: req.signal, prepare: shrinkImages,
+        onProgress: (done, total) => { setUploading({ done, total, cancel: req.cancel }); },
+        onBatch: (r) => { if (r) { setTask(r.task); skips.push(...r.errors.map((e) => (e.file ? `${e.file}: ${e.error}` : e.error))); } },
+      }));
     } finally {
+      req.done();
       setBusy(false);
+      setUploading(null);
     }
+    if (skips.length) void run(Promise.reject(new Error(`Skipped: ${skips.join("; ")}`)));
   };
 
   // Keys for the highlighted image: Enter accepts the suggestion, 1-9 label it, Delete dismisses, arrows move.
@@ -128,8 +147,9 @@ export default function Inbox({ task, setTask, run }: Props) {
   return (
     <div className="inbox">
       <DropZone disabled={busy} onFiles={(fs) => { void upload(fs); }}>
-        {busy ? "Working…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
+        {uploading ? `Uploading ${progressText(uploading)}…` : busy ? "Working…" : "Drop unlabelled images here (or click) to sort them with the model's suggestions"}
       </DropZone>
+      {uploading && <div className="row"><button className="ghost small" onClick={uploading.cancel}>Cancel upload</button></div>}
       {viewing !== null && list.length > 0 && (
         <Lightbox
           items={list.map((i) => ({
