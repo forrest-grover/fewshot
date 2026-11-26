@@ -119,6 +119,85 @@ def test_busy_cache_is_not_moved_aside(tmp_path, monkeypatch):
     assert not [p for p in tmp_path.iterdir() if "corrupt" in p.name]
 
 
+def _corrupt_middle(path):
+    """Overwrite the middle of a checkpointed cache file with junk (pages the header doesn't cover)."""
+    size = path.stat().st_size
+    with open(path, "r+b") as f:
+        f.seek(size // 2)
+        f.write(b"\xa5" * (64 * 1024))
+
+
+def test_damage_found_after_opening_is_a_miss_and_a_new_cache(tmp_path, caplog):
+    """Corruption that a read reaches only later (the file opened fine) makes the lookup a miss,
+    moves the file aside once and starts a new cache, instead of failing every lookup from then on."""
+    path = tmp_path / "cache.sqlite"
+    cache = EmbeddingCache(path)
+    keys = [f"k{i}" for i in range(2000)]
+    cache.put_many("s", {k: np.ones(256, np.float32) for k in keys})
+    cache._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # pylint: disable=protected-access
+    _corrupt_middle(path)
+    damaged = EmbeddingCache(path)  # opens fine: the header is intact
+    assert not damaged.get_many("s", keys)
+    assert len([p for p in tmp_path.glob("cache.sqlite.corrupt-*") if not p.name.endswith(("-wal", "-shm"))]) == 1
+    assert "unreadable" in caplog.text
+    damaged.put_many("s", {"k0": np.ones(256, np.float32)})
+    assert set(damaged.get_many("s", keys)) == {"k0"}
+
+
+class _Failing:  # pylint: disable=too-few-public-methods
+    """A connection whose queries fail with SQLite result ``code`` (11: corrupt; 5: busy)."""
+
+    def __init__(self, conn, code):
+        self.conn, self.code = conn, code
+
+    def _fail(self, *_args):
+        e = sqlite3.DatabaseError("database disk image is malformed")
+        e.sqlite_errorcode = self.code
+        raise e
+
+    execute = executemany = _fail
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+
+def _break(cache, code):
+    """Make ``cache``'s queries fail with SQLite result ``code``."""
+    cache.__dict__["_conn"] = _Failing(cache.__dict__["_conn"], code)
+
+
+def test_damage_found_by_a_write_moves_the_cache_aside_and_keeps_the_vectors(tmp_path):
+    """A write that finds the file damaged goes into the new cache; a busy one is raised as before."""
+    path = tmp_path / "cache.sqlite"
+    cache = EmbeddingCache(path)
+    _break(cache, 11)
+    cache.put_many("s", {"k": np.ones(3, np.float32)})
+    assert set(EmbeddingCache(path).get_many("s", ["k"])) == {"k"}
+    assert [p for p in tmp_path.iterdir() if p.name.startswith("cache.sqlite.corrupt-")]
+    _break(cache, 5)
+    with pytest.raises(sqlite3.DatabaseError):
+        cache.get_many("s", ["k"])
+    with pytest.raises(sqlite3.DatabaseError):
+        cache.put_many("s", {"k": np.ones(3, np.float32)})
+
+
+def test_damage_another_process_dealt_with_only_reopens(tmp_path):
+    """If the damaged file was already replaced (or removed) by another process, the new cache
+    there is opened, not moved aside too."""
+    path = tmp_path / "cache.sqlite"
+    cache = EmbeddingCache(path)
+    path.rename(tmp_path / "moved-by-other")
+    EmbeddingCache(path).put_many("s", {"k": np.ones(3, np.float32)})
+    _break(cache, 11)
+    assert not cache.get_many("s", ["k"])  # this lookup misses ...
+    assert set(cache.get_many("s", ["k"])) == {"k"}  # ... then the other's cache is used
+    assert not [p for p in tmp_path.iterdir() if "corrupt" in p.name]
+    path.unlink()
+    _break(cache, 26)
+    assert not cache.get_many("s", ["k"])
+    assert path.exists()
+
+
 # ---- pruning -------------------------------------------------------------
 def test_prune_cache_holds_the_task_locks(ws, monkeypatch):
     """Pruning decides what to keep and deletes the rest with every task locked."""
