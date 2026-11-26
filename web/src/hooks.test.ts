@@ -37,8 +37,9 @@ describe("taskUndoKey", () => {
     }
   });
 
-  it("undoes from a checkbox, select or button left focused", () => {
-    for (const html of ["<input type='checkbox'>", "<select><option>a</option></select>", "<button>x</button>"]) {
+  it("undoes from a checkbox, select, button, slider or date picker left focused", () => {
+    for (const html of ["<input type='checkbox'>", "<select><option>a</option></select>", "<button>x</button>",
+      "<input type='range'>", "<input type='color'>", "<input type='date'>"]) {
       expect(taskUndoKey(press(add(html), ctrlZ)), html).toBe("undo");
     }
   });
@@ -55,6 +56,7 @@ describe("typingAt", () => {
   it("counts text fields and selects, not checkboxes or buttons", () => {
     expect(typingAt(add("<input>"))).toBe(true);
     expect(typingAt(add("<select></select>"))).toBe(true);
+    expect(typingAt(add("<input type='range'>"))).toBe(true); // arrows move it, not page shortcuts
     expect(typingAt(add("<input type='checkbox'>"))).toBe(false);
     expect(typingAt(add("<button></button>"))).toBe(false);
     expect(typingAt(window)).toBe(false);

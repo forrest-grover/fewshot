@@ -1,24 +1,23 @@
 import { memo, useMemo, useRef, useState, type DragEvent } from "react";
-import { api, HttpError, type AddResult, type Example, type TaskDetail } from "./api";
-import { EXAMPLE_DRAG, filesFromDrop, isImage, useAbortOnLeave, usePasteImages, useShortcuts } from "./hooks";
-import { shrinkImages, THUMB_SIZE } from "./images";
+import { api, type Example, type TaskDetail } from "./api";
+import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts, type Uploads } from "./hooks";
+import { THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import TagEditor, { type TagEdit } from "./TagEditor";
 import { ClassSelect, DropZone } from "./ui";
-import { progressText, sendInBatches } from "./upload";
+import { progressText } from "./upload";
 
-interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
-interface Skipped { file: string | null; error: string }
+interface Props {
+  task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
+  uploads: Uploads; // uploads to classes (by class name), kept by the App so they go on in other tabs
+}
 
 /** Thumbnails shown per class at first, and added by each "Show more", so a class with thousands of
  * examples doesn't render thousands of images and class menus at once. */
 const PAGE = 60;
 
-export default function Examples({ task, setTask, run }: Props) {
+export default function Examples({ task, setTask, run, uploads }: Props) {
   const [newClass, setNewClass] = useState("");
-  // class -> the upload in progress: images sent so far, and how to stop it
-  const [uploading, setUploading] = useState<Partial<Record<string, { done: number; total: number; cancel: () => void }>>>({});
-  const [skipped, setSkipped] = useState<Partial<Record<string, Skipped[]>>>({}); // class -> files the last upload skipped
   const [shown, setShown] = useState<Partial<Record<string, number>>>({}); // class -> thumbnails shown
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set()); // selected example ids
   const [dropOn, setDropOn] = useState<string | null>(null); // class card under a drag
@@ -31,35 +30,13 @@ export default function Examples({ task, setTask, run }: Props) {
   const pointed = useRef<string | null>(null); // class card last hovered or focused: where a paste goes
   const anchor = useRef<string | null>(null); // last ticked example, for Shift+click ranges
 
-  const newUpload = useAbortOnLeave(task.name); // uploads stop when the task is closed
-  /** Add images to class ``label``, in batches (see sendInBatches): each shows as it lands, and
-   * Cancel (or leaving the task) stops the rest. A class takes one upload at a time. */
+  /** Add images to class ``label``, in batches (see useUploads), as one undo step: each batch
+   * shows as it lands, and Cancel (or opening another task) stops the rest. A class takes one
+   * upload at a time. */
   const upload = async (label: string, files: File[]) => {
-    if (uploading[label]) { fail(`Still adding images to ${label}: wait for it or cancel it first.`); return; }
-    const req = newUpload();
-    const skips: Skipped[] = [];
-    setSkipped((s) => ({ ...s, [label]: [] }));
-    /** One batch; one whose images were all unusable (400) is skipped, not the end of the upload. */
-    const send = async (fs: File[], signal: AbortSignal): Promise<AddResult | null> => {
-      try {
-        return await api.addExamples(task.name, label, fs, signal);
-      } catch (e) {
-        if (!(e instanceof HttpError && e.status === 400)) throw e;
-        skips.push({ file: null, error: e.message });
-        return null;
-      }
-    };
-    try {
-      await run(sendInBatches(files, send, {
-        signal: req.signal, prepare: shrinkImages,
-        onProgress: (done, total) => { setUploading((u) => ({ ...u, [label]: { done, total, cancel: req.cancel } })); },
-        onBatch: (r) => { if (r) { setTask(r.task); skips.push(...r.errors); } },
-      }));
-    } finally {
-      req.done();
-      setUploading((u) => ({ ...u, [label]: undefined }));
-      setSkipped((s) => ({ ...s, [label]: skips }));
-    }
+    if (uploads.slots[label]?.progress) { fail(`Still adding images to ${label}: wait for it or cancel it first.`); return; }
+    const name = task.name;
+    await uploads.start(label, files, (fs, signal, group) => api.addExamples(name, label, fs, signal, group));
   };
   /** Run a mutation and show its result; resolves to whether it succeeded. */
   const save = async (p: Promise<TaskDetail>) => {
@@ -352,8 +329,8 @@ export default function Examples({ task, setTask, run }: Props) {
 
       {task.classes.map((c, ci) => {
         const limit = shown[c.name] ?? PAGE;
-        const skip = skipped[c.name] ?? [];
-        const up = uploading[c.name]; // an upload in progress
+        const skip = uploads.slots[c.name]?.skipped ?? [];
+        const up = uploads.slots[c.name]?.progress; // an upload in progress
         const list = byClass.get(c.name) ?? [];
         const allPicked = list.length > 0 && list.every((e) => picked.has(e.id));
         return (
@@ -431,7 +408,7 @@ export default function Examples({ task, setTask, run }: Props) {
                   Skipped {skip.length} file{skip.length === 1 ? "" : "s"}:
                   <ul>{skip.map((e, i) => <li key={i}>{e.file && <><b>{e.file}</b>: </>}{e.error}</li>)}</ul>
                 </div>
-                <button className="ghost" aria-label="Dismiss" onClick={() => { setSkipped((s) => ({ ...s, [c.name]: [] })); }}>×</button>
+                <button className="ghost" aria-label="Dismiss" onClick={() => { uploads.dismiss(c.name); }}>×</button>
               </div>
             )}
           </section>
@@ -457,11 +434,17 @@ interface ThumbActions {
   annotate: (ex: Example) => void; remove: (ex: Example) => void;
 }
 
+interface ThumbProps { ex: Example; task: string; picked: boolean; classes: string[]; on: ThumbActions }
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+/** Whether a thumbnail would show the same: every response brings new example objects and class
+ * lists, so they are compared by what is shown, not by identity. */
+const sameThumb = (a: ThumbProps, b: ThumbProps) => a.task === b.task && a.picked === b.picked && a.on === b.on
+  && a.ex.id === b.ex.id && a.ex.label === b.ex.label && a.ex.source === b.ex.source && a.ex.note === b.ex.note
+  && sameList(a.ex.tags, b.ex.tags) && sameList(a.classes, b.classes);
+
 /** One example's thumbnail: tick box, image (click, Enter or Space opens it), class menu, edit
- * and delete. Memoised: a class can show hundreds. */
-const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: {
-  ex: Example; task: string; picked: boolean; classes: string[]; on: ThumbActions;
-}) {
+ * and delete. Memoised (see sameThumb): a class can show hundreds. */
+const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: ThumbProps) {
   return (
     <figure className={`thumb ${picked ? "picked" : ""}`} draggable onDragStart={(e) => { on.dragStart(ex, e); }}>
       <label className="pick" title="Tick to select (Shift+click for a range)">
@@ -496,7 +479,7 @@ const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: {
       </figcaption>
     </figure>
   );
-});
+}, sameThumb);
 
 const FOLD_KEY = "fewshot:folded:";
 

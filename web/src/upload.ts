@@ -3,6 +3,23 @@
 export interface BatchLimits { files: number; bytes: number }
 export const BATCH: BatchLimits = { files: 100, bytes: 32 * 1024 * 1024 };
 
+/** BATCH for a server that takes at most ``maxRequestBytes`` per request (``/api/health`` says):
+ * batches of at most half that, leaving room for the multipart framing, so a server configured
+ * below 32 MB still takes them. Unknown (an old server): BATCH. */
+export function batchLimits(maxRequestBytes?: number | null): BatchLimits {
+  if (!maxRequestBytes || !(maxRequestBytes > 0)) return BATCH;
+  return { files: BATCH.files, bytes: Math.max(1, Math.min(BATCH.bytes, Math.floor(maxRequestBytes / 2))) };
+}
+
+/** A new id for the undo group of one drop: the server makes its batches one undo step. A UUID
+ * where the browser has ``crypto.randomUUID`` (secure contexts only: https or localhost), else
+ * 32 random hex digits. */
+export function newUndoGroup(): string {
+  const c = crypto as Partial<Crypto> & Pick<Crypto, "getRandomValues">;
+  if (c.randomUUID) return c.randomUUID();
+  return Array.from(c.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** ``files`` split, in order, into runs of at most ``maxBytes`` bytes (a larger file goes alone). */
 export function splitBytes<T extends { size: number }>(files: T[], maxBytes: number): T[][] {
   const out: T[][] = [];

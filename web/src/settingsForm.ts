@@ -80,6 +80,13 @@ export function settingsPatch(task: TaskDetail, form: SettingsForm): { patch: Ta
   return { patch, problems };
 }
 
+/** ``edits`` after picking ``classifier`` in the menu: another classifier starts with blank params
+ * (its defaults); going back to the saved one drops both edits, so its saved params show and stay. */
+export function pickClassifier(edits: Edits, task: TaskDetail, classifier: string): Edits {
+  const { classifier: _c, params: _p, ...rest } = edits; // eslint-disable-line @typescript-eslint/no-unused-vars
+  return classifier === task.classifier ? rest : { ...rest, classifier, params: {} };
+}
+
 /** ``edits`` without those that were saved: the ones still exactly as they were when ``sent``. */
 export function afterSave(edits: Edits, sent: Edits): Edits {
   return Object.fromEntries(Object.entries(edits).filter(([k, v]) => sent[k as keyof Edits] !== v)) as Edits;

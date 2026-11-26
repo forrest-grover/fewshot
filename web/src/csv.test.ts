@@ -21,6 +21,14 @@ describe("csvCell", () => {
     expect(csvCell("@SUM(A1)")).toBe("'@SUM(A1)");
     expect(csvCell("\tcmd")).toBe("'\tcmd");
     expect(csvCell("cat=dog.jpg")).toBe("cat=dog.jpg");
+    expect(csvCell("-1e3+A1")).toBe("'-1e3+A1");
+  });
+
+  it("leaves negative numbers as numbers, given as text or not", () => {
+    expect(csvCell((-0.12345).toFixed(4))).toBe("-0.1235");
+    expect(csvCell("-12")).toBe("-12");
+    expect(csvCell("-1.5e-7")).toBe("-1.5e-7");
+    expect(csvCell(-1.5e-7)).toBe("-1.5e-7");
   });
 });
 
