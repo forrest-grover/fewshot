@@ -44,3 +44,16 @@ def test_constraints_pin_every_dependency():
         assert re.sub(r"[-_.]+", "-", name).lower() in pins, dep
     assert "-c constraints.txt" in (root / "Dockerfile").read_text()
     assert "-c constraints.txt" in (root / ".github" / "workflows" / "ci.yml").read_text()
+
+
+def test_tokens_in_workflows_and_docs_would_be_accepted():
+    """Every token set literally in CI, compose or the README passes the server's strength rule
+    (a weak one makes the server refuse to start, as the Docker CI probe once did)."""
+    from fewshot.server_settings import token_problem  # pylint: disable=import-outside-toplevel
+
+    root = Path(__file__).resolve().parent.parent
+    files = [*root.glob(".github/workflows/*.yml"), root / "docker-compose.yml", root / "README.md"]
+    found = [(f.name, m) for f in files
+             for m in re.findall(r"FEWSHOT_TOKEN=([^\s\"'$`)]+)", f.read_text())]
+    for name, token in found:
+        assert token_problem(token) is None, f"{name} sets FEWSHOT_TOKEN={token}, which the server refuses"

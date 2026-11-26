@@ -155,7 +155,7 @@ jobs:
       - name: Run the image; /healthz answers and / serves the UI
         run: |
           # FEWSHOT_WARM=0: no model download at startup
-          docker run -d --name fewshot -p 127.0.0.1:8000:8000 -e FEWSHOT_TOKEN=ci-token -e FEWSHOT_WARM=0 fewshot:ci
+          docker run -d --name fewshot -p 127.0.0.1:8000:8000 -e FEWSHOT_TOKEN="$(openssl rand -hex 16)" -e FEWSHOT_WARM=0 fewshot:ci
           for _ in $(seq 60); do
             if curl -fsS http://127.0.0.1:8000/healthz; then break; fi
             sleep 2
