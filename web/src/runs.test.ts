@@ -5,7 +5,7 @@ import { useByTask } from "./hooks";
 import { evalAfter, jobLost, NO_EVAL, type EvalRun } from "./runs";
 
 const job = (over: Partial<Job<EvalReport>> = {}): Job<EvalReport> => ({
-  id: "j1", task: "pets", kind: "evaluate", status: "running", stage: "embedding", done: 1, total: 4, result: null, error: null, ...over,
+  id: "j1", task: "pets", kind: "evaluate", status: "running", stage: "embedding", done: 1, total: 4, result: null, error: null, expired: false, ...over,
 });
 const report = { revision: 7 } as EvalReport;
 
@@ -42,5 +42,12 @@ describe("useByTask", () => {
     expect(result.current.map.a2?.job?.id).toBe("j1");
     act(() => { result.current.setFor("b")(null); });
     expect(result.current.map.b).toBeUndefined();
+  });
+});
+
+describe("a job being cancelled", () => {
+  it("is still running until it stops", () => {
+    const j = job({ status: "cancelling" });
+    expect(evalAfter({ ...NO_EVAL, job: job() }, j)?.job).toBe(j);
   });
 });

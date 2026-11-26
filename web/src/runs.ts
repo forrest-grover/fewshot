@@ -1,4 +1,4 @@
-import type { CompareReport, EvalReport, Job } from "./api";
+import { type CompareReport, type EvalReport, type Job, jobActive } from "./api";
 
 /** A task's last evaluation, and the background job computing the next one (polled by the App
  * until it ends, whichever task or tab is open). */
@@ -16,14 +16,14 @@ export interface CompareRun { report: CompareReport | null; job: Job<CompareRepo
  * failed one leaves the old report. A report from a job no longer tracked is ignored. */
 export function evalAfter(s: EvalRun | null, j: Job<EvalReport>): EvalRun | null {
   if (!s || s.job?.id !== j.id) return s;
-  if (j.status === "running") return { ...s, job: j };
+  if (jobActive(j)) return { ...s, job: j };
   return j.status === "done" ? { ...s, job: null, report: j.result, rev: j.result?.revision ?? null } : { ...s, job: null };
 }
 
 /** Like ``evalAfter``, for a comparison. */
 export function compareAfter(s: CompareRun | null, j: Job<CompareReport>): CompareRun | null {
   if (!s || s.job?.id !== j.id) return s;
-  if (j.status === "running") return { ...s, job: j };
+  if (jobActive(j)) return { ...s, job: j };
   return j.status === "done" ? { ...s, job: null, report: j.result } : { ...s, job: null };
 }
 

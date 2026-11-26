@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, log_clamped, make_classifier, temper, top_k
-from .images import IMAGE_EXTS
+from .folders import class_folders
 from .models import TaskConfig
 from .pipeline import Pipeline, new_classifier
 from .store import Task
@@ -428,13 +428,9 @@ def _compare_one(run: Callable[[], dict[str, Any]], spec: str) -> dict[str, Any]
 
 
 def load_folder_dataset(folder: Path) -> dict[str, list[Path]]:
-    """Map each subfolder name of ``folder`` to its sorted image files; empty classes are skipped."""
-    ds = {}
-    for d in sorted(p for p in folder.iterdir() if p.is_dir()):
-        files = sorted(f for f in d.iterdir() if f.suffix.lower() in IMAGE_EXTS and f.is_file())
-        if files:
-            ds[d.name] = files
-    return ds
+    """Map each subfolder name of ``folder`` to its sorted image files; empty classes, and hidden
+    or system folders such as ``__MACOSX``, are skipped (as ``fewshot import`` does)."""
+    return class_folders(folder)
 
 
 @dataclass

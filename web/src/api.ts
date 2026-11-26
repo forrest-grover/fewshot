@@ -34,7 +34,10 @@ export type ModelInfo = S["ModelsOut"];
 /** PATCH /api/tasks/{name}: every field is optional (the schema marks the clear_* flags required
  * only because they have defaults). */
 export type TaskSettings = Partial<S["TaskSettings"]>;
-export type JobStatus = "running" | "done" | "failed" | "cancelled";
+export type JobStatus = "running" | "cancelling" | "done" | "failed" | "cancelled";
+
+/** Whether a job is still working (a cancelled one runs until its next progress step). */
+export const jobActive = (j: { status: JobStatus }): boolean => j.status === "running" || j.status === "cancelling";
 /** A background job whose ``result`` (once done) is a ``T``. */
 export type Job<T> = Omit<S["JobOut"], "status" | "result"> & { status: JobStatus; result: T | null };
 

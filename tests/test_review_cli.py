@@ -384,13 +384,6 @@ def test_watch_retries_a_failed_move_later(run, task, tmp_path, monkeypatch):
     assert len(tries) == 1  # waits out its back-off instead of retrying every look
 
 
-def test_flip_keys_agree():
-    """Pruning keeps flipped vectors under the key the pipeline caches them under."""
-    from fewshot import pipeline  # pylint: disable=import-outside-toplevel
-
-    assert cache_module.FLIP_KEY == pipeline.FLIP_KEY
-
-
 def test_rich_is_a_declared_dependency():
     """The CLI's progress bars need rich, so it is a dependency."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

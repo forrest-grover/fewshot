@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, HttpError, type Job, type Prediction, type TaskDetail } from "./api";
+import { api, HttpError, type Job, jobActive, type Prediction, type TaskDetail } from "./api";
 
 const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
 
@@ -306,7 +306,7 @@ export function usePollJob<T>(jobId: string | undefined, onJob: (j: Job<T>) => v
         if (!live) return;
         failures = 0;
         latest.current.onJob(j);
-        if (j.status === "running") timer = setTimeout(poll, POLL_MS);
+        if (jobActive(j)) timer = setTimeout(poll, POLL_MS);
       }, (e: unknown) => {
         if (!live) return;
         failures += 1;

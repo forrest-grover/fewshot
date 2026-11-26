@@ -15,7 +15,8 @@ export interface paths {
         };
         /**
          * Health
-         * @description Liveness check; also lists loaded models and running jobs. Needs no token.
+         * @description Liveness check; also lists loaded models and running jobs. Needs no token, and no thread, so
+         *     it answers even while every thread is busy.
          */
         get: operations["health"];
         put?: never;
@@ -42,7 +43,8 @@ export interface paths {
         post?: never;
         /**
          * Cancel Job
-         * @description Ask a running job to stop; it does so at its next progress step (status becomes "cancelled").
+         * @description Ask a running job to stop: its status becomes "cancelling" (no longer counted against the
+         *     job limit), then "cancelled" at its next progress step.
          */
         delete: operations["cancel_job"];
         options?: never;
@@ -61,11 +63,12 @@ export interface paths {
         put?: never;
         /**
          * Login
-         * @description Check the server token and remember it in an HttpOnly cookie (30 days; Secure over HTTPS).
+         * @description Check the server token and start a session: an HttpOnly, SameSite=Strict cookie (Secure over
+         *     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
          *
-         *     After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds (here or with
-         *     other requests), further attempts get 429 until the window has passed, so the token can't be
-         *     guessed quickly.
+         *     After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds (here or as
+         *     Bearer headers), token checks from it get 429 until the window has passed, so the token
+         *     can't be guessed quickly.
          */
         post: operations["login"];
         delete?: never;
@@ -85,7 +88,7 @@ export interface paths {
         put?: never;
         /**
          * Logout
-         * @description Forget the login cookie.
+         * @description End the session: the cookie is deleted, and its session refused from now on.
          */
         post: operations["logout"];
         delete?: never;
@@ -182,7 +185,8 @@ export interface paths {
         head?: never;
         /**
          * Update Task
-         * @description Change task settings; switching classifier resets its params unless new ones are given.
+         * @description Change task settings. ``classifier_params`` replaces the params; switching classifier starts
+         *     its params afresh unless they are given. A temperature of 1 means none.
          */
         patch: operations["update_task"];
         trace?: never;
@@ -247,7 +251,8 @@ export interface paths {
         head?: never;
         /**
          * Patch Class
-         * @description Rename a class (relabelling its examples) and/or set its description.
+         * @description Rename a class (relabelling its examples) and/or set its description, as one change (one
+         *     undo step).
          */
         patch: operations["patch_class"];
         trace?: never;
@@ -368,7 +373,8 @@ export interface paths {
         /**
          * Start Evaluation
          * @description Start cross-validating the task in the background; poll GET /api/jobs/{id} for progress
-         *     (stage "embedding" counts images, "evaluating" counts folds) and the report.
+         *     (stage "embedding" counts images, "evaluating" counts folds) and the report. The same
+         *     evaluation of the same version already running is shared rather than started again.
          */
         post: operations["start_evaluation"];
         delete?: never;
@@ -402,8 +408,8 @@ export interface paths {
         head?: never;
         /**
          * Edit Examples
-         * @description Move several examples to another (possibly new) class and/or tag them; an unknown id
-         *     changes nothing (404).
+         * @description Move several examples to another (possibly new) class and/or tag them, as one change (one
+         *     undo step); an unknown id changes nothing (404).
          */
         patch: operations["edit_examples"];
         trace?: never;
@@ -467,7 +473,8 @@ export interface paths {
         head?: never;
         /**
          * Edit Example
-         * @description Move an example to another (possibly new) class, and/or set its tags or note.
+         * @description Move an example to another (possibly new) class, and/or set its tags or note, as one change
+         *     (one undo step).
          */
         patch: operations["edit_example"];
         trace?: never;
@@ -551,6 +558,27 @@ export interface paths {
          * @description Label inbox images, moving them to the examples (one undo step); 404 if an id isn't waiting.
          */
         post: operations["accept_inbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{name}/inbox/accept-confident": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept Confident
+         * @description Label as the model suggests every inbox image (of ``ids``, if given) it is at least
+         *     ``min_confidence`` sure of and doesn't reject, in one undo step.
+         */
+        post: operations["accept_confident"];
         delete?: never;
         options?: never;
         head?: never;
@@ -704,6 +732,16 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * AcceptConfident
+         * @description Body of POST .../inbox/accept-confident.
+         */
+        AcceptConfident: {
+            /** Ids */
+            ids?: string[] | null;
+            /** Min Confidence */
+            min_confidence: number;
+        };
+        /**
          * AddResult
          * @description POST .../examples.
          */
@@ -772,7 +810,7 @@ export interface components {
         };
         /**
          * ClassBody
-         * @description Body of POST .../classes.
+         * @description Body of POST .../classes. A description holds at most ``MAX_PROMPTS`` prompts (lines).
          */
         ClassBody: {
             /** Description */
@@ -1075,6 +1113,10 @@ export interface components {
             auth_required: boolean;
             /** Jobs Running */
             jobs_running: number;
+            /** Max Request Bytes */
+            max_request_bytes: number;
+            /** Max Upload Bytes */
+            max_upload_bytes: number;
             /** Models Loaded */
             models_loaded: string[];
             /** Status */
@@ -1173,6 +1215,11 @@ export interface components {
             done: number;
             /** Error */
             error: string | null;
+            /**
+             * Expired
+             * @default false
+             */
+            expired: boolean;
             /** Id */
             id: string;
             /** Kind */
@@ -2513,6 +2560,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["InboxLabels"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    accept_confident: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcceptConfident"];
             };
         };
         responses: {

@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from .cache import EmbeddingCache
+from .cache import FLIP_KEY, EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, hold, spec_supports_text
 from .images import image_id, load_image, to_rgb
@@ -24,7 +24,6 @@ from .text import fill_template, prompts
 
 ImageInput = bytes | str | Path | Image.Image
 Progress = Callable[[int, int], None]  # (done, total); may raise to cancel the work
-FLIP_KEY = ":flip"  # cache key suffix for flip-averaged embeddings
 
 
 @dataclass
