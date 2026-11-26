@@ -592,6 +592,65 @@ def test_concurrent_cold_requests_fit_once(ws, monkeypatch):
     assert not pipe._fitting  # pylint: disable=protected-access
 
 
+def test_a_newcomer_after_a_failed_fit_waits_with_the_others(ws, monkeypatch):
+    """When a fit fails while other requests wait for it, a request arriving then queues behind
+    them instead of fitting at the same time as the waiter that tries again."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_example(png(RED), "red")
+    t.add_example(png(BLUE), "blue")
+    pipe = Pipeline(ws)
+    real = pipeline.new_classifier
+    n = {"fits": 0, "active": 0, "most": 0}
+    second = threading.Event()
+
+    def watched(cfg):
+        clf = real(cfg)
+        fit = clf.fit
+
+        def counted(data):
+            n["fits"] += 1
+            n["active"] += 1
+            n["most"] = max(n["most"], n["active"])
+            try:
+                if n["fits"] == 1:
+                    deadline = time.monotonic() + 5
+                    while sum(g.users for g in pipe._fitting.values()) < 2 and time.monotonic() < deadline:  # pylint: disable=protected-access
+                        time.sleep(0.01)  # until a second request waits
+                    raise RuntimeError("first fit fails")
+                second.set()
+                time.sleep(0.3)
+                return fit(data)
+            finally:
+                n["active"] -= 1
+
+        clf.fit = counted  # type: ignore[method-assign]
+        return clf
+
+    monkeypatch.setattr(pipeline, "new_classifier", watched)
+    errors, out = [], []
+
+    def request():
+        try:
+            out.append(pipe.fitted(t))
+        except RuntimeError as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=request) for _ in range(2)]
+    for th in threads:
+        th.start()
+    assert second.wait(5)
+    late = threading.Thread(target=request)  # arrives while the waiter fits again
+    late.start()
+    for th in [*threads, late]:
+        th.join()
+    assert n["most"] == 1
+    assert n["fits"] == 2
+    assert len(errors) == 1
+    assert len(out) == 2
+    assert out[0] is out[1]
+    assert not pipe._fitting  # pylint: disable=protected-access
+
+
 # ---- flip averaging, prompt ensembles, repeated and chunked input --------
 class LeftRight(Embedder):  # pylint: disable=abstract-method
     """Mean colour of the left half, then of the right half: sensitive to mirroring."""

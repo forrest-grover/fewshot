@@ -68,9 +68,12 @@ class Pipeline:
         # deleted-and-recreated task that reaches the same revision from reusing a stale fit.
         self._fitted: dict[str, tuple[tuple[str, int, str], Classifier]] = {}
         self._lock = threading.Lock()
-        # (task name, stamp) -> lock held while that version is fitted, so concurrent requests for
-        # a task that isn't fitted yet wait for one fit instead of each fitting it themselves.
-        self._fitting: dict[tuple[str, tuple[str, int, str]], threading.Lock] = {}
+        # (task name, stamp) -> lock held while that version is fitted, with the requests using it,
+        # so concurrent requests for a task that isn't fitted yet wait for one fit instead of each
+        # fitting it themselves. The entry stays while any request waits on it, so after a failed
+        # fit a newcomer queues behind the waiters (which try again one at a time) instead of
+        # fitting alongside them.
+        self._fitting: dict[tuple[str, tuple[str, int, str]], _Gate] = {}
 
     # ---- embeddings --------------------------------------------------
     def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],
@@ -259,23 +262,26 @@ class Pipeline:
             hit = self._fitted.get(cfg.name)
             if hit and hit[0] == stamp:
                 return hit[1]
-            gate = self._fitting.setdefault(key, threading.Lock())
-        with gate:
-            with self._lock:  # fitted by another request while this one waited?
-                hit = self._fitted.get(cfg.name)
-                if hit and hit[0] == stamp:
-                    return hit[1]
-            try:
+            gate = self._fitting.setdefault(key, _Gate())
+            gate.users += 1
+        try:
+            with gate.lock:
+                with self._lock:  # fitted by another request while this one waited?
+                    hit = self._fitted.get(cfg.name)
+                    if hit and hit[0] == stamp:
+                        return hit[1]
                 clf = new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
                 with self._lock:
                     # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
                     cur = self._fitted.get(cfg.name)
                     if cur is None or cur[0][0] != stamp[0] or cur[0][1] <= stamp[1]:
                         self._fitted[cfg.name] = (stamp, clf)
-            finally:
-                with self._lock:
-                    self._fitting.pop(key, None)
-        return clf
+                return clf
+        finally:
+            with self._lock:
+                gate.users -= 1
+                if not gate.users:
+                    del self._fitting[key]
 
     # ---- prediction --------------------------------------------------
     def predict(self, task: Task | str, images: Sequence[ImageInput], top_k: int | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -375,6 +381,14 @@ class Pipeline:
         return [{"a": exs[i].id, "b": exs[j].id, "similarity": round(sim, 4),
                  "labels": [exs[i].label, exs[j].label], "same_label": exs[i].label == exs[j].label}
                 for sim, i, j in pairs[:limit]]
+
+
+class _Gate:  # pylint: disable=too-few-public-methods
+    """A lock held while one version of a task is fitted, and how many requests are using it."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
 
 
 def _attach_evidence(clf: Classifier, cfg: TaskConfig, Q: Vectors, preds: list[Prediction], k: int) -> None:
