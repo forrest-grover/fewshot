@@ -15,6 +15,7 @@ from fewshot.classifiers import (
     LogRegClassifier,
     PrototypeClassifier,
     make_classifier,
+    temper,
     top_k,
 )
 
@@ -482,16 +483,64 @@ def test_grid_searches_log_when_they_hit_an_end(caplog):
     y = np.array([0, 1])
     sure = np.array([[1.0, -1.0], [-1.0, 1.0]])
     grid = np.array([0.5, 1.0, 2.0])
-    assert classifiers._least_nll([g * sure for g in grid], grid, y, what="probe") == 2.0  # pylint: disable=protected-access
+    assert classifiers.least_nll(sure, grid, y, what="probe") == 2.0
     assert "probe chose 2, the high end of its grid" in caplog.text
     caplog.clear()
-    assert classifiers._least_nll([g * sure for g in (0.5, 5, 10)], grid, y, smooth=True) == 0.5  # pylint: disable=protected-access
+    assert classifiers.least_nll(sure, grid, y, smooth=True) == 0.5  # smoothed: best near 0.55
     assert "value chose 0.5, the low end of its grid" in caplog.text
     caplog.clear()
-    assert classifiers._least_nll([sure * 0, sure, sure * 0], grid, y) == 1.0  # pylint: disable=protected-access
+    assert classifiers.least_nll(sure, np.array([0.25, 0.55, 2.0]), y, smooth=True) == 0.55
     assert not caplog.text
     ev._fit_temperature(np.array([[0.501, 0.499], [0.499, 0.501]] * 50), np.array([0, 1] * 50))  # pylint: disable=protected-access
     assert "temperature chose" in caplog.text
+
+
+def _old_least_nll(logits, values, y, smooth=False):
+    """The grid search as it was, with every candidate's logits at once: the reference."""
+    rows = np.arange(len(y))
+    if smooth:
+        eps = 1.0 / (len(y) + 2)
+        Y = np.full(logits[0].shape, eps / max(logits[0].shape[1] - 1, 1))
+        Y[rows, y] = 1.0 - eps
+        nll = [-(Y * classifiers._log_softmax(z)).sum(1).mean() for z in logits]  # pylint: disable=protected-access
+    else:
+        nll = [-classifiers._log_softmax(z)[rows, y].mean() for z in logits]  # pylint: disable=protected-access
+    return np.array(nll), float(values[int(np.argmin(nll))])
+
+
+@pytest.mark.parametrize("smooth", [False, True])
+def test_grid_search_in_blocks_matches_all_at_once(monkeypatch, smooth):
+    """The grid search scores candidates block by block, a few rows at a time; it gives the same
+    cross-entropies and choices as scoring every candidate's logits at once."""
+    rng = np.random.default_rng(0)
+    n, C = 203, 7
+    A, B, y = rng.normal(size=(n, C)) * 3, rng.normal(size=(n, C)), rng.integers(0, C, n)
+    B[np.arange(n), y] += 1.0
+    grid = classifiers.GDA_ALPHAS
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 50)  # blocks of 7 rows
+    old, choice = _old_least_nll([A + a * 2.5 * B for a in grid], grid, y, smooth)
+    np.testing.assert_allclose(classifiers.nll_grid(B, grid * 2.5, y, A, smooth=smooth), old, rtol=1e-10)
+    assert classifiers.least_nll(B, grid, y, A, factor=2.5, smooth=smooth) == choice
+    old, choice = _old_least_nll([a * B for a in grid], grid, y, smooth)
+    assert classifiers.least_nll(B, grid, y, smooth=smooth) == choice
+
+
+def test_temperature_fit_matches_all_at_once(monkeypatch):
+    """Evaluation's temperature, fitted block by block, is the one the all-at-once search found,
+    with probabilities of 0 (classes a fold left out) floored as before."""
+    rng = np.random.default_rng(1)
+    n, C = 120, 5
+    P = classifiers._softmax(rng.normal(size=(n, C)) * 4)  # pylint: disable=protected-access
+    P[:10, 4] = 0.0
+    P /= P.sum(1, keepdims=True)
+    t = np.where(rng.random(n) < 0.7, P.argmax(1), rng.integers(0, 4, n))
+    eps = 1.0 / (n + 2)
+    Y = np.full(P.shape, eps / (C - 1))
+    Y[np.arange(n), t] = 1.0 - eps
+    with np.errstate(divide="ignore"):
+        old = [-(Y * np.log(np.clip(temper(P, float(T)), 1e-12, 1))).sum() for T in ev.TEMPERATURES]
+    monkeypatch.setattr(classifiers, "PREDICT_CELLS", 20)
+    assert ev._fit_temperature(P, t) == float(ev.TEMPERATURES[int(np.argmin(old))])  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize("name", ALL)

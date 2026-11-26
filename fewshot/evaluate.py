@@ -18,6 +18,7 @@ from .classifiers import (
     knn_similarity,
     log_clamped,
     make_classifier,
+    nll_grid,
     temper,
     top_k,
 )
@@ -263,13 +264,11 @@ TEMPERATURES = np.geomspace(0.01, 100, 81)  # the range a task's temperature may
 def _fit_temperature(P: np.ndarray, t: np.ndarray) -> float:
     """The grid temperature minimising cross-entropy against the true labels, smoothed by
     1/(n+2): held-out predictions that were all right still don't prove the model is never wrong,
-    and fitting them as certain would push the temperature (and every confidence) to the limit."""
-    eps = 1.0 / (len(t) + 2)
-    Y = np.full(P.shape, eps / (P.shape[1] - 1))
-    Y[np.arange(len(t)), t] = 1.0 - eps
+    and fitting them as certain would push the temperature (and every confidence) to the limit.
+    Tempering by T divides the log-probabilities by T (see ``temper``)."""
     with np.errstate(divide="ignore"):
-        logs = [np.log(np.clip(temper(P, float(T)), 1e-12, 1)) for T in TEMPERATURES]
-    best = int(np.argmin([-(Y * lg).sum() for lg in logs]))
+        logs = np.log(P)
+    best = int(np.argmin(nll_grid(logs, 1.0 / TEMPERATURES, t, smooth=True, floor=1e-12)))
     log_clamped("temperature", TEMPERATURES, best)
     return float(TEMPERATURES[best])
 

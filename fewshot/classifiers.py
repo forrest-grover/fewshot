@@ -709,30 +709,49 @@ def _fusion(zt: Scores, loo: Scores, exact: Callable[[], Scores], y: Labels, k: 
     zt, loo, y = zt[keep], loo[keep], y[keep]
     if len(y) < 2:
         return prior * rel, 1.0
-    chosen = _least_nll([zt + a * rel * loo for a in GDA_ALPHAS], GDA_ALPHAS, y, what="image-term weight")
+    chosen = least_nll(loo, GDA_ALPHAS, y, zt, factor=rel, what="image-term weight")
     pull = 1.0 / (1.0 + (k - 1) / 2)  # all prior at 1 image per class, less with more
     weight = float(np.exp((1 - pull) * np.log(chosen) + pull * np.log(prior))) * rel
     fused = text_weight * zt + weight * exact()[keep]
     scales = np.geomspace(0.1, 10, 41)
-    return weight, _least_nll([s * fused for s in scales], scales, y, what="fused logit scale")
+    return weight, least_nll(fused, scales, y, what="fused logit scale")
 
 
-def _least_nll(logits: list[Scores], values: Scores, y: Labels, smooth: bool = False,
-               what: str = "value") -> float:
-    """The value whose logits give the true classes ``y`` the least mean cross-entropy. With
-    ``smooth``, against targets smoothed by 1/(n+2) (as for a task's temperature): examples that
-    all came out right don't prove the scores are never wrong, and fitting them as certain would
-    push the scale, and every confidence, to the limit. A choice at either end of the grid may be
-    clamped; it is logged at debug level as ``what``."""
-    rows = np.arange(len(y))
-    if smooth:
-        eps = 1.0 / (len(y) + 2)
-        C = logits[0].shape[1]
-        Y = np.full(logits[0].shape, eps / max(C - 1, 1))  # (one class: nothing to spread it over)
-        Y[rows, y] = 1.0 - eps
-        best = int(np.argmin([-(Y * _log_softmax(z)).sum(1).mean() for z in logits]))
-    else:
-        best = int(np.argmin([-_log_softmax(z)[rows, y].mean() for z in logits]))
+def nll_grid(B: Scores, multipliers: Scores, y: Labels, A: Scores | None = None, *,  # pylint: disable=too-many-arguments,too-many-locals
+             smooth: bool = False, floor: float = 0.0) -> Scores:
+    """Mean cross-entropy of the true classes ``y`` under logits ``A + m * B`` (``A`` absent: 0)
+    for each m in ``multipliers``. With ``smooth``, against targets smoothed by 1/(n+2): examples
+    that all came out right don't prove the scores are never wrong, and fitting them as certain
+    would push the scale, and every confidence, to the limit. ``floor`` bounds the probabilities
+    from below (for logits that are -inf).
+
+    Each candidate is scored in blocks of rows (``PREDICT_CELLS`` values each) and summed, so a
+    grid search needs memory for one block, not for every candidate's (n, C) logits at once."""
+    n, C = B.shape
+    eps = 1.0 / (n + 2) if smooth else 0.0
+    spread = eps / max(C - 1, 1)  # (one class: nothing to spread it over)
+    low = math.log(floor) if floor > 0 else -np.inf
+    rows = max(1, PREDICT_CELLS // max(C, 1))
+    nll = np.zeros(len(multipliers))
+    for start in range(0, n, rows):
+        b, t = B[start:start + rows], y[start:start + rows]
+        a = None if A is None else A[start:start + rows]
+        idx = np.arange(len(t))
+        for i, m in enumerate(multipliers):
+            z = float(m) * b
+            ls = np.maximum(_log_softmax(z if a is None else a + z), low)
+            own = ls[idx, t]
+            nll[i] -= float(((1.0 - eps) * own + spread * (ls.sum(1) - own)).sum() if smooth else own.sum())
+    out: Scores = nll / max(n, 1)
+    return out
+
+
+def least_nll(B: Scores, values: Scores, y: Labels, A: Scores | None = None,  # pylint: disable=too-many-arguments
+              *, factor: float = 1.0, smooth: bool = False, what: str = "value") -> float:
+    """The value v in ``values`` whose logits ``A + (v * factor) * B`` give ``y`` the least
+    cross-entropy (see ``nll_grid``). A choice at either end of the grid may be clamped; it is
+    logged at debug level as ``what``."""
+    best = int(np.argmin(nll_grid(B, np.array([float(v) * factor for v in values]), y, A, smooth=smooth)))
     log_clamped(what, values, best)
     return float(values[best])
 
@@ -849,7 +868,7 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
             return default
         L, t = L[ok], self.y[ok]
         base = 10.0 / max(float(L.std()), 1e-12)
-        fitted = _least_nll([a * base * L for a in GDA_ALPHAS], GDA_ALPHAS, t, smooth=True, what="score scale") * base
+        fitted = least_nll(L, GDA_ALPHAS, t, factor=base, smooth=True, what="score scale") * base
         # Examples of a single class can't show how often the others are mistaken for it, so then
         # the fit only caps the default.
         return fitted if len(set(t.tolist())) > 1 else min(fitted, default)
