@@ -40,8 +40,7 @@ import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -49,11 +48,10 @@ from pydantic import ValidationError
 
 from . import blobs as _blobs
 from .classifiers import CLASSIFIERS
+from .embedders import check_embedder, loaded_embedders
 from .folders import class_folders, read_or_empty
-from .fsutil import FileStamp, os_reason
-from .fsutil import claim_dir as _claim_dir
+from .fsutil import FileStamp, os_reason, reclaim
 from .fsutil import dir_lock as _dir_lock
-from .fsutil import dir_locked as _dir_locked
 from .fsutil import file_lock as _file_lock
 from .fsutil import fsync_dir as _fsync_dir
 from .fsutil import stamp as _stamp
@@ -67,6 +65,7 @@ from .text import check_class_name, check_description, check_tag, check_template
 
 log = logging.getLogger(__name__)
 
+SpecCheck = Callable[[str], None]  # raises to refuse an embedder spec
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # Images saved per task.json write by Task.add_examples.
 ADD_CHUNK = 256
@@ -79,6 +78,13 @@ SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "rejec
 def default_root() -> Path:
     """Workspace root from ``$FEWSHOT_HOME``, defaulting to ``./fewshot_data``."""
     return Path(os.environ.get("FEWSHOT_HOME", "./fewshot_data")).resolve()
+
+
+def embedder_loads(spec: str) -> None:
+    """``embedders.check_embedder`` (load the model, ``ValueError`` if it can't be), skipped for
+    an embedder loaded already, such as one an interface has just checked."""
+    if spec not in loaded_embedders():
+        check_embedder(spec)
 
 
 class _NewImage(NamedTuple):
@@ -115,11 +121,12 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
     """
 
     def __init__(self, path: Path, config: TaskConfig, stamp: FileStamp | None = None,
-                 blobs: Path | None = None) -> None:
+                 blobs: Path | None = None, embedder_ok: SpecCheck | None = None) -> None:
         self.path = path
         if stamp is not None:  # read from task.json
             config = self._ahead(config, stamp[0])
         self.blobs = blobs  # the workspace's shared image store, if any
+        self.embedder_ok = embedder_ok or embedder_loads  # see Workspace
         self._writer: int | None = None  # thread id of the mutation in progress, if any
         self._draft: TaskConfig | None = None  # the config that mutation is editing
         self._published = config
@@ -145,7 +152,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
     def config(self, cfg: TaskConfig) -> None:
         if self._writer == threading.get_ident():
             self._draft = cfg
-        else:  # a task being built by its only user (new, duplicate, import)
+        else:  # a task being built by its only user (Workspace.build_task)
             self._published = cfg
 
     @property
@@ -320,15 +327,15 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
     def _store_image(self, file: str, data: bytes) -> bool:
         return _blobs.store_image(self.path, file, data, self.blobs, self._unsynced)
 
+    def _add_file(self, file: str, source: bytes | Path) -> None:
+        """Store ``file`` from its bytes, or from (a hard link to) another task's image file."""
+        if isinstance(source, bytes):
+            self._store_image(file, source)
+        else:
+            _blobs.link_image(self.path, file, source, self.blobs, self._unsynced)
+
     def _drop_file(self, file: str) -> None:
         _blobs.drop_file(self.path, file, self.blobs)
-
-    @classmethod
-    def new(cls, path: Path, config: TaskConfig, blobs: Path | None = None) -> Task:
-        """Write a new task's first ``task.json`` into ``path``, a folder only this caller uses yet."""
-        t = cls(path, config, blobs=blobs)
-        t._save()
-        return t
 
     def destroy(self) -> None:
         """Delete the task folder, waiting for any mutation in progress (in any process).
@@ -356,7 +363,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         uncalibrated and is stored as None. Changing the embedder also clears the temperature and
         reject thresholds (task and per class) fitted to the old one, and changing a
         ``settings.SCORING`` setting the temperature, unless given in ``kw``; returns the names of
-        those cleared. Changing nothing saves nothing."""
+        those cleared. Changing nothing saves nothing. A new embedder must pass ``embedder_ok``
+        (see ``Workspace``)."""
         bad = set(kw) - SETTINGS
         if bad:
             raise ValueError(f"Unknown settings: {sorted(bad)}")
@@ -374,6 +382,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                 err = e.errors()[0]
                 raise ValueError(f"{'.'.join(map(str, err['loc']))}: {err['msg']}") from None
             check_settings(new)
+            if new.embedder != self.config.embedder:
+                self.embedder_ok(new.embedder)
             if all(getattr(new, k) == getattr(self.config, k) for k in kw):
                 return []
             cleared = for_new_embedder(self.config, keep=kw) if new.embedder != self.config.embedder else []
@@ -782,12 +792,18 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
 class Workspace:
     """A folder of tasks plus the shared embedding cache."""
 
-    def __init__(self, root: Path | str | None = None, create: bool = True) -> None:
-        """The workspace in ``root`` (default ``default_root()``), made if missing and ``create``."""
+    def __init__(self, root: Path | str | None = None, create: bool = True,
+                 embedder_ok: SpecCheck | None = None) -> None:
+        """The workspace in ``root`` (default ``default_root()``), made if missing and ``create``.
+
+        ``embedder_ok`` checks an embedder spec chosen for a task (by ``create`` or
+        ``Task.update_settings``) and raises ``ValueError`` to refuse it: by default
+        ``embedder_loads``, so a bad spec fails there rather than at the first prediction."""
         self.root = Path(root).resolve() if root else default_root()
         if create:
             (self.root / "tasks").mkdir(parents=True, exist_ok=True)
         self.blobs = self.root / "blobs"
+        self.embedder_ok = embedder_ok or embedder_loads
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
 
@@ -826,7 +842,7 @@ class Workspace:
                     raise KeyError(f"No task {name!r}")
                 p = self.root / "tasks" / name
                 try:
-                    t = Task(p, *_read_config(p), blobs=self.blobs)
+                    t = Task(p, *_read_config(p), blobs=self.blobs, embedder_ok=self.embedder_ok)
                 except (FileNotFoundError, NotADirectoryError):
                     raise KeyError(f"No task {name!r}") from None
                 except (ValueError, OSError) as e:
@@ -844,21 +860,46 @@ class Workspace:
         return t
 
     def create(self, name: str, **settings: Any) -> Task:
-        """Create a new task folder; raises ``ValueError`` for bad or taken names."""
+        """Create a new task folder; an ``embedder`` given in ``settings`` must pass
+        ``embedder_ok``. Raises ``ValueError`` for a bad or taken name, an unknown classifier or
+        a refused embedder."""
         cfg = TaskConfig(name=name, **settings)
         if cfg.classifier not in CLASSIFIERS:
             raise ValueError(f"Unknown classifier {cfg.classifier!r}")
-        p = self._reserve(name)
+        if "embedder" in settings:
+            self.embedder_ok(cfg.embedder)
+        return self.build_task(cfg)
+
+    def build_task(self, cfg: TaskConfig, images: Iterable[tuple[str, bytes | Path]] = ()) -> Task:
+        """Make task ``cfg.name`` from ``cfg`` (saved as it is: check it first) and its image
+        files, each ``(file, source)`` stored as the task's ``file`` from the image's bytes or
+        from an image file of another task (hard-linked where possible, so it is shared).
+        ``images`` may be a generator, and raise to stop the build.
+
+        The task is built in a hidden folder and moved into place at the end, so a crash part-way
+        leaves no half-made task (``gc`` removes the leftover). The name's folder and the hidden
+        one stay locked meanwhile, so gc, or a create of the same name, can't take them for
+        leftovers however long it takes. Raises ``ValueError`` for a bad or taken name, and
+        whatever stopped the build (after removing what it made)."""
+        p = self._reserve(cfg.name)
+        build = self.root / "tasks" / f".tmp-{uuid.uuid4().hex}"
         try:
-            with _dir_lock(p):
-                (p / "images").mkdir()
-                t = Task.new(p, cfg, self.blobs)
+            build.mkdir()
+            with _dir_lock(p), _dir_lock(build):
+                (build / "images").mkdir()
+                t = Task(build, cfg, blobs=self.blobs, embedder_ok=self.embedder_ok)
+                for file, source in images:
+                    t._add_file(file, source)  # pylint: disable=protected-access  # a task only we can see yet
+                t._save(record=False)  # pylint: disable=protected-access
+                os.replace(build, p)  # replaces the empty reserved folder (POSIX)
         except BaseException:
+            shutil.rmtree(build, ignore_errors=True)
             shutil.rmtree(p, ignore_errors=True)
             raise
+        t.path = p
         _fsync_dir(p.parent)
         with self._lock:
-            self._tasks[name] = t
+            self._tasks[cfg.name] = t
         return t
 
     def _reserve(self, name: str) -> Path:
@@ -869,17 +910,12 @@ class Workspace:
         try:
             p.mkdir()  # atomic: of two concurrent creates, exactly one succeeds
         except FileExistsError:
-            if not _reclaim(p):  # unless left by a crash: then take the name back
+            if not reclaim(p, STALE_SECONDS):  # unless left by a crash: then take the name back
                 raise ValueError(f"Task {name!r} already exists") from None
-            return self._reserve_again(name)
-        return p
-
-    def _reserve_again(self, name: str) -> Path:
-        p = self.root / "tasks" / name
-        try:
-            p.mkdir()
-        except FileExistsError:  # pragma: no cover  # another process took it in between
-            raise ValueError(f"Task {name!r} already exists") from None
+            try:
+                p.mkdir()
+            except FileExistsError:  # pragma: no cover  # another process took it in between
+                raise ValueError(f"Task {name!r} already exists") from None
         return p
 
     def gc(self) -> dict[str, int]:
@@ -889,7 +925,7 @@ class Workspace:
         out = {"folders": 0, "images": 0, "blobs": 0}
         for p in (self.root / "tasks").iterdir():
             hidden = p.name.startswith((".tmp-", ".trash-"))
-            if p.is_dir() and (hidden or not (p / "task.json").exists()) and _reclaim(p):
+            if p.is_dir() and (hidden or not (p / "task.json").exists()) and reclaim(p, STALE_SECONDS):
                 out["folders"] += 1
         for t in self.list_tasks():
             with contextlib.suppress(KeyError):  # deleted by another process meanwhile
@@ -903,27 +939,13 @@ class Workspace:
         image file missing from the task (only if it was damaged) is left out with its example,
         as ``export_task`` does."""
         src = self.get(name)
-        with src._writing():  # pylint: disable=protected-access  # a consistent copy, not one mid-change
-            cfg = src.config
+        with src.locked() as cfg:  # a consistent copy, not one mid-change
             copy_cfg = cfg.model_copy(update={
                 "name": new, "uid": uuid.uuid4().hex, "revision": 0, "created": _now(),
                 "examples": [e for e in cfg.examples if examples and (src.path / e.file).is_file()],
                 "inbox": [x for x in cfg.inbox if inbox and (src.path / x.file).is_file()]})
-            p = self._reserve(new)
-            try:
-                with _dir_lock(p):  # so gc can't take it for a crash's leftover, however long this takes
-                    (p / "images").mkdir()
-                    t = Task(p, copy_cfg, blobs=self.blobs)
-                    for e in [*copy_cfg.examples, *copy_cfg.inbox]:
-                        t._store_image(e.file, (src.path / e.file).read_bytes())  # pylint: disable=protected-access
-                    t._save(record=False)  # pylint: disable=protected-access
-            except BaseException:
-                shutil.rmtree(p, ignore_errors=True)
-                raise
-            _fsync_dir(p.parent)
-        with self._lock:
-            self._tasks[new] = t
-        return t
+            files = [(e.file, src.path / e.file) for e in [*copy_cfg.examples, *copy_cfg.inbox]]
+            return self.build_task(copy_cfg, files)  # linked: the source's bytes aren't read
 
     def rename(self, old: str, new: str) -> Task:
         """Rename task ``old`` to ``new``; raises ``KeyError`` if ``old`` is missing and
@@ -972,39 +994,6 @@ class Workspace:
     def cache_path(self) -> Path:
         """Location of the shared embedding cache."""
         return self.root / "cache.sqlite"
-
-
-def _abandoned(folder: Path, locked: bool = False) -> bool:
-    """Whether ``folder`` is a leftover of a crash: no task.json (or hidden), untouched for
-    ``STALE_SECONDS`` (so it isn't a folder just made, before its builder locked it) and not
-    locked by a create, duplicate or import still building it, however long that takes (unless
-    ``locked``: the caller holds that lock itself)."""
-    try:
-        age = datetime.now(UTC).timestamp() - folder.stat().st_mtime
-    except FileNotFoundError:
-        return False
-    return (age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
-            and (locked or not _dir_locked(folder)))
-
-
-def _reclaim(folder: Path) -> bool:
-    """Delete ``folder`` if it is a crash's leftover (see ``_abandoned``); returns whether it went.
-
-    Judged again while holding its lock (taken without waiting) and moved aside to a ``.trash-``
-    name before it is removed, so a folder that another process took back and started building
-    in meanwhile is never the one deleted."""
-    if not _abandoned(folder):
-        return False
-    with _claim_dir(folder) as held:
-        if not held or not _abandoned(folder, locked=True):
-            return False
-        trash = folder.parent / f".trash-{uuid.uuid4().hex}"
-        try:
-            os.rename(folder, trash)
-        except FileNotFoundError:  # pragma: no cover  # removed by a process not taking the lock
-            return False
-    shutil.rmtree(trash, ignore_errors=True)
-    return True
 
 
 _n = functools.partial(plural, what="example")  # "1 example", "3 examples"

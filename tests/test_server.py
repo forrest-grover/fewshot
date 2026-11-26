@@ -152,6 +152,7 @@ def test_only_known_models_by_default(client, monkeypatch):
     """Non-preset specs are refused (403) without loading anything, unless a task already uses
     them or the server allows any model."""
     loads: list[str] = []
+    monkeypatch.setattr("fewshot.store.check_embedder", lambda spec: None)  # tasks whose model no longer loads
     monkeypatch.setattr(fewshot.api, "check_embedder", loads.append)
     r = client.post("/api/tasks", json={"name": "x", "embedder": "timm:some_model"})
     assert r.status_code == 403
@@ -171,6 +172,7 @@ def test_only_known_models_by_default(client, monkeypatch):
 def test_warm_models(client, monkeypatch):
     """Warm-up loads the most used embedders (default spec with no tasks), skipping failures."""
     loaded = []
+    monkeypatch.setattr("fewshot.store.check_embedder", lambda spec: None)  # tasks whose model no longer loads
 
     def fake_get(spec):
         if spec == "bad:x":
@@ -478,6 +480,7 @@ def test_choosing_a_model_loads_it_on_the_heavy_work_threads(client, monkeypatch
     """Creating a task or switching its embedder, which loads the model, waits on the server's
     own threads, like other heavy work."""
     threads = []
+    monkeypatch.setattr("fewshot.store.check_embedder", lambda spec: None)  # the server's own check is enough here
     monkeypatch.setattr(client.srv, "check_embedder", lambda _spec: threads.append(threading.current_thread().name))
     assert client.post("/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 201
     assert client.patch("/api/tasks/t", json={"embedder": "fake:other"}).status_code == 200

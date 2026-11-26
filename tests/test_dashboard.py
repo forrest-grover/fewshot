@@ -84,10 +84,11 @@ def test_failed_duplicate_leaves_nothing(ws, monkeypatch):
     def broken(*_a, **_k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(fewshot.store.Task, "_store_image", broken)
+    monkeypatch.setattr(fewshot.store.Task, "_add_file", broken)
     with pytest.raises(OSError, match="disk full"):
         ws.duplicate("t", "c")
     assert not (ws.root / "tasks" / "c").exists()
+    assert not [p for p in (ws.root / "tasks").iterdir() if p.name.startswith(".")]
 
 
 def test_api(tmp_path, monkeypatch):

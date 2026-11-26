@@ -187,6 +187,7 @@ def test_cli_eval_apply_with_a_class_gone(run, monkeypatch):
 def test_cli_config_says_what_switching_embedder_cleared(run, monkeypatch):
     """`config --embedder` reports the thresholds it cleared, and how to get them back."""
     monkeypatch.setattr("fewshot.services.check_embedder", lambda spec: None)
+    monkeypatch.setattr("fewshot.store.check_embedder", lambda spec: None)
     run("class", "threshold", "t", "red", "0.8")
     r = run("config", "t", "--embedder", "fake:other")
     assert "Cleared class thresholds: fitted to the previous settings (`fewshot undo t` restores them)" in r.output

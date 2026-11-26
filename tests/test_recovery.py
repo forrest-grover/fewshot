@@ -110,7 +110,7 @@ def test_gc_command(tmp_path):
 
 def test_abandoned_folder_vanishing(tmp_path):
     """A folder that disappears while being checked is not abandoned."""
-    assert not store._abandoned(tmp_path / "gone")  # pylint: disable=protected-access
+    assert not fsutil.abandoned(tmp_path / "gone", store.STALE_SECONDS)
     assert archive.MAX_IMPORT_TOTAL > 0
 
 
@@ -120,16 +120,16 @@ def test_gc_never_deletes_a_folder_taken_back_meanwhile(ws, monkeypatch):
     leftover = ws.root / "tasks" / "pets"
     leftover.mkdir()
     _age(leftover)
-    real = store._abandoned  # pylint: disable=protected-access
+    real = fsutil.abandoned
 
-    def racing(p, **kw):
-        found = real(p, **kw)
+    def racing(p, stale, **kw):
+        found = real(p, stale, **kw)
         if found and p == leftover and not kw:  # gc's first look: another process creates "pets"
-            monkeypatch.setattr(store, "_abandoned", real)
+            monkeypatch.setattr(fsutil, "abandoned", real)
             Workspace(ws.root).create("pets").upsert_class("cat")
         return found
 
-    monkeypatch.setattr(store, "_abandoned", racing)
+    monkeypatch.setattr(fsutil, "abandoned", racing)
     assert ws.gc()["folders"] == 0
     assert Workspace(ws.root).get("pets").class_names() == ["cat"]
     assert not [p for p in (ws.root / "tasks").iterdir() if p.name.startswith(".")]

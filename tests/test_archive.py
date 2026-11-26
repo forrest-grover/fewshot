@@ -101,6 +101,7 @@ def test_import_with_another_embedder_clears_fitted_settings(ws, embedder):
 
 def test_import_task_checks_the_embedder_whoever_calls_it(ws, run, tmp_path):
     """archive.import_task checks the embedder itself, so the CLI can't skip it."""
+    ws.embedder_ok = lambda spec: None  # made when it still loaded
     t = ws.create("t", embedder="nobackend:model")
     buf = io.BytesIO()
     export_task(ws, t.name, buf)

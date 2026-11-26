@@ -6,7 +6,10 @@ import contextlib
 import errno
 import importlib
 import os
+import shutil
 import tempfile
+import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -204,3 +207,36 @@ def os_reason(e: Exception) -> str:
     if isinstance(e, OSError) and e.strerror:
         return f"{e.filename}: {e.strerror}" if e.filename else e.strerror
     return str(e)
+
+
+def abandoned(folder: Path, stale_seconds: float, locked: bool = False) -> bool:
+    """Whether ``folder`` is a leftover of a crash: no task.json (or hidden), untouched for
+    ``stale_seconds`` (so it isn't a folder just made, before its builder locked it) and not
+    locked (``dir_lock``) by a create, duplicate or import still building it, however long that
+    takes (unless ``locked``: the caller holds that lock itself)."""
+    try:
+        age = time.time() - folder.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return (age > stale_seconds and (folder.name.startswith(".") or not (folder / "task.json").exists())
+            and (locked or not dir_locked(folder)))
+
+
+def reclaim(folder: Path, stale_seconds: float) -> bool:
+    """Delete ``folder`` if it is a crash's leftover (see ``abandoned``); returns whether it went.
+
+    Judged again while holding its lock (taken without waiting) and moved aside to a ``.trash-``
+    name before it is removed, so a folder that another process took back and started building
+    in meanwhile is never the one deleted."""
+    if not abandoned(folder, stale_seconds):
+        return False
+    with claim_dir(folder) as held:
+        if not held or not abandoned(folder, stale_seconds, locked=True):
+            return False
+        trash = folder.parent / f".trash-{uuid.uuid4().hex}"
+        try:
+            os.rename(folder, trash)
+        except FileNotFoundError:  # pragma: no cover  # removed by a process not taking the lock
+            return False
+    shutil.rmtree(trash, ignore_errors=True)
+    return True

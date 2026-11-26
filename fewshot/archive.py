@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import os
-import shutil
 import struct
 import uuid
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, Any
 
 from pydantic import ValidationError
 
 from .embedders import check_embedder
-from .fsutil import dir_lock, fsync_dir
 from .images import image_ext, image_id
 from .models import ClassDef, TaskConfig
 from .settings import check_settings, for_new_embedder
@@ -82,30 +80,17 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
                 for_new_embedder(cfg)
             (embedder_ok or check_embedder)(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
-            p = ws._reserve(cfg.name)  # pylint: disable=protected-access
-            # Built in a hidden folder and moved into place at the end, so a crash part-way leaves
-            # no half-imported task (Workspace.gc removes the leftover). Both folders stay locked
-            # meanwhile, so gc, or a create of the same name, can't take them for leftovers.
-            build = ws.root / "tasks" / f".tmp-{uuid.uuid4().hex}"
-            build.mkdir()
-            try:
-                with dir_lock(p), dir_lock(build):
-                    t = Task(build, cfg, blobs=ws.blobs)
-                    for e in [*cfg.examples, *cfg.inbox]:
-                        data = _read_member(z, images[e.file])
-                        if not image_id(data).startswith(e.id):  # not the bytes checked before
-                            raise ValueError(f"Not a valid task export: {e.file} changed while importing")
-                        t._store_image(e.file, data)  # pylint: disable=protected-access
-                    t._save(record=False)  # pylint: disable=protected-access
-                    os.replace(build, p)  # replaces the empty reserved folder (POSIX)
-            except BaseException:
-                shutil.rmtree(build, ignore_errors=True)
-                shutil.rmtree(p, ignore_errors=True)
-                raise
-            fsync_dir(p.parent)
+
+            def checked() -> Iterator[tuple[str, bytes]]:
+                for e in [*cfg.examples, *cfg.inbox]:
+                    data = _read_member(z, images[e.file])
+                    if not image_id(data).startswith(e.id):  # not the bytes checked before
+                        raise ValueError(f"Not a valid task export: {e.file} changed while importing")
+                    yield e.file, data
+
+            return ws.build_task(cfg, checked())
     except zipfile.BadZipFile as e:
         raise ValueError(f"Not a task export: {e}") from None
-    return ws.get(cfg.name)
 
 
 def _central_directory(f: IO[bytes]) -> tuple[int, int] | None:

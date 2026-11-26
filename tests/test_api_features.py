@@ -222,6 +222,7 @@ def test_model_that_cannot_load_is_a_400(client, task, monkeypatch):
         raise RuntimeError("couldn't reach huggingface.co")
 
     t = client.srv.ws.get(task)
+    t.embedder_ok = lambda spec: None  # chosen while it still loaded
     t.update_settings(embedder="timm:gone")
     monkeypatch.setattr(fewshot.embedders, "_build", offline)
     files = [("files", ("q.png", png(RED), "image/png"))]
