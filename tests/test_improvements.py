@@ -1,6 +1,8 @@
 """Second-review improvements: cache recovery, model memory, device checks, batch sizes, fits,
 duplicate images and the fast leave-one-out path."""
 
+import sqlite3
+
 import numpy as np
 import pytest
 import torch
@@ -28,6 +30,22 @@ def test_corrupt_cache_is_moved_aside(tmp_path, caplog):
     names = sorted(p.name for p in tmp_path.iterdir())
     assert any(n.startswith("cache.sqlite.corrupt-") and not n.endswith(("-wal", "-shm")) for n in names)
     assert "unreadable" in caplog.text
+
+
+def test_busy_cache_is_not_moved_aside(tmp_path, monkeypatch):
+    """A cache that is only locked or unwritable is reported, never mistaken for a damaged one."""
+    path = tmp_path / "cache.sqlite"
+    EmbeddingCache(path).put_many("s", {"k": np.ones(3, np.float32)})
+
+    def locked(_self):
+        e = sqlite3.OperationalError("database is locked")
+        e.sqlite_errorcode = 5  # SQLITE_BUSY
+        raise e
+
+    monkeypatch.setattr(EmbeddingCache, "_open", locked)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        EmbeddingCache(path)
+    assert not [p for p in tmp_path.iterdir() if "corrupt" in p.name]
 
 
 def test_models_in_use_are_not_unloaded(monkeypatch):

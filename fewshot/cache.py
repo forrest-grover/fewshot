@@ -24,6 +24,16 @@ log = logging.getLogger(__name__)
 BUSY_TIMEOUT = 30.0  # seconds to wait for another process's write to finish
 
 
+# SQLite's primary result codes for a file that isn't a sound database.
+_SQLITE_CORRUPT, _SQLITE_NOTADB = 11, 26
+
+
+def _damaged(e: sqlite3.DatabaseError) -> bool:
+    """Whether ``e`` says the database file itself is damaged, rather than busy or unwritable."""
+    code = getattr(e, "sqlite_errorcode", None)
+    return code is not None and code & 0xFF in (_SQLITE_CORRUPT, _SQLITE_NOTADB)
+
+
 class EmbeddingCache:
     """Thread-safe embedding store; vectors are float32 blobs."""
 
@@ -34,6 +44,8 @@ class EmbeddingCache:
         try:
             self._conn = self._open()
         except sqlite3.DatabaseError as e:
+            if not _damaged(e):  # busy, full, unreadable: the file may be fine, and in use
+                raise
             # It is only a cache: move a damaged file aside (for inspection) and start afresh,
             # rather than leaving the server and CLI unable to start.
             aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")

@@ -270,3 +270,4 @@ def test_undo_interrupted_after_commit_stays_redoable(task, monkeypatch):
     monkeypatch.undo()
     assert [e.label for e in task.config.examples] == ["red"]
     assert task.redo_label() == "add 1 example to blue"
+
