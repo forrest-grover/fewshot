@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import os
 import secrets
 from typing import TYPE_CHECKING, Any
 
@@ -29,11 +28,6 @@ ALLOW_NO_TOKEN_ENV = "FEWSHOT_ALLOW_NO_TOKEN"
 NO_TOKEN = ("This server has no token, so anyone who can reach it could read and change every task, and it "
             "was reached at {addr}, which isn't this machine's loopback address. Set FEWSHOT_TOKEN (e.g. to "
             "the output of `openssl rand -hex 16`), or set FEWSHOT_ALLOW_NO_TOKEN=1 to serve without one.")
-
-
-def allow_no_token_from_env() -> bool:
-    """Whether ``FEWSHOT_ALLOW_NO_TOKEN`` says to serve other machines without a token."""
-    return os.environ.get(ALLOW_NO_TOKEN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_loopback(host: str) -> bool | None:

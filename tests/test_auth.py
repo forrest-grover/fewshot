@@ -13,6 +13,7 @@ import fewshot.guard
 from fewshot.access import NO_TOKEN, exposure_problem
 from fewshot.auth import Sessions, WrongTokens
 from fewshot.guard import host_allowed
+from fewshot.server_settings import ServerSettings
 from tests.conftest import RED, api_client, api_task, host_client, png
 
 
@@ -301,8 +302,9 @@ def test_a_server_without_token_refuses_other_interfaces(tmp_path, monkeypatch, 
     allowed = TestClient(fewshot.api.create_app(app.state.server.settings, allow_no_token=True),
                          base_url="http://172.17.0.2")
     assert allowed.get("/api/tasks").status_code == 200
-    monkeypatch.setenv("FEWSHOT_ALLOW_NO_TOKEN", "1")
-    from_env = TestClient(fewshot.api.create_app(app.state.server.settings), base_url="http://172.17.0.2")
+    monkeypatch.setenv("FEWSHOT_ALLOW_NO_TOKEN", "1")  # read with the other settings, in one place
+    monkeypatch.setenv("FEWSHOT_HOME", str(app.state.server.settings.home))
+    from_env = TestClient(fewshot.api.create_app(ServerSettings.from_env()), base_url="http://172.17.0.2")
     assert from_env.get("/api/tasks").status_code == 200
 
 

@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import services
-from .access import SESSION_COOKIE, TOO_MANY_TOKENS, allow_no_token_from_env, check_token, client_address, guard
+from .access import SESSION_COOKIE, TOO_MANY_TOKENS, check_token, client_address, guard
 from .archive import export_task as write_export
 from .archive import import_task as read_export
 from .auth import SESSION_DAYS, Sessions, WrongTokens
@@ -197,9 +197,9 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
                allow_no_token: bool | None = None) -> FastAPI:
     """The server for ``settings`` (default: from the environment), on ``workspace`` (default:
     ``settings.home``). Without a token, it refuses requests that reach it on an address other
-    than loopback, unless ``allow_no_token`` (default: ``FEWSHOT_ALLOW_NO_TOKEN``)."""
-    allow = allow_no_token_from_env() if allow_no_token is None else allow_no_token
-    server = Server(settings or ServerSettings.from_env(), workspace, allow)
+    than loopback, unless ``allow_no_token`` (default: the settings', from ``FEWSHOT_ALLOW_NO_TOKEN``)."""
+    settings = settings or ServerSettings.from_env()
+    server = Server(settings, workspace, settings.allow_no_token if allow_no_token is None else allow_no_token)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
