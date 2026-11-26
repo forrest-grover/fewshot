@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier, temper
+from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, log_clamped, make_classifier, temper, top_k
 from .images import IMAGE_EXTS
 from .models import TaskConfig
 from .pipeline import Pipeline, new_classifier
@@ -54,7 +54,8 @@ class HeldOut:
 def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
     """Training ClassData restricted to rows ``train``, dropping classes left with
     neither images nor text. Returns it plus a map from subset class index to
-    original class index."""
+    original class index. Whether names are used as text is left to the fit, which
+    decides it from these rows only."""
     X, y = data.X[train], data.y[train]
     present = sorted(set(y.tolist()) | set(data.text))
     remap = {c: i for i, c in enumerate(present)}
@@ -63,7 +64,8 @@ def _subset(data: ClassData, train: np.ndarray) -> tuple[ClassData, np.ndarray]:
         X,
         np.array([remap[c] for c in y], int),
         {remap[c]: v for c, v in data.text.items()},
-        {remap[c]: v for c, v in data.name_text.items() if c in remap},
+        {remap[c]: v for c, v in data.names.items() if c in remap},
+        data.use_names,
     )
     return sub, np.array(present)
 
@@ -114,10 +116,10 @@ def _fold(data: ClassData, cfg: TaskConfig, test: np.ndarray, out: HeldOut) -> N
 
 
 def _text_unused(data: ClassData, cfg: TaskConfig) -> bool:
-    """Whether descriptions play no part in any leave-one-out fold: there are none, or their
-    weight is 0 and every class keeps an example when one is held out (a class left with only
-    its description would score through it)."""
-    if not data.text:
+    """Whether text plays no part in any leave-one-out fold: there are no descriptions and no
+    names that a fold might use as text, or the text's weight is 0 and every class keeps an
+    example when one is held out (a class left with only its description would score through it)."""
+    if not data.text and not (data.use_names and data.names):
         return True
     return cfg.text_weight == 0 and int(np.bincount(data.y, minlength=len(data.classes)).min()) >= 2
 
@@ -193,7 +195,7 @@ def _loo_knn(clf: KNNClassifier, X: np.ndarray, y: np.ndarray, rows: np.ndarray,
     k = min(clf.k, len(X) - 1)
     if k < 1:  # a single example: nothing left to vote
         return np.zeros((len(rows), C)), np.full(len(rows), -np.inf)
-    top = np.argpartition(-S, k - 1, axis=1)[:, :k]
+    top = top_k(S, k)  # ties broken as KNNClassifier breaks them
     top_s = np.take_along_axis(S, top, axis=1)
     votes = np.exp(clf.scale * (top_s - top_s.max(axis=1, keepdims=True)))
     scores = np.where(present, 1e-6, 0.0)  # the same floor as KNNClassifier, for classes still present
@@ -255,7 +257,9 @@ def _fit_temperature(P: np.ndarray, t: np.ndarray) -> float:
     Y[np.arange(len(t)), t] = 1.0 - eps
     with np.errstate(divide="ignore"):
         logs = [np.log(np.clip(temper(P, float(T)), 1e-12, 1)) for T in TEMPERATURES]
-    return float(TEMPERATURES[int(np.argmin([-(Y * lg).sum() for lg in logs]))])
+    best = int(np.argmin([-(Y * lg).sum() for lg in logs]))
+    log_clamped("temperature", TEMPERATURES, best)
+    return float(TEMPERATURES[best])
 
 
 def _cross_fitted(P: np.ndarray, t: np.ndarray) -> np.ndarray:

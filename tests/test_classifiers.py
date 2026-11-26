@@ -449,3 +449,97 @@ def test_gda_text_weight_scales_the_prior(monkeypatch):
     tiny, none = GDAClassifier(text_weight=1e-6).fit(data), GDAClassifier(text_weight=0.0).fit(data)
     Q = data.X + 0.1
     assert (tiny.predict(Q)[0].argmax(1) == none.predict(Q)[0].argmax(1)).all()
+
+
+def test_grid_searches_log_when_they_hit_an_end(caplog):
+    """A grid search that chooses an end of its grid (where the best value may lie beyond it) says
+    so at debug level; one that chooses inside it doesn't. So do evaluation's temperatures."""
+    import fewshot.evaluate as ev  # pylint: disable=import-outside-toplevel
+
+    caplog.set_level("DEBUG", logger="fewshot")
+    y = np.array([0, 1])
+    sure = np.array([[1.0, -1.0], [-1.0, 1.0]])
+    grid = np.array([0.5, 1.0, 2.0])
+    assert classifiers._least_nll([g * sure for g in grid], grid, y, what="probe") == 2.0  # pylint: disable=protected-access
+    assert "probe chose 2, the high end of its grid" in caplog.text
+    caplog.clear()
+    assert classifiers._least_nll([g * sure for g in (0.5, 5, 10)], grid, y, smooth=True) == 0.5  # pylint: disable=protected-access
+    assert "value chose 0.5, the low end of its grid" in caplog.text
+    caplog.clear()
+    assert classifiers._least_nll([sure * 0, sure, sure * 0], grid, y) == 1.0  # pylint: disable=protected-access
+    assert not caplog.text
+    ev._fit_temperature(np.array([[0.501, 0.499], [0.499, 0.501]] * 50), np.array([0, 1] * 50))  # pylint: disable=protected-access
+    assert "temperature chose" in caplog.text
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_refitting_forgets_the_previous_fit(name):
+    """Fitting a classifier again (here without text, after a fit with it) gives what a fresh one
+    would: no fitted scale, text vectors or gap carry over."""
+    rng = np.random.default_rng(0)
+    X, y = noise(rng, 12, 8), np.arange(12) % 3
+    text = dict(enumerate(noise(rng, 3, 8)))
+    plain = ClassData(list("abc"), X, y)
+    Q = noise(rng, 5, 8)
+    clf = make_classifier(name).fit(ClassData(list("abc"), X, y, text))
+    assert clf.Pt is not None
+    clf.fit(plain)
+    fresh = make_classifier(name).fit(plain)
+    assert clf.Pt is None
+    assert clf.gap is None
+    assert clf.logit_scale == fresh.logit_scale
+    np.testing.assert_allclose(clf.predict(Q)[0], fresh.predict(Q)[0], rtol=1e-6)
+
+
+def test_gda_pulls_means_with_the_classifiers_one_gap(monkeypatch):
+    """GDA moves the descriptions across the same modality gap as the rest of the fit (one
+    estimate, from ``_modality_gap``), not a second estimate of its own."""
+    rng = np.random.default_rng(1)
+    centres = noise(rng, 4, 16)
+    y = np.repeat(np.arange(4), 3)
+    X = unit(centres[y] + 0.3 * rng.normal(size=(12, 16)))
+    data = ClassData(list("abcd"), X, y, dict(enumerate(unit(centres + 0.2))))
+    real = GDAClassifier()
+    real.fit(data)
+    assert real.gap is not None
+    monkeypatch.setattr(classifiers, "_modality_gap", lambda d: np.zeros(16, np.float32))
+    zero = GDAClassifier()
+    zero.fit(data)
+    assert zero.W is not None
+    assert real.W is not None
+    assert not np.allclose(zero.W, real.W)
+
+
+def test_gda_prior_with_two_classes(monkeypatch):
+    """With 2 classes the class-mean test can't pass (at best p = 1/4), so the images are counted:
+    matching text pulls a binary task's means, swapped text doesn't, and 2 images can't show it."""
+    seen = _prior_strengths(monkeypatch)
+    data = _noisy_task(0.3, seed=8, C=2, k=4)
+    GDAClassifier().fit(data)
+    assert (seen[-1] > 0).all()
+    GDAClassifier().fit(ClassData(data.classes, data.X, data.y, {0: data.text[1], 1: data.text[0]}))
+    assert (seen[-1] == 0).all()
+    two = _noisy_task(0.3, seed=8, C=2, k=1)
+    GDAClassifier().fit(two)
+    assert (seen[-1] == 0).all()
+
+
+def test_gda_stand_in_anchors_are_shortened_without_the_pull(monkeypatch):
+    """A class whose only image is left out is represented by its anchor, shortened to the class
+    means' length, also when the text doesn't pull the means (here shuffled descriptions)."""
+    seen, lengths = _prior_strengths(monkeypatch), []
+    real = classifiers._GDALeaveOneOut.scores  # pylint: disable=protected-access
+
+    def spy(self, W, b, anchors=None, exact=True):
+        lengths.append((np.linalg.norm(anchors, axis=1), np.linalg.norm(self.mu, axis=1).mean()))
+        return real(self, W, b, anchors, exact)
+
+    monkeypatch.setattr(classifiers._GDALeaveOneOut, "scores", spy)  # pylint: disable=protected-access
+    data = _noisy_task(0.3, k=3)
+    order = np.roll(np.arange(len(data.classes)), 1)
+    shuffled = {i: data.text[int(j)] for i, j in enumerate(order)}
+    GDAClassifier().fit(ClassData(data.classes, data.X[2:], data.y[2:], shuffled))  # class 0: one image
+    assert (seen[-1] == 0).all()
+    norms, mean = lengths[-1]
+    assert mean < 0.9
+    np.testing.assert_allclose(norms, mean, rtol=1e-6)

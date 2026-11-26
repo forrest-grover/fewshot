@@ -12,7 +12,7 @@ from PIL import Image
 
 import fewshot.evaluate as ev
 from fewshot import embedders, fetch
-from fewshot.classifiers import ClassData
+from fewshot.classifiers import ClassData, top_k
 from fewshot.embedders import Embedder, register_embedder, unregister_embedder
 from fewshot.evaluate import evaluate_task
 from fewshot.models import TaskConfig
@@ -215,6 +215,27 @@ def test_fast_leave_one_out_matches_refitting(classifier, params, labels):
     assert np.allclose(fast.conf, slow.conf, atol=1e-5)
     scored = slow.pred >= 0
     assert np.allclose(fast.sim[scored], slow.sim[scored], atol=1e-5)
+
+
+@pytest.mark.parametrize(("k", "at", "labels"), [(2, [1, 1, 0, 0, 0, 0, 0, 0], [1, 0, 1, 0, 0, 1, 1, 0]),
+                                                 (1, [0, 2, 2, 0, 0, 0, 0], [1, 1, 1, 0, 2, 2, 1]),
+                                                 (3, [2, 2, 2, 0, 2, 2, 0, 0], [0, 2, 2, 1, 1, 2, 0, 2])])
+def test_fast_knn_leave_one_out_matches_refitting_on_ties(k, at, labels):
+    """With exact ties (repeated vectors), the closed-form kNN leave-one-out still matches refitting:
+    both give tied neighbours to the lower column, and taking a column out keeps that order."""
+    data = ClassData(["a", "b", "c"][: max(labels) + 1], np.eye(3, dtype=np.float32)[at], np.array(labels))
+    cfg = TaskConfig(name="t", classifier="knn", classifier_params={"k": k})
+    fast = ev._fast_leave_one_out(data, cfg, None)  # pylint: disable=protected-access
+    slow = _slow_leave_one_out(data, cfg)
+    assert np.array_equal(fast.pred, slow.pred)
+    assert np.allclose(fast.conf, slow.conf, atol=1e-5)
+
+
+def test_top_k_breaks_ties_by_column():
+    """``top_k`` takes the largest entries, and the lowest columns among equal ones."""
+    S = np.array([[1.0, 3, 3, 3, 0], [5, 4, 3, 2, 1], [0, 0, 0, 0, 0]])
+    assert top_k(S, 2).tolist() == [[1, 2], [0, 1], [0, 1]]
+    assert top_k(S, 5).tolist() == [[0, 1, 2, 3, 4]] * 3
 
 
 def test_fast_knn_with_a_single_example(ws):

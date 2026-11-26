@@ -12,12 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import numpy.typing as npt
 from PIL import Image, ImageOps
 
 from .cache import EmbeddingCache
-from .classifiers import ClassData, Classifier, Labels, binomial_tail, make_classifier
-from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
+from .classifiers import ClassData, Classifier, make_classifier
+from .embedders import Embedder, Vectors, cache_namespace, get_embedder, hold, spec_supports_text
 from .images import image_id, load_image, to_rgb
 from .models import TaskConfig
 from .store import Task, Workspace
@@ -70,6 +69,9 @@ class Pipeline:
         # deleted-and-recreated task that reaches the same revision from reusing a stale fit.
         self._fitted: dict[str, tuple[tuple[str, int, str], Classifier]] = {}
         self._lock = threading.Lock()
+        # (task name, stamp) -> lock held while that version is fitted, so concurrent requests for
+        # a task that isn't fitted yet wait for one fit instead of each fitting it themselves.
+        self._fitting: dict[tuple[str, tuple[str, int, str]], threading.Lock] = {}
 
     # ---- embeddings --------------------------------------------------
     def embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],
@@ -88,6 +90,12 @@ class Pipeline:
         """
         if not items:
             return np.zeros((0, 0), np.float32)
+        with hold(spec):
+            return self._embed_images(spec, items, errors, progress, flip)
+
+    def _embed_images(self, spec: str, items: Sequence[tuple[str | None, ImageInput]],  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                      errors: dict[int, str] | None, progress: Progress | None, flip: bool) -> Vectors:
+        """``embed_images`` with the model held."""
         ns = cache_namespace(spec)
         if flip:
             items = [(k + FLIP_KEY if k else None, im) for k, im in items]
@@ -144,11 +152,12 @@ class Pipeline:
         """Embed image files, reading each once (for both its cache key and decoding) and holding
         only ``chunk`` files' bytes at a time. ``progress(done, total)`` counts files."""
         parts = []
-        for start in range(0, len(paths), chunk):
-            blobs = [p.read_bytes() for p in paths[start : start + chunk]]
-            parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs], flip=flip))
-            if progress:
-                progress(min(start + chunk, len(paths)), len(paths))
+        with hold(spec):  # also while reading the next chunk's files
+            for start in range(0, len(paths), chunk):
+                blobs = [p.read_bytes() for p in paths[start : start + chunk]]
+                parts.append(self.embed_images(spec, [(image_id(b), b) for b in blobs], flip=flip))
+                if progress:
+                    progress(min(start + chunk, len(paths)), len(paths))
         return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
 
     def embed_texts(self, spec: str, texts: Sequence[str]) -> Vectors:
@@ -191,6 +200,12 @@ class Pipeline:
         """Training data for ``task`` (as of ``cfg``, default its current config), leaving out
         example indices in ``exclude``. ``progress`` reports images embedded (see ``embed_images``)."""
         cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
+        with hold(cfg.embedder):
+            return self._class_data(task, exclude, cfg, progress)
+
+    def _class_data(self, task: Task, exclude: set[int] | None, cfg: TaskConfig,
+                    progress: Progress | None) -> ClassData:
+        """``class_data`` with the model held."""
         classes = [c.name for c in cfg.classes]
         idx = {c: i for i, c in enumerate(classes)}
         X = self.example_embeddings(task, cfg, progress)
@@ -198,40 +213,32 @@ class Pipeline:
         if exclude:
             keep = np.array([i not in exclude for i in range(len(y))], bool)
             X, y = X[keep], y[keep]
-        text: dict[int, Vectors] = {}
         labelled = set(y.tolist())
-        if spec_supports_text(cfg.embedder):
-            text = self._indexed_texts(cfg.embedder, {i: c.description for i, c in enumerate(cfg.classes)
-                                                      if prompts(c.description)})
-            if cfg.names_as_text:
-                text.update(self._name_texts(cfg, X, y, text, labelled))
+        text, names = self._texts(cfg, labelled)
         # A class with neither examples nor text (e.g. just created) has nothing to fit; leave it out.
         used = [i for i in range(len(classes)) if i in text or i in labelled]
-        # With some descriptions, the other classes' names help estimate the modality gap.
-        names = self._indexed_texts(cfg.embedder, {i: classes[i].replace("_", " ") for i in used
-                                                   if i not in text}) if text else {}
         if len(used) < len(classes):
             remap = {old: new for new, old in enumerate(used)}
             classes = [classes[i] for i in used]
             y = np.array([remap[i] for i in y], int)
             text = {remap[i]: v for i, v in text.items()}
             names = {remap[i]: v for i, v in names.items()}
-        return ClassData(classes, X, y, text, names)
+        return ClassData(classes, X, y, text, names, cfg.names_as_text and spec_supports_text(cfg.embedder))
 
-    def _name_texts(self, cfg: TaskConfig, X: Vectors, y: Labels, text: dict[int, Vectors],  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                    labelled: set[int]) -> dict[int, Vectors]:
-        """Text from ``NAME_TEMPLATE`` for the classes with examples but no description, if those
-        names classify their examples better than chance would (see ``names_match``, among every
-        class with text or examples); otherwise none, since meaningless names (codes, numbers)
-        would only pull predictions off."""
-        named = {i: fill_template(NAME_TEMPLATE, cfg.classes[i].name) for i in sorted(labelled - set(text))}
-        if not named:
-            return {}
-        names = self._indexed_texts(cfg.embedder, named)
-        candidates = sorted(set(text) | set(names))
-        T = np.stack([text[i] if i in text else names[i] for i in candidates])
-        guess = np.array(candidates)[(X @ T.T).argmax(1)]
-        return names if names_match(guess, y, np.isin(y, list(names)), len(candidates)) else {}
+    def _texts(self, cfg: TaskConfig, labelled: set[int]) -> tuple[dict[int, Vectors], dict[int, Vectors]]:
+        """Embedded descriptions, and names of the classes in ``labelled`` (those with examples)
+        without one, by class index; none for an image-only embedder. The names are the classes'
+        text if they match the examples (decided in the classifier's fit, see ``with_names``), and
+        with some descriptions they help estimate the modality gap, so they are embedded only for
+        either use."""
+        if not spec_supports_text(cfg.embedder):
+            return {}, {}
+        text = self._indexed_texts(cfg.embedder, {i: c.description for i, c in enumerate(cfg.classes)
+                                                  if prompts(c.description)})
+        if not (text or cfg.names_as_text):
+            return text, {}
+        return text, self._indexed_texts(cfg.embedder, {i: fill_template(NAME_TEMPLATE, cfg.classes[i].name)
+                                                        for i in sorted(labelled - set(text))})
 
     def _indexed_texts(self, spec: str, texts: dict[int, str]) -> dict[int, Vectors]:
         """Embed ``{class index: text}``, keeping the indices."""
@@ -246,16 +253,27 @@ class Pipeline:
         cfg = cfg or task.config  # one snapshot: another thread may swap in a reloaded config
         # The model's namespace is part of the key, so re-registering a spec's embedder refits.
         stamp = (cfg.uid, cfg.revision, cache_namespace(cfg.embedder))
+        key = (cfg.name, stamp)
         with self._lock:
             hit = self._fitted.get(cfg.name)
             if hit and hit[0] == stamp:
                 return hit[1]
-        clf = new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
-        with self._lock:
-            # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
-            cur = self._fitted.get(cfg.name)
-            if cur is None or cur[0][0] != stamp[0] or cur[0][1] <= stamp[1]:
-                self._fitted[cfg.name] = (stamp, clf)
+            gate = self._fitting.setdefault(key, threading.Lock())
+        with gate:
+            with self._lock:  # fitted by another request while this one waited?
+                hit = self._fitted.get(cfg.name)
+                if hit and hit[0] == stamp:
+                    return hit[1]
+            try:
+                clf = new_classifier(cfg).fit(self.class_data(task, cfg=cfg))
+                with self._lock:
+                    # A slow fit of an older revision mustn't replace a newer one fitted meanwhile.
+                    cur = self._fitted.get(cfg.name)
+                    if cur is None or cur[0][0] != stamp[0] or cur[0][1] <= stamp[1]:
+                        self._fitted[cfg.name] = (stamp, clf)
+            finally:
+                with self._lock:
+                    self._fitting.pop(key, None)
         return clf
 
     # ---- prediction --------------------------------------------------
@@ -274,11 +292,12 @@ class Pipeline:
             raise ValueError(f"top_k must be at least 1, got {top_k}")
         task = self.ws.get(task) if isinstance(task, str) else task
         cfg = cfg or task.config
-        clf = self.fitted(task, cfg)
-        if not images:
-            return []
         errors: dict[int, str] = {}
-        Q = self._embed_queries(cfg, images, errors, progress)
+        with hold(cfg.embedder):  # one model for the fit and every chunk of images
+            clf = self.fitted(task, cfg)
+            if not images:
+                return []
+            Q = self._embed_queries(cfg, images, errors, progress)
         probs, sims, per_class = clf.predict_full(Q)
         thr = threshold_for(cfg, clf)
         preds = [Prediction.failed(errors[i]) if i in errors else _to_pred(clf, thr, row, top_k)
@@ -389,20 +408,6 @@ def threshold_for(cfg: TaskConfig, clf: Classifier) -> np.ndarray | None:
 
 READ_CHUNK = 256  # image files read into memory at once by predict
 NAME_TEMPLATE = "a photo of a {}."  # text for a class described only by its name
-NAME_TEST_LEVEL = 0.05  # names are used as text when matching the examples this well is unlikely by chance
-
-
-def names_match(guess: Labels, truth: Labels, named: npt.NDArray[np.bool_], texts: int) -> bool:
-    """Whether text guesses ``guess`` of every example's class ``truth`` hit it, among the examples
-    of the classes described by their names (``named``), more often than chance would (one-sided
-    binomial test at ``NAME_TEST_LEVEL``). Chance is the hit rate of guesses unrelated to the
-    images: one is class c as often as the guesses for all the examples are, so texts that send
-    every image to the largest class score no better than chance however unbalanced the classes
-    are. With every example in one class that rate can't show whether the text tells the class
-    apart, so chance is then one in the number of ``texts`` (classes with text)."""
-    rate = np.bincount(guess, minlength=int(max(guess.max(), truth.max())) + 1) / len(guess)
-    chance = 1.0 / texts if len(set(truth.tolist())) == 1 else float(rate[truth[named]].mean())
-    return binomial_tail(int((guess == truth)[named].sum()), int(named.sum()), chance) < NAME_TEST_LEVEL
 
 
 def _deduplicated(progress: Progress) -> Progress:

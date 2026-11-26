@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 
+import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
@@ -53,11 +54,41 @@ def load_image(data: bytes, draft: int | None = None, max_side: int | None = Non
 
 def to_rgb(im: Image.Image) -> Image.Image:
     """``im`` as RGB, with any transparency composited onto white: converting directly would show
-    whatever colour transparent pixels happen to hold, usually black."""
+    whatever colour transparent pixels happen to hold, usually black. Grayscale with more than 8
+    bits per pixel is rescaled first (see ``_to_8bit``)."""
     if "A" in im.getbands() or "a" in im.getbands() or (im.mode == "P" and "transparency" in im.info):
         rgba = im.convert("RGBA")
         return Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
+    if im.mode in HIGH_DEPTH_MODES:
+        im = _to_8bit(im)
     return im.convert("RGB")
+
+
+HIGH_DEPTH_MODES = {"I;16", "I;16B", "I;16L", "I;16N", "I", "F"}
+SENSOR_DEPTHS = (8, 10, 12, 14, 16)  # bits per pixel that integer grayscale is assumed to use
+
+
+def _to_8bit(im: Image.Image) -> Image.Image:
+    """16-bit, 32-bit integer or float grayscale as 8-bit ("L"). Pillow's own conversion clips at
+    255, so a 16-bit image comes out almost all white.
+
+    Integer pixels from 0 to 65535 are scaled linearly from the smallest of ``SENSOR_DEPTHS`` that
+    holds the brightest pixel: a full-range 16-bit image is divided by 257, as a browser shows it,
+    while 10-, 12- or 14-bit data stored in 16 bits (as medical and industrial cameras write it)
+    fills the 8-bit range instead of coming out nearly black. Rounding up to a standard depth keeps
+    the scale the same for most images from one sensor (only one darker than a quarter of its range
+    is brightened), and 0 stays black. Floats from 0 to 1 are scaled by 255. Anything else has no
+    known range, so it is stretched from its own minimum to its maximum."""
+    a = np.nan_to_num(np.asarray(im, dtype=np.float64))
+    lo, hi = (float(a.min()), float(a.max())) if a.size else (0.0, 0.0)
+    if im.mode != "F" and lo >= 0 and hi <= 65535:
+        depth = next(d for d in SENSOR_DEPTHS if hi < 2**d)
+        a = a * (255 / (2**depth - 1))
+    elif im.mode == "F" and lo >= 0 and hi <= 1:
+        a = a * 255
+    else:
+        a = (a - lo) * (255 / (hi - lo)) if hi > lo else np.zeros_like(a)
+    return Image.fromarray(np.rint(a).clip(0, 255).astype(np.uint8))
 
 
 def thumbnail(data: bytes, size: int) -> bytes:
