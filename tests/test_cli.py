@@ -620,6 +620,21 @@ def test_bench_way_one_is_an_error(run, bench_data):
     assert (r.exit_code, "way must be at least 2, or 0 for every class" in r.output) == (1, True)
 
 
+@pytest.mark.usefixtures("task")
+def test_cache_commands_that_only_look_make_nothing(run, root):
+    """cache info and prune --dry-run report a missing cache without making it, or a workspace;
+    a real prune of a workspace without a cache makes nothing either."""
+    missing = root.parent / "nows"
+    for args in (["info"], ["prune", "--dry-run"], ["prune"]):
+        r = CliRunner().invoke(cli.app, ["cache", *args, "--root", str(missing)])
+        assert r.exit_code == 0
+        assert "No cache at" in r.output
+    assert not missing.exists()
+    assert "No cache at" in run("cache", "info").output
+    assert "nothing to prune" in run("cache", "prune", "--dry-run").output
+    assert not (root / "cache.sqlite").exists()
+
+
 def test_cache_info_and_prune(run, root, task):
     """cache info lists namespaces; prune drops vectors of deleted examples, dry run first."""
     assert run("predict", task, root / "tasks" / task / "images").exit_code == 0  # fills the cache

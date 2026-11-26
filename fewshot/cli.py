@@ -894,6 +894,9 @@ def cache_info(root: Path | None = ROOT_OPT) -> None:
     from .cache import EmbeddingCache  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
     ws = _ws(root)
+    if not ws.cache_path.is_file():  # opening it would make it (and the workspace)
+        typer.echo(f"No cache at {ws.cache_path}")
+        return
     cache = EmbeddingCache(ws.cache_path)
     typer.echo(f"{ws.cache_path}: {_mb(ws.cache_path.stat().st_size)}")
     for ns, n, size in cache.stats():
@@ -916,6 +919,9 @@ def cache_prune(
     from .cache import prune_unused  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
     ws = _ws(root)
+    if not ws.cache_path.is_file() and (dry_run or not ws.root.is_dir()):  # a look shouldn't make one
+        typer.echo(f"No cache at {ws.cache_path}: nothing to prune")
+        return
     try:
         n, blobs = prune_unused(ws, dry_run=dry_run, vacuum=vacuum)
     except ValueError as e:
