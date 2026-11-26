@@ -221,7 +221,7 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
           <div className="row inbox-bar">
             <label className="inline">
               <span>Order</span>
-              <select value={sort} onChange={(e) => { setSort(e.target.value as InboxSort); setShown(PAGE); }}>
+              <select className="inbox-order" value={sort} onChange={(e) => { setSort(e.target.value as InboxSort); setShown(PAGE); }}>
                 {Object.entries(SORTS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
               </select>
             </label>

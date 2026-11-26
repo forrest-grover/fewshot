@@ -1154,6 +1154,19 @@ label.inline {
   margin: 12px 0 4px;
 }
 
+/* The order menu's options are long: on a narrow screen it shrinks to fit (the chosen option
+   is cut off) instead of widening the page. */
+.inbox-bar label.inline {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.inbox-order {
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
 .inbox-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
