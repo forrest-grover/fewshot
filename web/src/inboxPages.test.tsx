@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, type InboxEntry } from "./api";
-import type { Uploads } from "./hooks";
+import type { Uploads } from "./useUploads";
 import Inbox from "./Inbox";
 import { fetchInbox } from "./inboxPages";
 import { taskDetail } from "./test-data";

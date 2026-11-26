@@ -4,10 +4,15 @@ import Evaluate from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { Gate, Latest, stepToast, taskUndoKey, typingAt, useByTask, usePredictResults, useUploads, type UploadStop } from "./hooks";
+import NewTask from "./NewTask";
+import { taskUndoKey, typingAt } from "./keys";
+import { usePredictResults } from "./predictResults";
+import { Gate, Latest, stepToast, useByTask } from "./state";
+import { useUploads, type UploadStop } from "./useUploads";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
+import SignIn from "./SignIn";
 import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
 import { ErrorBox, JobPoller } from "./ui";
 import { BATCH, batchLimits, isAbort } from "./upload";
@@ -326,96 +331,5 @@ export default function App() {
         </div>
       )}
     </div>
-  );
-}
-
-/** Asks for the server's token (set with `fewshot serve --token`); the server keeps it in a cookie. */
-function SignIn() {
-  const [token, setToken] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  return (
-    <main className="sign-in">
-      <form
-        className="new-task"
-        onSubmit={(e) => {
-          e.preventDefault();
-          setBusy(true);
-          api.login(token).then(
-            () => { location.reload(); },
-            (err: unknown) => { setBusy(false); setError(err instanceof Error ? err.message : String(err)); },
-          );
-        }}
-      >
-        <h1>Sign in</h1>
-        <p className="muted">This fewshot server needs its access token (the one it was started with, <code>fewshot serve --token</code>).</p>
-        <ErrorBox error={error} onClose={() => { setError(null); }} />
-        <label>
-          <span>Token</span>
-          <input type="password" autoComplete="current-password" value={token} onChange={(e) => { setToken(e.target.value); }} required autoFocus />
-        </label>
-        <button type="submit" disabled={busy || !token}>{busy ? "Signing in…" : "Sign in"}</button>
-      </form>
-    </main>
-  );
-}
-
-function NewTask({ models, run, onCreated }: {
-  models: ModelInfo | null; run: <T>(p: Promise<T>) => Promise<T | undefined>; onCreated: (t: TaskDetail) => void;
-}) {
-  const [name, setName] = useState("");
-  const [embedder, setEmbedder] = useState("");
-  const [busy, setBusy] = useState(false);
-  const spec = embedder || (models?.embedders[0]?.spec ?? "");
-  const importZip = useRef<HTMLInputElement>(null);
-  return (
-    <>
-    <form
-      className="new-task"
-      onSubmit={(e) => {
-        e.preventDefault();
-        setBusy(true);
-        void run(api.createTask(name.trim(), spec || undefined, "gda")).then((t) => {
-          setBusy(false);
-          if (t) onCreated(t);
-        });
-      }}
-    >
-      <h1>New task</h1>
-      <p className="muted">
-        A task is a set of classes plus a few labeled images of each. New images are embedded with a pretrained vision model and
-        assigned to the closest class. No training run is needed: add, remove, or relabel examples and predictions update immediately.
-      </p>
-      <label>
-        <span>Name</span>
-        <input value={name} onChange={(e) => { setName(e.target.value); }} placeholder="e.g. weld-defects" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" required autoFocus />
-      </label>
-      <label>
-        <span>Embedder</span>
-        <select value={spec} onChange={(e) => { setEmbedder(e.target.value); }}>
-          {models?.embedders.map((m) => <option key={m.spec} value={m.spec}>{m.label}</option>)}
-        </select>
-        <small className="muted">{models?.embedders.find((m) => m.spec === spec)?.notes}</small>
-      </label>
-      <button type="submit" disabled={busy || !name.trim()}>{busy ? "Creating… (loads the model on first use)" : "Create task"}</button>
-    </form>
-    <div className="new-task import">
-      <h3>Or import a task</h3>
-      <p className="muted">From a zip made with “Export” on a task's Settings tab, or <code>fewshot export</code>.</p>
-      <input ref={importZip} type="file" accept=".zip,application/zip" hidden onChange={(e) => {
-        const f = e.target.files?.[0];
-        e.target.value = "";
-        if (!f) return;
-        setBusy(true);
-        void run(api.importTask(f, name.trim() || undefined)).then((t) => {
-          setBusy(false);
-          if (t) onCreated(t);
-        });
-      }} />
-      <button className="secondary" disabled={busy} onClick={() => { importZip.current?.click(); }}>
-        Import zip{name.trim() ? ` as “${name.trim()}”` : ""}…
-      </button>
-    </div>
-    </>
   );
 }

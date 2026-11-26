@@ -3,7 +3,7 @@ import { api, type DuplicatePair, type ModelInfo, type TaskDetail } from "./api"
 import Compare from "./Compare";
 import { downloadCsv } from "./csv";
 import { pct } from "./format";
-import { Gate, type SetFor } from "./hooks";
+import { Gate, type SetFor } from "./state";
 import Lightbox from "./Lightbox";
 import { NO_EVAL, type CompareRun, type EvalRun } from "./runs";
 import Threshold from "./Threshold";

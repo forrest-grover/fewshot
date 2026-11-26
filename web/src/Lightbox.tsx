@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef } from "react";
-import { topModal, useFocusTrap } from "./hooks";
+import { topModal, useFocusTrap } from "./keys";
 
 export interface LightboxItem {
   url: string; // the image (large)

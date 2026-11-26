@@ -1,6 +1,8 @@
 import { memo, useMemo, useRef, useState, type DragEvent } from "react";
 import { api, type Example, type TaskDetail } from "./api";
-import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts, type Uploads } from "./hooks";
+import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages } from "./files";
+import { useShortcuts } from "./keys";
+import type { Uploads } from "./useUploads";
 import { THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import TagEditor, { type TagEdit } from "./TagEditor";

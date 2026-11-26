@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { Gate, Latest, stepToast, taskUndoKey, typingAt } from "./hooks";
+import { taskUndoKey, typingAt } from "./keys";
+import { Gate, Latest, stepToast } from "./state";
 import { taskDetail } from "./test-data";
 
 /** A keydown dispatched at ``target`` (an element in the document); its ``target`` stays set. */

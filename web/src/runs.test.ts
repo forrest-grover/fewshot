@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { EvalReport, Job } from "./api";
-import { useByTask } from "./hooks";
+import { useByTask } from "./state";
 import { evalAfter, jobLost, NO_EVAL, type EvalRun } from "./runs";
 
 const job = (over: Partial<Job<EvalReport>> = {}): Job<EvalReport> => ({

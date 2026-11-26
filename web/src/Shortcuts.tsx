@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useFocusTrap } from "./hooks";
+import { useFocusTrap } from "./keys";
 
 const KEYS: [string, [string, string][]][] = [
   ["Everywhere", [

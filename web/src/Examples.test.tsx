@@ -2,7 +2,7 @@ import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, type Example, type TaskDetail } from "./api";
 import Examples from "./Examples";
-import type { Uploads } from "./hooks";
+import type { Uploads } from "./useUploads";
 import { taskDetail } from "./test-data";
 
 afterEach(cleanup);
