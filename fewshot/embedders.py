@@ -167,6 +167,9 @@ class Embedder(ABC):
         finally:
             with _load_lock:
                 self.users -= 1
+                evicted = _evict_locked() if not self.users else []
+            if evicted:  # models loaded meanwhile went over the limit only because this one was busy
+                _free_gpu_memory()
 
     @abstractmethod
     def _embed_image_batch(self, images: Sequence[Image.Image]) -> Vectors: ...
@@ -437,16 +440,21 @@ def hold(spec: str) -> Iterator[None]:
     ``Embedder.users`` only counts calls into the model, so an operation that embeds batch by
     batch, decoding images or reading files in between, would leave it idle between calls; held
     for the whole operation (embedding a task, predicting, evaluating), the model can't be
-    unloaded for another one halfway and loaded again for the next batch. Doesn't load anything."""
+    unloaded for another one halfway and loaded again for the next batch. Doesn't load anything.
+    When the last hold ends, models over the limit (kept only because this one was held) go."""
     with _load_lock:
         _held[spec] = _held.get(spec, 0) + 1
     try:
         yield
     finally:
+        evicted: list[str] = []
         with _load_lock:
             _held[spec] -= 1
             if not _held[spec]:
                 del _held[spec]
+                evicted = _evict_locked()
+        if evicted:
+            _free_gpu_memory()
 
 
 def _build(spec: str) -> Embedder:

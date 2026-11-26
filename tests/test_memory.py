@@ -225,6 +225,7 @@ def test_model_is_held_between_batches(ws, monkeypatch):
     emb.batch_size = 1
     monkeypatch.setattr(embedders, "_loaded", {"m:a": emb})
     monkeypatch.setenv("FEWSHOT_MAX_MODELS", "1")
+    monkeypatch.setattr(embedders, "_free_gpu_memory", lambda: None)
     evicted = []
 
     def load_another(done, _total):
@@ -232,14 +233,45 @@ def test_model_is_held_between_batches(ws, monkeypatch):
         with embedders._load_lock:  # pylint: disable=protected-access
             embedders._loaded[f"m:other{done}"] = ColorEmbedder()  # pylint: disable=protected-access
             evicted.extend(embedders._evict_locked(keep=f"m:other{done}"))  # pylint: disable=protected-access
+            assert "m:a" in embedders._loaded  # pylint: disable=protected-access
 
     items = [(None, Image.new("RGB", (2, 2), (i * 50, 0, 0))) for i in range(3)]
     Pipeline(ws).embed_images("m:a", items, progress=load_another)
     assert "m:a" not in evicted
-    assert evicted == ["m:other1", "m:other2"]
     assert not embedders._held  # pylint: disable=protected-access
-    with embedders._load_lock:  # pylint: disable=protected-access
-        assert embedders._evict_locked(keep="m:other3") == ["m:a"]  # pylint: disable=protected-access
+    assert list(embedders._loaded) == ["m:other3"]  # pylint: disable=protected-access  # m:a went when its hold ended
+
+
+def test_models_over_the_limit_go_when_free(monkeypatch):
+    """A model kept past the limit only because it was held or embedding is unloaded, and GPU
+    memory freed, as soon as it is free; one still held by another operation stays."""
+    freed = []
+    monkeypatch.setattr(embedders, "_free_gpu_memory", lambda: freed.append(1))
+    monkeypatch.setattr(embedders, "_loaded", {"m:a": ColorEmbedder()})
+    monkeypatch.setenv("FEWSHOT_MAX_MODELS", "1")
+    with embedders.hold("m:a"):
+        with embedders.hold("m:a"), embedders._load_lock:  # pylint: disable=protected-access
+            embedders._loaded["m:b"] = ColorEmbedder()  # pylint: disable=protected-access  # loaded meanwhile
+            assert not embedders._evict_locked(keep="m:b")  # pylint: disable=protected-access
+        assert set(embedders._loaded) == {"m:a", "m:b"}  # pylint: disable=protected-access
+        assert not freed
+    assert list(embedders._loaded) == ["m:b"]  # pylint: disable=protected-access
+    assert freed == [1]
+
+    class LoadsAnother(ColorEmbedder):
+        """Another model is loaded while this one embeds."""
+
+        def _embed_image_batch(self, images):
+            with embedders._load_lock:  # pylint: disable=protected-access
+                embedders._loaded["m:c"] = ColorEmbedder()  # pylint: disable=protected-access
+                assert not embedders._evict_locked(keep="m:c")  # pylint: disable=protected-access
+            return super()._embed_image_batch(images)
+
+    busy = LoadsAnother()
+    monkeypatch.setattr(embedders, "_loaded", {"m:busy": busy})
+    busy.embed_images([Image.new("RGB", (2, 2))])
+    assert list(embedders._loaded) == ["m:c"]  # pylint: disable=protected-access
+    assert freed == [1, 1]
 
 
 def test_use_count_follows_embedding():
