@@ -539,7 +539,8 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
     name: str,
     folder: Path = typer.Argument(..., help="Folder new images arrive in"),
     out: Path = typer.Option(..., help="Where images go: OUT/<class>/, OUT/_unknown/ (rejected or not confident "
-                                       "enough) or OUT/_error/"),
+                                       "enough) or OUT/_error/ (a class named _unknown, _error or "
+                                       "predictions.jsonl goes to OUT/_class_<name>/)"),
     copy: bool = typer.Option(False, "--copy", help="Copy instead of moving (then each file is handled once per run)"),
     min_confidence: float | None = typer.Option(None, min=0, max=1, help="Below this, an image goes to _unknown"),
     interval: float = typer.Option(2.0, min=0.1, help="Seconds between looks at the folder"),
@@ -646,10 +647,20 @@ def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out
     return handled
 
 
+WATCH_RESERVED = {"_unknown", "_error", "predictions.jsonl"}  # watch's own names in OUT
+CLASS_PREFIX = "_class_"  # put before a class name that would be one of them
+
+
 def _folder_for(p: Prediction, min_confidence: float | None) -> str:
-    """The folder under OUT a prediction sends its image to."""
+    """The folder under OUT a prediction sends its image to: its class's, except that a class
+    named like one of watch's own (or like such a folder, starting with CLASS_PREFIX) goes to
+    CLASS_PREFIX + its name, so no class shares a folder with another or with watch's own."""
     unsure = p.rejected or (min_confidence is not None and p.confidence < min_confidence)
-    return "_error" if p.error else "_unknown" if unsure or not p.label else p.label
+    if p.error:
+        return "_error"
+    if unsure or not p.label:
+        return "_unknown"
+    return CLASS_PREFIX + p.label if p.label in WATCH_RESERVED or p.label.startswith(CLASS_PREFIX) else p.label
 
 
 def _place(f: Path, folder: Path, copy: bool) -> Path:
