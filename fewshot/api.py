@@ -241,6 +241,7 @@ def _detail(t: Task) -> dict[str, Any]:
         "reject_below": c.reject_below,
         "reject_below_zero_shot": c.reject_below_zero_shot,
         "flip": c.flip,
+        "names_as_text": c.names_as_text,
         "temperature": c.temperature,
         "revision": c.revision,
         "inbox_count": len(c.inbox),

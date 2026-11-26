@@ -107,6 +107,7 @@ class TaskDetail(BaseModel):
     reject_below: float | None
     reject_below_zero_shot: float | None
     flip: bool
+    names_as_text: bool
     temperature: float | None
     revision: int
     inbox_count: int  # images waiting in the inbox (listed by GET .../inbox)
@@ -325,6 +326,7 @@ class TaskSettings(_Body):
     reject_below_zero_shot: float | None = None
     clear_reject_zero_shot: bool = False
     flip: bool | None = None
+    names_as_text: bool | None = None
     temperature: float | None = None
     clear_temperature: bool = False
 

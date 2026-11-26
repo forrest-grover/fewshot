@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import math
 import os
 import threading
 from collections.abc import Callable, Sequence
@@ -15,11 +16,11 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .cache import EmbeddingCache
-from .classifiers import ClassData, Classifier, make_classifier
+from .classifiers import ClassData, Classifier, Labels, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
 from .images import image_id, load_image, to_rgb
 from .store import Task, TaskConfig, Workspace
-from .text import prompts
+from .text import fill_template, prompts
 
 ImageInput = bytes | str | Path | Image.Image
 Progress = Callable[[int, int], None]  # (done, total); may raise to cancel the work
@@ -197,11 +198,13 @@ class Pipeline:
             keep = np.array([i not in exclude for i in range(len(y))], bool)
             X, y = X[keep], y[keep]
         text: dict[int, Vectors] = {}
+        labelled = set(y.tolist())
         if spec_supports_text(cfg.embedder):
             text = self._indexed_texts(cfg.embedder, {i: c.description for i, c in enumerate(cfg.classes)
                                                       if prompts(c.description)})
+            if cfg.names_as_text:
+                text.update(self._name_texts(cfg, X, y, text, labelled))
         # A class with neither examples nor text (e.g. just created) has nothing to fit; leave it out.
-        labelled = set(y.tolist())
         used = [i for i in range(len(classes)) if i in text or i in labelled]
         # With some descriptions, the other classes' names help estimate the modality gap.
         names = self._indexed_texts(cfg.embedder, {i: classes[i].replace("_", " ") for i in used
@@ -213,6 +216,23 @@ class Pipeline:
             text = {remap[i]: v for i, v in text.items()}
             names = {remap[i]: v for i, v in names.items()}
         return ClassData(classes, X, y, text, names)
+
+    def _name_texts(self, cfg: TaskConfig, X: Vectors, y: Labels, text: dict[int, Vectors],  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                    labelled: set[int]) -> dict[int, Vectors]:
+        """Text from ``NAME_TEMPLATE`` for the classes with examples but no description, if those
+        names classify their examples better than chance would (one-sided binomial test at
+        ``NAME_TEST_LEVEL``, among every class with text or examples); otherwise none, since
+        meaningless names (codes, numbers) would only pull predictions off."""
+        named = {i: fill_template(NAME_TEMPLATE, cfg.classes[i].name) for i in sorted(labelled - set(text))}
+        if not named:
+            return {}
+        names = self._indexed_texts(cfg.embedder, named)
+        candidates = sorted(set(text) | set(names))
+        T = np.stack([text[i] if i in text else names[i] for i in candidates])
+        rows = np.isin(y, list(names))
+        guess = np.array(candidates)[(X[rows] @ T.T).argmax(1)]
+        correct = int((guess == y[rows]).sum())
+        return names if binomial_tail(correct, int(rows.sum()), 1 / len(candidates)) < NAME_TEST_LEVEL else {}
 
     def _indexed_texts(self, spec: str, texts: dict[int, str]) -> dict[int, Vectors]:
         """Embed ``{class index: text}``, keeping the indices."""
@@ -369,6 +389,20 @@ def threshold_for(cfg: TaskConfig, clf: Classifier) -> np.ndarray | None:
 
 
 READ_CHUNK = 256  # image files read into memory at once by predict
+NAME_TEMPLATE = "a photo of a {}."  # text for a class described only by its name
+NAME_TEST_LEVEL = 0.05  # names are used as text when matching the examples this well is unlikely by chance
+
+
+def binomial_tail(k: int, n: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p), computed in log space so large n doesn't overflow."""
+    if k <= 0 or p >= 1:
+        return 1.0
+    if k > n:
+        return 0.0
+    logs = [math.lgamma(n + 1) - math.lgamma(j + 1) - math.lgamma(n - j + 1) + j * math.log(p)
+            + (n - j) * math.log1p(-p) for j in range(k, n + 1)]
+    top = max(logs)
+    return math.exp(top) * sum(math.exp(v - top) for v in logs)
 
 
 def _deduplicated(progress: Progress) -> Progress:

@@ -11,7 +11,7 @@ export interface Example {
 export interface TaskDetail {
   name: string; embedder: string; supports_text: boolean; classifier: string;
   classifier_params: Record<string, unknown>; text_weight: number; reject_below: number | null;
-  reject_below_zero_shot: number | null; flip: boolean; temperature: number | null; inbox_count: number;
+  reject_below_zero_shot: number | null; flip: boolean; names_as_text: boolean; temperature: number | null; inbox_count: number;
   can_undo: boolean; can_redo: boolean; undo_label: string; redo_label: string; // labels: e.g. "delete 3 examples"
   revision: number; classes: ClassInfo[]; examples: Example[];
 }

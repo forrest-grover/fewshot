@@ -138,7 +138,7 @@ def show(name: str, as_json: bool = JSON_OPT, root: Path | None = ROOT_OPT) -> N
         return
     typer.echo(f"{c.name}\n  embedder:   {c.embedder}\n  classifier: {c.classifier} {c.classifier_params or ''}"
                f"\n  text_weight: {c.text_weight}   reject_below: {c.reject_below}   "
-               f"reject_below_zero_shot: {c.reject_below_zero_shot}   flip: {c.flip}   "
+               f"reject_below_zero_shot: {c.reject_below_zero_shot}   flip: {c.flip}   names: {c.names_as_text}   "
                f"temperature: {c.temperature or 1}")
     for cd in c.classes:
         desc = "  " + " | ".join(f'"{line}"' for line in cd.description.splitlines() if line.strip())
@@ -173,6 +173,9 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     clear_reject_zero_shot: bool = typer.Option(False, "--clear-reject-zero-shot"),
     flip: bool | None = typer.Option(None, "--flip/--no-flip",
                                      help="Average each image's embedding with its mirror image's"),
+    names: bool | None = typer.Option(None, "--names/--no-names",
+                                      help="Use class names as text for classes without a description (when "
+                                           "the names match the examples)"),
     temperature: float | None = typer.Option(None, help="Confidence calibration (see `fewshot eval`); 1 = none"),
     root: Path | None = ROOT_OPT,
 ) -> None:
@@ -199,8 +202,7 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
         kw["reject_below"] = None
     if reject_below_zero_shot is not None or clear_reject_zero_shot:
         kw["reject_below_zero_shot"] = reject_below_zero_shot
-    if flip is not None:
-        kw["flip"] = flip
+    kw.update({k: v for k, v in (("flip", flip), ("names_as_text", names)) if v is not None})
     if temperature is not None:
         kw["temperature"] = None if temperature == 1 else temperature
     try:

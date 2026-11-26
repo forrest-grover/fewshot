@@ -10,7 +10,7 @@ from PIL import Image
 from fewshot.classifiers import KNNClassifier
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.images import image_id
-from fewshot.pipeline import Pipeline, Prediction
+from fewshot.pipeline import Pipeline, Prediction, binomial_tail
 from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
@@ -147,8 +147,9 @@ def test_class_data_and_exclude(ws, emb):
 
 
 def test_class_data_text_for_described_classes(ws, emb):
-    """With a text-capable spec only classes with a non-blank description get text vectors."""
-    t = make_task(ws, embedder=TEXT_SPEC)
+    """With a text-capable spec (and names_as_text off) only classes with a non-blank description get
+    text vectors."""
+    t = make_task(ws, embedder=TEXT_SPEC, names_as_text=False)
     pipe = Pipeline(ws)
     assert not pipe.class_data(t).text
     t.upsert_class("blue", "something blue")
@@ -165,7 +166,7 @@ def test_class_data_text_for_described_classes(ws, emb):
 
 def test_text_only_class_is_predicted(ws, emb):
     """A class known only from its description can win a prediction."""
-    t = ws.create("t", embedder=TEXT_SPEC)
+    t = ws.create("t", embedder=TEXT_SPEC, names_as_text=False)
     t.add_example(png(RED), "red")
     t.add_example(png(GREEN), "green")
     t.upsert_class("blue", "pure blue")
@@ -175,10 +176,36 @@ def test_text_only_class_is_predicted(ws, emb):
 
 
 def test_names_are_not_embedded_without_descriptions(ws, emb):
-    """Class names are only embedded when some class has a description."""
-    t = make_task(ws, embedder=TEXT_SPEC)
+    """With names_as_text off, class names are only embedded when some class has a description."""
+    t = make_task(ws, embedder=TEXT_SPEC, names_as_text=False)
     assert not Pipeline(ws).class_data(t).name_text
     assert emb.texts == []
+
+
+def test_names_as_text_when_they_match(ws, emb):
+    """Classes with examples but no description use their names as text when the names classify
+    the examples better than chance; names that don't are left out, as are classes without examples."""
+    t = make_task(ws, embedder=TEXT_SPEC)
+    t.upsert_class("yellow")  # no examples: not described by its name
+    d = Pipeline(ws).class_data(t)
+    assert sorted(d.text) == [0, 1, 2]
+    assert emb.texts == ["a photo of a red.", "a photo of a green.", "a photo of a blue."]
+    assert [int(d.text[i].argmax()) for i in range(3)] == [0, 1, 2]
+    wrong = ws.create("wrong", embedder=TEXT_SPEC)  # every name points at another class's colour
+    for label, rgb in [("green-a", RED), ("blue-b", GREEN), ("red-c", BLUE)]:
+        for i in range(2):
+            wrong.add_example(png(rgb, noise=15, seed=i), label)
+    assert not Pipeline(ws).class_data(wrong).text
+
+
+def test_binomial_tail():
+    """P(X >= k) for a binomial, exact at the edges and stable for large n."""
+    assert binomial_tail(0, 5, 0.5) == 1.0
+    assert binomial_tail(6, 5, 0.5) == 0.0
+    assert binomial_tail(2, 2, 0.5) == pytest.approx(0.25)
+    assert binomial_tail(3, 3, 1.0) == 1.0
+    assert binomial_tail(2000, 2000, 0.01) < 1e-300  # no overflow
+    assert binomial_tail(500, 1000, 0.5) == pytest.approx(0.5126, abs=1e-3)
 
 
 # ---- classifier caching ------------------------------------------------
@@ -292,7 +319,7 @@ def test_registered_embedder_decides_text_support(ws, emb):
     """Descriptions are used for any spec whose registered embedder supports text, whatever its name."""
     register_embedder("mine:v1", emb)
     try:
-        t = make_task(ws, embedder="mine:v1")
+        t = make_task(ws, embedder="mine:v1", names_as_text=False)
         t.upsert_class("red", "a red thing")
         assert sorted(Pipeline(ws).class_data(t).text) == [0]
     finally:

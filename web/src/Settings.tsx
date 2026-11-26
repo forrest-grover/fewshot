@@ -38,6 +38,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
   const [reject, setReject] = useState(optional(task.reject_below));
   const [rejectZero, setRejectZero] = useState(optional(task.reject_below_zero_shot));
   const [flip, setFlip] = useState(task.flip);
+  const [names, setNames] = useState(task.names_as_text);
   const [temperature, setTemperature] = useState(optional(task.temperature));
   const [newName, setNewName] = useState(task.name);
   const [copyName, setCopyName] = useState(`${task.name}-copy`);
@@ -52,7 +53,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
     setFormKey(taskKey);
     setEmbedder(task.embedder); setClassifier(task.classifier); setParams(paramTexts(task.classifier_params));
     setTextWeight(task.text_weight); setReject(optional(task.reject_below));
-    setRejectZero(optional(task.reject_below_zero_shot)); setFlip(task.flip); setNewName(task.name);
+    setRejectZero(optional(task.reject_below_zero_shot)); setFlip(task.flip); setNames(task.names_as_text); setNewName(task.name);
     setTemperature(optional(task.temperature));
   }
 
@@ -90,7 +91,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
       text_weight: textWeight,
       ...(rejectValue === null ? { clear_reject: true } : { reject_below: rejectValue }),
       ...(rejectZeroValue === null ? { clear_reject_zero_shot: true } : { reject_below_zero_shot: rejectZeroValue }),
-      flip,
+      flip, names_as_text: names,
       ...(temperatureValue === null ? { clear_temperature: true } : { temperature: temperatureValue }),
     }));
     setSaving(false);
@@ -173,6 +174,14 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
         <span>Average each image with its mirror image</span>
         <small className="muted check-help">Often a little more accurate when left and right don't matter (most photos). Embedding takes twice as long.</small>
       </label>
+
+      {task.supports_text && (
+        <label className="check">
+          <input type="checkbox" checked={names} onChange={(e) => { setNames(e.target.checked); }} />
+          <span>Use class names as descriptions</span>
+          <small className="muted check-help">A class without a description is described as "a photo of a &lt;name&gt;.", which helps a lot with few examples when names are real words (about 20 points at one example per class). Names that don't match the examples, such as codes, are ignored automatically.</small>
+        </label>
+      )}
 
       {problems.length > 0 && <div className="error" role="alert"><span>{problems.join(". ")}.</span></div>}
       <div className="row">

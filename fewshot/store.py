@@ -72,7 +72,7 @@ MAX_NOTE = 2000
 # A task folder without task.json (or a .tmp-/.trash- folder) this old is left over from a crash.
 STALE_SECONDS = 600
 SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "reject_below",
-            "reject_below_zero_shot", "flip", "temperature"}
+            "reject_below_zero_shot", "flip", "temperature", "names_as_text"}
 
 
 def default_root() -> Path:
@@ -212,6 +212,9 @@ class TaskConfig(BaseModel):
     # far lower (about 0.2-0.35 for CLIP) than image-to-image ones; None never rejects them.
     reject_below_zero_shot: float | None = None
     flip: bool = False  # average each image's embedding with its mirror image's (test-time augmentation)
+    # With a text-capable embedder, a class with examples but no description uses "a photo of a
+    # <name>." as its text, unless the names don't match the examples (see Pipeline.class_data).
+    names_as_text: bool = True
     temperature: float | None = None  # confidence calibration fitted by evaluation (None: 1, uncalibrated)
     classes: list[ClassDef] = Field(default_factory=list)
     examples: list[Example] = Field(default_factory=list)
