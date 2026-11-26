@@ -78,6 +78,22 @@ def test_the_session_cookie_is_signed_not_the_token(tmp_path):
     assert not sessions._revoked  # pylint: disable=protected-access
 
 
+def test_revoked_sessions_are_bounded(monkeypatch):
+    """Logged-out sessions are remembered until they expire, at most REVOKED_KEPT at once (those
+    expiring soonest are forgotten first), so logging out stays cheap however many do."""
+    monkeypatch.setattr(fewshot.auth, "REVOKED_KEPT", 2)
+    sessions = Sessions("s3cret-s3cret-s3cret")
+    values = [sessions.issue(seconds=100 + i) for i in range(3)]
+    for v in values:
+        sessions.revoke(v)
+    sessions.revoke(values[2])  # again: no second entry
+    assert [sessions.valid(v) for v in values] == [True, False, False]  # the soonest to expire went
+    assert len(sessions._expiring) == len(sessions._revoked) == 2  # pylint: disable=protected-access
+    monkeypatch.setattr(time, "time", lambda: 10**12)  # long after they all expired
+    sessions.revoke(None)
+    assert not sessions._revoked  # pylint: disable=protected-access
+
+
 # ---- wrong tokens --------------------------------------------------------
 # These changed on purpose: wrong tokens past the limit get 429, but the right token is always
 # accepted (it used to get 429 too, which let one stranger behind a shared address lock out

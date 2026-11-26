@@ -202,3 +202,7 @@ def test_evaluate_runs_as_a_job(server, monkeypatch):
     with pytest.raises(ApiError, match="Evaluation cancelled") as e:
         fs.evaluate("empty", poll=0)
     assert e.value.status == 409
+    replies = iter([{"id": "j", "status": "done", "error": None, "result": None, "expired": True}])
+    with pytest.raises(ApiError, match="no longer keeps its report") as e:
+        fs.evaluate("empty", poll=0)
+    assert e.value.status == 410

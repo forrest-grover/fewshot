@@ -200,13 +200,17 @@ class Client:
         """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...).
 
         Runs as a background job on the server, polled every ``poll`` seconds, so a long evaluation
-        isn't cut off by the request timeout. A failed or cancelled job raises ``ApiError``."""
+        isn't cut off by the request timeout. A failed or cancelled job raises ``ApiError``, as
+        does (410) one whose report the server dropped before it was fetched."""
         job = self.request("POST", f"/tasks/{_seg(task)}/evaluate/jobs", params={"folds": folds})
         while job["status"] in {"running", "cancelling"}:
             time.sleep(poll)
             job = self.request("GET", f"/jobs/{_seg(job['id'])}")
         if job["status"] != "done":
             raise ApiError(409 if job["status"] == "cancelled" else 400, job["error"] or f"Evaluation {job['status']}")
+        if job["result"] is None:  # finished, but the server has dropped the report since
+            raise ApiError(410, "The evaluation finished, but the server no longer keeps its report (it keeps "
+                                "only the most recent ones); evaluate again")
         return job["result"]  # type: ignore[no-any-return]
 
 
