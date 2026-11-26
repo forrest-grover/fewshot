@@ -8,7 +8,9 @@ way a bad value is refused with a message naming it, before the server starts.
     The workspace (default ``./fewshot_data``).
 ``FEWSHOT_TOKEN``
     If set, every /api request except /api/login and /api/health needs this token, as a
-    ``Bearer`` header or the session cookie /api/login sets.
+    ``Bearer`` header or the session cookie /api/login sets. It must be one that can't be guessed
+    online (see ``token_problem``): at least 16 characters, not just a few different ones
+    repeated. ``openssl rand -hex 16`` makes a good one.
 ``FEWSHOT_ALLOW_ANY_MODEL=1``
     Let API callers choose any embedder spec. By default only presets, registered embedders and
     specs existing tasks already use are accepted, so a caller can't make the server download
@@ -37,6 +39,10 @@ way a bad value is refused with a message naming it, before the server starts.
 ``FEWSHOT_WORKERS``
     Threads for heavy work: predictions, evaluations, uploads, imports and thumbnails (default 4).
     Other requests have their own threads, so heavy work can't keep the server from answering.
+
+One process serves the app: logged-out sessions, wrong-token counts and background jobs are kept
+in its memory, so running several (``uvicorn --workers N``) isn't supported; a server started
+that way warns.
 """
 
 from __future__ import annotations
@@ -46,13 +52,37 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .guard import host_name
+from .guard import MAX_BULK_JSON_BYTES, MAX_JSON_BYTES, host_name
+
+__all__ = ["MAX_BULK_JSON_BYTES", "MAX_JSON_BYTES", "ServerSettings", "token_problem"]
 
 MB = 1024 * 1024
-MAX_JSON_BYTES = 1 * MB  # request bodies other than uploads and lists of ids
-MAX_BULK_JSON_BYTES = 16 * MB  # JSON bodies listing ids (bulk edit, delete, accept, dismiss)
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 _TRUE, _FALSE = {"1", "true", "yes", "on"}, {"", "0", "false", "no", "off"}
+MIN_TOKEN_LENGTH = 16
+MIN_TOKEN_CHARACTERS = 5  # different characters in it
+MAX_WORKERS = 256
+
+
+def token_problem(token: str) -> str | None:
+    """Why ``token`` is too weak to protect a server, or None if it isn't.
+
+    A correct token is always accepted, and wrong ones from an address are refused after a few a
+    minute, so what keeps the server safe is a token nobody can guess, even from many addresses.
+    Strength can't be measured from the string itself; this refuses the tokens that are weak
+    on their face: shorter than ``MIN_TOKEN_LENGTH`` characters (16 random ones, even only hex
+    digits, are 2**64 possibilities), or made of fewer than ``MIN_TOKEN_CHARACTERS`` different
+    characters ("aaaa...", "abab...", "1234" repeated). A random token of 16 hex digits has
+    fewer than 5 different ones about once in two million; one of 32 (``openssl rand -hex 16``)
+    practically never.
+    """
+    if len(token) < MIN_TOKEN_LENGTH:
+        return (f"it has {len(token)} characters; use at least {MIN_TOKEN_LENGTH} random ones, "
+                "e.g. from `openssl rand -hex 16`")
+    if len(set(token)) < MIN_TOKEN_CHARACTERS:
+        return (f"it repeats {len(set(token))} different characters; use a random one, "
+                "e.g. from `openssl rand -hex 16`")
+    return None
 
 
 @dataclass(frozen=True)
@@ -75,10 +105,12 @@ class ServerSettings:  # pylint: disable=too-many-instance-attributes  # one fie
             v = getattr(self, name)
             if not 0 < v < float("inf"):
                 raise ValueError(f"{name} must be a positive number of megabytes, got {v}")
-        if not 1 <= self.workers <= 256:
-            raise ValueError(f"workers must be between 1 and 256, got {self.workers}")
+        if not 1 <= self.workers <= MAX_WORKERS:
+            raise ValueError(f"workers must be between 1 and {MAX_WORKERS}, got {self.workers}")
         if self.token is not None and not self.token.strip():
             object.__setattr__(self, "token", None)
+        if self.token is not None and (why := token_problem(self.token)):
+            raise ValueError(f"The token is too weak to be safe: {why}")
         object.__setattr__(self, "allowed_hosts", frozenset(host_name(h) for h in self.allowed_hosts if h.strip()))
 
     @property
@@ -115,13 +147,24 @@ class ServerSettings:  # pylint: disable=too-many-instance-attributes  # one fie
                 raise ValueError(f"{name} must be a positive number, got {raw!r}")
             return v
 
+        def whole(name: str, default: int, top: int) -> int:
+            raw = env.get(name, "").strip()
+            if not raw:
+                return default
+            if not raw.isdigit() or not 1 <= int(raw) <= top:
+                raise ValueError(f"{name} must be a whole number from 1 to {top}, got {raw!r}")
+            return int(raw)
+
+        token = env.get("FEWSHOT_TOKEN", "").strip() and env["FEWSHOT_TOKEN"]
+        if token and (why := token_problem(token)):
+            raise ValueError(f"FEWSHOT_TOKEN is too weak to be safe: {why}")
         hosts = [h for h in env.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
         home = env.get("FEWSHOT_HOME")
-        return cls(home=Path(home) if home else None, token=env.get("FEWSHOT_TOKEN") or None,
+        return cls(home=Path(home) if home else None, token=token or None,
                    allow_any_model=flag("FEWSHOT_ALLOW_ANY_MODEL", False), warm=flag("FEWSHOT_WARM", True),
                    allow_urls=flag("FEWSHOT_ALLOW_URLS", False),
                    allowed_hosts=frozenset(hosts or LOCAL_HOSTS),
                    max_upload_mb=number("FEWSHOT_MAX_UPLOAD_MB", 50),
                    max_request_mb=number("FEWSHOT_MAX_REQUEST_MB", 1024),
                    forwarded_allow_ips=env.get("FEWSHOT_FORWARDED_ALLOW_IPS", "").strip() or "127.0.0.1",
-                   workers=int(number("FEWSHOT_WORKERS", 4)))
+                   workers=whole("FEWSHOT_WORKERS", 4, MAX_WORKERS))

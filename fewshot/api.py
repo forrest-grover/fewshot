@@ -18,7 +18,6 @@ import functools
 import logging
 import mimetypes
 import os
-import re
 import secrets
 import tempfile
 import threading
@@ -30,7 +29,6 @@ from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -50,7 +48,7 @@ from .embedders import (
     max_models,
     spec_supports_text,
 )
-from .guard import LimitBody, cross_site, host_allowed
+from .guard import LimitBody, body_limit, cross_site, host_allowed, without_input
 from .images import thumbnail
 from .inbox import chunked
 from .jobs import Job, Jobs, TooManyJobs
@@ -86,7 +84,7 @@ from .schemas import (
     TaskSummary,
     Urls,
 )
-from .server_settings import MAX_BULK_JSON_BYTES, MAX_JSON_BYTES, ServerSettings
+from .server_settings import ServerSettings
 from .store import Task, Workspace
 from .text import check_class_name
 
@@ -110,6 +108,7 @@ class Server:  # pylint: disable=too-many-instance-attributes  # the server's pa
         self.jobs = Jobs()
         self.wrong_tokens = WrongTokens()
         self.sessions = Sessions(settings.token) if settings.token else None
+        self.warned_proxy = False  # see _note_untrusted_proxy
         self.heavy = ThreadPoolExecutor(settings.workers, thread_name_prefix="fewshot-work")
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
@@ -185,46 +184,11 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
     app.state.server = server
     app.include_router(router)
     app.middleware("http")(_guard)
-    app.add_exception_handler(RequestValidationError, _invalid)
+    app.add_exception_handler(RequestValidationError, without_input)
     # Added last, so it runs first.
-    app.add_middleware(LimitBody, limit=functools.partial(body_limit, server.settings))
+    app.add_middleware(LimitBody, limit=functools.partial(body_limit, server.settings.max_request_bytes))
     mount_ui(app, Path(__file__).resolve().parent.parent / "web" / "dist")
     return app
-
-
-# Routes whose bodies may be large: uploads (multipart only) and JSON lists of ids. The limit
-# comes from the route, never from what the client says the body is, so a body labelled as an
-# upload gets the small limit anywhere else (FastAPI would read it whole to parse JSON).
-UPLOAD_ROUTES = re.compile(r"/api/tasks/(?:import|[^/]+/(?:examples|inbox|predict))")  # POST
-BULK_ROUTES = {"PATCH": re.compile(r"/api/tasks/[^/]+/examples"),
-               "POST": re.compile(r"/api/tasks/[^/]+/(?:examples/delete|inbox/accept|inbox/accept-confident"
-                                  r"|inbox/dismiss)")}
-
-
-def body_limit(settings: ServerSettings, scope: Any) -> int:
-    """The largest body the request in ``scope`` may send: ``max_request_bytes`` for a multipart
-    body to an upload route, ``MAX_BULK_JSON_BYTES`` for a route taking a list of ids, else
-    ``MAX_JSON_BYTES``."""
-    path, method = scope["path"], scope["method"]
-    root = scope.get("root_path", "")
-    if root and path.startswith(root):
-        path = path[len(root):]
-    if method == "POST" and UPLOAD_ROUTES.fullmatch(path):
-        ctype = dict(scope["headers"]).get(b"content-type", b"").lower()
-        if ctype.startswith(b"multipart/form-data"):  # any other body there is no upload: small
-            return settings.max_request_bytes
-    bulk = BULK_ROUTES.get(method)
-    if bulk is not None and bulk.fullmatch(path):
-        return MAX_BULK_JSON_BYTES
-    return MAX_JSON_BYTES
-
-
-async def _invalid(_: Request, exc: Exception) -> JSONResponse:
-    """422 for a request that doesn't validate, like FastAPI's own but without each error's
-    ``input``, so a large bad body isn't sent back."""
-    assert isinstance(exc, RequestValidationError)
-    errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
-    return JSONResponse({"detail": jsonable_encoder(errors)}, 422)
 
 
 @functools.cache
@@ -250,7 +214,7 @@ router = APIRouter()
 # ---- access control -----------------------------------------------------
 SESSION_COOKIE = "fewshot_session"
 OPEN_PATHS = {"/api/login", "/api/health"}  # reachable without the token
-TOO_MANY_TOKENS = "Too many wrong tokens; try again in a minute"
+TOO_MANY_TOKENS = "Too many wrong tokens from this address; try again in a minute"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
@@ -260,20 +224,34 @@ def _client(request: Request) -> str:
 
 
 def _check_token(srv: Server, client: str, given: str) -> int | None:
-    """Check a token from ``client`` (at login, or as a Bearer header): None if right, 401 if
-    wrong, 429 once the client gave ``LOGIN_FAILURES`` wrong tokens within ``LOGIN_WINDOW``
-    seconds, so a token can't be guessed quickly. Only wrong tokens count. A session cookie is
-    checked without this: it can't be guessed, so a client signed in keeps working while others
-    behind the same address are refused."""
+    """Check a token from ``client`` (at login, or as a Bearer header): None if right (always,
+    compared in constant time), else 401, or 429 once the client gave ``LOGIN_FAILURES`` wrong
+    tokens within ``LOGIN_WINDOW`` seconds. Only wrong tokens count, and they are what gets
+    refused: a stranger guessing from a shared address (behind a proxy that isn't trusted) can't
+    lock out the clients there that know the token. That a right guess would still get in is
+    safe because the token can't be guessed (``ServerSettings`` refuses weak ones); the limit
+    just keeps a guesser slow and noisy."""
     token = srv.settings.token
-    if token is None:
+    if token is None or secrets.compare_digest(given.encode(), token.encode()):
         return None
-    if srv.wrong_tokens.blocked(client):
-        return 429
-    if secrets.compare_digest(given.encode(), token.encode()):
-        return None
+    blocked = srv.wrong_tokens.blocked(client)
     srv.wrong_tokens.wrong(client)
-    return 401
+    return 429 if blocked else 401
+
+
+def _note_untrusted_proxy(srv: Server, request: Request) -> None:
+    """Warn (once) if requests come through a proxy whose X-Forwarded-For isn't trusted: every
+    client behind it then has the proxy's address, so wrong tokens are counted for all at once."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if srv.warned_proxy or forwarded is None:
+        return
+    client = _client(request)
+    if client not in {a.strip() for a in forwarded.split(",")}:
+        srv.warned_proxy = True
+        log.warning("Requests come through a proxy at %s whose X-Forwarded-For isn't trusted, so every client "
+                    "behind it has its address: one client's wrong tokens get the others' wrong tokens refused "
+                    "too (right tokens always work). Set FEWSHOT_FORWARDED_ALLOW_IPS (--forwarded-allow-ips) "
+                    "to the proxy's address.", client)
 
 
 async def _guard(request: Request, call_next: Any) -> Response:
@@ -285,6 +263,8 @@ async def _guard(request: Request, call_next: Any) -> Response:
     path = request.url.path
     if request.method not in SAFE_METHODS and path.startswith("/api/") and cross_site(request):
         return JSONResponse({"detail": "Cross-site requests are not allowed"}, 403)
+    if srv.sessions is not None:
+        _note_untrusted_proxy(srv, request)
     if srv.sessions is not None and path.startswith("/api/") and path not in OPEN_PATHS:
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
@@ -351,8 +331,8 @@ async def login(srv: Srv, body: Login, request: Request, response: Response) -> 
     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
 
     After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds (here or as
-    Bearer headers), token checks from it get 429 until the window has passed, so the token
-    can't be guessed quickly.
+    Bearer headers), further wrong ones from it get 429 until it has sent none for that long; the
+    right token is always accepted.
     """
     refused = _check_token(srv, _client(request), body.token)
     if refused == 429:

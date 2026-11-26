@@ -12,7 +12,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 
-LOGIN_FAILURES = 10  # wrong tokens per client within LOGIN_WINDOW before token checks answer 429
+LOGIN_FAILURES = 10  # wrong tokens per client within LOGIN_WINDOW before further wrong ones get 429
 LOGIN_WINDOW = 60.0
 LOGIN_CLIENTS = 10_000  # clients with recent wrong tokens remembered at once (the oldest are forgotten)
 SESSION_DAYS = 30  # how long a login lasts
@@ -21,22 +21,23 @@ SESSION_DAYS = 30  # how long a login lasts
 class WrongTokens:
     """Recent wrong tokens per client address, to answer 429 to a client guessing tokens.
 
-    Only wrong tokens make an entry; entries expire after ``LOGIN_WINDOW`` and at most
-    ``LOGIN_CLIENTS`` are kept (the least recently wrong go first), so the map stays small however
-    many addresses guess."""
+    Only wrong tokens make an entry, and each keeps the times of its last ``LOGIN_FAILURES``;
+    they expire after ``LOGIN_WINDOW`` and at most ``LOGIN_CLIENTS`` are kept (the least recently
+    wrong go first), so the map stays small however many addresses guess, however fast."""
 
     def __init__(self) -> None:
         self._seen: OrderedDict[str, deque[float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def _recent(self, client: str, now: float) -> deque[float]:
-        recent = self._seen.get(client, deque())
+        recent = self._seen.get(client, deque(maxlen=LOGIN_FAILURES))
         while recent and now - recent[0] > LOGIN_WINDOW:
             recent.popleft()
         return recent
 
     def blocked(self, client: str) -> bool:
-        """Whether ``client`` gave ``LOGIN_FAILURES`` wrong tokens within the last ``LOGIN_WINDOW``."""
+        """Whether ``client``'s last ``LOGIN_FAILURES`` wrong tokens all came within the last
+        ``LOGIN_WINDOW`` seconds."""
         with self._lock:
             recent = self._recent(client, time.monotonic())
             if not recent:

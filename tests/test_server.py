@@ -3,6 +3,7 @@ upload limits, the model allowlist and warm-up."""
 
 import asyncio
 import importlib
+import secrets
 import subprocess
 import sys
 import threading
@@ -59,8 +60,9 @@ def test_the_body_limit_comes_from_the_route_not_the_content_type(tmp_path):
         assert r.status_code == 413, path
         assert client.post(path, content=body, headers=multipart).status_code == 401, path  # past the limit
     assert client.request("GET", "/api/tasks/t/examples", content=body, headers=multipart).status_code == 413
-    root = fewshot.api.body_limit(ServerSettings(), {"path": "/app/api/tasks/import", "root_path": "/app",
-                                                    "method": "POST", "headers": [(b"content-type", b"multipart/form-data")]})
+    scope = {"path": "/app/api/tasks/import", "root_path": "/app", "method": "POST",
+             "headers": [(b"content-type", b"multipart/form-data")]}
+    root = fewshot.guard.body_limit(ServerSettings().max_request_bytes, scope)
     assert root == ServerSettings().max_request_bytes
 
 
@@ -84,7 +86,8 @@ def test_validation_errors_dont_echo_the_body(client):
     r = client.post("/api/tasks", json={"name": "x", "junk": "y" * 500_000})
     assert r.status_code == 422
     assert len(r.content) < 1000
-    assert r.json()["detail"] == [{"type": "extra_forbidden", "loc": ["body", "junk"], "msg": "Extra inputs are not permitted"}]
+    assert r.json()["detail"] == [{"type": "extra_forbidden", "loc": ["body", "junk"],
+                                   "msg": "Extra inputs are not permitted"}]
 
 
 def _asgi(chunks, inner):
@@ -250,11 +253,12 @@ def test_export_headers_and_import_with_another_embedder(client):
 # ---- settings and the app factory ----------------------------------------
 def test_settings_from_the_environment_are_checked():
     """Every setting is read and checked in one place, with a message naming the bad variable."""
-    s = ServerSettings.from_env({"FEWSHOT_TOKEN": "x", "FEWSHOT_WARM": "0", "FEWSHOT_ALLOW_URLS": "yes",
+    s = ServerSettings.from_env({"FEWSHOT_TOKEN": "0123456789abcdef", "FEWSHOT_WARM": "0", "FEWSHOT_ALLOW_URLS": "yes",
                                  "FEWSHOT_ALLOWED_HOSTS": "a.lan, B.lan:8000", "FEWSHOT_MAX_UPLOAD_MB": "2",
                                  "FEWSHOT_WORKERS": "3", "FEWSHOT_HOME": "/w",
                                  "FEWSHOT_FORWARDED_ALLOW_IPS": "10.0.0.1"})
-    assert (s.token, s.warm, s.allow_urls, s.allowed_hosts) == ("x", False, True, frozenset({"a.lan", "b.lan"}))
+    assert (s.token, s.warm, s.allow_urls) == ("0123456789abcdef", False, True)
+    assert s.allowed_hosts == {"a.lan", "b.lan"}
     assert (s.max_upload_bytes, s.workers, str(s.home), s.forwarded_allow_ips) == (2 * 2**20, 3, "/w", "10.0.0.1")
     d = ServerSettings.from_env({})
     assert (d.token, d.warm, d.max_request_mb) == (None, True, 1024)
@@ -262,7 +266,10 @@ def test_settings_from_the_environment_are_checked():
     for env, message in [({"FEWSHOT_MAX_UPLOAD_MB": "abc"}, "FEWSHOT_MAX_UPLOAD_MB must be a number"),
                          ({"FEWSHOT_MAX_REQUEST_MB": "-5"}, "FEWSHOT_MAX_REQUEST_MB must be a positive number"),
                          ({"FEWSHOT_MAX_UPLOAD_MB": "inf"}, "must be a positive number"),
-                         ({"FEWSHOT_WARM": "maybe"}, "FEWSHOT_WARM must be 1 or 0")]:
+                         ({"FEWSHOT_WARM": "maybe"}, "FEWSHOT_WARM must be 1 or 0"),
+                         ({"FEWSHOT_WORKERS": "0.5"}, "FEWSHOT_WORKERS must be a whole number from 1 to 256"),
+                         ({"FEWSHOT_WORKERS": "300"}, "FEWSHOT_WORKERS must be a whole number"),
+                         ({"FEWSHOT_TOKEN": "s3cret"}, "FEWSHOT_TOKEN is too weak to be safe: it has 6 characters")]:
         with pytest.raises(ValueError, match=message):
             ServerSettings.from_env(env)
     with pytest.raises(ValueError, match="max_upload_mb must be a positive"):
@@ -270,6 +277,17 @@ def test_settings_from_the_environment_are_checked():
     with pytest.raises(ValueError, match="workers must be between"):
         ServerSettings(workers=0)
     assert ServerSettings(token="  ").token is None
+    assert ServerSettings.from_env({"FEWSHOT_TOKEN": " "}).token is None
+
+
+def test_tokens_that_could_be_guessed_are_refused():
+    """A token must have at least 16 characters, of at least 5 different ones; random ones pass."""
+    for weak, why in [("short-token", "it has 11 characters"), ("a" * 40, "it repeats 1 different characters"),
+                      ("1234" * 8, "it repeats 4 different characters")]:
+        with pytest.raises(ValueError, match=f"The token is too weak to be safe: {why}"):
+            ServerSettings(token=weak)
+    for good in ("0123456789abcdef", secrets.token_hex(16), secrets.token_urlsafe(12), "correct horse battery"):
+        assert ServerSettings(token=good).token == good
 
 
 def test_importing_the_api_reads_no_settings_and_makes_no_workspace(tmp_path, monkeypatch):
