@@ -101,9 +101,10 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     }
   };
   const exportCsv = () => {
+    const round4 = (x: number) => Number(x.toFixed(4)); // a number, so a spreadsheet reads it as one
     const row = (it: Item) => {
       const p: Prediction = it.pred;
-      return [it.name, p.label, p.labels.join(";"), p.top_label, p.confidence.toFixed(4), p.similarity.toFixed(4), p.rejected, p.error];
+      return [it.name, p.label, p.labels.join(";"), p.top_label, round4(p.confidence), round4(p.similarity), p.rejected, p.error];
     };
     downloadCsv(`${task.name}-predictions.csv`, [
       ["file", "label", "labels", "top_label", "confidence", "similarity", "rejected", "error"], ...items.map(row),
