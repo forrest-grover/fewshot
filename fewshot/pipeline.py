@@ -17,7 +17,7 @@ from PIL import Image, ImageOps
 from .cache import FLIP_KEY, EmbeddingCache
 from .classifiers import ClassData, Classifier, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, hold, spec_supports_text
-from .images import image_id, load_image, to_rgb
+from .images import conversion_key, image_id, load_image, to_rgb, white_level
 from .models import TaskConfig
 from .store import Task, Workspace
 from .text import fill_template, prompts
@@ -79,7 +79,9 @@ class Pipeline:
         """Embed ``(cache_key or None, image)`` pairs, using and filling the cache.
 
         With ``flip``, each vector is the normalised mean of the image's and its mirror image's
-        embeddings (test-time augmentation), cached under the key plus ``FLIP_KEY``.
+        embeddings (test-time augmentation), cached under the key plus ``FLIP_KEY``. An image whose
+        conversion to RGB has changed is cached under its key plus ``CONVERSION_KEY`` (before any
+        ``FLIP_KEY``), so vectors of the old conversion aren't reused (see ``conversion_key``).
 
         Uncached images are decoded, embedded and cached one batch at a time, so memory stays
         bounded however many there are, and an interrupted run keeps what it finished. An
@@ -96,8 +98,8 @@ class Pipeline:
                       errors: dict[int, str] | None, progress: Progress | None, flip: bool) -> Vectors:
         """``embed_images`` with the model held."""
         ns = cache_namespace(spec)
-        if flip:
-            items = [(k + FLIP_KEY if k else None, im) for k, im in items]
+        # How the image is converted to RGB is part of the key, so a change to it re-embeds it.
+        items = [(k + conversion_key(im) + (FLIP_KEY if flip else "") if k else None, im) for k, im in items]
         emb, hit = self._cached(spec, ns, [k for k, _ in items])
         out = {i: hit[k] for i, (k, _) in enumerate(items) if k and k in hit}  # row index -> vector
         if emb is not None:
@@ -527,7 +529,7 @@ EMBED_MAX_SIDE = 2048  # images are shrunk to this before embedding, so a batch 
 
 def _to_pil(im: ImageInput) -> Image.Image:
     if isinstance(im, Image.Image):
-        im = to_rgb(ImageOps.exif_transpose(im))
+        im = to_rgb(ImageOps.exif_transpose(im), white_level(im))
         if max(im.size) > EMBED_MAX_SIDE:
             im.thumbnail((EMBED_MAX_SIDE, EMBED_MAX_SIDE), Image.Resampling.LANCZOS)
         return im

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .embedders import Vectors
+from .images import CONVERSION_KEY
 
 if TYPE_CHECKING:
     from .store import Workspace
@@ -27,8 +28,14 @@ log = logging.getLogger(__name__)
 
 BUSY_TIMEOUT = 30.0  # seconds to wait for another process's write to finish
 # Suffix of the key a flip-averaged image embedding is cached under (as pipeline.FLIP_KEY, which
-# writes them); pruning keeps both keys of each image in use.
+# writes them); pruning keeps every key of each image in use (see ``image_keys``).
 FLIP_KEY = ":flip"
+
+
+def image_keys(image_id: str) -> tuple[str, ...]:
+    """Every key an image's vectors may be cached under: its id, plus ``CONVERSION_KEY`` if its
+    conversion to RGB has changed (see ``images.conversion_key``), each plus ``FLIP_KEY`` too."""
+    return tuple(image_id + c + f for c in ("", CONVERSION_KEY) for f in ("", FLIP_KEY))
 
 
 # SQLite's primary result codes for a file that isn't a sound database.
@@ -159,7 +166,7 @@ def prune_unused(ws: Workspace, dry_run: bool = False, vacuum: bool = False) -> 
                 tasks.remove(t)
         ids = {e.id for t in tasks for e in [*t.config.examples, *t.config.inbox]}
         ids |= {f.split("/", 1)[1].rsplit(".", 1)[0] for t in tasks for f in t.kept_files()}
-        n = cache.prune({k for i in ids for k in (i, i + FLIP_KEY)}, dry_run=dry_run)
+        n = cache.prune({k for i in ids for k in image_keys(i)}, dry_run=dry_run)
     if dry_run:
         return n, 0
     if vacuum:
