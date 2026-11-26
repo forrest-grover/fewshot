@@ -10,8 +10,8 @@ The same engine is exposed four ways: a Python library, a CLI, a REST API, and a
 
 ```bash
 conda create -p ./.env python=3.12 nodejs=22 -c conda-forge
-./.env/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128   # RTX 50xx needs cu128+
-./.env/bin/pip install -e ".[dev]"
+./.env/bin/pip install --no-deps -c constraints.txt torch torchvision --index-url https://download.pytorch.org/whl/cu128   # RTX 50xx needs cu128+
+./.env/bin/pip install -c constraints.txt -e ".[dev]"
 cd web && npm install && npm run build && cd ..
 ./.env/bin/fewshot serve            # UI at http://127.0.0.1:8000, API docs at /docs
 ```
@@ -169,5 +169,10 @@ Tasks, images and the embedding cache live in the `/data` volume and downloaded 
 | `pylint fewshot tests` | 10.00/10 |
 | `pytest --cov` | 100% line and branch coverage (`fail_under = 100`) |
 | `npm run typecheck` / `lint` / `build` in `web/` | `tsc`, ESLint (typescript-eslint strict type-checked) and Stylelint with zero warnings |
+| `npm test` / `npm run check:api` in `web/` | the UI's unit tests (Vitest) pass; `src/api-schema.ts` matches the server's OpenAPI schema |
 
-The Python tests take about 10 seconds and download no models: they use fake embedders registered with `register_embedder`, and mock open_clip, timm and CUDA.
+The Python tests take about 30 seconds and download no models: they use fake embedders registered with `register_embedder`, and mock open_clip, timm and CUDA. They are grouped by topic (`tests/test_<topic>.py`, e.g. `test_fetch`, `test_archive`, `test_history`, `test_auth`), with shared fixtures and helpers in `tests/conftest.py`; a test that leaves anything in the working directory fails. One opt-in test embeds an image and a text with the smallest real preset: `FEWSHOT_TEST_MODELS=1 pytest -m model` (it downloads the weights into `HF_HOME` unless they are cached). Besides these checks, CI runs the locking, transaction, history and store tests on macOS, and builds the Docker image, starts it and checks that `/healthz` answers and `/` serves the UI. A weekly workflow (`.github/workflows/scheduled.yml`) runs the checks against the newest release of every dependency, and the real-model test.
+
+### Dependencies
+
+`pyproject.toml` gives loose ranges, as a library should (with lower bounds where the code needs them: open_clip 3.0 for the PE Core presets). `constraints.txt` pins the exact versions of every dependency, and theirs, that the checks pass with; CI and the Dockerfile install with `-c constraints.txt`, so a new upstream release can't break them, and the weekly workflow shows when one would. torch is pinned without its local label (`torch==2.11.0` matches `2.11.0+cpu` and `+cu128`) and installed with `--no-deps` from the wheel index of your choice. To refresh the pins: in a fresh environment, install without the constraints (`pip install --no-deps torch torchvision --index-url ...`, then `pip install -e ".[dev,siglip]"`), run `scripts/check.sh`, and then `python scripts/freeze_constraints.py > constraints.txt`.

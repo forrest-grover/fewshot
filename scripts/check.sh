@@ -13,5 +13,7 @@ step pytest;  pytest -q --cov --cov-report=term-missing
 cd web
 step tsc;     npm run -s typecheck
 step lint;    npm run -s lint
+step vitest;  npm run -s test
+step api;     npm run -s check:api
 step build;   npm run -s build
 printf '\nAll checks passed.\n'

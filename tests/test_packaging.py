@@ -27,7 +27,7 @@ def test_compose_publishes_on_this_machine_and_images_are_pinned():
 def test_constraints_pin_every_dependency():
     """constraints.txt pins each dependency pyproject.toml declares (extras too) to one exact version,
     without local labels (so the CPU and CUDA builds of torch both match) or CUDA-only packages;
-    the Dockerfile installs with it."""
+    CI and the Dockerfile install with it."""
     tomllib = pytest.importorskip("tomllib")
     root = Path(__file__).resolve().parent.parent
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
@@ -43,3 +43,4 @@ def test_constraints_pin_every_dependency():
         name = re.split(r"[\[<>=!~; ]", dep, maxsplit=1)[0]
         assert re.sub(r"[-_.]+", "-", name).lower() in pins, dep
     assert "-c constraints.txt" in (root / "Dockerfile").read_text()
+    assert "-c constraints.txt" in (root / ".github" / "workflows" / "ci.yml").read_text()

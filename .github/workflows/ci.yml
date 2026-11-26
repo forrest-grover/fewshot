@@ -9,21 +9,25 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+# Dependencies come from constraints.txt (exact versions the checks pass with); torch is installed
+# first, without its dependencies, from the CPU wheel index, and the rest from PyPI.
 jobs:
   python:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # only used to publish the coverage badge data to the `badges` branch
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: constraints.txt
       - name: Install (CPU-only torch; tests use a fake embedder and download no models)
         run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev]"
+          pip install --no-deps -c constraints.txt torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -c constraints.txt -e ".[dev]"
       - name: ruff
         run: ruff check --output-format=github .
       - name: mypy
@@ -33,13 +37,9 @@ jobs:
       - name: pytest with coverage (fails under 100%)
         id: pytest
         run: pytest -q --cov --cov-report=term-missing
-      - name: Publish coverage badge data
+      - name: Coverage badge data
         # Runs even when the coverage step failed, so the badge shows the real number.
-        if: >-
-          always() && steps.pytest.outcome != 'skipped'
-          && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: always() && steps.pytest.outcome != 'skipped'
         run: |
           # --fail-under=0: below the threshold, coverage would also print its failure message here.
           pct=$(coverage report --format=total --fail-under=0 || true)
@@ -48,15 +48,81 @@ jobs:
           elif [ "$pct" -ge 90 ];  then color=green
           elif [ "$pct" -ge 75 ];  then color=yellow
           else color=red; fi
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > badge/coverage.json
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.pytest.outcome != 'skipped'
+        with:
+          name: coverage
+          path: |
+            badge/coverage.json
+            .coverage
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      # The UI's API types are generated from the server's OpenAPI schema, which needs fewshot.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: UI types match the API (npm run check:api)
+        working-directory: web
+        run: |
+          npm ci
+          npm run check:api
+
+  badge:
+    # Only this job may write to the repository: it publishes the coverage badge data to `badges`.
+    needs: python
+    if: >-
+      always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.python.result != 'skipped' && needs.python.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        id: download
+        continue-on-error: true # no artifact: the tests didn't get as far as coverage
+        with:
+          name: coverage
+      - name: Publish coverage badge data
+        if: steps.download.outcome == 'success' && hashFiles('badge/coverage.json') != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pct=$(python3 -c 'import json; print(json.load(open("badge/coverage.json"))["message"])')
           dir=$(mktemp -d)
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > "$dir/coverage.json"
+          cp badge/coverage.json "$dir/coverage.json"
           cd "$dir"
           git init -q -b badges
           git add coverage.json
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -qm "Coverage ${pct}% at ${GITHUB_SHA::7}"
+              commit -qm "Coverage ${pct} at ${GITHUB_SHA::7}"
           git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
+
+  macos:
+    # README promises that the store's flock-based locking and atomic saves work on macOS too.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: constraints.txt
+      - name: Install (PyPI's macOS torch is CPU/MPS only)
+        run: |
+          pip install --no-deps -c constraints.txt torch torchvision
+          pip install -c constraints.txt -e ".[dev]"
+      - name: pytest (locking, transactions, history and the store)
+        env:
+          FEWSHOT_DEVICE: cpu
+        run: >-
+          pytest -q tests/test_locking.py tests/test_transactions.py tests/test_history.py
+          tests/test_store.py tests/test_blobs.py tests/test_recovery.py tests/test_archive.py tests/test_cache.py
 
   web:
     runs-on: ubuntu-latest
@@ -75,5 +141,32 @@ jobs:
         run: npm run typecheck
       - name: eslint + stylelint
         run: npm run lint
+      - name: vitest
+        run: npm test
       - name: build
         run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: docker build
+        run: docker build -t fewshot:ci .
+      - name: Run the image; /healthz answers and / serves the UI
+        run: |
+          # FEWSHOT_WARM=0: no model download at startup
+          docker run -d --name fewshot -p 127.0.0.1:8000:8000 -e FEWSHOT_TOKEN=ci-token -e FEWSHOT_WARM=0 fewshot:ci
+          for _ in $(seq 60); do
+            if curl -fsS http://127.0.0.1:8000/healthz; then break; fi
+            sleep 2
+          done
+          echo
+          curl -fsS http://127.0.0.1:8000/healthz
+          curl -fsS http://127.0.0.1:8000/ | tee index.html | head -5
+          grep -q '<div id="root">' index.html || { echo "/ doesn't serve the built UI"; exit 1; }
+          asset=$(grep -o '/assets/[^"]*\.js' index.html | head -1)
+          curl -fsS -o /dev/null "http://127.0.0.1:8000${asset}"
+          test "$(docker inspect -f '{{.Config.User}}' fewshot)" = fewshot
+      - name: Server log
+        if: always()
+        run: docker logs fewshot || true
