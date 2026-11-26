@@ -62,7 +62,7 @@ ruff==0.17.6
 safetensors==0.8.0
 scikit-learn==1.9.1
 scipy==1.18.1
-setuptools==78.1.0
+setuptools==80.9.0
 shellingham==1.5.4
 starlette==1.10.0
 sympy==1.14.0

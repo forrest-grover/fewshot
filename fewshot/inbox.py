@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterable, Iterator, Mapping
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING
 
 from .images import image_ext, image_id
 from .models import Example, InboxItem
@@ -22,10 +22,9 @@ if TYPE_CHECKING:
 INBOX_CHUNK = 256  # images stored per save while adding
 
 
-T = TypeVar("T")
 
 
-def chunked(items: Iterable[T], size: int) -> Iterator[list[T]]:
+def chunked[T](items: Iterable[T], size: int) -> Iterator[list[T]]:
     """``items`` in lists of ``size`` (the last may be shorter), holding one list at a time."""
     batch: list[T] = []
     for item in items:

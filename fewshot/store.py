@@ -41,7 +41,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -952,7 +952,7 @@ def _abandoned(folder: Path) -> bool:
     ``STALE_SECONDS`` (so it isn't a folder just made, before its builder locked it) and not
     locked by a create, duplicate or import still building it, however long that takes."""
     try:
-        age = datetime.now(timezone.utc).timestamp() - folder.stat().st_mtime
+        age = datetime.now(UTC).timestamp() - folder.stat().st_mtime
     except FileNotFoundError:
         return False
     return (age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())

@@ -9,7 +9,7 @@ step() { printf '\n== %s\n' "$1"; }
 step ruff;    ruff check .
 step mypy;    mypy
 step pylint;  pylint --fail-under=10 fewshot tests
-step pytest;  pytest -q --cov --cov-report=term-missing
+step pytest;  CUDA_VISIBLE_DEVICES= pytest -q --cov --cov-report=term-missing  # CPU, as in CI
 cd web
 step tsc;     npm run -s typecheck
 step lint;    npm run -s lint

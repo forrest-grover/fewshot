@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "fewshot"
 version = "0.1.0"
 description = "Embedding-based few-shot image classification: library, CLI, REST API and web UI"
-requires-python = ">=3.10"
+requires-python = ">=3.12"  # what CI, Docker and constraints.txt use
 dependencies = [
     "torch",
     "torchvision",
@@ -56,7 +56,7 @@ good-names-rgxs = ["^[_a-zA-Z][_a-zA-Z0-9]?$"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py312"
 extend-exclude = ["web"]
 
 [tool.ruff.lint]

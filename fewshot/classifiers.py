@@ -40,7 +40,7 @@ import math
 import numbers
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -52,8 +52,6 @@ log = logging.getLogger(__name__)
 
 Labels = npt.NDArray[np.int_]  # class indices
 Scores = npt.NDArray[np.floating[Any]]  # log-probabilities, probabilities or similarities
-
-_T = TypeVar("_T")
 
 
 @dataclass
@@ -103,7 +101,7 @@ def _softmax(z: Scores) -> Scores:
     return e / e.sum(axis=1, keepdims=True)
 
 
-def _fitted(value: _T | None) -> _T:
+def _fitted[T](value: T | None) -> T:
     """``value`` if ``fit`` has set it; raises RuntimeError on an unfitted classifier."""
     if value is None:
         raise RuntimeError("Classifier is not fitted; call fit() first")
