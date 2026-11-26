@@ -48,6 +48,7 @@ that way warns.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +84,23 @@ def token_problem(token: str) -> str | None:
         return (f"it repeats {len(set(token))} different characters; use a random one, "
                 "e.g. from `openssl rand -hex 16`")
     return None
+
+
+def requested_processes(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+    """How many processes the server was started with, as far as can be told: uvicorn's (or
+    gunicorn's) ``--workers N`` / ``-w N`` in ``argv`` (default ``sys.argv``, which a worker
+    process inherits), else ``WEB_CONCURRENCY``, which both read. ``fewshot serve --workers`` sets
+    threads, not processes, and isn't counted."""
+    argv = sys.argv if argv is None else argv
+    env = os.environ if env is None else env
+    raw = env.get("WEB_CONCURRENCY", "")
+    if argv and any(server in Path(arg).parts for arg in argv[:2] for server in ("uvicorn", "gunicorn")):
+        for i, arg in enumerate(argv):
+            if arg in {"--workers", "-w"} and i + 1 < len(argv):
+                raw = argv[i + 1]
+            elif arg.startswith("--workers="):
+                raw = arg.partition("=")[2]
+    return int(raw) if raw.strip().isdigit() else 1
 
 
 @dataclass(frozen=True)

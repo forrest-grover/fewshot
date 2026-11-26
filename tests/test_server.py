@@ -16,6 +16,7 @@ import pytest
 import fewshot.api
 import fewshot.guard
 import fewshot.responses
+import fewshot.server_settings
 import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
 from fewshot.pipeline import Prediction
@@ -482,3 +483,22 @@ def test_choosing_a_model_loads_it_on_the_heavy_work_threads(client, monkeypatch
     assert client.patch("/api/tasks/t", json={"embedder": "fake:other"}).status_code == 200
     assert len(threads) == 2
     assert all(name.startswith("fewshot-work") for name in threads)
+
+
+def test_several_processes_are_noticed_and_warned_about(client, monkeypatch, caplog):
+    """uvicorn's or gunicorn's --workers (or WEB_CONCURRENCY) count as processes, fewshot serve's
+    --workers (threads) doesn't; a server started with several warns, as its state is per process."""
+    count = fewshot.server_settings.requested_processes
+    uvicorn = ["/venv/bin/uvicorn", "fewshot.api:app"]
+    assert count([*uvicorn, "--workers", "4"], {}) == 4
+    assert count([*uvicorn, "--workers=3"], {}) == 3
+    assert count(["/venv/lib/uvicorn/__main__.py", "fewshot.api:app", "--workers", "x"], {}) == 1
+    assert count(["/venv/bin/python", "/venv/bin/gunicorn", "-w", "2"], {}) == 2
+    assert count([*uvicorn, "--workers"], {"WEB_CONCURRENCY": "5"}) == 5
+    assert count(["/venv/bin/fewshot", "serve", "--workers", "8"], {}) == 1
+    assert count([], {}) == 1
+    assert count() == 1  # these tests
+    monkeypatch.setattr(fewshot.api, "requested_processes", lambda: 2)
+    with caplog.at_level("WARNING", logger="fewshot.api"), client:
+        pass
+    assert "started with 2 processes, which isn't supported" in caplog.text

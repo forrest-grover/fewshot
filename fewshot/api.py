@@ -87,7 +87,7 @@ from .schemas import (
     TaskSummary,
     Urls,
 )
-from .server_settings import ServerSettings
+from .server_settings import ServerSettings, requested_processes
 from .store import Task, Workspace
 from .text import check_class_name
 
@@ -197,6 +197,11 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if (n := requested_processes()) > 1:
+            log.warning("This server was started with %d processes, which isn't supported: logged-out sessions, "
+                        "wrong-token limits and background jobs are kept in each process's memory, so a request "
+                        "can miss what another process knows (a job's progress, a logout). Run one process; "
+                        "FEWSHOT_WORKERS sets its threads for heavy work.", n)
         if server.settings.warm:
             threading.Thread(target=server.warm_models, name="fewshot-warm", daemon=True).start()
         yield
