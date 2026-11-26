@@ -508,3 +508,17 @@ def test_gda_pulls_means_with_the_classifiers_one_gap(monkeypatch):
     assert zero.W is not None
     assert real.W is not None
     assert not np.allclose(zero.W, real.W)
+
+
+def test_gda_prior_with_two_classes(monkeypatch):
+    """With 2 classes the class-mean test can't pass (at best p = 1/4), so the images are counted:
+    matching text pulls a binary task's means, swapped text doesn't, and 2 images can't show it."""
+    seen = _prior_strengths(monkeypatch)
+    data = _noisy_task(0.3, seed=8, C=2, k=4)
+    GDAClassifier().fit(data)
+    assert (seen[-1] > 0).all()
+    GDAClassifier().fit(ClassData(data.classes, data.X, data.y, {0: data.text[1], 1: data.text[0]}))
+    assert (seen[-1] == 0).all()
+    two = _noisy_task(0.3, seed=8, C=2, k=1)
+    GDAClassifier().fit(two)
+    assert (seen[-1] == 0).all()

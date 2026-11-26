@@ -407,6 +407,7 @@ class LogRegClassifier(Classifier):
 GDA_ALPHAS = np.geomspace(0.01, 100, 41)  # image-term weights tried, relative to the text term
 TEXT_PRIOR = 1.5  # multiplies the empirical-Bayes weight of a class's text in its mean
 PRIOR_TEST_LEVEL = 0.05  # the text pulls the means only if its anchors match them this unlikely by chance
+MEAN_TEST_CLASSES = 4  # with fewer described classes, the pull's test counts images instead of class means
 ONE_SHOT_SPREAD = 0.1  # with 1 image per class: share of the image-to-text distance put down to noise
 
 
@@ -478,7 +479,7 @@ class GDAClassifier(Classifier):
         # (The same gap as text-only classes' anchors and image-only classes' text sides.)
         anchors = self._centred((_fitted(self.Pt) - _fitted(self.gap)).astype(np.float32)).astype(np.float64)
         # text_weight scales the text's pull on the means as it does its scores, so 0 is no text.
-        lam = self.text_weight * self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None)
+        lam = self.text_weight * self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None, X)
         loo.pull_towards(anchors, lam)
         self._set_means(loo.mu, loo.prec)
         stand_in = anchors.copy()
@@ -497,7 +498,7 @@ class GDAClassifier(Classifier):
         self.W, self.b = W.astype(np.float32), (-0.5 * (W * mu).sum(1)).astype(np.float32)
 
     def _prior_strength(self, mu: Scores, anchors: Scores, imgs: Labels, nu: float,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                        spread_known: bool) -> Scores:
+                        spread_known: bool, X: Vectors) -> Scores:
         """How many images' worth of weight each class's text anchor gets in its mean (see the
         class doc): ``TEXT_PRIOR`` times sigma^2 / tau^2, the images' spread around their class
         mean over the class means' spread around their anchors (per dimension, estimated from
@@ -507,14 +508,18 @@ class GDAClassifier(Classifier):
         nearest anchor is its own) more often than chance would, by a one-sided binomial test at
         ``PRIOR_TEST_LEVEL``. The estimate can't tell text unrelated to the images from steady
         text when the images scatter widely: shuffling the descriptions gave lam about 1 and cut
-        accuracy at 2 images per class from 45% (no pull) to 30%."""
+        accuracy at 2 images per class from 45% (no pull) to 30%. With fewer than
+        ``MEAN_TEST_CLASSES`` described classes that test can't pass (2 classes give at best
+        p = 1/4), so the examples ``X`` are counted instead: the text must classify them better
+        than chance, as names must (``names_match``). On pairs of classes this adds 0.3 points at 4
+        images per class; with more classes, counting images instead would also pass text that
+        only some classes' descriptions match."""
         lam = np.zeros(len(imgs))
         on = _fitted(self.described) & (imgs > 0)
         if not on.any():
             return lam
         dist = (mu[on] ** 2).sum(1)[:, None] + (anchors[on] ** 2).sum(1)[None, :] - 2 * mu[on] @ anchors[on].T
-        hits = int((dist.argmin(1) == np.arange(len(dist))).sum())
-        if binomial_tail(hits, len(dist), 1.0 / len(dist)) >= PRIOR_TEST_LEVEL:
+        if not self._text_matches(dist, on, X):
             return lam
         d2 = float(np.diag(dist).mean()) / mu.shape[1]
         s2 = nu if spread_known else ONE_SHOT_SPREAD * d2  # no spread to measure with 1 image each
@@ -522,6 +527,17 @@ class GDAClassifier(Classifier):
         t2 = max(d2 - s2 / k, 1e-3 * s2, 1e-12)  # a mean of k images is off by s2 / k itself
         lam[on] = TEXT_PRIOR * s2 / t2
         return lam
+
+    def _text_matches(self, dist: Scores, on: npt.NDArray[np.bool_], X: Vectors) -> bool:
+        """The test in ``_prior_strength``: ``dist`` holds the squared distances from the classes
+        ``on``'s means to their anchors (rows: means), ``X`` the examples."""
+        if len(dist) >= MEAN_TEST_CLASSES:
+            hits = int((dist.argmin(1) == np.arange(len(dist))).sum())
+            return binomial_tail(hits, len(dist), 1.0 / len(dist)) < PRIOR_TEST_LEVEL
+        y = _fitted(self._y)[: len(X)]
+        rows, cls = on[y], np.flatnonzero(on)
+        guess = cls[(X[rows] @ _fitted(self.Pt)[cls].T).argmax(1)]
+        return names_match(guess, y[rows], np.ones(int(rows.sum()), bool), len(cls))
 
     def _text_scores(self, X: Vectors, y: Labels, raw_mu: Scores, imgs: Labels
                      ) -> tuple[Scores, npt.NDArray[np.bool_]]:
