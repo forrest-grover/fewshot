@@ -9,7 +9,8 @@ from PIL import Image
 
 from fewshot import embedders, history, store
 from fewshot.images import image_id, load_image
-from fewshot.store import TaskConfig, Workspace
+from fewshot.models import TaskConfig
+from fewshot.store import Workspace
 from fewshot.text import check_class_name
 from tests.conftest import png
 

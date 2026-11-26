@@ -1,0 +1,43 @@
+{
+  "name": "t",
+  "embedder": "openclip:PE-Core-B-16@meta",
+  "classifier": "gda",
+  "classifier_params": {},
+  "text_weight": 1.0,
+  "reject_below": null,
+  "reject_below_zero_shot": null,
+  "flip": false,
+  "names_as_text": true,
+  "temperature": null,
+  "classes": [
+    {
+      "name": "a",
+      "description": "",
+      "reject_below": null
+    }
+  ],
+  "examples": [
+    {
+      "id": "046bd967bdaf3660b4e18365daed09d0",
+      "file": "images/046bd967bdaf3660b4e18365daed09d0.png",
+      "source": "",
+      "added": "2026-11-26T17:43:19+00:00",
+      "label": "a",
+      "tags": [],
+      "note": ""
+    },
+    {
+      "id": "dc06e32e82e31ce2d4fdde17e251dd6f",
+      "file": "images/dc06e32e82e31ce2d4fdde17e251dd6f.png",
+      "source": "",
+      "added": "2026-11-26T17:43:19+00:00",
+      "label": "a",
+      "tags": [],
+      "note": ""
+    }
+  ],
+  "inbox": [],
+  "created": "2026-11-26T17:43:19+00:00",
+  "revision": 5,
+  "uid": "a2dc43ea73fd427497c08f9590b40e96"
+}

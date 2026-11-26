@@ -19,7 +19,8 @@ from .cache import EmbeddingCache
 from .classifiers import ClassData, Classifier, Labels, binomial_tail, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
 from .images import image_id, load_image, to_rgb
-from .store import Task, TaskConfig, Workspace
+from .models import TaskConfig
+from .store import Task, Workspace
 from .text import fill_template, prompts
 
 ImageInput = bytes | str | Path | Image.Image

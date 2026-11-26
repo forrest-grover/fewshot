@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from .classifiers import check_params
 
 if TYPE_CHECKING:
-    from .store import TaskConfig
+    from .models import TaskConfig
 
 THRESHOLDS = {"reject_below", "reject_below_zero_shot"}  # settings evaluation results don't depend on
 # Settings added later, as read from a task saved before them: what keeps its old behaviour (new

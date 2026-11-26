@@ -10,8 +10,8 @@ import fewshot.evaluate as ev
 from fewshot import embedders
 from fewshot.cache import EmbeddingCache
 from fewshot.classifiers import ClassData
+from fewshot.models import TaskConfig
 from fewshot.pipeline import Pipeline
-from fewshot.store import TaskConfig
 from tests.conftest import ColorEmbedder, png
 
 RED, BLUE = (220, 30, 30), (30, 30, 220)

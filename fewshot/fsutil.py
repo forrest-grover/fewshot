@@ -1,4 +1,4 @@
-"""File helpers for the task store: change stamps, a cross-process lock and atomic writes."""
+"""File helpers for the task store: change stamps, cross-process locks and durable atomic writes."""
 
 from __future__ import annotations
 
@@ -68,12 +68,66 @@ def _lock(fd: int) -> None:
             continue
 
 
+@contextlib.contextmanager
+def dir_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on folder ``path`` itself while a task is built in it, so that
+    ``dir_locked`` (and so ``Workspace.gc``) can tell it from a crash's leftover however long the
+    build takes. The lock follows the folder when it is renamed. No-op without ``fcntl``."""
+    if fcntl is None:  # pragma: no cover  # Windows: gc falls back to the folder's age
+        yield
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def dir_locked(path: Path) -> bool:
+    """Whether some process (this one included) holds ``dir_lock`` on folder ``path``."""
+    if fcntl is None:  # pragma: no cover  # Windows
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)  # releases the probe's own lock, never another holder's (flock is per open file)
+    return False
+
+
+def fsync_dir(path: Path) -> None:
+    """Make the creation, renaming or removal of entries in folder ``path`` durable (POSIX; a
+    no-op where folders can't be opened, such as Windows)."""
+    if not hasattr(os, "O_DIRECTORY"):  # pragma: no cover  # Windows
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_synced(fd: int, data: bytes) -> None:
+    """Write ``data`` to the new file ``fd`` (closing it) and flush it to disk, so that once it is
+    renamed or linked into place a power cut can't leave it empty or partly written."""
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def write_atomic(path: Path, data: bytes) -> None:
-    """Write ``path`` so that readers see either nothing or all of ``data``."""
+    """Write ``path`` so that readers see either nothing or all of ``data``, and the content is on
+    disk before the name points at it. (The rename itself is durable after ``fsync_dir``.)"""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
+        _write_synced(fd, data)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -83,12 +137,12 @@ def write_atomic(path: Path, data: bytes) -> None:
 
 def create_exclusive(path: Path, data: bytes) -> bool:
     """Create ``path`` with all of ``data`` unless it already exists; returns whether it was
-    created. Readers never see it partly written. Raises ``OSError`` where hard links aren't
-    supported (the file is written aside and linked into place)."""
+    created. Readers never see it partly written, and its content is on disk before it is linked
+    into place. Raises ``OSError`` where hard links aren't supported (the file is written aside
+    and linked into place)."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
+        _write_synced(fd, data)
         os.link(tmp, path)
         return True
     except FileExistsError:

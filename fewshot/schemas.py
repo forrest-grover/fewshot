@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .store import MAX_NOTE
+from .models import MAX_NOTE
 
 MAX_URLS = 100  # per request
 

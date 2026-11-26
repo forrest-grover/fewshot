@@ -13,10 +13,11 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, TypeVar
 
 from .images import image_ext, image_id
+from .models import Example, InboxItem
 from .text import check_class_name
 
 if TYPE_CHECKING:
-    from .store import InboxItem, TaskConfig
+    from .models import TaskConfig
 
 INBOX_CHUNK = 256  # images stored per save while adding
 
@@ -95,8 +96,6 @@ class TaskInbox:
     def _inbox_batch(self, batch: list[tuple[bytes, str]],
                      record: bool) -> tuple[list[InboxItem | ValueError], bool]:
         """Add one chunk; returns its results and whether it saved (it added an image)."""
-        from .store import InboxItem  # pylint: disable=import-outside-toplevel,cyclic-import  # store imports this
-
         checked = [_decoded(data, source) for data, source in batch]  # before locking, like examples
         out: list[InboxItem | ValueError] = []
         created: list[str] = []  # files this call wrote (an image kept for undo may be there already)
@@ -133,8 +132,6 @@ class TaskInbox:
         """Label inbox images (``{id: class}``), moving them to the examples in one save and undo
         step; classes are created as needed. Raises ``KeyError`` for an id not in the inbox and
         ``ValueError`` for a bad class name, changing nothing; returns how many moved."""
-        from .store import Example  # pylint: disable=import-outside-toplevel,cyclic-import  # store imports this
-
         clean = {iid: check_class_name(label) for iid, label in labels.items()}
         with self._writing():
             items = [self.inbox_item(iid) for iid in clean]

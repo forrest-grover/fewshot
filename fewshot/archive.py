@@ -12,9 +12,11 @@ from typing import IO, Any
 
 from pydantic import ValidationError
 
+from .fsutil import dir_lock, fsync_dir
 from .images import image_ext, image_id
+from .models import ClassDef, TaskConfig
 from .settings import check_settings, for_new_embedder
-from .store import ClassDef, Task, TaskConfig, Workspace
+from .store import Task, Workspace
 from .text import check_class_name
 
 # Limits on what an export zip may unpack to (guards against zip bombs): per image, for task.json,
@@ -70,19 +72,25 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
             p = ws._reserve(cfg.name)  # pylint: disable=protected-access
             # Built in a hidden folder and moved into place at the end, so a crash part-way leaves
-            # no half-imported task (Workspace.gc removes the leftover).
+            # no half-imported task (Workspace.gc removes the leftover). Both folders stay locked
+            # meanwhile, so gc, or a create of the same name, can't take them for leftovers.
             build = ws.root / "tasks" / f".tmp-{uuid.uuid4().hex}"
             build.mkdir()
             try:
-                t = Task(build, cfg, blobs=ws.blobs)
-                for e in [*cfg.examples, *cfg.inbox]:
-                    t._store_image(e.file, _read_member(z, images[e.file]))  # pylint: disable=protected-access
-                t._save(record=False)  # pylint: disable=protected-access
-                os.replace(build, p)  # replaces the empty reserved folder (POSIX)
+                with dir_lock(p), dir_lock(build):
+                    t = Task(build, cfg, blobs=ws.blobs)
+                    for e in [*cfg.examples, *cfg.inbox]:
+                        data = _read_member(z, images[e.file])
+                        if not image_id(data).startswith(e.id):  # not the bytes checked before
+                            raise ValueError(f"Not a valid task export: {e.file} changed while importing")
+                        t._store_image(e.file, data)  # pylint: disable=protected-access
+                    t._save(record=False)  # pylint: disable=protected-access
+                    os.replace(build, p)  # replaces the empty reserved folder (POSIX)
             except BaseException:
                 shutil.rmtree(build, ignore_errors=True)
                 shutil.rmtree(p, ignore_errors=True)
                 raise
+            fsync_dir(p.parent)
     except zipfile.BadZipFile as e:
         raise ValueError(f"Not a task export: {e}") from None
     return ws.get(cfg.name)
@@ -101,15 +109,16 @@ def _check_member(z: zipfile.ZipFile, info: zipfile.ZipInfo) -> None:
     """``ValueError`` unless the member is an image whose content hashes to the id in its name and
     whose extension matches its real format."""
     data = _read_member(z, info)
-    name = info.filename.rsplit("/", 1)[-1]
+    filename = info.filename
+    name = filename.rsplit("/", 1)[-1]
     if not image_id(data).startswith(name.split(".", 1)[0]):
-        raise ValueError(f"Not a valid task export: {info.filename} doesn't match its id")
+        raise ValueError(f"Not a valid task export: {filename} doesn't match its id")
     try:
         ext = image_ext(data)
     except ValueError as e:
-        raise ValueError(f"Not a valid task export: {info.filename}: {e}") from None
+        raise ValueError(f"Not a valid task export: {filename}: {e}") from None
     if not name.endswith("." + ext):
-        raise ValueError(f"Not a valid task export: {info.filename} is really a .{ext} image")
+        raise ValueError(f"Not a valid task export: {filename} is really a .{ext} image")
 
 
 def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipInfo]]:

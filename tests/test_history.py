@@ -7,10 +7,11 @@ import zipfile
 
 import pytest
 
-from fewshot import history, store
+from fewshot import history, models, store
 from fewshot.archive import export_task, import_task
 from fewshot.images import image_id
-from fewshot.store import Example, TaskConfig, Workspace
+from fewshot.models import Example, TaskConfig
+from fewshot.store import Workspace
 from fewshot.text import check_tag, check_template, prompts
 from tests.conftest import png
 
@@ -467,7 +468,7 @@ def test_tags_and_notes(ws):
     with pytest.raises(KeyError):
         t.annotate(["nope"], tags=[])
     with pytest.raises(ValueError, match="Note is longer"):
-        t.annotate([a], note="x" * (store.MAX_NOTE + 1))
+        t.annotate([a], note="x" * (models.MAX_NOTE + 1))
     assert Workspace(ws.root).get("t").example(a).note == "check this"
 
 

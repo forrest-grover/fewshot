@@ -31,7 +31,6 @@ macOS); elsewhere only threads within one process are serialised.
 from __future__ import annotations
 
 import contextlib
-import copy
 import functools
 import json
 import logging
@@ -46,30 +45,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import ValidationError
 
 from .classifiers import CLASSIFIERS
-from .embedders import DEFAULT_SPEC
 from .fsutil import FileStamp
 from .fsutil import create_exclusive as _create_exclusive
+from .fsutil import dir_lock as _dir_lock
+from .fsutil import dir_locked as _dir_locked
 from .fsutil import file_lock as _file_lock
+from .fsutil import fsync_dir as _fsync_dir
 from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
 from .images import IMAGE_EXTS, image_ext, image_id
 from .inbox import TaskInbox, chunked, listed, plural
-from .settings import STORED_DEFAULTS, THRESHOLDS, check_settings, for_new_embedder, for_new_scoring
+from .models import MAX_NOTE, ClassDef, Example, TaskConfig, _copy_config, _now, _read_config
+from .settings import THRESHOLDS, check_settings, for_new_embedder, for_new_scoring
 from .text import check_class_name, check_tag, check_template, fill_template, prompts
 
 log = logging.getLogger(__name__)
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-# Example files are always written as images/<id>.<ext>; anything else in task.json was not
-# written by us, and following it could read or delete files outside the task.
-EXAMPLE_FILE_RE = re.compile(r"^images/[0-9a-f]{16}(?:[0-9a-f]{16})?\.[a-z0-9]{1,10}$")
 # Images saved per task.json write by Task.add_examples.
 ADD_CHUNK = 256
-MAX_NOTE = 2000
 # A task folder without task.json (or a .tmp-/.trash- folder) this old is left over from a crash.
 STALE_SECONDS = 600
 SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "reject_below",
@@ -101,163 +99,49 @@ def _check_item(data: bytes, label: str, source: str) -> _NewImage | ValueError:
     return _NewImage(data, image_id(data), ext, label, source)
 
 
-def _copy_config(cfg: TaskConfig) -> TaskConfig:
-    """A copy of ``cfg`` that edits can't reach back through. Classes and examples are immutable,
-    so new lists of the same objects are enough; only the params dict is copied. This is far
-    cheaper than a deep copy, which matters because every write to a task makes one."""
-    return cfg.model_copy(update={
-        "classifier_params": copy.deepcopy(cfg.classifier_params),
-        "classes": list(cfg.classes),
-        "examples": list(cfg.examples),
-        "inbox": list(cfg.inbox),
-    })
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
-    """Parse ``path/task.json`` and stamp the exact file that was read.
-
-    The folder's name is the task's name: a task.json naming another (a folder renamed by hand, or
-    a rename interrupted after moving the folder) is taken under the folder's name, and the next
-    save writes that. Raises ``ValueError`` if the file is not a valid config.
-    """
-    with open(path / "task.json", "rb") as f:
-        stamp = _stamp(os.fstat(f.fileno()))
-        data = f.read()
-    try:
-        cfg = TaskConfig.stored(data)
-    except ValidationError as e:
-        err = e.errors()[0]
-        where = ".".join(map(str, err["loc"]))
-        raise ValueError(f"{path / 'task.json'} is invalid: {where + ': ' if where else ''}{err['msg']}") from None
-    if cfg.name != path.name:
-        log.warning("%s names task %r; using its folder name %r", path / "task.json", cfg.name, path.name)
-        cfg = cfg.model_copy(update={"name": path.name})
-    return cfg, stamp
-
-
-class ClassDef(BaseModel):
-    """A class label with an optional text description. Immutable: edits replace the object."""
-
-    model_config = ConfigDict(frozen=True)
-
-    name: str
-    description: str = ""  # used as a CLIP text prompt when non-empty
-    # Similarity under which a prediction of this class becomes "unknown"; overrides the task's
-    # reject_below (classes differ in how tightly their images cluster). Not used zero-shot.
-    reject_below: float | None = None
-
-
-class ImageRef(BaseModel):
-    """An image stored in the task folder, named by its content id. Immutable: edits replace it."""
-
-    model_config = ConfigDict(frozen=True)
-
-    id: str
-    file: str  # images/<id>.<ext>, relative to the task folder
-    source: str = ""
-    added: str = Field(default_factory=_now)
-
-    @field_validator("file")
-    @classmethod
-    def _inside_images(cls, v: str) -> str:
-        if not EXAMPLE_FILE_RE.fullmatch(v):
-            raise ValueError(f"must be images/<id>.<ext>, got {v!r}")
-        return v
-
-    @model_validator(mode="after")
-    def _named_by_id(self) -> ImageRef:
-        # The file name is how the shared image store finds the content, so it must be the id.
-        if self.file.split("/", 1)[1].rsplit(".", 1)[0] != self.id:
-            raise ValueError(f"file {self.file!r} is not named by the example id {self.id!r}")
-        return self
-
-
-class InboxItem(ImageRef):
-    """An unlabelled image waiting in the task's inbox to be labelled (or dismissed)."""
-
-
-class Example(ImageRef):
-    """A labeled example image stored in the task folder. Immutable: edits replace the object."""
-
-    label: str
-    tags: tuple[str, ...] = ()
-    note: str = ""
-
-    @field_validator("tags")
-    @classmethod
-    def _clean_tags(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(check_tag(t) for t in v))
-
-    @field_validator("note")
-    @classmethod
-    def _short_note(cls, v: str) -> str:
-        if len(v) > MAX_NOTE:
-            raise ValueError(f"note is longer than {MAX_NOTE} characters")
-        return v
-
-
-class TaskConfig(BaseModel):
-    """Everything persisted in ``task.json``."""
-
-    name: str
-    embedder: str = DEFAULT_SPEC
-    classifier: str = "gda"
-    classifier_params: dict[str, Any] = Field(default_factory=dict)
-    text_weight: float = 1.0
-    reject_below: float | None = None  # similarity under which predictions become "unknown"
-    # The same for zero-shot predictions (no example images), whose image-to-text similarities are
-    # far lower (about 0.2-0.35 for CLIP) than image-to-image ones; None never rejects them.
-    reject_below_zero_shot: float | None = None
-    flip: bool = False  # average each image's embedding with its mirror image's (test-time augmentation)
-    # With a text-capable embedder, a class with examples but no description uses "a photo of a
-    # <name>." as its text, unless the names don't match the examples (see Pipeline.class_data).
-    names_as_text: bool = True
-    temperature: float | None = None  # confidence calibration fitted by evaluation (None: 1, uncalibrated)
-    classes: list[ClassDef] = Field(default_factory=list)
-    examples: list[Example] = Field(default_factory=list)
-    inbox: list[InboxItem] = Field(default_factory=list)  # unlabelled images waiting to be labelled
-    created: str = Field(default_factory=_now)
-    revision: int = 0
-    uid: str = Field(default_factory=lambda: uuid.uuid4().hex)  # tells a re-created task from the old one
-
-    @model_validator(mode="before")
-    @classmethod
-    def _stored_defaults(cls, data: Any, info: ValidationInfo) -> Any:
-        stored = info.context and info.context.get("stored") and isinstance(data, dict)
-        return {**STORED_DEFAULTS, **data} if stored else data
-
-    @classmethod
-    def stored(cls, data: bytes | str) -> TaskConfig:
-        """Parse a saved task.json (or a kept version or an export of one), reading settings it
-        predates as ``STORED_DEFAULTS``. Raises ``ValidationError``."""
-        return cls.model_validate_json(data, context={"stored": True})
-
-    def files(self) -> set[str]:
-        """Every image file this version uses: examples' and the inbox's."""
-        return {e.file for e in self.examples} | {i.file for i in self.inbox}
-
-
-class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  # the whole editing API of a task
+class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,too-many-instance-attributes  # the whole editing API of a task
     """A task folder: its config plus example images. Every mutation is saved immediately.
 
     Mutations are serialised across threads and processes, and start from the latest
     ``task.json`` on disk. A mutation on a task deleted by another process raises ``KeyError``.
+
+    ``config`` is a snapshot of the saved task: other threads only ever see versions that were
+    written to ``task.json``, and a snapshot is never changed once published, so a reader can hold
+    one for a whole prediction or evaluation. Inside a mutation (``_writing``), and only in the
+    thread making it, ``config`` is the draft being edited; it is published when ``_save``
+    commits it, and dropped if the mutation fails first.
     """
 
     def __init__(self, path: Path, config: TaskConfig, stamp: FileStamp | None = None,
                  blobs: Path | None = None) -> None:
         self.path = path
-        self.config = config
         self.blobs = blobs  # the workspace's shared image store, if any
-        self._lock = threading.RLock()
-        self._stamp = stamp  # of the task.json that ``config`` matches
+        self._writer: int | None = None  # thread id of the mutation in progress, if any
+        self._draft: TaskConfig | None = None  # the config that mutation is editing
+        self._published = config
+        self._lock = threading.RLock()  # held for a whole mutation: serialises writers
+        self._state = threading.Lock()  # held briefly to swap ``_published`` and ``_stamp`` together
+        self._stamp = stamp  # of the task.json that ``_published`` matches
         self._depth = 0  # nesting of ``_writing`` in the thread holding ``_lock``
+        self._commits = 0  # saves that reached task.json, to tell a failed save from a later failure
+        self._unsynced: set[Path] = set()  # folders with new image files not yet made durable
 
     # ---- persistence -------------------------------------------------
+    @property
+    def config(self) -> TaskConfig:
+        """The task's settings, classes and examples: the latest saved version, or within a
+        mutation, in the thread making it, the draft it edits."""
+        if self._writer == threading.get_ident() and self._draft is not None:
+            return self._draft
+        return self._published
+
+    @config.setter
+    def config(self, cfg: TaskConfig) -> None:
+        if self._writer == threading.get_ident():
+            self._draft = cfg
+        else:  # a task being built by its only user (new, duplicate, import)
+            self._published = cfg
+
     @property
     def name(self) -> str:
         """The task name."""
@@ -266,12 +150,13 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
     def refresh(self) -> bool:
         """Reload ``task.json`` if it changed on disk; returns whether it did.
 
+        Never waits for a mutation in progress (whose result is published when it commits).
         Raises ``FileNotFoundError`` if the task was deleted.
         """
-        with self._lock:
+        with self._state:
             if self._stamp == _stamp(os.stat(self.path / "task.json")):
                 return False
-            self.config, self._stamp = _read_config(self.path)
+            self._published, self._stamp = _read_config(self.path)
             return True
 
     @contextlib.contextmanager
@@ -279,8 +164,10 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
         """Context for a mutation: exclusive across threads and processes, starting from the
         latest saved config.
 
-        The mutation edits a fresh copy of ``config``, so a reader holding the previous config
-        object never sees it change mid-read. If the mutation fails, the copy is dropped.
+        The mutation edits a draft that only its own thread sees as ``config``; other threads see
+        each version once ``_save`` has committed it. If the mutation fails, the draft is dropped
+        and ``config`` stays at the last version saved, which may be one this mutation saved
+        before failing.
         """
         with self._lock:
             if self._depth:  # nested in a mutation that already holds the locks
@@ -296,16 +183,14 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
                     raise KeyError(f"No task {self.name!r}") from e
-                before = self.config
-                self.config = _copy_config(before)
+                self._draft = _copy_config(self._published)
+                self._writer = threading.get_ident()
                 self._depth = 1
                 try:
                     yield
-                except BaseException:
-                    self.config = before
-                    self._stamp = None  # re-read on next refresh, in case the save got partway
-                    raise
                 finally:
+                    self._writer = None
+                    self._draft = None
                     self._depth = 0
 
     def _save(self, gone: Iterable[str] = (), record: bool = True, label: str = "", keep_redo: bool = False) -> None:
@@ -315,35 +200,69 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
         ``label`` describing the change, and (unless ``keep_redo``) undone changes can no longer
         be redone. ``gone`` names the image files this change stopped using, which are deleted
         once no kept version uses them.
+
+        The change commits when the new task.json replaces the old one. If anything fails before
+        that, nothing changed and the error is raised; the clean-up after it (forgetting undone
+        changes, pruning history, deleting unused images) is logged if it fails, never raised,
+        because the change has been made.
         """
-        old_rev = self.config.revision
-        self.config.revision += 1
+        cfg = self.config
+        old_rev = cfg.revision
+        cfg.revision += 1
         made: list[Path] = []
+        stale_redo: Path | None = None
         fd, tmp = tempfile.mkstemp(dir=self.path, prefix=".task.json.", suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
-                f.write(self.config.model_dump_json(indent=2).encode())
+                f.write(cfg.model_dump_json(indent=2).encode())
                 f.flush()
                 os.fsync(f.fileno())
+            while self._unsynced:  # the new image files' names, before a task.json naming them
+                _fsync_dir(self._unsynced.pop())
             if record and (self.path / "task.json").exists():
                 made = self._snapshot(old_rev, sorted(set(gone)), label)
+            if record and not keep_redo:
+                # Out of reach before the commit: a crash between the two then costs the undone
+                # changes, never lets a redo overwrite this one.
+                stale_redo = self._set_redo_aside()
             os.replace(tmp, self.path / "task.json")
         except BaseException:
+            cfg.revision = old_rev
             for leftover in [Path(tmp), *made]:  # a version that never got replaced is no step to undo
                 with contextlib.suppress(OSError):
                     os.unlink(leftover)
+            if stale_redo is not None:
+                with contextlib.suppress(OSError):
+                    os.rename(stale_redo, self.path / "history" / "redo")
             raise
-        self._stamp = _stamp(os.stat(self.path / "task.json"))
+        self._publish(cfg)
+        self._after_commit(stale_redo, record)
+
+    def _publish(self, cfg: TaskConfig) -> None:
+        """Make ``cfg``, just written to task.json, what other threads see."""
+        try:
+            st: FileStamp | None = _stamp(os.stat(self.path / "task.json"))
+        except OSError:  # pragma: no cover  # re-read on the next refresh instead
+            st = None
+        with self._state:
+            # Inside a mutation the draft may still be edited: publish a copy no edit reaches.
+            self._published = _copy_config(cfg) if self._writer == threading.get_ident() else cfg
+            self._stamp = st
+            self._commits += 1
+
+    def _after_commit(self, stale_redo: Path | None, record: bool) -> None:
+        """Make the commit durable and clean up after it; failures are logged, since raising
+        would report a change that was made as one that failed."""
+        steps: list[tuple[str, Any]] = [("sync the task folder", lambda: _fsync_dir(self.path))]
+        if stale_redo is not None:
+            steps.append(("forget undone changes", lambda: self._clear_redo(stale_redo)))
         if record:
-            if not keep_redo:
-                self._clear_redo()
-            self._prune_history()
-        if hasattr(os, "O_DIRECTORY"):  # pragma: no branch  # make the rename itself durable (POSIX)
-            dfd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
+            steps.append(("prune history", self._prune_history))
+        for what, step in steps:
             try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+                step()
+            except Exception:  # pylint: disable=broad-exception-caught  # the change is saved regardless
+                log.exception("%s: the change was saved, but failed to %s", self.path, what)
 
     # ---- image files -------------------------------------------------
     def _blob(self, file: str) -> Path | None:
@@ -361,14 +280,21 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
         Returns whether this call created the file (False if it was there already)."""
         dest = self.path / file
         dest.parent.mkdir(exist_ok=True)
-        if dest.exists():  # kept for undo, or re-added: same content, since the name is its hash
+        if _intact(dest, data):  # kept for undo, or re-added: same content, since the name is its hash
             return False
+        dest.unlink(missing_ok=True)  # cut short by a power cut: store it again
+        self._unsynced.add(dest.parent)
         blob = self._blob(file)
         if blob is not None:
             made = False
             try:
                 blob.parent.mkdir(parents=True, exist_ok=True)
                 made = _create_exclusive(blob, data)
+                if not made and not _intact(blob, data):  # a damaged copy must not spread to this task
+                    _write_atomic(blob, data)
+                    made = True
+                if made:
+                    self._unsynced.add(blob.parent)
                 os.link(blob, dest)
                 return True
             except FileExistsError:  # another writer stored this file in this task first
@@ -406,6 +332,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
             files |= set().union(*(self._gone(p) for _, p in self._history()))
             trash = self.path.parent / f".trash-{uuid.uuid4().hex}"
             os.rename(self.path, trash)
+            _fsync_dir(self.path.parent)
             shutil.rmtree(trash)
             for f in files:  # the shared copies no other task links to
                 blob = self._blob(f)
@@ -596,13 +523,15 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
         return out
 
     def _save_new(self, created: list[str], record: bool, label: str) -> None:
-        """``_save`` after storing new image files; if the save fails, the files ``created`` (named
-        by no saved version) are removed again."""
+        """``_save`` after storing new image files; if the save fails before committing, the files
+        ``created`` (named by no saved version) are removed again."""
+        commits = self._commits
         try:
             self._save(record=record, label=label)
         except BaseException:
-            for f in created:
-                self._drop_file(f)
+            if self._commits == commits:  # not committed: no version names them
+                for f in created:
+                    self._drop_file(f)
             raise
 
     def _ensure_class(self, label: str) -> None:
@@ -862,8 +791,14 @@ class Workspace:
         if cfg.classifier not in CLASSIFIERS:
             raise ValueError(f"Unknown classifier {cfg.classifier!r}")
         p = self._reserve(name)
-        (p / "images").mkdir()
-        t = Task.new(p, cfg, self.blobs)
+        try:
+            with _dir_lock(p):
+                (p / "images").mkdir()
+                t = Task.new(p, cfg, self.blobs)
+        except BaseException:
+            shutil.rmtree(p, ignore_errors=True)
+            raise
+        _fsync_dir(p.parent)
         with self._lock:
             self._tasks[name] = t
         return t
@@ -919,14 +854,16 @@ class Workspace:
                 "inbox": [x for x in cfg.inbox if inbox and (src.path / x.file).is_file()]})
             p = self._reserve(new)
             try:
-                (p / "images").mkdir()
-                t = Task(p, copy_cfg, blobs=self.blobs)
-                for e in [*copy_cfg.examples, *copy_cfg.inbox]:
-                    t._store_image(e.file, (src.path / e.file).read_bytes())  # pylint: disable=protected-access
-                t._save(record=False)  # pylint: disable=protected-access
+                with _dir_lock(p):  # so gc can't take it for a crash's leftover, however long this takes
+                    (p / "images").mkdir()
+                    t = Task(p, copy_cfg, blobs=self.blobs)
+                    for e in [*copy_cfg.examples, *copy_cfg.inbox]:
+                        t._store_image(e.file, (src.path / e.file).read_bytes())  # pylint: disable=protected-access
+                    t._save(record=False)  # pylint: disable=protected-access
             except BaseException:
                 shutil.rmtree(p, ignore_errors=True)
                 raise
+            _fsync_dir(p.parent)
         with self._lock:
             self._tasks[new] = t
         return t
@@ -955,6 +892,7 @@ class Workspace:
                 os.rename(dest, src)
                 t.path = src
                 raise
+            _fsync_dir(dest.parent)
         with self._lock:
             self._tasks.pop(old, None)
             self._tasks[new] = t
@@ -986,13 +924,24 @@ class Workspace:
 
 
 def _abandoned(folder: Path) -> bool:
-    """Whether ``folder`` is a leftover of a crash: no task.json (or hidden) and untouched for
-    ``STALE_SECONDS``, so no create or import in progress can own it."""
+    """Whether ``folder`` is a leftover of a crash: no task.json (or hidden), untouched for
+    ``STALE_SECONDS`` (so it isn't a folder just made, before its builder locked it) and not
+    locked by a create, duplicate or import still building it, however long that takes."""
     try:
         age = datetime.now(timezone.utc).timestamp() - folder.stat().st_mtime
     except FileNotFoundError:
         return False
-    return age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
+    return (age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
+            and not _dir_locked(folder))
+
+
+def _intact(path: Path, data: bytes) -> bool:
+    """Whether the stored file ``path``, named by the hash of ``data``, exists whole. Its size is
+    enough to check: only a power cut can leave it different, and that leaves it short."""
+    try:
+        return path.stat().st_size == len(data)
+    except FileNotFoundError:
+        return False
 
 
 _n = functools.partial(plural, what="example")  # "1 example", "3 examples"

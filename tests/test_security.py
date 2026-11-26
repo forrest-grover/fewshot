@@ -9,13 +9,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import fewshot.api
-from fewshot import archive, store
+from fewshot import archive, models
 from fewshot.archive import import_task
 from fewshot.embedders import DEFAULT_SPEC
 from fewshot.images import image_id
 from tests.conftest import png
 
-RED = (220, 30, 30)
+RED, BLUE = (220, 30, 30), (30, 30, 220)
 
 
 def _client(tmp_path, monkeypatch, hosts=None, base_url="http://testserver"):
@@ -89,7 +89,7 @@ def test_images_are_served_only_as_images(tmp_path, monkeypatch):
     t = fewshot.api.ws.get("t")
     (t.path / f"images/{hid}.html").write_bytes(page)
     with t._writing():  # pylint: disable=protected-access
-        t.config.examples.append(store.Example(id=hid, label="red", file=f"images/{hid}.html"))
+        t.config.examples.append(models.Example(id=hid, label="red", file=f"images/{hid}.html"))
         t._save()  # pylint: disable=protected-access
     r = c.get(f"/api/tasks/t/examples/{hid}/image")
     assert r.headers["content-type"] == "application/octet-stream"
@@ -118,6 +118,25 @@ def test_import_refuses_files_that_are_not_images(ws):
     with pytest.raises(ValueError, match=r"is really a \.png image"):
         import_task(ws, _one(png(RED), "jpg"))
     assert import_task(ws, _one(png(RED), "png")).name == "t"
+
+
+def test_import_stores_only_the_bytes_it_checked(ws, monkeypatch):
+    """An image whose bytes differ when read again to be stored is refused, and nothing is left."""
+    real = archive._read_member  # pylint: disable=protected-access
+    reads = {"n": 0}
+
+    def changing(z, info, limit=None):
+        data = real(z, info, limit)
+        if info.filename.startswith("images/"):
+            reads["n"] += 1
+            if reads["n"] > 1:  # the read that stores it, after the one that checked it
+                return png(BLUE)
+        return data
+
+    monkeypatch.setattr(archive, "_read_member", changing)
+    with pytest.raises(ValueError, match="changed while importing"):
+        import_task(ws, _one(png(RED), "png"))
+    assert not list((ws.root / "tasks").iterdir())
 
 
 def test_import_total_size_limit(ws, monkeypatch):

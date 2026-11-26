@@ -12,8 +12,8 @@ import fewshot.evaluate as ev
 from fewshot import cli
 from fewshot.classifiers import ClassData, make_classifier, temper
 from fewshot.evaluate import evaluate_task
+from fewshot.models import TaskConfig
 from fewshot.pipeline import Pipeline
-from fewshot.store import TaskConfig
 from tests.conftest import png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,7 +23,7 @@ from pydantic import ValidationError
 from .fsutil import write_atomic as _write_atomic
 
 if TYPE_CHECKING:
-    from .store import TaskConfig
+    from .models import TaskConfig
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class TaskHistory:
 
     path: Path
     config: TaskConfig
+    _commits: int
 
     def _writing(self) -> contextlib.AbstractContextManager[None]:  # pragma: no cover  # Task's
         raise NotImplementedError
@@ -52,7 +54,7 @@ class TaskHistory:
         hist = self.path / folder
         hist.mkdir(parents=True, exist_ok=True)
         snap = hist / f"{rev:010d}.json"
-        snap.unlink(missing_ok=True)
+        self._forget(snap)  # with any side files a crashed attempt at this revision left
         try:
             os.link(self.path / "task.json", snap)  # free: task.json is about to be replaced, not changed
         except OSError:  # pragma: no cover  # filesystems without hard links
@@ -93,15 +95,23 @@ class TaskHistory:
     def _redo_files(self) -> set[str]:
         return set().union(*(self._files_in(p) for _, p in self._redo_list()))
 
-    def _clear_redo(self) -> None:
-        """A new change makes undone ones unreachable: forget them and the images only they used."""
-        redo = self._redo_list()
-        if not redo:
-            return
-        files = self._redo_files()
-        shutil.rmtree(self.path / "history" / "redo", ignore_errors=True)
+    def _set_redo_aside(self) -> Path | None:
+        """Move the undone versions out of reach (a new change is about to make them so); returns
+        where they went, for ``_clear_redo`` once the change is saved, or None if there were none."""
+        redo = self.path / "history" / "redo"
+        if not redo.is_dir():
+            return None
+        aside = self.path / "history" / f".redo-{uuid.uuid4().hex}"
+        os.rename(redo, aside)
+        return aside
+
+    def _clear_redo(self, aside: Path) -> None:
+        """Forget undone versions moved ``aside`` and delete the images only they used."""
+        files = set().union(*(self._files_in(p) for p in aside.glob("*.json")))
+        shutil.rmtree(aside, ignore_errors=True)
         files -= self.config.files()
         files -= set().union(*(self._files_in(p) for _, p in self._history()))
+        files -= self._redo_files()
         for f in files:
             self._drop_file(f)
 
@@ -145,6 +155,8 @@ class TaskHistory:
     def _drop_unused_images(self) -> int:
         """Delete image files that neither the task nor any kept version names; returns how many."""
         with self._writing():
+            for stale in (self.path / "history").glob(".redo-*"):  # set aside by a save that crashed
+                shutil.rmtree(stale, ignore_errors=True)
             used = self.config.files() | self._redo_files()
             used |= set().union(*(self._files_in(p) for _, p in self._history()))
             images = self.path / "images"
@@ -205,8 +217,15 @@ class TaskHistory:
             rev, snap = snaps[-1]
             old = self._restorable(snap, "undo")
             # The current version becomes the next redo, under the undone change's description.
-            self._snapshot(self.config.revision, [], self._label(snap), folder="history/redo")
-            self._restore(old)
+            redo = self._snapshot(self.config.revision, [], self._label(snap), folder="history/redo")
+            commits = self._commits
+            try:
+                self._restore(old)
+            except BaseException:
+                if self._commits == commits:  # nothing was undone: nothing to redo
+                    for f in redo:
+                        f.unlink(missing_ok=True)
+                raise
             self._forget(snap)
             return rev
 
@@ -233,7 +252,7 @@ class TaskHistory:
             self._forget(snap)
             raise ValueError(f"Can't {what}: {snap.name} is invalid and was removed; {what} again to go "
                              "further") from e
-        missing = [e.file for e in cfg.examples if not (self.path / e.file).exists()]
+        missing = [f for f in sorted(cfg.files()) if not (self.path / f).exists()]
         if missing:
             raise ValueError(f"Can't {what}: {len(missing)} image files are gone, e.g. {missing[0]}")
         return cfg

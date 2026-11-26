@@ -15,8 +15,8 @@ from fewshot import embedders, fetch
 from fewshot.classifiers import ClassData
 from fewshot.embedders import Embedder, register_embedder, unregister_embedder
 from fewshot.evaluate import evaluate_task
+from fewshot.models import TaskConfig
 from fewshot.pipeline import FLIP_KEY, Pipeline
-from fewshot.store import TaskConfig
 from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)

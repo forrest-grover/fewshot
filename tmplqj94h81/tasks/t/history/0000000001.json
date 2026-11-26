@@ -1,0 +1,18 @@
+{
+  "name": "t",
+  "embedder": "openclip:PE-Core-B-16@meta",
+  "classifier": "gda",
+  "classifier_params": {},
+  "text_weight": 1.0,
+  "reject_below": null,
+  "reject_below_zero_shot": null,
+  "flip": false,
+  "names_as_text": true,
+  "temperature": null,
+  "classes": [],
+  "examples": [],
+  "inbox": [],
+  "created": "2026-11-26T17:43:18+00:00",
+  "revision": 1,
+  "uid": "fe3f50ca59d043798a2304c3a49f77c7"
+}

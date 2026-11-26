@@ -13,8 +13,9 @@ import numpy as np
 
 from .classifiers import ClassData, KNNClassifier, PrototypeClassifier, make_classifier, temper
 from .images import IMAGE_EXTS
+from .models import TaskConfig
 from .pipeline import Pipeline, new_classifier
-from .store import Task, TaskConfig
+from .store import Task
 from .text import fill_template
 
 EvalProgress = Callable[[str, int, int], None]  # (stage, done, total); may raise to cancel

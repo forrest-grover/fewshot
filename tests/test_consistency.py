@@ -8,8 +8,9 @@ import zipfile
 import pytest
 
 from fewshot.archive import export_task, import_task
+from fewshot.models import TaskConfig
 from fewshot.pipeline import Pipeline
-from fewshot.store import TaskConfig, Workspace
+from fewshot.store import Workspace
 from tests.conftest import png
 
 RED, PINK, BLUE = (255, 0, 0), (200, 0, 60), (0, 0, 255)
