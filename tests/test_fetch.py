@@ -2,6 +2,7 @@
 connections, redirects and timeouts, against local HTTP servers."""
 
 import http.server
+import itertools
 import socket
 import threading
 import time
@@ -9,7 +10,7 @@ import time
 import pytest
 
 from fewshot import fetch
-from tests.conftest import RED, png
+from tests.conftest import RED, png, serve_http
 
 
 # ---- fetching ------------------------------------------------------------
@@ -38,12 +39,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 @pytest.fixture(name="server")
 def fixture_server():
     """A local HTTP server: /img is a PNG, /redirect goes to /img, anything else is 404."""
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    th = threading.Thread(target=srv.serve_forever, daemon=True)
-    th.start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
-    srv.server_close()
+    with serve_http(_Handler) as url:
+        yield url
 
 
 def test_fetch_url(server):
@@ -102,6 +99,43 @@ def test_nat64_and_mapped_private_addresses_are_refused(monkeypatch):
     assert fetch.public_addresses("nat64.test", 80) == ["64:ff9b::808:808"]
 
 
+def _resolves_to(monkeypatch, ip):
+    """Make every host name resolve to ``ip`` alone."""
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    sockaddr = (ip, 80, 0, 0) if family == socket.AF_INET6 else (ip, 80)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: [(family, socket.SOCK_STREAM, 6, "", sockaddr)])
+
+
+@pytest.mark.parametrize("ip", [
+    "10.0.0.1", "::1",  # private, loopback
+    "100.64.0.1",  # carrier-grade NAT (shared address space): neither private nor loopback, but not public
+    "169.254.169.254",  # link-local: cloud metadata services
+    "0.0.0.0", "::",  # "this host": connecting to it reaches the local machine
+    "192.0.0.1",  # IETF protocol assignments
+    "198.18.0.1",  # benchmarking
+    "240.0.0.1",  # reserved
+    "fc00::1",  # unique local
+    "fe80::1",  # link-local
+    "2001:db8::1",  # documentation
+    "::ffff:127.0.0.1",  # IPv4-mapped loopback
+    "::ffff:10.0.0.1",  # IPv4-mapped private
+    "64:ff9b::7f00:1",  # NAT64 of 127.0.0.1
+    "64:ff9b::a9fe:a9fe",  # NAT64 of 169.254.169.254
+])
+def test_every_kind_of_non_public_address_is_refused(monkeypatch, ip):
+    """Anything but a globally routable address is refused, not just private and loopback ones."""
+    _resolves_to(monkeypatch, ip)
+    with pytest.raises(ValueError, match="not a public address"):
+        fetch.public_addresses("inside.test", 80)
+
+
+@pytest.mark.parametrize("ip", ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"])
+def test_public_addresses_pass(monkeypatch, ip):
+    """Globally routable addresses, also IPv4-mapped or through NAT64, pass."""
+    _resolves_to(monkeypatch, ip)
+    assert fetch.public_addresses("outside.test", 80) == [ip]
+
+
 # ---- pinned connections --------------------------------------------------
 def test_fetch_connects_to_the_checked_address(server, monkeypatch):
     """Each connection goes to the address that passed the check, looked up once: the host name
@@ -148,10 +182,51 @@ def test_fetch_https_is_pinned_too(server, monkeypatch):
     assert looked_up == ["pinned.invalid", "pinned.invalid"]
 
 
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_public_only_fetches_ignore_proxy_settings(server, monkeypatch, scheme):
+    """With public_only no proxy is used, even when HTTP(S)_PROXY name one: a proxy would make the
+    connection, to wherever the checked host name resolves for it. Here the proxy is a dead port,
+    so a fetch through it would fail."""
+    port = int(server.rsplit(":", 1)[1])
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(var, "http://127.0.0.1:1")
+    connected_for: list[str] = []
+
+    def checked(host, _port):
+        connected_for.append(host)
+        return ["127.0.0.1"]
+
+    monkeypatch.setattr(fetch, "public_addresses", checked)
+    if scheme == "http":
+        assert fetch.fetch_url(f"http://pinned.invalid:{port}/img", 10_000, public_only=True) == png(RED)
+    else:  # a plain-HTTP server: the TLS handshake fails, after connecting straight to it
+        with pytest.raises(ValueError, match="Could not fetch"):
+            fetch.fetch_url(f"https://pinned.invalid:{port}/img", 10_000, public_only=True)
+    assert connected_for == ["pinned.invalid", "pinned.invalid"]  # the check, then the connection: no proxy
+
+
 # ---- redirects and timeouts ----------------------------------------------
+# The slow responses send a little every DRIP seconds, so no single read is slow, until the test
+# ends or TRICKLE_FOR passes: only the client's deadline can end the request sooner. TIMEOUT is far
+# below TRICKLE_FOR, so a deadline that didn't hold shows as a request lasting much longer than it.
+DRIP, TRICKLE_FOR, TIMEOUT = 0.05, 30.0, 0.5
+
+
 class _Hostile(http.server.BaseHTTPRequestHandler):
-    """/ftp redirects to an ftp:// URL; /status and /headers trickle the status line and headers;
-    others send a body a byte at a time."""
+    """/ftp redirects to an ftp:// URL; /status trickles the status line, /headers header lines,
+    and others the body, a byte or a line at a time."""
+
+    done = threading.Event()  # set when the test ends: stop trickling
+
+    def _trickle(self, pieces):
+        """Send ``pieces`` one per DRIP seconds, until done or TRICKLE_FOR has passed."""
+        for piece in itertools.islice(pieces, int(TRICKLE_FOR / DRIP)):
+            if self.done.wait(DRIP):
+                return
+            self.wfile.write(piece)
+            self.wfile.flush()
 
     def do_GET(self):  # pylint: disable=invalid-name  # http.server's naming
         """Answer as the path says."""
@@ -159,28 +234,16 @@ class _Hostile(http.server.BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "ftp://127.0.0.1:1/secret")
             self.end_headers()
-            return
-        if self.path == "/headers":  # a header line every 0.1 s, for 3 s
+        elif self.path == "/headers":
             self.send_response(200)
             self.flush_headers()
-            for _ in range(30):
-                self.wfile.write(b"X-Slow: 1\r\n")
-                self.wfile.flush()
-                time.sleep(0.1)
-            return
-        if self.path == "/status":  # the status line a byte every 0.1 s
-            for c in b"HTTP/1.1 200 OK\r\n":
-                self.wfile.write(bytes([c]))
-                self.wfile.flush()
-                time.sleep(0.1)
-            return
-        self.send_response(200)
-        self.send_header("Content-Length", "20")
-        self.end_headers()
-        for _ in range(20):
-            self.wfile.write(b"x")
-            self.wfile.flush()
-            time.sleep(0.1)
+            self._trickle(itertools.repeat(b"X-Slow: 1\r\n"))
+        elif self.path == "/status":
+            self._trickle(itertools.chain((bytes([c]) for c in b"HTTP/1.1 200 OK\r\n"), itertools.repeat(b"X: 1\r\n")))
+        else:  # no Content-Length: the body lasts until the connection closes
+            self.send_response(200)
+            self.end_headers()
+            self._trickle(itertools.repeat(b"x"))
 
     def log_message(self, *_args):
         pass
@@ -189,11 +252,10 @@ class _Hostile(http.server.BaseHTTPRequestHandler):
 @pytest.fixture(name="hostile")
 def fixture_hostile():
     """The URL of a local server running ``_Hostile``."""
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Hostile)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
-    srv.server_close()
+    _Hostile.done.clear()
+    with serve_http(_Hostile) as url:
+        yield url
+        _Hostile.done.set()
 
 
 def test_redirects_only_to_http(hostile, monkeypatch):
@@ -209,8 +271,8 @@ def test_timeout_bounds_the_whole_download(hostile):
     """A body sent a byte at a time fails once the timeout has passed, though no single read is slow."""
     t0 = time.monotonic()
     with pytest.raises(ValueError, match=r"took longer than 0\.5 s"):
-        fetch.fetch_url(hostile + "/drip", 10_000, timeout=0.5)
-    assert time.monotonic() - t0 < 1.5
+        fetch.fetch_url(hostile + "/drip", 10_000, timeout=TIMEOUT)
+    assert TIMEOUT <= time.monotonic() - t0 < TRICKLE_FOR / 3
 
 
 @pytest.mark.parametrize("path", ["/status", "/headers"])
@@ -218,8 +280,8 @@ def test_timeout_bounds_the_headers_too(hostile, path):
     """A status line or headers sent a bit at a time can't hold the caller past the timeout either."""
     t0 = time.monotonic()
     with pytest.raises(ValueError, match=r"took longer than 0\.5 s"):
-        fetch.fetch_url(hostile + path, 10_000, timeout=0.5)
-    assert time.monotonic() - t0 < 1.5
+        fetch.fetch_url(hostile + path, 10_000, timeout=TIMEOUT)
+    assert TIMEOUT <= time.monotonic() - t0 < TRICKLE_FOR / 3
 
 
 def test_deadline_shuts_late_sockets_at_once():

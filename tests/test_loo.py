@@ -98,3 +98,23 @@ def test_fast_leave_one_out_is_tempered_like_refitting():
     for test in ev._folds(data.y, 12, 0):  # pylint: disable=protected-access
         ev._fold(data, cfg, test, slow)  # pylint: disable=protected-access
     assert np.allclose(fast.conf, slow.conf, atol=1e-5)
+
+
+@pytest.mark.parametrize(("classifier", "params"), [("prototype", {}), ("knn", {"k": 3})])
+def test_fast_leave_one_out_in_chunks_matches_refitting(monkeypatch, classifier, params):
+    """Held out a few rows at a time (LOO_CHUNK), every chunk, not just the first, gives what
+    refitting gives: each row is compared with all the others but itself."""
+    monkeypatch.setattr(ev, "LOO_CHUNK", 4)
+    rng = np.random.default_rng(3)
+    y = np.array([0, 1, 2] * 5)
+    X = rng.normal(size=(len(y), 6)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    data = ClassData(["a", "b", "c"], X, y)
+    cfg = TaskConfig(name="t", classifier=classifier, classifier_params=params)
+    seen = []
+    fast = ev._fast_leave_one_out(data, cfg, lambda done, n: seen.append(done))  # pylint: disable=protected-access
+    slow = _slow_leave_one_out(data, cfg)
+    assert seen == [0, 4, 8, 12, 15]
+    assert np.array_equal(fast.pred, slow.pred)
+    assert np.allclose(fast.conf, slow.conf, atol=1e-5)
+    assert np.allclose(fast.sim, slow.sim, atol=1e-5)

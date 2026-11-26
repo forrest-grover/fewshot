@@ -5,6 +5,7 @@ Two ``Workspace`` objects on the same root stand in for two processes: each has 
 different descriptors exclude each other even within one process.
 """
 
+import contextlib
 import fcntl
 import json
 import multiprocessing
@@ -154,7 +155,8 @@ def test_delete_files_after_saving(pair, monkeypatch):
 
 
 def test_waiting_writer_follows_a_recreated_task(pair):
-    """A writer that waited while the task was deleted and re-created locks the new lock file."""
+    """A writer that waited while the task was deleted and re-created locks the new lock file:
+    once the old file's lock is free, it waits for whoever holds the new one."""
     a, b = pair
     tb = b.get("t")
     lock = a.root / "tasks" / "t" / ".lock"
@@ -165,13 +167,17 @@ def test_waiting_writer_follows_a_recreated_task(pair):
         tb.upsert_class("late")
         done.set()
 
-    with fsutil.file_lock(lock):  # pylint: disable=protected-access
+    with contextlib.ExitStack() as old:
+        old.enter_context(fsutil.file_lock(lock))
         th = threading.Thread(target=write)
         th.start()
         started.wait()
         assert not done.wait(0.2)  # blocked on our lock
         shutil.rmtree(lock.parent)
         a.create("t")
+        with fsutil.file_lock(lock):  # the new task's lock, held by "another process"
+            old.close()  # the deleted file's lock is free now
+            assert not done.wait(0.5), "the writer went ahead with the lock of the deleted task"
     th.join()
     assert [c["name"] for c in on_disk(a)["classes"]] == ["late"]
 

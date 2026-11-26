@@ -182,7 +182,7 @@ def serve_http(handler: type[http.server.BaseHTTPRequestHandler]) -> Iterator[st
     """Run a local threaded HTTP server with ``handler``; yields its base URL ("http://127.0.0.1:PORT")."""
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     srv.daemon_threads = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         yield f"http://127.0.0.1:{srv.server_address[1]}"
     finally:

@@ -134,6 +134,9 @@ def _ranks(probs: np.ndarray, truth: np.ndarray, known: np.ndarray) -> np.ndarra
     return ranks
 
 
+LOO_CHUNK = 1024  # examples held out at once by the fast leave-one-out: bounds its memory to LOO_CHUNK x N
+
+
 def _fast_leave_one_out(data: ClassData, cfg: TaskConfig,
                         progress: Callable[[int, int], None] | None) -> HeldOut:
     """Leave-one-out for the prototype and kNN classifiers without refitting per example: each
@@ -145,10 +148,10 @@ def _fast_leave_one_out(data: ClassData, cfg: TaskConfig,
     present = np.ones((n, C), bool)  # classes left with examples once example i is held out
     present[np.arange(n), y] = np.bincount(y, minlength=C)[y] > 1
     out = HeldOut.empty(n, C)
-    for start in range(0, n, 1024):
+    for start in range(0, n, LOO_CHUNK):
         if progress:
             progress(start, n)
-        rows = np.arange(start, min(start + 1024, n))
+        rows = np.arange(start, min(start + LOO_CHUNK, n))
         if isinstance(clf, PrototypeClassifier):
             probs, sim = _loo_prototype(clf, X, y, rows, present[rows])
         else:
