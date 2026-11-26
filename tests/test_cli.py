@@ -7,6 +7,7 @@ import json
 import os
 import socket
 from pathlib import Path
+from typing import get_args
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from typer.testing import CliRunner
 
 from fewshot import cache as cache_module
 from fewshot import cli, cli_common, embedders
+from fewshot.classifiers import CLASSIFIERS
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
 from fewshot.server_settings import ServerSettings, served_host
 from fewshot.store import Workspace
@@ -65,6 +67,17 @@ def test_help_shows_text_in_brackets_and_values(command, shown):
     assert shown in " ".join(r.output.split())
 
 
+def test_choices_are_usage_errors(run):
+    """An unknown classifier or inbox order is a usage error (2) naming the choices, which are the
+    library's own."""
+    assert sorted(CLASSIFIERS) == list(get_args(cli_common.ClassifierName))
+    for args in (["create", "x", "--classifier", "bogus"], ["inbox", "ls", "x", "--sort", "bogus"],
+                 ["bench", ".", "--classifier", "gda", "--classifier", "bogus"]):
+        r = run(*args)
+        assert r.exit_code == 2
+        assert "'bogus' is not one of" in r.output
+
+
 def test_models_lists_presets():
     """`models` prints every preset spec and label."""
     r = CliRunner().invoke(cli.app, ["models"])
@@ -106,13 +119,14 @@ def test_create_list_show(run, root):
 @pytest.mark.parametrize(("args", "message"), [
     (["pets"], "already exists"),
     (["bad name!"], "Task names use"),
-    (["other", "--classifier", "nope"], "Unknown classifier"),
+    (["other", "--classifier", "nope"], "'nope' is not one of"),
 ])
 def test_create_errors(run, args, message):
-    """`create` rejects duplicates, bad names and unknown classifiers with exit code 1."""
+    """`create` rejects duplicates and bad names with exit code 1, unknown classifiers as a usage
+    error (2)."""
     run("create", "pets", "--embedder", "fake:color")
     r = run("create", *args)
-    assert r.exit_code == 1
+    assert r.exit_code == (2 if "--classifier" in args else 1)
     assert message in r.output
 
 
@@ -184,7 +198,7 @@ def test_config_and_create_validate_embedders(run, root, task):
 
 
 @pytest.mark.parametrize(("args", "message"), [
-    (["--classifier", "nope"], "Unknown classifier"),
+    (["--classifier", "nope"], "'nope' is not one of 'gda', 'knn', 'logreg', 'prototype'"),
     (["--param", "k"], "Bad --param 'k'"),
     (["--param", "=3"], "Bad --param '=3'"),
     (["--param", "k=three"], "Bad --param 'k=three'"),
@@ -195,7 +209,7 @@ def test_config_and_create_validate_embedders(run, root, task):
 def test_config_errors(run, root, task, args, message):
     """Invalid settings and malformed --param values fail without changing the task."""
     r = run("config", task, *args)
-    assert r.exit_code == (2 if message.startswith("Bad --param") else 1)  # 2: a usage error
+    assert r.exit_code == (2 if message.startswith(("Bad --param", "'nope'")) else 1)  # 2: a usage error
     assert message in r.output
     assert load(root).config.classifier == "gda"
 

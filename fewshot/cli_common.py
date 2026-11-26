@@ -10,7 +10,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, get_args
 
 import typer
 
@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from .pipeline import Pipeline
 
 MAX_DOWNLOAD = 50 * 1024 * 1024  # largest image fetched from a URL
+ClassifierName = Literal["gda", "knn", "logreg", "prototype"]  # classifiers.CLASSIFIERS (a test keeps them equal)
+CLASSIFIER_LIST = " | ".join(get_args(ClassifierName))
+InboxSort = Literal["uncertain", "confident", "novel", "added"]  # Pipeline.inbox_suggestions's orders
 JSON_OPT = typer.Option(False, "--json", help="Print JSON")
 
 ROOT_OPT = typer.Option(None, "--root", envvar="FEWSHOT_HOME", help="Workspace directory [default: ./fewshot_data]")
@@ -38,6 +41,14 @@ def command_group(help_text: str) -> typer.Typer:
 # Exit statuses: 1 when the command failed (or failed for some of its inputs), 2 for a usage error
 # (options that don't go together, missing arguments), as for the usage errors Typer reports itself.
 FAILED, USAGE = 1, 2
+
+
+def classifier_names(names: list[str]) -> list[str]:
+    """Check a repeatable --classifier option's values (Typer can't make a list of choices)."""
+    for n in names:
+        if n not in get_args(ClassifierName):
+            raise typer.BadParameter(f"{n!r} is not one of " + ", ".join(map(repr, get_args(ClassifierName))))
+    return names
 
 
 def fail(msg: str, code: int = FAILED) -> NoReturn:

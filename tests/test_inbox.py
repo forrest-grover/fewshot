@@ -181,7 +181,9 @@ def test_cli(tmp_path):
     run("inbox", "add", "t", tmp_path / "y.png")
     item = Workspace(root).get("t").config.inbox[0].id
     assert run("inbox", "dismiss", "t", item[:6]).output.strip() == "Dismissed 1 images; 0 left"
-    assert run("inbox", "ls", "t", "--sort", "nope").exit_code == 1
+    r = run("inbox", "ls", "t", "--sort", "nope")
+    assert r.exit_code == 2  # a usage error, like any other bad option value
+    assert "'nope' is not one of 'uncertain', 'confident', 'novel', 'added'" in r.output
 
 
 def test_chunked_inbox_add_is_one_undo_step_when_the_first_chunk_adds_nothing(ws):

@@ -10,6 +10,7 @@ from . import services
 from .cli_common import (
     JSON_OPT,
     ROOT_OPT,
+    InboxSort,
     blobs,
     command_group,
     echo_json,
@@ -123,17 +124,15 @@ def inbox_add(name: str, paths: list[str], root: Path | None = ROOT_OPT) -> None
 @inbox_app.command("ls")
 def inbox_ls(
     name: str,
-    sort: str = typer.Option("uncertain", help="uncertain (most useful to label first) | confident | novel | added"),
+    sort: InboxSort = typer.Option("uncertain", help="uncertain: most useful to label first; confident; novel: "
+                                                     "unlike any example; added: in the order added"),
     limit: int = typer.Option(50, min=1, help="Show at most this many"),
     as_json: bool = JSON_OPT,
     root: Path | None = ROOT_OPT,
 ) -> None:
     """List inbox images with the model's suggestion, in the order to label them."""
     t = get_task(root, name)
-    try:
-        items = make_pipeline(workspace(root)).inbox_suggestions(t, sort)[:limit]
-    except ValueError as e:
-        fail(str(e))
+    items = make_pipeline(workspace(root)).inbox_suggestions(t, sort)[:limit]
     if as_json:
         echo_json(items)
         return

@@ -16,7 +16,17 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from . import services
-from .cli_common import FAILED, JSON_OPT, ROOT_OPT, Source, command_group, report_skipped
+from .cli_common import (
+    CLASSIFIER_LIST,
+    FAILED,
+    JSON_OPT,
+    ROOT_OPT,
+    ClassifierName,
+    Source,
+    classifier_names,
+    command_group,
+    report_skipped,
+)
 from .cli_common import add_files as _add_files
 from .cli_common import echo_json as _echo_json
 from .cli_common import error_text as _error_text
@@ -72,7 +82,7 @@ def models(as_json: bool = JSON_OPT) -> None:
 def create(
     name: str,
     embedder: str | None = typer.Option(None, help="Embedder spec; see `fewshot models`"),
-    classifier: str = typer.Option("gda", help="gda | prototype | knn | logreg"),
+    classifier: ClassifierName = "gda",
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Create a task."""
@@ -137,7 +147,7 @@ def _parse_params(param: list[str]) -> dict[str, Any]:
 def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
     name: str,
     embedder: str | None = None,
-    classifier: str | None = None,
+    classifier: ClassifierName | None = None,
     param: list[str] = typer.Option([], help="Classifier param KEY=VALUE (e.g. k=3, scale=20). Repeatable."),
     text_weight: float | None = None,
     reject_below: float | None = typer.Option(None, help="Similarity threshold (-1 to 1) for 'unknown'"),
@@ -808,7 +818,8 @@ def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | Non
 def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     folder: Path,
     embedder: list[str] = typer.Option(None, help=f"Embedder spec(s) to compare [default: {DEFAULT_SPEC}]"),
-    classifier: list[str] = typer.Option(["gda"], help="Classifier(s) to compare"),
+    classifier: list[str] = typer.Option(["gda"], callback=classifier_names,
+                                         help=f"Classifier(s) to compare: {CLASSIFIER_LIST}"),
     way: int = typer.Option(5, min=0, help="Classes per episode; 0 for every class with enough images"),
     shot: list[int] = typer.Option([1, 5], min=0, help="Shot count(s)"),
     query: int = typer.Option(15, min=1),
