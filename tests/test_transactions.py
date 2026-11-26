@@ -210,14 +210,14 @@ def test_duplicate_is_locked_while_built(ws, monkeypatch):
     src = ws.create("src")
     src.add_example(png(RED, noise=15, seed=1), "red")
     seen = {}
-    real = store.Task._store_image  # pylint: disable=protected-access
+    real = store.Task._add_file  # pylint: disable=protected-access
 
-    def store_and_gc(self, file, data):
-        if self.path.name == "copy":
-            seen["gc"] = ws.gc()["folders"]
-        return real(self, file, data)
+    def store_and_gc(self, file, source):
+        if self.path.name.startswith(".tmp-"):  # what gc would remove (it waits for the source task)
+            seen["gc"] = sum(fsutil.reclaim(p, store.STALE_SECONDS) for p in (ws.root / "tasks").iterdir())
+        return real(self, file, source)
 
-    monkeypatch.setattr(store.Task, "_store_image", store_and_gc)
+    monkeypatch.setattr(store.Task, "_add_file", store_and_gc)
     ws.duplicate("src", "copy")
     assert seen["gc"] == 0
     assert len(ws.get("copy").config.examples) == 1

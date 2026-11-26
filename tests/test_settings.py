@@ -84,6 +84,7 @@ def test_zero_shot_threshold_and_flip_settings(ws):
 def test_switching_embedder_clears_what_was_fitted_to_the_old_one(ws):
     """Temperature and thresholds (task and per class) are cleared unless given too; undo restores."""
     t = red_blue_task(ws)
+    t.embedder_ok = lambda spec: None  # "fake:other" stands for any other model
     t.update_settings(temperature=2.0, reject_below=0.5, reject_below_zero_shot=0.2)
     t.set_class_thresholds({"red": 0.8})
     assert t.update_settings(classifier="knn", temperature=2.0) == []  # kept: given too

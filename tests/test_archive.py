@@ -101,6 +101,7 @@ def test_import_with_another_embedder_clears_fitted_settings(ws, embedder):
 
 def test_import_task_checks_the_embedder_whoever_calls_it(ws, run, tmp_path):
     """archive.import_task checks the embedder itself, so the CLI can't skip it."""
+    ws.embedder_ok = lambda spec: None  # made when it still loaded
     t = ws.create("t", embedder="nobackend:model")
     buf = io.BytesIO()
     export_task(ws, t.name, buf)
@@ -248,6 +249,56 @@ def test_import_total_size_limit(ws, monkeypatch):
     with pytest.raises(ValueError, match="unpack to more than"):
         import_task(ws, _one(png(RED), "png"))
     assert not list((ws.root / "tasks").iterdir())
+
+
+def _many(n, comment=b""):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for i in range(n):
+            z.writestr(f"{i}", b"")
+        z.comment = comment
+    return buf.getvalue()
+
+
+def test_import_counts_the_files_before_zipfile_reads_them(ws, monkeypatch):
+    """A zip listing more than MAX_IMPORT_FILES files is refused before zipfile builds an object
+    for each (about 6 times the zip's size in memory), Zip64 or not, whatever count it declares."""
+    monkeypatch.setattr(archive, "MAX_IMPORT_FILES", 3)
+    real, zips = zipfile.ZipFile, (_many(4), _many(4, comment=b"a comment"))
+    monkeypatch.setattr(zipfile, "ZipFile", lambda *a, **kw: pytest.fail("zipfile read a zip with too many files"))
+    for data in zips:
+        with pytest.raises(ValueError, match="holds more than 3 files"):
+            import_task(ws, io.BytesIO(data))
+    lying = bytearray(zips[0])
+    lying[-12:-10] = (1).to_bytes(2, "little")  # declares 1 file of 4
+    with pytest.raises(ValueError, match="holds more than 3"):
+        import_task(ws, io.BytesIO(bytes(lying)))
+    monkeypatch.setattr(zipfile, "ZipFile", real)
+    with pytest.raises(ValueError, match=r"no task\.json"):  # 3 is allowed
+        import_task(ws, io.BytesIO(_many(3)))
+    with pytest.raises(ValueError, match=r"no task\.json"):  # nothing at all
+        import_task(ws, io.BytesIO(_many(0)))
+    huge = bytearray(_many(3))
+    huge[-10:-6] = (10**6).to_bytes(4, "little")  # a directory larger than the zip
+    for bad in (b"x" * 100, bytes(huge)):
+        with pytest.raises(ValueError, match="Not a task export"):
+            import_task(ws, io.BytesIO(bad))
+    damaged = bytearray(_many(3))
+    damaged[damaged.index(b"PK\x01\x02") + 1] = 0  # zipfile reports the broken directory
+    with pytest.raises(ValueError, match="Not a task export"):
+        import_task(ws, io.BytesIO(bytes(damaged)))
+
+
+def test_import_counts_the_files_of_a_zip64_archive(ws, monkeypatch):
+    """Over 65,535 files a zip keeps its directory's size and place in Zip64 records."""
+    data = _many(0x10000 + 1)
+    assert b"PK\x06\x06" in data
+    monkeypatch.setattr(archive, "MAX_IMPORT_FILES", 0x10000)
+    with pytest.raises(ValueError, match="holds more than 65,536 files"):
+        import_task(ws, io.BytesIO(data))
+    broken = data.replace(b"PK\x06\x06", b"PK\x00\x00")  # the record the locator points at isn't one
+    with pytest.raises(ValueError, match="Not a task export"):
+        import_task(ws, io.BytesIO(broken))
 
 
 def test_import_checks_class_thresholds(ws, tmp_path):

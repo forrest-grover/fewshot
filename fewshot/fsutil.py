@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib
 import os
+import shutil
 import tempfile
+import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -30,16 +34,25 @@ def stamp(st: os.stat_result) -> FileStamp:
 
 
 @contextlib.contextmanager
-def file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive lock on ``path`` (created if missing) across processes: ``flock`` on
-    Linux and macOS, ``msvcrt.locking`` on Windows.
+def file_lock(path: Path, shared: bool = False) -> Iterator[None]:
+    """Hold a lock on ``path`` (created if missing) across processes: ``flock`` on Linux and
+    macOS, ``msvcrt.locking`` (always exclusive) on Windows. An exclusive lock waits for every
+    other holder; a ``shared`` one only for exclusive holders, and needs no write access to an
+    existing ``path`` (where it can't be created either, as in a read-only folder, nobody can be
+    changing what it guards, and nothing is locked).
 
     Raises ``FileNotFoundError`` if the folder holding ``path`` is gone.
     """
     while True:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            _lock(fd)
+            fd = _open_lock(path, shared)
+        except PermissionError:
+            if not shared or path.exists():
+                raise
+            yield
+            return
+        try:
+            _lock(fd, shared)
             # If the task was deleted (and maybe recreated) while we waited, we hold a lock on a
             # file that is no longer at ``path``; start again on the current one.
             with contextlib.suppress(FileNotFoundError):
@@ -55,10 +68,22 @@ def file_lock(path: Path) -> Iterator[None]:
         os.close(fd)  # releases the lock
 
 
-def _lock(fd: int) -> None:
-    """Block until this process holds the exclusive lock on open file ``fd``."""
+def _open_lock(path: Path, shared: bool) -> int:
+    if shared:
+        with contextlib.suppress(FileNotFoundError):
+            return os.open(path, os.O_RDONLY)  # flock needs no write access
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        if e.errno == errno.EROFS:  # a read-only file system: as for a folder without write access
+            raise PermissionError(e.errno, e.strerror, e.filename) from e
+        raise
+
+
+def _lock(fd: int, shared: bool = False) -> None:
+    """Block until this process holds the lock (exclusive unless ``shared``) on open file ``fd``."""
     if fcntl is not None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         return
     while True:  # pragma: no cover  # Windows: LK_LOCK gives up after 10 one-second tries
         try:
@@ -80,6 +105,31 @@ def dir_lock(path: Path) -> Iterator[None]:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def claim_dir(path: Path) -> Iterator[bool]:
+    """Try to take ``dir_lock`` on folder ``path`` without waiting; yields whether this caller now
+    holds it on the folder still at ``path`` (False if another process holds it, or the folder is
+    gone or was replaced meanwhile). Without ``fcntl`` it yields True and locks nothing."""
+    if fcntl is None:  # pragma: no cover  # Windows
+        yield True
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            st, now = os.fstat(fd), os.stat(path)
+            held = (st.st_dev, st.st_ino) == (now.st_dev, now.st_ino)
+        except OSError:  # BlockingIOError: someone else holds it; FileNotFoundError: gone since
+            held = False
+        yield held
     finally:
         os.close(fd)
 
@@ -122,10 +172,34 @@ def _write_synced(fd: int, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
+def _read_umask() -> int:
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+_UMASK = _read_umask()  # read once: setting it to read it isn't thread-safe
+
+
+def mkstemp(path: Path) -> tuple[int, str]:
+    """A new temporary file next to ``path`` (``.<name>.*.tmp``), open for writing, with the
+    permissions an ordinary new file gets (``tempfile`` makes it 0600 whatever the umask, which
+    would lock the group out of a shared workspace). Returns its descriptor and path."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    if hasattr(os, "fchmod"):  # pragma: no branch  # POSIX
+        try:
+            os.fchmod(fd, 0o666 & ~_UMASK)
+        except BaseException:
+            os.close(fd)
+            os.unlink(tmp)
+            raise
+    return fd, tmp
+
+
 def write_atomic(path: Path, data: bytes) -> None:
     """Write ``path`` so that readers see either nothing or all of ``data``, and the content is on
     disk before the name points at it. (The rename itself is durable after ``fsync_dir``.)"""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = mkstemp(path)
     try:
         _write_synced(fd, data)
         os.replace(tmp, path)
@@ -140,7 +214,7 @@ def create_exclusive(path: Path, data: bytes) -> bool:
     created. Readers never see it partly written, and its content is on disk before it is linked
     into place. Raises ``OSError`` where hard links aren't supported (the file is written aside
     and linked into place)."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = mkstemp(path)
     try:
         _write_synced(fd, data)
         os.link(tmp, path)
@@ -157,3 +231,36 @@ def os_reason(e: Exception) -> str:
     if isinstance(e, OSError) and e.strerror:
         return f"{e.filename}: {e.strerror}" if e.filename else e.strerror
     return str(e)
+
+
+def abandoned(folder: Path, stale_seconds: float, locked: bool = False) -> bool:
+    """Whether ``folder`` is a leftover of a crash: no task.json (or hidden), untouched for
+    ``stale_seconds`` (so it isn't a folder just made, before its builder locked it) and not
+    locked (``dir_lock``) by a create, duplicate or import still building it, however long that
+    takes (unless ``locked``: the caller holds that lock itself)."""
+    try:
+        age = time.time() - folder.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return (age > stale_seconds and (folder.name.startswith(".") or not (folder / "task.json").exists())
+            and (locked or not dir_locked(folder)))
+
+
+def reclaim(folder: Path, stale_seconds: float) -> bool:
+    """Delete ``folder`` if it is a crash's leftover (see ``abandoned``); returns whether it went.
+
+    Judged again while holding its lock (taken without waiting) and moved aside to a ``.trash-``
+    name before it is removed, so a folder that another process took back and started building
+    in meanwhile is never the one deleted."""
+    if not abandoned(folder, stale_seconds):
+        return False
+    with claim_dir(folder) as held:
+        if not held or not abandoned(folder, stale_seconds, locked=True):
+            return False
+        trash = folder.parent / f".trash-{uuid.uuid4().hex}"
+        try:
+            os.rename(folder, trash)
+        except FileNotFoundError:  # pragma: no cover  # removed by a process not taking the lock
+            return False
+    shutil.rmtree(trash, ignore_errors=True)
+    return True

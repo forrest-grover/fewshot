@@ -108,6 +108,24 @@ def test_create_rejects_duplicates_and_unknown_classifier(ws):
     assert not (ws.root / "tasks" / "b").exists()
 
 
+def test_the_library_checks_a_chosen_embedder(ws, tmp_path):
+    """A spec given to create, or a new one to update_settings, must load (whoever calls), so a
+    typo fails there and not at the first prediction; the check is the workspace's to choose."""
+    with pytest.raises(ValueError, match="Could not load embedder 'nobackend:typo'"):
+        ws.create("x", embedder="nobackend:typo")
+    assert not list((ws.root / "tasks").iterdir())
+    t = ws.create("t", embedder="fake:color")
+    with pytest.raises(ValueError, match="Could not load embedder 'bogus:zzz'"):
+        t.update_settings(embedder="bogus:zzz")
+    assert ws.get("t").config.embedder == "fake:color"
+    ws.create("d")  # no embedder given: nothing to check (or load)
+    checked: list[str] = []
+    own = Workspace(tmp_path / "own", embedder_ok=checked.append)
+    own.create("a", embedder="any:thing").update_settings(embedder="other:x", classifier="knn")
+    Workspace(own.root, embedder_ok=checked.append).get("a").update_settings(embedder="other:y")
+    assert checked == ["any:thing", "other:x", "other:y"]
+
+
 def test_get_list_and_reload(ws):
     """get() caches, loads from disk in a fresh workspace, and rejects bad or missing names."""
     ws.create("b")

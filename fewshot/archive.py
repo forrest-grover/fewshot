@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import os
-import shutil
+import struct
 import uuid
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, Any
 
 from pydantic import ValidationError
 
 from .embedders import check_embedder
-from .fsutil import dir_lock, fsync_dir
 from .images import image_ext, image_id
 from .models import ClassDef, TaskConfig
 from .settings import check_settings, for_new_embedder
@@ -25,6 +24,11 @@ from .text import check_class_name, check_description
 MAX_IMPORT_IMAGE = 50 * 1024 * 1024
 MAX_IMPORT_CONFIG = 64 * 1024 * 1024
 MAX_IMPORT_TOTAL = 10 * 1024 * 1024 * 1024
+# Files an export zip may list (its images and task.json): checked before zipfile reads the zip's
+# directory, which costs about half a kilobyte of memory per file.
+MAX_IMPORT_FILES = 250_000
+
+_EOCD, _EOCD64, _LOCATOR64, _CENTRAL = b"PK\x05\x06", b"PK\x06\x06", b"PK\x06\x07", b"PK\x01\x02"
 
 
 def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
@@ -32,12 +36,12 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
     the number of examples written and of examples left out because their image file was
     missing. Raises ``KeyError`` if there is no such task.
 
-    The task is locked meanwhile, so another process can't rename or change it half-way; an image
-    file missing from the task (only if it was damaged) is left out with its example.
+    The task is locked meanwhile (``Task.locked``, which needs no write access), so another
+    process can't rename or change it half-way; an image file missing from the task (only if it
+    was damaged) is left out with its example.
     """
     t = ws.get(name)
-    with t._writing(), zipfile.ZipFile(out, "w") as z:  # pylint: disable=protected-access
-        cfg = t.config
+    with t.locked() as cfg, zipfile.ZipFile(out, "w") as z:
         kept: dict[str, list[Any]] = {"examples": [], "inbox": []}
         for field, items in (("examples", cfg.examples), ("inbox", cfg.inbox)):
             for e in items:
@@ -64,6 +68,10 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
     Raises ``ValueError`` if the zip isn't a valid export, its embedder can't be loaded, or the
     name is bad or taken.
     """
+    if isinstance(src, Path):
+        with open(src, "rb") as f:
+            return import_task(ws, f, name, embedder_ok, embedder)
+    _count_files(src)
     try:
         with zipfile.ZipFile(src) as z:
             cfg, images = _read_export(z)
@@ -72,30 +80,74 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
                 for_new_embedder(cfg)
             (embedder_ok or check_embedder)(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
-            p = ws._reserve(cfg.name)  # pylint: disable=protected-access
-            # Built in a hidden folder and moved into place at the end, so a crash part-way leaves
-            # no half-imported task (Workspace.gc removes the leftover). Both folders stay locked
-            # meanwhile, so gc, or a create of the same name, can't take them for leftovers.
-            build = ws.root / "tasks" / f".tmp-{uuid.uuid4().hex}"
-            build.mkdir()
-            try:
-                with dir_lock(p), dir_lock(build):
-                    t = Task(build, cfg, blobs=ws.blobs)
-                    for e in [*cfg.examples, *cfg.inbox]:
-                        data = _read_member(z, images[e.file])
-                        if not image_id(data).startswith(e.id):  # not the bytes checked before
-                            raise ValueError(f"Not a valid task export: {e.file} changed while importing")
-                        t._store_image(e.file, data)  # pylint: disable=protected-access
-                    t._save(record=False)  # pylint: disable=protected-access
-                    os.replace(build, p)  # replaces the empty reserved folder (POSIX)
-            except BaseException:
-                shutil.rmtree(build, ignore_errors=True)
-                shutil.rmtree(p, ignore_errors=True)
-                raise
-            fsync_dir(p.parent)
+
+            def checked() -> Iterator[tuple[str, bytes]]:
+                for e in [*cfg.examples, *cfg.inbox]:
+                    data = _read_member(z, images[e.file])
+                    if not image_id(data).startswith(e.id):  # not the bytes checked before
+                        raise ValueError(f"Not a valid task export: {e.file} changed while importing")
+                    yield e.file, data
+
+            return ws.build_task(cfg, checked())
     except zipfile.BadZipFile as e:
         raise ValueError(f"Not a task export: {e}") from None
-    return ws.get(cfg.name)
+
+
+def _central_directory(f: IO[bytes]) -> tuple[int, int] | None:
+    """Where the zip in ``f`` has its central directory, ``(start, size)``, found as zipfile
+    (``_EndRecData``) finds it: from the end of central directory record, and the Zip64 one if
+    there is one. None where zipfile would find none, or refuse the records it found."""
+    size = f.seek(0, os.SEEK_END)
+    if size < 22:
+        return None
+    f.seek(size - 22)
+    rec, at = f.read(22), size - 22
+    if not (rec[:4] == _EOCD and rec[-2:] == b"\0\0"):  # not a record without a comment: search
+        tail_at = max(0, size - 22 - 0xFFFF)  # for one followed by a comment of up to 64 KB
+        f.seek(tail_at)
+        tail = f.read()
+        i = tail.rfind(_EOCD)
+        if i < 0 or len(tail) - i < 22:
+            return None
+        rec, at = tail[i : i + 22], tail_at + i
+    (cd_size,) = struct.unpack_from("<L", rec, 12)
+    end = at  # the directory ends where the record (or the Zip64 one) starts
+    if at >= 20:
+        f.seek(at - 20)
+        locator = f.read(20)
+        if locator[:4] == _LOCATOR64:
+            # The Zip64 record is where the locator says, or else (data prepended) just before it.
+            (where,) = struct.unpack_from("<Q", locator, 8)
+            for end in (where, at - 20 - 56):
+                f.seek(max(0, end))
+                rec64 = f.read(56)
+                if end >= 0 and len(rec64) == 56 and rec64[:4] == _EOCD64:
+                    (cd_size,) = struct.unpack_from("<Q", rec64, 40)
+                    break
+            else:
+                return None
+    return (end - cd_size, cd_size) if end >= cd_size else None
+
+
+def _count_files(f: IO[bytes]) -> None:
+    """``ValueError`` if the zip in ``f`` lists more than ``MAX_IMPORT_FILES`` files, counted by
+    walking its central directory's headers (zipfile trusts neither its declared count nor any
+    limit, and builds an object per entry)."""
+    where = _central_directory(f)
+    if where is not None:
+        pos, size = where
+        end, n = pos + size, 0
+        while pos < end:
+            f.seek(pos)
+            header = f.read(46)
+            if len(header) < 46 or header[:4] != _CENTRAL:
+                break  # damaged: zipfile reports it
+            n += 1
+            if n > MAX_IMPORT_FILES:
+                raise ValueError(f"Not imported: the zip holds more than {MAX_IMPORT_FILES:,} files")
+            name_len, extra_len, comment_len = struct.unpack_from("<HHH", header, 28)
+            pos += 46 + name_len + extra_len + comment_len
+    f.seek(0)
 
 
 def _read_member(z: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int | None = None) -> bytes:

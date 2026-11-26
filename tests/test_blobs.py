@@ -2,7 +2,9 @@
 clean-up."""
 
 import os
+from pathlib import Path
 
+from fewshot import blobs as blobs_mod
 from fewshot import history, store
 from fewshot.fsutil import create_exclusive
 from fewshot.models import TaskConfig
@@ -24,6 +26,37 @@ def test_images_are_stored_once_across_tasks(ws, monkeypatch):
     monkeypatch.setattr(history, "HISTORY_KEPT", 0)
     b.upsert_class("x")  # prunes the version holding the image
     assert not blob.exists()
+
+
+def test_duplicate_links_the_images_instead_of_reading_them(ws, monkeypatch):
+    """A duplicate's images are more hard links to the source's files (and so to the shared
+    copies), made without reading them; without hard links they are copied."""
+    t = ws.create("t", embedder="fake:color")
+    e = t.add_example(png(RED), "red")
+    old = t.add_example(png(RED, noise=5, seed=1), "red")
+    t.path.joinpath(old.file).unlink()  # a task-local file (no shared copy) is linked too
+    t.path.joinpath(old.file).write_bytes(png(RED, noise=5, seed=1))
+    real_read = Path.read_bytes
+
+    def no_reads(p):
+        assert "images" not in p.parts, f"read {p}"
+        return real_read(p)
+
+    monkeypatch.setattr(Path, "read_bytes", no_reads)
+    c = ws.duplicate("t", "c")
+    assert os.path.samefile(c.path / e.file, ws.blobs / e.id[:2] / f"{e.id}.png")
+    assert os.path.samefile(c.path / old.file, t.path / old.file)
+    monkeypatch.setattr(Path, "read_bytes", real_read)
+    blobs_mod.link_image(c.path, e.file, t.path / old.file, ws.blobs, set())  # there already: kept
+    assert os.path.samefile(c.path / e.file, t.path / e.file)
+
+    def no_links(*_):
+        raise OSError("not supported")
+
+    monkeypatch.setattr(os, "link", no_links)
+    d = ws.duplicate("t", "d")
+    assert (d.path / e.file).read_bytes() == png(RED)
+    assert (d.path / e.file).stat().st_nlink == 1
 
 
 def test_store_falls_back_to_copies(ws, monkeypatch):
@@ -69,7 +102,8 @@ def test_without_a_blob_store(tmp_path):
     """A Task made without a workspace store writes plain files."""
     p = tmp_path / "t"
     p.mkdir()
-    t = store.Task.new(p, TaskConfig(name="t", embedder="fake:color"))
+    t = store.Task(p, TaskConfig(name="t", embedder="fake:color"))
+    t._save()  # pylint: disable=protected-access
     e = t.add_example(png(RED), "red")
     t.delete_example(e.id)
     assert (p / e.file).exists()  # kept for undo

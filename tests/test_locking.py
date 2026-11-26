@@ -6,16 +6,21 @@ different descriptors exclude each other even within one process.
 """
 
 import contextlib
+import errno
 import fcntl
+import io
 import json
 import multiprocessing
 import os
 import shutil
 import threading
 
+import numpy as np
 import pytest
 
 from fewshot import fsutil
+from fewshot.archive import export_task
+from fewshot.cache import EmbeddingCache, prune_unused
 from fewshot.fsutil import write_atomic
 from fewshot.store import Workspace
 from tests.conftest import RED, png
@@ -243,3 +248,91 @@ def test_write_atomic_cleans_up(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         write_atomic(tmp_path / "x", b"data")
     assert not list(tmp_path.iterdir())
+
+
+# ---- reading while holding a task still ------------------------------------
+def test_locked_readers_share_the_lock_and_writers_wait(pair):
+    """Readers in ``Task.locked`` don't wait for each other; a change waits for them all."""
+    a, b = pair
+    ta, tb = a.get("t"), b.get("t")
+    done = threading.Event()
+
+    def write():
+        tb.upsert_class("x")
+        done.set()
+
+    with ta.locked() as cfg:
+        with Workspace(a.root).get("t").locked():  # another reader gets in at once
+            pass
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert not done.wait(0.2)
+        assert cfg.classes == []
+    writer.join(5)
+    assert done.is_set()
+    with ta.locked() as cfg:
+        assert [c.name for c in cfg.classes] == ["x"]  # the latest saved version
+
+
+def test_locked_inside_and_around_a_change(pair):
+    """Within a change ``locked`` yields the draft; a change inside ``locked`` is refused (its
+    exclusive lock would wait for our own shared one forever); a deleted task is a KeyError."""
+    a, b = pair
+    t = a.get("t")
+    with t._writing():  # pylint: disable=protected-access
+        t.config.classes = []
+        with t.locked() as cfg:
+            assert cfg is t.config
+    with t.locked(), pytest.raises(RuntimeError, match="while reading it"):
+        t.upsert_class("x")
+    t.upsert_class("y")  # fine again afterwards
+    b.delete("t")
+    with pytest.raises(KeyError), t.locked():
+        pass  # pragma: no cover
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anything")
+def test_reads_need_no_write_access(tmp_path):
+    """Export and a dry-run cache prune work in a workspace this user can't write to, with or
+    without a lock file (a task never changed has none); changes still fail there."""
+    ws = Workspace(tmp_path / "ws")
+    ws.create("t").add_example(png(RED), "red")
+    ws.create("fresh")
+    EmbeddingCache(ws.cache_path).put_many("x", {"k": np.ones(1, np.float32)})
+    folders = [p for p in ws.root.rglob("*") if p.is_dir()] + [ws.root]
+    for p in folders:
+        p.chmod(0o555)
+    try:
+        assert not (ws.root / "tasks" / "fresh" / ".lock").exists()
+        ro = Workspace(ws.root, create=False)
+        for name in ("t", "fresh"):
+            export_task(ro, name, io.BytesIO())
+        assert prune_unused(ro, dry_run=True)[0] == 1
+        with pytest.raises(PermissionError):
+            ro.get("fresh").upsert_class("x")
+    finally:
+        for p in folders:
+            p.chmod(0o755)
+
+
+def test_a_read_only_file_system_is_like_a_read_only_folder(tmp_path, monkeypatch):
+    """EROFS when creating the lock file is treated as missing write access."""
+    real = os.open
+
+    def read_only(path, flags, *args):
+        if flags & os.O_CREAT:
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return real(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", read_only)
+    with fsutil.file_lock(tmp_path / ".lock", shared=True):
+        pass
+    with pytest.raises(PermissionError), fsutil.file_lock(tmp_path / ".lock"):
+        pass  # pragma: no cover
+
+    def broken(*_):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(os, "open", broken)
+    with pytest.raises(OSError, match="I/O error"), fsutil.file_lock(tmp_path / ".lock"):
+        pass  # pragma: no cover

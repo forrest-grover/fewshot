@@ -55,6 +55,7 @@ class EmbeddingCache:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.Lock()
+        self._ino: int | None = None  # of the file the connection opened
         try:
             self._conn = self._open()
         except sqlite3.DatabaseError as e:
@@ -62,12 +63,31 @@ class EmbeddingCache:
                 raise
             # It is only a cache: move a damaged file aside (for inspection) and start afresh,
             # rather than leaving the server and CLI unable to start.
-            aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
-            log.warning("Embedding cache %s is unreadable (%s); moved it to %s and starting a new one", path, e, aside)
-            for suffix in ("", "-wal", "-shm"):
-                with contextlib.suppress(FileNotFoundError):
-                    os.replace(f"{path}{suffix}", f"{aside}{suffix}")
+            self._move_aside(e)
             self._conn = self._open()
+
+    def _move_aside(self, e: sqlite3.DatabaseError) -> None:
+        aside = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}")
+        log.warning("Embedding cache %s is unreadable (%s); moved it to %s and starting a new one", self.path, e, aside)
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.replace(f"{self.path}{suffix}", f"{aside}{suffix}")
+
+    def _recover(self, e: sqlite3.DatabaseError) -> None:
+        """After ``e``, damage found in the open cache (a read or write reached a corrupt page),
+        move the file aside and continue with a new one; raise ``e`` if it isn't damage. Another
+        process that found it first may have done so already: then only reopen. Call holding
+        ``_lock``."""
+        if not _damaged(e):
+            raise e
+        self._conn.close()
+        try:
+            same = os.stat(self.path).st_ino == self._ino
+        except FileNotFoundError:
+            same = False
+        if same:
+            self._move_aside(e)
+        self._conn = self._open()
 
     def _open(self) -> sqlite3.Connection:
         # The server and CLI may share this file: wait up to BUSY_TIMEOUT for the other's write
@@ -79,32 +99,50 @@ class EmbeddingCache:
             conn.execute("PRAGMA synchronous=NORMAL")  # durable enough for a cache, much faster
             conn.execute("CREATE TABLE IF NOT EXISTS emb (spec TEXT, key TEXT, vec BLOB, PRIMARY KEY (spec, key))")
             conn.commit()
+            self._ino = os.stat(self.path).st_ino
         except sqlite3.DatabaseError:
             conn.close()
             raise
         return conn
 
     def get_many(self, spec: str, keys: list[str]) -> dict[str, Vectors]:
-        """Return the cached vectors among ``keys`` (missing keys are simply absent)."""
+        """Return the cached vectors among ``keys`` (missing keys are simply absent).
+
+        A damaged cache file is moved aside and a new one started (see ``_recover``): every key
+        is then missing."""
         found: dict[str, Vectors] = {}
         with self._lock:
-            for i in range(0, len(keys), 500):
-                chunk = keys[i : i + 500]
-                q = f"SELECT key, vec FROM emb WHERE spec=? AND key IN ({','.join('?' * len(chunk))})"
-                for k, blob in self._conn.execute(q, [spec, *chunk]):
-                    found[k] = np.frombuffer(blob, dtype=np.float32)
+            try:
+                for i in range(0, len(keys), 500):
+                    chunk = keys[i : i + 500]
+                    q = f"SELECT key, vec FROM emb WHERE spec=? AND key IN ({','.join('?' * len(chunk))})"
+                    for k, blob in self._conn.execute(q, [spec, *chunk]):
+                        found[k] = np.frombuffer(blob, dtype=np.float32)
+            except sqlite3.DatabaseError as e:
+                self._recover(e)
+                return {}
         return found
 
     def put_many(self, spec: str, items: dict[str, Vectors]) -> None:
-        """Insert or replace vectors for ``spec``."""
+        """Insert or replace vectors for ``spec`` (into a new cache file if the current one turns
+        out to be damaged: see ``_recover``)."""
         if not items:
             return
+        rows = [(spec, k, np.asarray(v, dtype=np.float32).tobytes()) for k, v in items.items()]
         with self._lock:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO emb VALUES (?, ?, ?)",
-                [(spec, k, np.asarray(v, dtype=np.float32).tobytes()) for k, v in items.items()],
-            )
+            try:
+                self._insert(rows)
+            except sqlite3.DatabaseError as e:
+                self._recover(e)
+                self._insert(rows)
+
+    def _insert(self, rows: list[tuple[str, str, bytes]]) -> None:
+        try:
+            self._conn.executemany("INSERT OR REPLACE INTO emb VALUES (?, ?, ?)", rows)
             self._conn.commit()
+        except sqlite3.DatabaseError:
+            self._conn.rollback()
+            raise
 
     def stats(self) -> list[tuple[str, int, int]]:
         """``(namespace, rows, bytes of vectors)`` per namespace, largest first."""
@@ -161,7 +199,7 @@ def prune_unused(ws: Workspace, dry_run: bool = False, vacuum: bool = False) -> 
     with contextlib.ExitStack() as locks:
         for t in list(tasks):
             try:
-                locks.enter_context(t._writing())  # pylint: disable=protected-access  # one consistent view of every task
+                locks.enter_context(t.locked())  # one consistent view of every task
             except KeyError:  # deleted meanwhile: its vectors needn't be kept
                 tasks.remove(t)
         ids = {e.id for t in tasks for e in [*t.config.examples, *t.config.inbox]}

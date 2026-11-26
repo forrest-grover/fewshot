@@ -69,6 +69,22 @@ def store_image(task_dir: Path, file: str, data: bytes, blobs: Path | None, unsy
     return True
 
 
+def link_image(task_dir: Path, file: str, src: Path, blobs: Path | None, unsynced: set[Path]) -> None:
+    """Store another task's image file ``src`` as ``task_dir/file``: as another hard link to the
+    same file (and so to its shared copy, if it has one) where possible, as ``store_image`` does
+    otherwise."""
+    dest = task_dir / file
+    dest.parent.mkdir(exist_ok=True)
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        return
+    except OSError:  # no hard links here
+        store_image(task_dir, file, src.read_bytes(), blobs, unsynced)
+        return
+    unsynced.add(dest.parent)
+
+
 def release(blob: Path | None) -> None:
     """Delete ``blob`` if no task file links to it any more."""
     if blob is None:
