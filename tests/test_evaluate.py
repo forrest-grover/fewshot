@@ -250,13 +250,20 @@ def test_benchmark_zero_shot_without_text_fails(ws, tmp_path):
         benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=0, query=2, episodes=1)
 
 
-@pytest.mark.parametrize(("arg", "value"), [("way", 1), ("shot", -1), ("query", 0), ("episodes", 0)])
+@pytest.mark.parametrize(("arg", "value"), [("way", 1), ("way", -1), ("shot", -1), ("query", 0), ("episodes", 0)])
 def test_benchmark_rejects_meaningless_arguments(ws, tmp_path, arg, value):
     """Arguments that would give NaN or an empty benchmark are ValueErrors."""
     folder = make_folder(tmp_path / "data", classes=("red", "blue"))
     kw = {"way": 2, "shot": 1, "query": 1, "episodes": 1, arg: value}
     with pytest.raises(ValueError, match=f"{arg} must be at least"):
         benchmark(Pipeline(ws), folder, "fake:color", **kw)
+
+
+def test_benchmark_every_class(ws, tmp_path):
+    """way=0 uses every class with enough images in each episode."""
+    folder = make_folder(tmp_path / "data", per_class=4, classes=("red", "green", "blue"))
+    r = benchmark(Pipeline(ws), folder, "fake:color", way=0, shot=1, query=3, episodes=2)
+    assert (r["way"], r["accuracy"]) == (3, 1.0)
 
 
 @pytest.mark.parametrize(("classifier", "n", "method"), [

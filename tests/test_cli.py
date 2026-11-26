@@ -603,7 +603,7 @@ def test_unreadable_file_is_skipped_when_adding(run, task, tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize(("args", "option"), [
-    (["--way", "1"], "--way"), (["--query", "0"], "--query"), (["--episodes", "0"], "--episodes"),
+    (["--way", "-1"], "--way"), (["--query", "0"], "--query"), (["--episodes", "0"], "--episodes"),
     (["--shot", "-1"], "--shot"),
 ])
 def test_bench_rejects_out_of_range_options(run, bench_data, args, option):
@@ -611,6 +611,12 @@ def test_bench_rejects_out_of_range_options(run, bench_data, args, option):
     r = run("bench", bench_data, "--embedder", "fake:color", *args)
     assert r.exit_code == 2
     assert option in r.output
+
+
+def test_bench_way_one_is_an_error(run, bench_data):
+    """One class per episode is meaningless (0 means every class)."""
+    r = run("bench", bench_data, "--embedder", "fake:color", "--way", "1")
+    assert (r.exit_code, "way must be at least 2, or 0 for every class" in r.output) == (1, True)
 
 
 def test_cache_info_and_prune(run, root, task):

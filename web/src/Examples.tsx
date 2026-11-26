@@ -227,7 +227,7 @@ export default function Examples({ task, setTask, run }: Props) {
             title="Fill empty descriptions from the class names. CLIP uses them as text prompts."
             onClick={() => {
               // Several templates, separated by "|", become several prompts per class.
-              const tpl = prompt("Description template ({} = class name; separate several with |)", "a photo of a {} | a close-up photo of a {}")
+              const tpl = prompt("Description template ({} = class name; separate several with |). Naming the kind of thing helps, e.g. \"a photo of a {}, a type of bird\".", "a photo of a {} | a close-up photo of a {}")
                 ?.split("|").map((x) => x.trim()).filter(Boolean).join("\n");
               if (tpl) void save(api.describe(task.name, tpl, false));
             }}

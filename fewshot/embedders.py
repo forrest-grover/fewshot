@@ -4,7 +4,7 @@ Every embedder returns L2-normalised float32 vectors so downstream classifiers
 can use dot products as cosine similarity. Embedders are identified by a spec
 string of the form ``<backend>:<model>[@<pretrained>]``:
 
-    openclip:ViT-B-32@laion2b_s34b_b79k
+    openclip:PE-Core-B-16@meta
     timm:vit_small_patch14_dinov2.lvd142m
 """
 
@@ -43,44 +43,48 @@ class EmbedderInfo:
     notes: str
 
 
-# Presets shown in the UI/CLI. Any valid spec string also works.
+# Presets shown in the UI/CLI. Any valid spec string also works. Accuracy notes come from the
+# all-classes benchmark over six datasets in the README (GDA classifier, 3 seeds).
 PRESETS: list[EmbedderInfo] = [
+    EmbedderInfo(
+        "openclip:PE-Core-B-16@meta",
+        "PE Core B/16 (Meta)",
+        True,
+        "Default: fast, and the most accurate base-size model here (78% at 1 example per class, 89% at "
+        "16, averaged over six datasets). Supports text descriptions.",
+    ),
+    EmbedderInfo(
+        "openclip:PE-Core-L-14-336@meta",
+        "PE Core L/14, 336 px (Meta)",
+        True,
+        "Most accurate (83% at 1 example per class, 92% at 16), about 4x slower to embed than B/16. "
+        "Supports text descriptions.",
+    ),
+    EmbedderInfo(
+        "openclip:ViT-B-16-SigLIP2-256@webli",
+        "SigLIP 2 B/16, 256 px (WebLI)",
+        True,
+        "Close to PE Core B/16, and reads descriptions in many languages. Needs `pip install transformers` "
+        "for its tokenizer.",
+    ),
     EmbedderInfo(
         "openclip:ViT-B-32@laion2b_s34b_b79k",
         "CLIP ViT-B/32 (LAION-2B)",
         True,
-        "Fast default. Supports text class descriptions, so classes work with zero images.",
-    ),
-    EmbedderInfo(
-        "openclip:ViT-L-14@laion2b_s32b_b82k",
-        "CLIP ViT-L/14 (LAION-2B)",
-        True,
-        "Higher accuracy than ViT-B/32, about 4x slower. Supports text descriptions.",
+        "Smallest download; the previous default. About 10 points less accurate than PE Core B/16.",
     ),
     EmbedderInfo(
         "timm:vit_small_patch14_dinov2.lvd142m",
         "DINOv2 ViT-S/14",
         False,
-        "Image-only. Often better than CLIP on fine-grained visual differences.",
-    ),
-    EmbedderInfo(
-        "timm:vit_base_patch14_dinov2.lvd142m",
-        "DINOv2 ViT-B/14",
-        False,
-        "Image-only. Larger DINOv2.",
+        "Image-only and small. On the benchmark photos it trails PE Core even without descriptions; it may "
+        "suit images unlike web photos.",
     ),
     EmbedderInfo(
         "timm:vit_large_patch14_dinov2.lvd142m",
         "DINOv2 ViT-L/14",
         False,
-        "Image-only. Largest DINOv2 preset: most accurate on fine-grained classes, about 3x slower than ViT-B.",
-    ),
-    EmbedderInfo(
-        "openclip:ViT-B-16-SigLIP2@webli",
-        "SigLIP 2 ViT-B/16 (WebLI)",
-        True,
-        "Usually more accurate than CLIP, with multilingual descriptions. Needs `pip install transformers` "
-        "for its tokenizer.",
+        "Image-only. Larger DINOv2; on the benchmark it trails PE Core B/16 by 2 to 3 points at 16 examples.",
     ),
 ]
 

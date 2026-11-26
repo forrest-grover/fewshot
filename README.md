@@ -49,22 +49,35 @@ A class description can hold several prompts, one per line (`fewshot class descr
 
 ## Measured accuracy
 
-Oxford-IIIT Pets, 5-way episodes, 300 episodes each, ±95% CI under about 0.01:
+Accuracy over every class of six datasets at once (Oxford Pets, DTD textures, Oxford Flowers, FGVC Aircraft, EuroSAT, Food-101; 10 to 102 classes), with k example images per class, 3 random draws, up to 50 test images per class, the `gda` classifier, and a description per class such as "a photo of a {}, a type of pet." (averaged over the six datasets):
 
-| Embedder | 0-shot | 1-shot | 5-shot |
-|---|---|---|---|
-| CLIP ViT-B/32, images only | – | 84.5% | 96.3% |
-| CLIP ViT-B/32, images + "a photo of a {}, a type of pet" | 97.6% | 97.6–98.0% | 98.4–98.6% |
-| DINOv2 ViT-S/14, images only | – | 94.7% | 98.3% |
+| Embedder | 0 | 1 | 2 | 4 | 8 | 16 examples per class |
+|---|---|---|---|---|---|---|
+| PE Core L/14, 336 px (most accurate preset) | 80.3% | 83.3% | 85.9% | 88.2% | 90.6% | 92.3% |
+| SigLIP 2 L/16, 256 px | 77.7% | 81.1% | 83.8% | 86.8% | 89.3% | 91.0% |
+| PE Core B/16 (default) | 75.5% | 78.3% | 80.9% | 83.3% | 86.3% | 88.6% |
+| SigLIP 2 B/16, 256 px | 73.0% | 76.7% | 79.6% | 83.2% | 86.6% | 88.5% |
+| CLIP ViT-B/32 LAION-2B (previous default) | 60.5% | 66.7% | 70.0% | 73.9% | 77.5% | 79.8% |
 
-Use CLIP with descriptions when class names are meaningful words. Use DINOv2 when they aren't (part numbers, defect codes, individual identities), since it is stronger on images alone. Reproduce these numbers with `fewshot bench <folder> --embedder ... --shot 1 --shot 5 [--text-template ...]`.
+Images only, without descriptions:
+
+| Embedder | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| PE Core L/14, 336 px | 64.3% | 78.9% | 85.6% | 89.5% | 91.7% |
+| PE Core B/16 | 56.1% | 70.0% | 78.9% | 84.3% | 87.3% |
+| DINOv2 ViT-L/14 | 60.0% | 67.9% | 74.8% | 80.7% | 85.2% |
+| DINOv3 ViT-B/16 | 50.9% | 63.9% | 73.4% | 80.3% | 84.1% |
+| DINOv2 ViT-S/14 | 54.6% | 65.3% | 72.5% | 79.2% | 83.5% |
+| CLIP ViT-B/32 | 48.0% | 60.4% | 69.3% | 75.6% | 78.9% |
+
+On these datasets the text-capable models beat DINOv2 and DINOv3 even on images alone, so prefer PE Core whether or not your classes have meaningful names; DINOv2 may still suit images unlike web photos (try both with "Compare models"). Descriptions help most at few examples (zero-shot PE Core B/16 is 75.5%); naming the kind of thing ("…, a type of flower") is worth about 2 points over "a photo of a {}" at 0–1 examples, while generic prompt ensembles did not help. Averaging each image with its mirror image (`flip`) added under a point, and combining two models' predictions (PE Core L with SigLIP 2 L) about one point at twice the embedding cost. Embedding speed on an RTX 5070: about 300 images/s for the B/16 models, 70 for PE Core L/14-336. Run the same protocol on your own folder of `<class>/<image>` with `fewshot bench <folder> --way 0 --query 50 --episodes 3 --shot 1 --shot 16 --embedder ... [--text-template ...]` (`--way 0` uses every class; the default is 5-way episodes).
 
 To choose a model for your own task, compare embedders on its labelled examples: "Compare models" on the Evaluate tab, `fewshot compare TASK -e timm:vit_small_patch14_dinov2.lvd142m` (or `--presets` for all of them), or `POST .../compare/jobs` with `{"embedders": [...]}` (a background job, like evaluation). Each model is cross-validated with the task's other settings, and the results give accuracy, macro-F1 and the time taken (images already in the embedding cache are fast, so the first run of a model is slower). A model that can't be loaded is reported and the others still run. Switch with "Use this model" or `fewshot config TASK --embedder ...`; nothing changes until you do. Switching clears the temperature and reject thresholds (the task's and each class's), which were fitted to the old model's scores; evaluate again for new suggestions, or undo the switch to get them back. Changing only thresholds keeps the last evaluation current, since evaluation doesn't depend on them.
 
 ## CLI
 
 ```bash
-fewshot create pets --embedder openclip:ViT-B-32@laion2b_s34b_b79k
+fewshot create pets --embedder openclip:PE-Core-B-16@meta
 fewshot import pets ./photos --shots 5        # ./photos/<class>/<image>
 fewshot add pets Beagle a.jpg b.jpg
 fewshot class describe pets "a photo of a {}, a type of pet"

@@ -815,7 +815,7 @@ def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | Non
                       **opts)
     except ValueError as err:
         _fail(str(err))
-    return (f"{e:42} {c:9} {opts['way']}-way {s}-shot{' +text' if tt else '      '}  "
+    return (f"{e:42} {c:9} {r['way']}-way {s}-shot{' +text' if tt else '      '}  "
             f"acc {r['accuracy']:.3f} ± {r['ci95']:.3f}")
 
 
@@ -824,7 +824,7 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     folder: Path,
     embedder: list[str] = typer.Option(None, help="Embedder spec(s) to compare [default: CLIP ViT-B/32]"),
     classifier: list[str] = typer.Option(["gda"], help="Classifier(s) to compare"),
-    way: int = typer.Option(5, min=2),
+    way: int = typer.Option(5, min=0, help="Classes per episode; 0 for every class with enough images"),
     shot: list[int] = typer.Option([1, 5], min=0, help="Shot count(s)"),
     query: int = typer.Option(15, min=1),
     episodes: int = typer.Option(200, min=1),

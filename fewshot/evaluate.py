@@ -495,14 +495,17 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     ``shot=0`` with a ``text_template`` such as ``"a photo of a {}"`` measures
     CLIP zero-shot accuracy. ``flip`` averages each image with its mirror image.
     """
-    for arg, value, low in (("way", way, 2), ("shot", shot, 0), ("query", query, 1), ("episodes", episodes, 1)):
+    for arg, value, low in (("shot", shot, 0), ("query", query, 1), ("episodes", episodes, 1)):
         if value < low:
             raise ValueError(f"{arg} must be at least {low}, got {value}")
+    if way == 1 or way < 0:
+        raise ValueError(f"way must be at least 2, or 0 for every class; got {way}")
     if shot == 0 and not text_template:  # checked before embedding the whole dataset
         raise ValueError("shot=0 (zero-shot) needs a text_template such as 'a photo of a {}'")
     ds = {c: fs for c, fs in load_folder_dataset(folder).items() if len(fs) >= shot + query}
-    if len(ds) < way:
-        raise ValueError(f"Only {len(ds)} classes have >= {shot + query} images; need {way}")
+    way = way or len(ds)  # 0: every class with enough images
+    if len(ds) < max(way, 2):
+        raise ValueError(f"Only {len(ds)} classes have >= {shot + query} images; need {max(way, 2)}")
     sampler = _EpisodeSampler.embed(pipe, ds, embedder, text_template, progress, flip)
 
     rng = np.random.default_rng(seed)
