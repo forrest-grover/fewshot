@@ -327,8 +327,10 @@ def test_cross_site_reads_are_refused_but_images(client):
     for site in ("cross-site", "same-site"):
         r = client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": site})
         assert r.status_code == 403, site
-        assert r.json()["detail"] == f"Cross-site request refused: the browser sent it from another site (Sec-Fetch-Site: {site})"
-    assert client.get(f"/api/tasks/{task}/examples/{eid}/image", headers={"Sec-Fetch-Site": "cross-site"}).status_code == 200
+        assert r.json()["detail"] == ("Cross-site request refused: the browser sent it from another site "
+                                      f"(Sec-Fetch-Site: {site})")
+    image = f"/api/tasks/{task}/examples/{eid}/image"
+    assert client.get(image, headers={"Sec-Fetch-Site": "cross-site"}).status_code == 200
     assert client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
     assert client.get(f"/api/tasks/{task}/inbox", headers={"Sec-Fetch-Site": "none"}).status_code == 200
     assert client.get(f"/api/tasks/{task}/inbox").status_code == 200
@@ -364,4 +366,5 @@ def test_schema_declares_the_access_errors(client):
     paths = client.get("/openapi.json").json()["paths"]
     for op in (paths["/api/tasks"]["post"], paths["/api/tasks/{name}/examples"]["post"]):
         assert {"401", "403", "413", "429"} <= set(op["responses"]), op["operationId"]
-        assert op["responses"]["403"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/Problem"}
+        schema = op["responses"]["403"]["content"]["application/json"]["schema"]
+        assert schema == {"$ref": "#/components/schemas/Problem"}

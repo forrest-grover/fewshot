@@ -24,6 +24,18 @@ def test_compose_publishes_on_this_machine_and_images_are_pinned():
     assert bases == ["node:22-bookworm-slim", "python:3.12-slim-bookworm"]
 
 
+def test_compose_runs_the_server_locked_down():
+    """docker-compose.yml runs the container read-only (the server writes to its volumes and /tmp
+    only), without capabilities or a way to gain privileges; CI runs the image the same way."""
+    root = Path(__file__).resolve().parent.parent
+    compose = (root / "docker-compose.yml").read_text()
+    for line in ("read_only: true", 'tmpfs: ["/tmp:size=2g,mode=1777"]', "cap_drop: [ALL]",
+                 'security_opt: ["no-new-privileges:true"]'):
+        assert f"    {line}\n" in compose, line
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+    assert "--read-only --tmpfs /tmp:size=2g,mode=1777 --cap-drop ALL --security-opt no-new-privileges:true" in ci
+
+
 def test_constraints_pin_every_dependency():
     """constraints.txt pins each dependency pyproject.toml declares (extras too) to one exact version,
     without local labels (so the CPU and CUDA builds of torch both match) or CUDA-only packages;

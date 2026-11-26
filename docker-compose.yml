@@ -18,6 +18,12 @@ services:
     volumes:
       - fewshot-data:/data      # tasks, images and the embedding cache
       - fewshot-models:/models  # downloaded model weights
+    # The server writes only to its volumes and to /tmp (uploads larger than 1 MB are spooled
+    # there while they are stored, so give it room for the largest upload, FEWSHOT_MAX_REQUEST_MB).
+    read_only: true
+    tmpfs: ["/tmp:size=2g,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
 volumes:
   fewshot-data:

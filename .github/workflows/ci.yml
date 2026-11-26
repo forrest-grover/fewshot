@@ -155,7 +155,10 @@ jobs:
       - name: Run the image; /healthz answers and / serves the UI
         run: |
           # FEWSHOT_WARM=0: no model download at startup
-          docker run -d --name fewshot -p 127.0.0.1:8000:8000 -e FEWSHOT_TOKEN="$(openssl rand -hex 16)" -e FEWSHOT_WARM=0 fewshot:ci
+          # Locked down as docker-compose.yml runs it: read-only but for the volumes and /tmp, no capabilities.
+          docker run -d --name fewshot -p 127.0.0.1:8000:8000 -e FEWSHOT_TOKEN="$(openssl rand -hex 16)" -e FEWSHOT_WARM=0 \
+            --read-only --tmpfs /tmp:size=2g,mode=1777 --cap-drop ALL --security-opt no-new-privileges:true \
+            -v fewshot-data:/data -v fewshot-models:/models fewshot:ci
           for _ in $(seq 60); do
             if curl -fsS http://127.0.0.1:8000/healthz; then break; fi
             sleep 2
@@ -167,6 +170,16 @@ jobs:
           asset=$(grep -o '/assets/[^"]*\.js' index.html | head -1)
           curl -fsS -o /dev/null "http://127.0.0.1:8000${asset}"
           test "$(docker inspect -f '{{.Config.User}}' fewshot)" = fewshot
+      - name: Without a token, the image refuses requests from outside the container
+        run: |
+          docker run -d --name fewshot-open -p 127.0.0.1:8001:8000 -e FEWSHOT_WARM=0 fewshot:ci
+          for _ in $(seq 60); do
+            if curl -fsS http://127.0.0.1:8001/healthz; then break; fi
+            sleep 2
+          done
+          echo
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8001/api/tasks)" = 403
+          docker exec fewshot-open python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/tasks', timeout=4)"
       - name: Server log
         if: always()
         run: docker logs fewshot || true
