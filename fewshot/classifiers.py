@@ -482,10 +482,10 @@ class GDAClassifier(Classifier):
         lam = self.text_weight * self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None, X)
         loo.pull_towards(anchors, lam)
         self._set_means(loo.mu, loo.prec)
-        stand_in = anchors.copy()
-        if (lam > 0).any():  # a class whose only image is left out is represented by its anchor
-            # alone, shortened to the class means' length: a longer mean would be penalised for it
-            stand_in[lam > 0] *= float(np.linalg.norm(loo.mu[lam > 0], axis=1).mean())
+        # A class whose only image is left out is represented by its anchor alone, shortened to
+        # the class means' length (whether or not the text pulls them): a longer mean would be
+        # penalised for it.
+        stand_in = anchors * float(np.linalg.norm(loo.mu[imgs > 0], axis=1).mean())
         zt, keep = self._text_scores(X, y, raw_mu, imgs)
         W, b = _fitted(self.W), _fitted(self.b)
         self.weight, self.logit_scale = _fusion(

@@ -522,3 +522,24 @@ def test_gda_prior_with_two_classes(monkeypatch):
     two = _noisy_task(0.3, seed=8, C=2, k=1)
     GDAClassifier().fit(two)
     assert (seen[-1] == 0).all()
+
+
+def test_gda_stand_in_anchors_are_shortened_without_the_pull(monkeypatch):
+    """A class whose only image is left out is represented by its anchor, shortened to the class
+    means' length, also when the text doesn't pull the means (here shuffled descriptions)."""
+    seen, lengths = _prior_strengths(monkeypatch), []
+    real = classifiers._GDALeaveOneOut.scores  # pylint: disable=protected-access
+
+    def spy(self, W, b, anchors=None, exact=True):
+        lengths.append((np.linalg.norm(anchors, axis=1), np.linalg.norm(self.mu, axis=1).mean()))
+        return real(self, W, b, anchors, exact)
+
+    monkeypatch.setattr(classifiers._GDALeaveOneOut, "scores", spy)  # pylint: disable=protected-access
+    data = _noisy_task(0.3, k=3)
+    order = np.roll(np.arange(len(data.classes)), 1)
+    shuffled = {i: data.text[int(j)] for i, j in enumerate(order)}
+    GDAClassifier().fit(ClassData(data.classes, data.X[2:], data.y[2:], shuffled))  # class 0: one image
+    assert (seen[-1] == 0).all()
+    norms, mean = lengths[-1]
+    assert mean < 0.9
+    np.testing.assert_allclose(norms, mean, rtol=1e-6)
