@@ -578,13 +578,24 @@ def list_examples(srv: Srv, name: str, offset: int = Query(0, ge=0), limit: int 
 
 def _uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
     """The uploaded files, each read only when it is needed, so a big upload is never held in
-    memory whole; one over the upload limit carries an error instead of its bytes."""
+    memory whole; one over the upload limit carries an error instead of its bytes.
+
+    A file that can no longer be read (closed once the request was given up, as when the client
+    went away) stops the upload with a 400 and a log line: the batch being read isn't stored,
+    as it is stored only once read whole, while batches stored before it stay."""
     limit = srv.settings.max_upload_bytes
-    for f in files:
+    for i, f in enumerate(files):
         # Browsers (and fewshot.client) send a '"' in a file name as %22, per the HTML standard;
         # the multipart parser leaves it encoded.
         name = f.filename.replace("%22", '"') if f.filename else ""
-        data = f.file.read(limit + 1)
+        try:
+            data = f.file.read(limit + 1)
+        except (ValueError, OSError) as e:  # ValueError: read of a closed file
+            log.warning("Stopped an upload at file %d of %d (%s): it can't be read any more (%s), most likely as "
+                        "the client went away. Images of batches stored before it are kept.", i + 1, len(files),
+                        name, e)
+            raise HTTPException(400, f"The upload stopped at file {i + 1} of {len(files)} ({name}): it could no "
+                                     "longer be read; images before it may have been stored") from None
         if len(data) > limit:
             yield services.Blob(name, None, f"File is larger than the {limit / 1024 / 1024:g} MB upload limit")
         else:

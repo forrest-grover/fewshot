@@ -5,6 +5,7 @@ import io
 from typing import Any
 
 import pytest
+from fastapi import HTTPException, UploadFile
 from PIL import Image
 
 import fewshot.api
@@ -576,3 +577,20 @@ def test_images_are_served_only_as_images(tmp_path, monkeypatch):
         t._save()  # pylint: disable=protected-access
     r = c.get(f"/api/tasks/t/examples/{hid}/image")
     assert r.headers["content-type"] == "application/octet-stream"
+
+
+def test_an_upload_whose_files_are_closed_stops_cleanly(client, monkeypatch, caplog):
+    """If the request is abandoned while its upload is being stored (the client went away), the
+    files it was reading are closed: the upload stops with a 400 and a log line, the batch being
+    read isn't stored, and batches stored before stay."""
+    assert client.post("/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 201
+    monkeypatch.setattr(Task.add_examples, "__defaults__", (2, None))  # batches of 2 images
+    files = [UploadFile(io.BytesIO(png(RED, noise=10, seed=i)), filename=f"r{i}.png") for i in range(5)]
+    files[3].file.close()
+    with pytest.raises(HTTPException) as e:
+        fewshot.api._add_examples(client.srv, "t", "red", fewshot.api._uploads(client.srv, files))  # pylint: disable=protected-access
+    assert (e.value.status_code, e.value.detail) == (
+        400, "The upload stopped at file 4 of 5 (r3.png): it could no longer be read; images before it may have "
+             "been stored")
+    assert len(client.get("/api/tasks/t").json()["examples"]) == 2  # the first batch; not r2.png's
+    assert any("Stopped an upload at file 4 of 5 (r3.png)" in r.getMessage() for r in caplog.records)
