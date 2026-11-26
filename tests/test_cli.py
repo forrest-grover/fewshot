@@ -218,7 +218,7 @@ def test_config_errors(run, root, task, args, message):
 
 def test_a_task_deleted_meanwhile_is_an_error_not_a_traceback(run, root, task, photos, monkeypatch):
     """A task another process deletes between looking it up and changing it gives an error."""
-    real_get = cli_common.Workspace.get
+    real_get = Workspace.get
 
     def get_then_lose(ws, name):
         t = real_get(ws, name)
@@ -227,7 +227,7 @@ def test_a_task_deleted_meanwhile_is_an_error_not_a_traceback(run, root, task, p
 
     eid = load(root).config.examples[0].id
     waiting = png((90, 90, 90))
-    monkeypatch.setattr(cli_common.Workspace, "get", get_then_lose)
+    monkeypatch.setattr(Workspace, "get", get_then_lose)
     for args in (["delete", task, "--yes"], ["example", "rm", task, eid], ["example", "relabel", task, "x", eid],
                  ["example", "tag", task, eid, "--add", "x"], ["example", "note", task, eid, "n"],
                  ["inbox", "dismiss", task, image_id(waiting)], ["class", "add", task, "x"],
@@ -564,7 +564,8 @@ def test_serve(monkeypatch, tmp_path):
     _, srv, kw = served(monkeypatch, "--port", "9001")
     assert kw == {"host": "127.0.0.1", "port": 9001, "proxy_headers": True, "forwarded_allow_ips": "127.0.0.1"}
     assert srv.ws.root == Path(os.environ["FEWSHOT_HOME"]).resolve()
-    _, srv, kw = served(monkeypatch, "--host", "0.0.0.0", "--root", str(tmp_path), "--forwarded-allow-ips", "10.0.0.2")
+    _, srv, kw = served(monkeypatch, "--host", "0.0.0.0", "--root", str(tmp_path), "--forwarded-allow-ips", "10.0.0.2",
+                         "--no-token")
     assert (kw["host"], kw["port"], kw["forwarded_allow_ips"]) == ("0.0.0.0", 8000, "10.0.0.2")
     assert srv.ws.root == tmp_path.resolve()
 
@@ -576,8 +577,14 @@ def test_serve_settings(monkeypatch):
     r, srv, _ = served(monkeypatch)
     assert (srv.settings.token, srv.settings.allow_any_model, srv.settings.warm) == (None, False, True)
     assert "Warning" not in r.output
-    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--no-warm", "--allow-any-model")
-    assert "Warning: serving on 0.0.0.0 without --token" in r.output
+    monkeypatch.setattr("uvicorn.run", lambda *a, **kw: pytest.fail("started"))
+    r = CliRunner().invoke(cli.app, ["serve", "--host", "0.0.0.0"])
+    assert r.exit_code == 1
+    assert "This server has no token" in r.output
+    assert "(--token, --no-token)" in r.output
+    r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--no-warm", "--allow-any-model", "--no-token")
+    assert "Warning: serving on 0.0.0.0 without a token" in r.output
+    assert srv.allow_no_token
     assert (srv.settings.allow_any_model, srv.settings.warm) == (True, False)
     r, srv, _ = served(monkeypatch, "--host", "0.0.0.0", "--token", "t0ken-for-the-cli")
     assert "Warning" not in r.output
@@ -586,9 +593,11 @@ def test_serve_settings(monkeypatch):
     assert {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()} <= names
     assert "*" not in names
     assert "Answering requests by IP address or for: localhost" in r.output
-    assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "*")[1].settings.allowed_hosts == {"*"}
+    anyhost = served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "*", "--no-token")[1]
+    assert anyhost.settings.allowed_hosts == {"*"}
     assert served(monkeypatch)[1].settings.allowed_hosts == {"localhost", "127.0.0.1", "::1"}
     monkeypatch.setenv("FEWSHOT_ALLOWED_HOSTS", " box.lan, ,10.0.0.5")  # as in docker-compose.yml
+    monkeypatch.setenv("FEWSHOT_ALLOW_NO_TOKEN", "1")  # the variable says so too
     assert served(monkeypatch, "--host", "0.0.0.0")[1].settings.allowed_hosts == {"box.lan", "10.0.0.5"}
     # The option wins.
     assert served(monkeypatch, "--host", "0.0.0.0", "--allowed-host", "a.lan")[1].settings.allowed_hosts == {"a.lan"}

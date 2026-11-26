@@ -12,6 +12,10 @@ starts. An empty variable counts as unset.
     ``Bearer`` header or the session cookie /api/login sets. It must be one that can't be guessed
     online (see ``token_problem``): at least 16 characters, not just a few different ones
     repeated. ``openssl rand -hex 16`` makes a good one.
+``FEWSHOT_ALLOW_NO_TOKEN=1``
+    Serve other machines without a token. Without it, a server with no token answers only
+    requests that reach it on a loopback address, and ``fewshot serve`` refuses to listen on
+    another one (see ``access.exposure_problem``).
 ``FEWSHOT_ALLOW_ANY_MODEL=1``
     Let API callers choose any embedder spec. By default only presets, registered embedders and
     specs existing tasks already use are accepted, so a caller can't make the server download
@@ -147,6 +151,7 @@ class ServerSettings:  # pylint: disable=too-many-instance-attributes  # one fie
 
     home: Path | None = None  # None: FEWSHOT_HOME or ./fewshot_data, as for the library
     token: str | None = None
+    allow_no_token: bool = False
     allow_any_model: bool = False
     warm: bool = True
     allow_urls: bool = False
@@ -219,6 +224,7 @@ class ServerSettings:  # pylint: disable=too-many-instance-attributes  # one fie
         hosts = [h for h in env.get("FEWSHOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
         home = env.get("FEWSHOT_HOME", "").strip()
         return cls(home=Path(home) if home else None, token=token or None,
+                   allow_no_token=flag("FEWSHOT_ALLOW_NO_TOKEN", False),
                    allow_any_model=flag("FEWSHOT_ALLOW_ANY_MODEL", False), warm=flag("FEWSHOT_WARM", True),
                    allow_urls=flag("FEWSHOT_ALLOW_URLS", False),
                    allowed_hosts=frozenset(hosts) or default_hosts(served_host(env=env) if host is None else host),

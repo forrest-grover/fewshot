@@ -282,6 +282,8 @@ def test_settings_from_the_environment_are_checked():
     assert ServerSettings(token="  ").token is None
     assert ServerSettings.from_env({"FEWSHOT_TOKEN": " "}).token is None
     assert ServerSettings.from_env({"FEWSHOT_WARM": "", "FEWSHOT_ALLOW_URLS": " "}).warm  # empty: unset
+    assert ServerSettings.from_env({"FEWSHOT_ALLOW_NO_TOKEN": "1"}).allow_no_token
+    assert not ServerSettings.from_env({}).allow_no_token
 
 
 def test_tokens_that_could_be_guessed_are_refused():
