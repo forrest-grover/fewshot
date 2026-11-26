@@ -85,10 +85,9 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
 }
 
 const t = (name: string) => `/api/tasks/${encodeURIComponent(name)}`;
-/** The multipart fields of upload ``B`` besides its files. ``undo_group`` (uploads with the same
- * one become one undo step) is added by hand until the schema is regenerated from a server that
- * has it; the intersection stays correct once it is there too. */
-type UploadFields<B> = Omit<B, "files"> & { undo_group?: string | null };
+/** The multipart fields of upload ``B`` besides its files (``undo_group``: uploads with the same
+ * one become one undo step). */
+type UploadFields<B> = Omit<B, "files">;
 const files = (fs: File[], extra: Partial<Record<string, string | null>> = {}) => {
   const fd = new FormData();
   fs.forEach((f) => { fd.append("files", f); });
