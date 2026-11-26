@@ -152,6 +152,34 @@ def _token_ok(given: str | None) -> bool:
     return TOKEN is None or (given is not None and secrets.compare_digest(given.encode(), TOKEN.encode()))
 
 
+_failed_logins: dict[str, deque[float]] = {}  # client address -> times of recent wrong tokens
+_login_lock = threading.Lock()
+TOO_MANY_TOKENS = "Too many wrong tokens; try again in a minute"
+
+
+def _client(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+def _check_token(client: str, given: str | None) -> int | None:
+    """Check a token from ``client`` (at login, or with a request): None if right, 401 if wrong or
+    missing, 429 after LOGIN_FAILURES wrong tokens (a missing one doesn't count) from that client
+    within LOGIN_WINDOW seconds, right or not, so the token can't be guessed quickly anywhere."""
+    now = time.monotonic()
+    with _login_lock:
+        recent = _failed_logins.setdefault(client, deque())
+        while recent and now - recent[0] > LOGIN_WINDOW:
+            recent.popleft()
+        if len(recent) >= LOGIN_FAILURES:
+            return 429
+        if not _token_ok(given):
+            if given is not None:
+                recent.append(now)
+            return 401
+        _failed_logins.pop(client, None)
+    return None
+
+
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
@@ -167,7 +195,10 @@ async def _guard(request: Request, call_next: Any) -> Response:
     if TOKEN is not None and path.startswith("/api/") and path not in OPEN_PATHS:
         auth = request.headers.get("authorization", "")
         given = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get(AUTH_COOKIE)
-        if not _token_ok(given):
+        refused = _check_token(_client(request), given)
+        if refused == 429:
+            return JSONResponse({"detail": TOO_MANY_TOKENS}, 429)
+        if refused:
             return JSONResponse({"detail": "Not signed in"}, 401, headers={"WWW-Authenticate": "Bearer"})
     response: Response = await call_next(request)
     return response
@@ -265,29 +296,21 @@ def health() -> dict[str, Any]:
             "jobs_running": running, "url_fetch": ALLOW_URLS}
 
 
-_failed_logins: dict[str, deque[float]] = {}  # client address -> times of recent wrong tokens
-_login_lock = threading.Lock()
 
 
 @app.post("/api/login", status_code=204)
 def login(body: Login, request: Request, response: Response) -> None:
     """Check the server token and remember it in an HttpOnly cookie (30 days; Secure over HTTPS).
 
-    After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds, further
-    attempts get 429 until the window has passed, so the token can't be guessed quickly.
+    After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds (here or with
+    other requests), further attempts get 429 until the window has passed, so the token can't be
+    guessed quickly.
     """
-    client = request.client.host if request.client else "?"
-    now = time.monotonic()
-    with _login_lock:
-        recent = _failed_logins.setdefault(client, deque())
-        while recent and now - recent[0] > LOGIN_WINDOW:
-            recent.popleft()
-        if len(recent) >= LOGIN_FAILURES:
-            raise HTTPException(429, "Too many wrong tokens; try again in a minute")
-        if not _token_ok(body.token):
-            recent.append(now)
-            raise HTTPException(401, "Wrong token")
-        _failed_logins.pop(client, None)
+    refused = _check_token(_client(request), body.token)
+    if refused == 429:
+        raise HTTPException(429, TOO_MANY_TOKENS)
+    if refused:
+        raise HTTPException(401, "Wrong token")
     if TOKEN is not None:
         https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
         response.set_cookie(AUTH_COOKIE, TOKEN, max_age=30 * 86400, httponly=True, samesite="strict", secure=https)
@@ -858,8 +881,9 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
         raise HTTPException(400, f"folds must be at least 2, got {folds}")
     kind = "evaluate" if folds is None else f"evaluate:{folds}"
     running = jobs.running()
-    same = next((j for j in running if (j.task, j.kind) == (name, kind) and j.revision == t.config.revision), None)
-    if same is not None:  # the same evaluation is already running: share it
+    same = next((j for j in running if (j.task, j.kind) == (name, kind) and j.revision == t.config.revision
+                 and not j.cancel.is_set()), None)
+    if same is not None:  # the same evaluation is already running (and not stopping): share it
         return same.to_dict()
     job = Job(task=name, kind=kind, revision=t.config.revision)
     return _start(job, lambda progress: _evaluated(t, evaluate_task(pipe, t, folds, progress=progress)))

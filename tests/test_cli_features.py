@@ -244,3 +244,18 @@ def test_serve_size_limits(monkeypatch):
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
     CliRunner().invoke(cli.app, ["serve", "--max-upload-mb", "5", "--max-request-mb", "100.5"])
     assert (os.environ["FEWSHOT_MAX_UPLOAD_MB"], os.environ["FEWSHOT_MAX_REQUEST_MB"]) == ("5", "100.5")
+
+
+def test_serve_keeps_settings_from_the_environment(monkeypatch):
+    """Settings already in the environment (as in a container) stand unless an option is given."""
+    import uvicorn  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+    env = {"FEWSHOT_ALLOW_URLS": "1", "FEWSHOT_ALLOW_ANY_MODEL": "1", "FEWSHOT_WARM": "0",
+           "FEWSHOT_MAX_UPLOAD_MB": "5", "FEWSHOT_MAX_REQUEST_MB": "7"}
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert CliRunner().invoke(cli.app, ["serve"]).exit_code == 0
+    assert {k: os.environ[k] for k in env} == {**env, "FEWSHOT_WARM": ""}  # the API's "off"
+    assert CliRunner().invoke(cli.app, ["serve", "--warm", "--max-upload-mb", "9"]).exit_code == 0
+    assert (os.environ["FEWSHOT_WARM"], os.environ["FEWSHOT_MAX_UPLOAD_MB"]) == ("1", "9")

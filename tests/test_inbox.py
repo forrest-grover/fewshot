@@ -176,7 +176,10 @@ def test_cli(tmp_path):
     assert run("inbox", "accept", "t").exit_code == 1  # neither --label nor --min-confidence
     assert run("inbox", "accept", "t", "zzzz", "--label", "x").exit_code == 1
     assert run("inbox", "accept", "t", "--min-confidence", "1.0").output.strip() == "Nothing to accept"
-    assert "Labelled 2 inbox images; 0 left" in run("inbox", "accept", "t", "--min-confidence", "0.5").output
+    second = items[1]["id"][:8]  # with ids, only those are accepted
+    assert "Labelled 1 inbox images; 1 left" in run("inbox", "accept", "t", second, "--min-confidence", "0.5").output
+    assert second not in {x.id[:8] for x in Workspace(root).get("t").config.inbox}
+    assert "Labelled 1 inbox images; 0 left" in run("inbox", "accept", "t", "--min-confidence", "0.5").output
     run("inbox", "add", "t", tmp_path / "new" / "0.png")  # labelled already: refused
     run("inbox", "add", "t", tmp_path / "x.png")
     (tmp_path / "y.png").write_bytes(png(BLUE, noise=10, seed=3))
@@ -184,6 +187,17 @@ def test_cli(tmp_path):
     item = Workspace(root).get("t").config.inbox[0].id
     assert run("inbox", "dismiss", "t", item[:6]).output.strip() == "Dismissed 1 images; 0 left"
     assert run("inbox", "ls", "t", "--sort", "nope").exit_code == 1
+
+
+def test_chunked_inbox_add_is_one_undo_step_when_the_first_chunk_adds_nothing(ws):
+    """A first chunk of images already labelled saves nothing, so the next chunk keeps the version
+    before the call for undo: one undo takes back the add and not the change before it."""
+    t = _task(ws)
+    t.upsert_class("green", "a green thing")
+    t.add_to_inbox([(png(RED), ""), (png(BLUE), ""), (png(RED, noise=10), ""), (png(BLUE, noise=10), "")], chunk=2)
+    assert len(t.config.inbox) == 2
+    t.undo()
+    assert (t.config.inbox, t.class_names()) == ([], ["red", "blue", "green"])
 
 
 def test_inbox_edges(ws, monkeypatch):

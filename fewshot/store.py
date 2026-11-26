@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from .classifiers import CLASSIFIERS
 from .embedders import DEFAULT_SPEC
@@ -56,8 +57,8 @@ from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
 from .images import IMAGE_EXTS, image_ext, image_id
-from .inbox import TaskInbox
-from .settings import THRESHOLDS, check_settings, for_new_embedder
+from .inbox import TaskInbox, chunked, listed, plural
+from .settings import STORED_DEFAULTS, THRESHOLDS, check_settings, for_new_embedder, for_new_scoring
 from .text import check_class_name, check_tag, check_template, fill_template, prompts
 
 log = logging.getLogger(__name__)
@@ -127,7 +128,7 @@ def _read_config(path: Path) -> tuple[TaskConfig, FileStamp]:
         stamp = _stamp(os.fstat(f.fileno()))
         data = f.read()
     try:
-        cfg = TaskConfig.model_validate_json(data)
+        cfg = TaskConfig.stored(data)
     except ValidationError as e:
         err = e.errors()[0]
         where = ".".join(map(str, err["loc"]))
@@ -222,6 +223,18 @@ class TaskConfig(BaseModel):
     created: str = Field(default_factory=_now)
     revision: int = 0
     uid: str = Field(default_factory=lambda: uuid.uuid4().hex)  # tells a re-created task from the old one
+
+    @model_validator(mode="before")
+    @classmethod
+    def _stored_defaults(cls, data: Any, info: ValidationInfo) -> Any:
+        stored = info.context and info.context.get("stored") and isinstance(data, dict)
+        return {**STORED_DEFAULTS, **data} if stored else data
+
+    @classmethod
+    def stored(cls, data: bytes | str) -> TaskConfig:
+        """Parse a saved task.json (or a kept version or an export of one), reading settings it
+        predates as ``STORED_DEFAULTS``. Raises ``ValidationError``."""
+        return cls.model_validate_json(data, context={"stored": True})
 
     def files(self) -> set[str]:
         """Every image file this version uses: examples' and the inbox's."""
@@ -405,7 +418,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
         """Change embedder/classifier settings (see ``SETTINGS``); unknown keys raise ``ValueError``.
 
         Changing the embedder also clears the temperature and reject thresholds (task and per
-        class) fitted to the old one, unless given in ``kw``; returns the names of those cleared."""
+        class) fitted to the old one, and changing a ``settings.SCORING`` setting the temperature,
+        unless given in ``kw``; returns the names of those cleared. Changing nothing saves nothing."""
         bad = set(kw) - SETTINGS
         if bad:
             raise ValueError(f"Unknown settings: {sorted(bad)}")
@@ -416,7 +430,10 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
                 err = e.errors()[0]
                 raise ValueError(f"{'.'.join(map(str, err['loc']))}: {err['msg']}") from None
             check_settings(new)
+            if all(getattr(new, k) == getattr(self.config, k) for k in kw):
+                return []
             cleared = for_new_embedder(self.config, keep=kw) if new.embedder != self.config.embedder else []
+            cleared = for_new_scoring(self.config, new, keep=kw) + cleared
             for k in kw:
                 setattr(self.config, k, getattr(new, k))
             before = self.config.revision
@@ -536,19 +553,17 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
         a generator, and only one chunk of image bytes is held at a time.
         """
         results: list[Example | ValueError] = []
-        batch: list[tuple[bytes, str, str]] = []
-        for item in items:
-            batch.append(item)
-            if len(batch) >= chunk:
-                results += self._add_batch(batch, record=not results)
-                batch = []
-        if batch:
-            results += self._add_batch(batch, record=not results)
+        recorded = False
+        for batch in chunked(items, chunk):
+            part = self._add_batch(batch, record=not recorded)
+            results += part
+            recorded = recorded or any(not isinstance(r, ValueError) for r in part)
         return results
 
     def _add_batch(self, batch: list[tuple[bytes, str, str]], record: bool = True) -> list[Example | ValueError]:
-        """Add one chunk. Only the first chunk of an ``add_examples`` call keeps the version before
-        it for undo (``record``), so one undo takes back the whole call."""
+        """Add one chunk (saving unless every item failed). Only the first chunk of an
+        ``add_examples`` call that saves keeps the version before it for undo (``record``), so one
+        undo takes back the whole call."""
         checked = [_check_item(*item) for item in batch]  # decoding happens here, before locking
         out: list[Example | ValueError] = []
         created: list[str] = []
@@ -575,8 +590,9 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
                     at[c.id] = len(examples)
                     examples.append(ex)
                 out.append(ex)
-            if any(not isinstance(r, ValueError) for r in out):
-                self._save_new(created, record, _add_label(out))
+            added = [r.label for r in out if not isinstance(r, ValueError)]
+            if added:
+                self._save_new(created, record, f"add {_n(len(added))} to {listed(added)}")
         return out
 
     def _save_new(self, created: list[str], record: bool, label: str) -> None:
@@ -815,6 +831,9 @@ class Workspace:
         """
         with self._lock:
             t = self._tasks.get(name)
+            if t is not None and t.path.name != name:  # renamed since (a rename racing this one)
+                del self._tasks[name]
+                t = None
             if t is None:
                 if not NAME_RE.fullmatch(name):
                     raise KeyError(f"No task {name!r}")
@@ -888,13 +907,16 @@ class Workspace:
 
     def duplicate(self, name: str, new: str, examples: bool = True, inbox: bool = False) -> Task:
         """A copy of task ``name`` as ``new``, with its settings and classes, and its examples and
-        inbox if asked; images are shared through the image store, the history starts empty."""
+        inbox if asked; images are shared through the image store, the history starts empty. An
+        image file missing from the task (only if it was damaged) is left out with its example,
+        as ``export_task`` does."""
         src = self.get(name)
         with src._writing():  # pylint: disable=protected-access  # a consistent copy, not one mid-change
             cfg = src.config
             copy_cfg = cfg.model_copy(update={
                 "name": new, "uid": uuid.uuid4().hex, "revision": 0, "created": _now(),
-                "examples": list(cfg.examples) if examples else [], "inbox": list(cfg.inbox) if inbox else []})
+                "examples": [e for e in cfg.examples if examples and (src.path / e.file).is_file()],
+                "inbox": [x for x in cfg.inbox if inbox and (src.path / x.file).is_file()]})
             p = self._reserve(new)
             try:
                 (p / "images").mkdir()
@@ -916,6 +938,8 @@ class Workspace:
         if new == old:
             return t
         with t._writing():  # pylint: disable=protected-access  # the workspace owns its tasks' folders
+            if t.path.name != old:  # a concurrent rename got there first
+                raise KeyError(f"No task {old!r}")
             dest = self._reserve(new)
             src = t.path
             try:
@@ -971,13 +995,4 @@ def _abandoned(folder: Path) -> bool:
     return age > STALE_SECONDS and (folder.name.startswith(".") or not (folder / "task.json").exists())
 
 
-def _n(count: int) -> str:
-    """ "1 example", "3 examples"."""
-    return f"{count} example{'' if count == 1 else 's'}"
-
-
-def _add_label(results: list[Example | ValueError]) -> str:
-    """Undo description of an add: "add 3 examples to red" (classes listed, at most three)."""
-    labels = list(dict.fromkeys(r.label for r in results if isinstance(r, Example)))
-    where = ", ".join(labels[:3]) + (", ..." if len(labels) > 3 else "")
-    return f"add {_n(sum(isinstance(r, Example) for r in results))} to {where}"
+_n = functools.partial(plural, what="example")  # "1 example", "3 examples"

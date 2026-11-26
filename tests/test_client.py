@@ -107,3 +107,23 @@ def test_client_sends_many_images_in_batches(server, monkeypatch):
     with pytest.raises(ValueError, match="No images given"):
         fs.add_to_inbox("batched", [])
     fs.delete_task("batched")
+
+
+def test_a_refused_batch_doesnt_lose_the_others(server, monkeypatch):
+    """A batch the server refuses (nothing in it could be added) becomes an error; only if every
+    batch is refused does the call raise, and other errors still raise at once."""
+    monkeypatch.setattr("fewshot.client.BATCH", 2)
+    fs = Client(server, token="secret")
+    fs.create_task("refused", embedder="fake:color")
+    bad = [("x.png", b"junk"), ("y.png", b"junk")]
+    r = fs.add_examples("refused", "red", [*bad, ("r.png", png(RED))])
+    assert (len(r["added"]), r["errors"][0]["file"], len(r["task"]["examples"])) == (1, None, 1)
+    assert "No images added" in r["errors"][0]["error"]
+    r = fs.add_to_inbox("refused", [("r.png", png(RED)), ("r2.png", png(RED)), ("u.png", png(BLUE))])
+    assert (len(r["added"]), len(r["errors"])) == (1, 1)  # the first batch is all examples already
+    with pytest.raises(ApiError) as e:
+        fs.add_examples("refused", "red", [*bad, *bad])
+    assert e.value.status == 400
+    with pytest.raises(ApiError) as e:
+        fs.add_examples("nope", "red", bad)
+    assert e.value.status == 404

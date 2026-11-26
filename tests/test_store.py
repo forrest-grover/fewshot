@@ -468,6 +468,16 @@ def test_add_examples_in_chunks(ws, monkeypatch):
     assert len(saves) == 3  # nothing added: no save
 
 
+def test_chunked_add_is_one_undo_step_when_the_first_chunk_adds_nothing(ws):
+    """The first chunk that saves keeps the version before the call, even if earlier chunks failed:
+    one undo takes back the add and nothing before it."""
+    t = ws.create("t")
+    t.upsert_class("keep")
+    t.add_examples([(b"junk", "a", ""), (b"junk2", "a", ""), (png(RED), "a", ""), (png(GREEN), "a", "")], chunk=2)
+    t.undo()
+    assert (t.class_names(), t.config.examples) == (["keep"], [])
+
+
 def test_add_examples_from_dir_raises_after_adding_the_rest(ws, tmp_path):
     """An unreadable image in an imported folder is raised once the readable ones are in."""
     src = tmp_path / "src"

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import http.client
 import ipaddress
 import socket
-import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,30 +69,79 @@ def _pin(conn: http.client.HTTPConnection) -> None:
     conn._create_connection = connect  # type: ignore[attr-defined]  # pylint: disable=protected-access
 
 
-class _PinnedHTTP(http.client.HTTPConnection):
-    """An HTTP connection to the checked public address of its host."""
+class _Deadline:
+    """Shuts down every socket of a download once its time is up, so a server trickling headers
+    or body can't hold the caller: blocked reads return at once, whatever phase they are in."""
+
+    def __init__(self, seconds: float) -> None:
+        self.expired = False
+        self._socks: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+
+    def __enter__(self) -> _Deadline:
+        self._timer.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._timer.cancel()
+
+    def watch(self, sock: socket.socket) -> None:
+        """Shut ``sock`` down at the deadline (at once if it has passed)."""
+        with self._lock:
+            self._socks.append(sock)
+            if self.expired:
+                self._shut(sock)
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            for sock in self._socks:
+                self._shut(sock)
+
+    @staticmethod
+    def _shut(sock: socket.socket) -> None:
+        # socket.socket's own shutdown: ssl.SSLSocket's drops its TLS state under a concurrent read.
+        with contextlib.suppress(OSError):
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+class _TimedConnection(http.client.HTTPConnection):
+    """A connection whose socket the download's ``_Deadline`` shuts down; with ``public`` it goes
+    to the checked public address of its host."""
+
+    def __init__(self, *args: Any, deadline: _Deadline, public: bool, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline, self._public = deadline, public
 
     def connect(self) -> None:
-        _pin(self)
+        if self._public:
+            _pin(self)
         super().connect()
+        self._deadline.watch(self.sock)
 
 
-class _PinnedHTTPS(http.client.HTTPSConnection):
-    """An HTTPS connection to the checked public address of its host."""
-
-    def connect(self) -> None:
-        _pin(self)
-        super().connect()
+class _TimedHTTPS(_TimedConnection, http.client.HTTPSConnection):
+    """The HTTPS kind of ``_TimedConnection``."""
 
 
-class _PublicHTTPHandler(urllib.request.HTTPHandler):
+class _TimedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline: _Deadline, public: bool) -> None:
+        super().__init__()
+        self._conn = functools.partial(_TimedConnection, deadline=deadline, public=public)
+
     def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        return self.do_open(_PinnedHTTP, req)
+        return self.do_open(self._conn, req)
 
 
-class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+class _TimedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline: _Deadline, public: bool) -> None:
+        super().__init__()
+        self._conn = functools.partial(_TimedHTTPS, deadline=deadline, public=public)
+
     def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        return self.do_open(_PinnedHTTPS, req)
+        return self.do_open(self._conn, req, context=self._context)  # type: ignore[attr-defined]
 
 
 class _HTTPRedirectOnly(urllib.request.HTTPRedirectHandler):
@@ -110,31 +161,33 @@ CHUNK = 64 * 1024
 
 def fetch_url(url: str, max_bytes: int, timeout: float = 20.0, public_only: bool = False) -> bytes:
     """The body at ``url``; raises ``ValueError`` for a bad URL, an HTTP or network error, or a
-    body over ``max_bytes`` (read no further). ``timeout`` bounds the whole download, not just
+    body over ``max_bytes`` (read no further). ``timeout`` bounds the whole download (headers too), not just
     each read, so a server sending a byte at a time can't hold the caller. Redirects are followed
     to http(s) URLs only. With ``public_only``, every connection (redirects too) goes to a public
     address, the very one that was checked, and no proxy is used."""
     if not is_url(url):
         raise ValueError(f"Not an http(s) URL: {url}")
-    deadline = time.monotonic() + timeout
     handlers: list[urllib.request.BaseHandler] = [_HTTPRedirectOnly()]
     if public_only:
         check_public(url)
-        handlers += [urllib.request.ProxyHandler({}), _PublicHTTPHandler(), _PublicHTTPSHandler()]
-    opener = urllib.request.build_opener(*handlers)
+        handlers.append(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            data = bytearray()
-            while len(data) <= max_bytes and (chunk := resp.read1(CHUNK)):
-                data += chunk
-                if time.monotonic() > deadline:
-                    raise ValueError(f"Could not fetch {url}: took longer than {timeout:g} s")
-    except urllib.error.HTTPError as e:
-        raise ValueError(f"Could not fetch {url}: HTTP {e.code} {e.reason}") from None
-    except (urllib.error.URLError, OSError) as e:
-        reason = getattr(e, "reason", e)
-        raise ValueError(f"Could not fetch {url}: {reason}") from None
+    with _Deadline(timeout) as deadline:
+        handlers += [_TimedHTTPHandler(deadline, public_only), _TimedHTTPSHandler(deadline, public_only)]
+        try:
+            with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
+                data = bytearray()
+                while len(data) <= max_bytes and (chunk := resp.read1(CHUNK)):
+                    data += chunk
+        except urllib.error.HTTPError as e:
+            raise ValueError(f"Could not fetch {url}: HTTP {e.code} {e.reason}") from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            if deadline.expired:
+                raise ValueError(f"Could not fetch {url}: took longer than {timeout:g} s") from None
+            reason = getattr(e, "reason", e)
+            raise ValueError(f"Could not fetch {url}: {reason}") from None
+    if deadline.expired:  # the shut-down socket ended the body early
+        raise ValueError(f"Could not fetch {url}: took longer than {timeout:g} s")
     if len(data) > max_bytes:
         raise ValueError(f"{url} is larger than the {max_bytes / 1024 / 1024:g} MB limit")
     return bytes(data)

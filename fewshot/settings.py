@@ -11,6 +11,9 @@ if TYPE_CHECKING:
     from .store import TaskConfig
 
 THRESHOLDS = {"reject_below", "reject_below_zero_shot"}  # settings evaluation results don't depend on
+# Settings added later, as read from a task saved before them: what keeps its old behaviour (new
+# tasks get the field's default instead).
+STORED_DEFAULTS = {"names_as_text": False}
 MODEL_FITTED = ("temperature", "reject_below", "reject_below_zero_shot")  # on one embedder's score scale
 
 
@@ -25,6 +28,19 @@ def for_new_embedder(cfg: TaskConfig, keep: Collection[str] = ()) -> list[str]:
         cfg.classes = [c.model_copy(update={"reject_below": None}) for c in cfg.classes]
         cleared.append("class thresholds")
     return cleared
+
+
+# Settings that change a task's confidences, so a temperature fitted under the old ones is stale.
+SCORING = ("classifier", "classifier_params", "text_weight", "names_as_text")
+
+
+def for_new_scoring(cfg: TaskConfig, new: TaskConfig, keep: Collection[str] = ()) -> list[str]:
+    """Clear, in place, ``cfg``'s fitted temperature (unless in ``keep``) if ``new`` changes a
+    ``SCORING`` setting: it calibrated the old confidences. Returns ``["temperature"]`` if cleared."""
+    if "temperature" in keep or cfg.temperature is None or all(getattr(cfg, k) == getattr(new, k) for k in SCORING):
+        return []
+    cfg.temperature = None
+    return ["temperature"]
 
 
 def check_settings(cfg: TaskConfig) -> None:

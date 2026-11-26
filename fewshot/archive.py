@@ -123,7 +123,7 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
     except KeyError:
         raise ValueError("Not a task export: no task.json") from None
     try:
-        cfg = TaskConfig.model_validate_json(_read_member(z, info, MAX_IMPORT_CONFIG))
+        cfg = TaskConfig.stored(_read_member(z, info, MAX_IMPORT_CONFIG))
     except ValidationError as err_:
         err = err_.errors()[0]
         raise ValueError(f"task.json is invalid: {'.'.join(map(str, err['loc']))}: {err['msg']}") from None

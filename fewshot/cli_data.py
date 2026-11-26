@@ -160,21 +160,25 @@ def inbox_ls(
 @inbox_app.command("accept")
 def inbox_accept(
     name: str,
-    ids: list[str] = typer.Argument(None, help="Inbox ids to label as --label"),
+    ids: list[str] = typer.Argument(None, help="Inbox ids to label as --label (or to choose from)"),
     label: str | None = typer.Option(None, help="Class for the given ids"),
     min_confidence: float | None = typer.Option(
-        None, min=0, max=1, help="Instead, accept every suggestion at least this confident (not rejected)"),
+        None, min=0, max=1, help="Instead, accept every suggestion (of the given ids, if any) at least this "
+                                 "confident (not rejected)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Label inbox images as examples: the given ids as --label, or every suggestion above --min-confidence."""
+    """Label inbox images as examples: the given ids as --label, or every suggestion (of the given ids,
+    if any) above --min-confidence."""
     t = get_task(root, name)
     if (min_confidence is None) == (label is None) or (label is not None and not ids):
-        fail("Give ids with --label, or --min-confidence alone")
+        fail("Give ids with --label, or --min-confidence (with or without ids)")
     if label is not None:
         labels = dict.fromkeys(_inbox_ids(t, ids or []), label)
     else:
+        wanted = set(_inbox_ids(t, ids)) if ids else None
         items = make_pipeline(workspace(root)).inbox_suggestions(t, "confident")
         labels = {i["id"]: i["prediction"]["label"] for i in items if i.get("prediction")
+                  and (wanted is None or i["id"] in wanted)
                   and not i["prediction"]["rejected"] and i["prediction"]["confidence"] >= (min_confidence or 0)}
     if not labels:
         typer.echo("Nothing to accept")

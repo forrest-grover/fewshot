@@ -104,22 +104,34 @@ class Client:
 
     # ---- data ----------------------------------------------------------
     def add_examples(self, task: str, label: str, images: Iterable[Image]) -> dict[str, Any]:
-        """Add labelled examples (the class is created if needed). Raises ``ApiError`` (400) if a
-        batch has no image that could be added; earlier batches stay added."""
+        """Add labelled examples (the class is created if needed). Images that can't be added are
+        listed in ``errors``, with the reason for a whole batch the server refused (``file`` None);
+        raises ``ApiError`` (400) if no image at all could be added."""
         return self._upload(f"/tasks/{_seg(task)}/examples", images, {"label": label})
 
     def add_to_inbox(self, task: str, images: Iterable[Image]) -> dict[str, Any]:
-        """Add unlabelled images to the task's inbox."""
+        """Add unlabelled images to the task's inbox; errors are reported as by ``add_examples``,
+        and ``ApiError`` (400) is raised if no image could be added (e.g. all are examples already)."""
         return self._upload(f"/tasks/{_seg(task)}/inbox", images, {})
 
     def _upload(self, path: str, images: Iterable[Image], fields: dict[str, str]) -> dict[str, Any]:
-        """POST ``images`` a batch at a time; ``added`` and ``errors`` are combined, ``task`` is the last."""
+        """POST ``images`` a batch at a time; ``added`` and ``errors`` are combined, ``task`` is the
+        last. A batch refused with 400 (nothing in it added) adds its reason to ``errors``; if every
+        batch was refused, the first refusal is raised."""
         out: dict[str, Any] = {"added": [], "errors": [], "task": None}
+        refused: ApiError | None = None
         for batch in _batches(images):
-            r = self.request("POST", path, fields=fields, files=batch)
+            try:
+                r = self.request("POST", path, fields=fields, files=batch)
+            except ApiError as e:
+                if e.status != 400:
+                    raise
+                refused = refused or e
+                out["errors"] = out["errors"] + [{"file": None, "error": str(e.detail)}]
+                continue
             out = {"added": out["added"] + r["added"], "errors": out["errors"] + r["errors"], "task": r["task"]}
         if out["task"] is None:
-            raise ValueError("No images given")
+            raise refused or ValueError("No images given")
         return out
 
     def inbox(self, task: str, sort: str = "uncertain") -> dict[str, Any]:

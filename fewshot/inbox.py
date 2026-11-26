@@ -9,8 +9,8 @@ Labelling one moves it to the examples; the model's suggestions for the inbox co
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING
+from collections.abc import Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, TypeVar
 
 from .images import image_ext, image_id
 from .text import check_class_name
@@ -21,7 +21,29 @@ if TYPE_CHECKING:
 INBOX_CHUNK = 256  # images stored per save while adding
 
 
-def _n(count: int, what: str = "image") -> str:
+T = TypeVar("T")
+
+
+def chunked(items: Iterable[T], size: int) -> Iterator[list[T]]:
+    """``items`` in lists of ``size`` (the last may be shorter), holding one list at a time."""
+    batch: list[T] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def listed(names: Iterable[str]) -> str:
+    """The distinct ``names`` in order, at most three: "red, blue, green, ..."."""
+    unique = list(dict.fromkeys(names))
+    return ", ".join(unique[:3]) + (", ..." if len(unique) > 3 else "")
+
+
+def plural(count: int, what: str = "image") -> str:
+    """ "1 image", "3 images"."""
     return f"{count} {what}{'' if count == 1 else 's'}"
 
 
@@ -63,17 +85,16 @@ class TaskInbox:
         step for the whole call. Returns per item its ``InboxItem`` (the existing one if it is
         already waiting) or the ``ValueError`` that kept it out: unreadable, or already labelled."""
         out: list[InboxItem | ValueError] = []
-        batch: list[tuple[bytes, str]] = []
-        for item in items:
-            batch.append(item)
-            if len(batch) >= chunk:
-                out += self._inbox_batch(batch, record=not out)
-                batch = []
-        if batch:
-            out += self._inbox_batch(batch, record=not out)
+        recorded = False  # once a chunk has saved, the version before the call is kept for undo
+        for batch in chunked(items, chunk):
+            part, saved = self._inbox_batch(batch, record=not recorded)
+            out += part
+            recorded = recorded or saved
         return out
 
-    def _inbox_batch(self, batch: list[tuple[bytes, str]], record: bool) -> list[InboxItem | ValueError]:
+    def _inbox_batch(self, batch: list[tuple[bytes, str]],
+                     record: bool) -> tuple[list[InboxItem | ValueError], bool]:
+        """Add one chunk; returns its results and whether it saved (it added an image)."""
         from .store import InboxItem  # pylint: disable=import-outside-toplevel,cyclic-import  # store imports this
 
         checked = [_decoded(data, source) for data, source in batch]  # before locking, like examples
@@ -98,8 +119,8 @@ class TaskInbox:
                     out.append(item)
                     new += 1
             if new:
-                self._save_new(created, record, f"add {_n(new)} to the inbox")
-        return out
+                self._save_new(created, record, f"add {plural(new)} to the inbox")
+        return out, new > 0
 
     def inbox_item(self, iid: str) -> InboxItem:
         """The inbox image with id ``iid``; ``KeyError`` if it isn't waiting there."""
@@ -122,9 +143,7 @@ class TaskInbox:
                 self.config.examples.append(Example(id=item.id, file=item.file, source=item.source,
                                                     label=clean[item.id]))
             self.config.inbox = [x for x in self.config.inbox if x.id not in clean]
-            classes = sorted(set(clean.values()))
-            where = ", ".join(classes[:3]) + (", ..." if len(classes) > 3 else "")
-            self._save(label=f"label {_n(len(items))} from the inbox as {where}")
+            self._save(label=f"label {plural(len(items))} from the inbox as {listed(sorted(clean.values()))}")
             return len(items)
 
     def dismiss(self, ids: Iterable[str]) -> int:
@@ -134,5 +153,5 @@ class TaskInbox:
         with self._writing():
             gone = [self.inbox_item(iid).file for iid in wanted]
             self.config.inbox = [x for x in self.config.inbox if x.id not in wanted]
-            self._save(gone=gone, label=f"dismiss {_n(len(gone))} from the inbox")
+            self._save(gone=gone, label=f"dismiss {plural(len(gone))} from the inbox")
             return len(gone)

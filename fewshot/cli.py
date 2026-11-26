@@ -213,9 +213,9 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
 
 
 def _say_cleared(name: str, cleared: list[str]) -> None:
-    """Tell the user which settings switching embedder cleared, if any."""
+    """Tell the user which settings switching embedder or scoring settings cleared, if any."""
     if cleared:
-        typer.echo(f"Cleared {', '.join(cleared)}: fitted to the previous embedder "
+        typer.echo(f"Cleared {', '.join(cleared)}: fitted to the previous settings "
                    f"(`fewshot undo {name}` restores them)", err=True)
 
 
@@ -852,14 +852,18 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments  
     port: int = 8000,
     token: str | None = typer.Option(None, envvar="FEWSHOT_TOKEN", show_envvar=True,
                                      help="Require this token for the API and UI"),
-    allow_any_model: bool = typer.Option(False, "--allow-any-model",
+    allow_any_model: bool = typer.Option(False, "--allow-any-model", envvar="FEWSHOT_ALLOW_ANY_MODEL",
+                                         show_envvar=True,
                                          help="Let API callers load any embedder spec, not just presets"),
-    warm: bool = typer.Option(True, "--warm/--no-warm", help="Load the models tasks use at startup"),
-    allow_urls: bool = typer.Option(False, "--allow-urls",
+    warm: bool = typer.Option(True, "--warm/--no-warm", envvar="FEWSHOT_WARM", show_envvar=True,
+                              help="Load the models tasks use at startup"),
+    allow_urls: bool = typer.Option(False, "--allow-urls", envvar="FEWSHOT_ALLOW_URLS", show_envvar=True,
                                     help="Let API callers send image URLs for the server to download "
                                          "(public addresses only)"),
-    max_upload_mb: float = typer.Option(50, help="Largest image accepted per upload"),
-    max_request_mb: float = typer.Option(1024, help="Largest request body accepted"),
+    max_upload_mb: float = typer.Option(50, envvar="FEWSHOT_MAX_UPLOAD_MB", show_envvar=True,
+                                        help="Largest image accepted per upload"),
+    max_request_mb: float = typer.Option(1024, envvar="FEWSHOT_MAX_REQUEST_MB", show_envvar=True,
+                                         help="Largest request body accepted"),
     allowed_host: list[str] = typer.Option(
         [], "--allowed-host", help="Host name clients use to reach the server; others are refused (IP addresses "
                                    "always work). Repeatable; '*' allows any. [default: $FEWSHOT_ALLOWED_HOSTS "

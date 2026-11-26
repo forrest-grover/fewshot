@@ -4,6 +4,7 @@ host names, unchecked thresholds, unfitted model weights and overconfident calib
 import http.server
 import importlib
 import io
+import socket
 import threading
 import time
 import zipfile
@@ -24,7 +25,8 @@ RED = (220, 30, 30)
 
 
 class _Hostile(http.server.BaseHTTPRequestHandler):
-    """/ftp redirects to an ftp:// URL; /drip sends its body a byte at a time."""
+    """/ftp redirects to an ftp:// URL; /status and /headers trickle the status line and headers;
+    others send a body a byte at a time."""
 
     def do_GET(self):  # pylint: disable=invalid-name  # http.server's naming
         """Answer as the path says."""
@@ -32,6 +34,20 @@ class _Hostile(http.server.BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "ftp://127.0.0.1:1/secret")
             self.end_headers()
+            return
+        if self.path == "/headers":  # a header line every 0.1 s, for 3 s
+            self.send_response(200)
+            self.flush_headers()
+            for _ in range(30):
+                self.wfile.write(b"X-Slow: 1\r\n")
+                self.wfile.flush()
+                time.sleep(0.1)
+            return
+        if self.path == "/status":  # the status line a byte every 0.1 s
+            for c in b"HTTP/1.1 200 OK\r\n":
+                self.wfile.write(bytes([c]))
+                self.wfile.flush()
+                time.sleep(0.1)
             return
         self.send_response(200)
         self.send_header("Content-Length", "20")
@@ -70,6 +86,25 @@ def test_timeout_bounds_the_whole_download(hostile):
     with pytest.raises(ValueError, match=r"took longer than 0\.5 s"):
         fetch.fetch_url(hostile + "/drip", 10_000, timeout=0.5)
     assert time.monotonic() - t0 < 1.5
+
+
+@pytest.mark.parametrize("path", ["/status", "/headers"])
+def test_timeout_bounds_the_headers_too(hostile, path):
+    """A status line or headers sent a bit at a time can't hold the caller past the timeout either."""
+    t0 = time.monotonic()
+    with pytest.raises(ValueError, match=r"took longer than 0\.5 s"):
+        fetch.fetch_url(hostile + path, 10_000, timeout=0.5)
+    assert time.monotonic() - t0 < 1.5
+
+
+def test_deadline_shuts_late_sockets_at_once():
+    """A connection made after the deadline (a redirect, say) is shut down as soon as it is watched."""
+    a, b = socket.socketpair()
+    with a, b, fetch._Deadline(0) as deadline:  # pylint: disable=protected-access
+        while not deadline.expired:
+            time.sleep(0.01)
+        deadline.watch(a)
+        assert a.recv(1) == b""
 
 
 def _png_of(mode, size):

@@ -179,6 +179,31 @@ def test_history_is_pruned_and_old_images_deleted(ws, monkeypatch):
     assert not (t.path / green.file).exists()
 
 
+def test_pruning_keeps_images_a_redone_version_uses(ws, monkeypatch):
+    """Redo records the files it drops, and pruning keeps every file a kept version names: a
+    re-added, re-deleted, undone and redone example can still be undone back after pruning."""
+    monkeypatch.setattr(history, "HISTORY_KEPT", 3)
+    t = _task(ws, n=1)
+    red = t.config.examples[0]
+    t.delete_example(red.id)
+    t.add_example(png(RED, noise=10, seed=0), "red")
+    t.delete_example(red.id)
+    t.undo()
+    t.redo()  # the version kept for undo has red; the redo dropped it
+    assert t._gone(t._history()[-1][1]) == {red.file}  # pylint: disable=protected-access
+    t.upsert_class("a")
+    t.upsert_class("b")  # prunes the first drop of red; the redone version still names it
+    assert (t.path / red.file).exists()
+    t.undo()
+    t.undo()
+    t.undo()
+    assert t.example(red.id).file == red.file
+    t.delete_example(red.id)
+    for name in "cdef":
+        t.upsert_class(name)
+    assert not (t.path / red.file).exists()  # once no kept version names it, it goes
+
+
 def test_history_survives_files_read_without_validation(ws):
     """A kept version that can't be parsed names no files (it is still listed for undo)."""
     t = _task(ws, n=1)
@@ -274,6 +299,23 @@ def test_rename_task(ws):
     assert t.class_names() == ["red", "green"]
     assert t.name == "u"
     assert ws.rename("u", "u") is t
+
+
+def test_concurrent_renames(ws, monkeypatch):
+    """Of two renames of one task that both looked it up first, only the first succeeds; a cached
+    task under a name it no longer has is never returned for that name."""
+    t = _task(ws)
+    real_get = ws.get
+    monkeypatch.setattr(ws, "get", lambda name: t if name == "t" else real_get(name))  # a stale lookup
+    ws.rename("t", "u")
+    with pytest.raises(KeyError, match="No task 't'"):
+        ws.rename("t", "v")
+    monkeypatch.setattr(ws, "get", real_get)
+    assert not (ws.root / "tasks" / "v").exists()
+    ws._tasks["v"] = t  # pylint: disable=protected-access  # as if cached under a name it has lost
+    with pytest.raises(KeyError, match="No task 'v'"):
+        ws.get("v")
+    assert ws.get("u") is t
 
 
 def test_rename_errors(ws, monkeypatch):

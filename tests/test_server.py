@@ -334,6 +334,25 @@ def test_jobs_are_capped_and_shared(client, monkeypatch):
     _wait(client, first["id"])
 
 
+def test_a_cancelled_evaluation_is_not_shared(client, monkeypatch):
+    """An evaluation asked to stop, though still running, isn't handed to the next request."""
+    task = _task(client, n=1)
+    release = threading.Event()
+
+    def slow(_pipe, _task, _folds, progress):
+        release.wait(5)
+        progress("evaluating", 0, 1)  # raises Cancelled
+
+    monkeypatch.setattr(fewshot.api, "evaluate_task", slow)
+    first = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
+    assert client.delete(f"/api/jobs/{first}").status_code == 200
+    second = client.post(f"/api/tasks/{task}/evaluate/jobs").json()["id"]
+    assert second != first
+    client.delete(f"/api/jobs/{second}")
+    release.set()
+    assert [_wait(client, j)["status"] for j in (first, second)] == ["cancelled", "cancelled"]
+
+
 def test_login_is_rate_limited_and_secure_over_https(tmp_path, monkeypatch):
     """Too many wrong tokens get 429 for a while; over HTTPS the cookie is Secure."""
     api = _reload(tmp_path, monkeypatch, FEWSHOT_TOKEN="s3cret")
@@ -349,6 +368,23 @@ def test_login_is_rate_limited_and_secure_over_https(tmp_path, monkeypatch):
     assert "secure" not in r.headers["set-cookie"].lower()
     https = TestClient(api.app, base_url="https://testserver")
     assert "secure" in https.post("/api/login", json={"token": "s3cret"}).headers["set-cookie"].lower()
+
+
+def test_wrong_tokens_on_any_request_count_towards_the_limit(tmp_path, monkeypatch):
+    """Guessing with Bearer tokens or cookies is limited like /api/login (no token at all isn't a
+    guess), and the limit then covers login too."""
+    api = _reload(tmp_path, monkeypatch, FEWSHOT_TOKEN="s3cret")
+    monkeypatch.setattr(api, "LOGIN_FAILURES", 2)
+    c = TestClient(api.app)
+    for _ in range(3):
+        assert c.get("/api/tasks").status_code == 401
+    assert c.get("/api/tasks", headers={"Authorization": "Bearer a"}).status_code == 401
+    assert c.get("/api/tasks", headers={"Cookie": f"{api.AUTH_COOKIE}=b"}).status_code == 401
+    r = c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"})
+    assert (r.status_code, r.json()["detail"]) == (429, api.TOO_MANY_TOKENS)
+    assert c.post("/api/login", json={"token": "s3cret"}).status_code == 429
+    monkeypatch.setattr(api, "LOGIN_WINDOW", 0.0)
+    assert c.get("/api/tasks", headers={"Authorization": "Bearer s3cret"}).status_code == 200
 
 
 def test_export_headers_and_import_with_another_embedder(client):

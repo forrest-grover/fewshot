@@ -72,6 +72,17 @@ def test_duplicate(ws):
         ws.duplicate("nope", "x")
 
 
+def test_duplicate_leaves_out_missing_images(ws):
+    """An example or inbox image whose file is gone (a damaged task) is left out of the copy."""
+    t = _task(ws, n=2)
+    t.add_to_inbox([(png(RED, noise=10, seed=9), "x.png")])
+    (t.path / t.config.examples[0].file).unlink()
+    (t.path / t.config.inbox[0].file).unlink()
+    c = ws.duplicate("t", "c", inbox=True)
+    assert [e.id for e in c.config.examples] == [e.id for e in t.config.examples[1:]]
+    assert c.config.inbox == []
+
+
 def test_failed_duplicate_leaves_nothing(ws, monkeypatch):
     """If copying fails part-way, the new folder is removed."""
     _task(ws)

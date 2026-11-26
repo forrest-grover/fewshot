@@ -195,7 +195,7 @@ def test_cli_config_says_what_switching_embedder_cleared(run, monkeypatch):
     monkeypatch.setattr("fewshot.cli.check_embedder", lambda spec: None)
     run("class", "threshold", "t", "red", "0.8")
     r = run("config", "t", "--embedder", "fake:other")
-    assert "Cleared class thresholds: fitted to the previous embedder (`fewshot undo t` restores them)" in r.output
+    assert "Cleared class thresholds: fitted to the previous settings (`fewshot undo t` restores them)" in r.output
 
 
 def test_cli_eval_apply_keeps_an_old_report_old(run, monkeypatch):

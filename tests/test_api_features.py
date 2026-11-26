@@ -147,6 +147,13 @@ def test_settings_for_zero_shot_threshold_and_flip(client, task):
     assert "either reject_below_zero_shot or clear_reject_zero_shot" in r.json()["detail"]
 
 
+def test_patch_without_changes_saves_nothing(client, task):
+    """PATCH with no settings (or the current ones) makes no new revision or undo step."""
+    before = client.get(f"/api/tasks/{task}").json()
+    for body in ({}, {"flip": before["flip"]}):
+        assert client.patch(f"/api/tasks/{task}", json=body).json()["revision"] == before["revision"]
+
+
 def test_predict_top_k_and_labels(client, task):
     """top_k trims the scores; every prediction lists its labels."""
     files = [("files", ("q.png", png(RED, seed=9), "image/png"))]

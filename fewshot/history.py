@@ -137,7 +137,7 @@ class TaskHistory:
             self._forget(p)
         # A file dropped again later is deleted when that later version goes.
         gone -= self.config.files()
-        gone -= set().union(*(self._gone(p) for _, p in kept))
+        gone -= set().union(*(self._gone(p) | self._files_in(p) for _, p in kept))
         gone -= self._redo_files()
         for f in gone:
             self._drop_file(f)
@@ -167,7 +167,7 @@ class TaskHistory:
         for rev, snap in self._history():
             if rev == revision:
                 try:
-                    cfg = type(self.config).model_validate_json(snap.read_bytes())
+                    cfg = type(self.config).stored(snap.read_bytes())
                 except ValidationError:
                     break
                 return cfg.model_copy(update={"name": self.config.name})
@@ -219,7 +219,8 @@ class TaskHistory:
                 raise ValueError("Nothing to redo")
             rev, snap = redo[-1]
             new = self._restorable(snap, "redo")
-            self._restore(new, label=self._label(snap))
+            # The version redo replaces is kept for undo: name the files the redo stops using.
+            self._restore(new, label=self._label(snap), gone=self.config.files() - new.files())
             self._forget(snap)
             return rev
 
@@ -227,7 +228,7 @@ class TaskHistory:
         """The version in ``snap``, if it can be restored; ``ValueError`` (after removing a damaged
         one, so the next try can go further) otherwise."""
         try:
-            cfg = type(self.config).model_validate_json(snap.read_bytes())
+            cfg = type(self.config).stored(snap.read_bytes())
         except ValidationError as e:
             self._forget(snap)
             raise ValueError(f"Can't {what}: {snap.name} is invalid and was removed; {what} again to go "
@@ -237,12 +238,13 @@ class TaskHistory:
             raise ValueError(f"Can't {what}: {len(missing)} image files are gone, e.g. {missing[0]}")
         return cfg
 
-    def _restore(self, cfg: TaskConfig, label: str | None = None) -> None:
+    def _restore(self, cfg: TaskConfig, label: str | None = None, gone: Iterable[str] = ()) -> None:
         """Make ``cfg`` the current version, keeping the task's name, uid and rising revision. With
-        a ``label`` (a redo) the replaced version is kept for undo, otherwise (an undo) it isn't."""
+        a ``label`` (a redo) the replaced version is kept for undo, with ``gone`` the image files
+        the change stops using; otherwise (an undo) it isn't."""
         self.config = cfg.model_copy(update={"name": self.config.name, "uid": self.config.uid,
                                              "revision": self.config.revision})
-        self._save(record=label is not None, label=label or "", keep_redo=True)
+        self._save(gone=gone, record=label is not None, label=label or "", keep_redo=True)
 
     @staticmethod
     def _files_in(snap: Path) -> set[str]:
