@@ -144,6 +144,9 @@ class ClassDef(BaseModel):
 
     name: str
     description: str = ""  # used as a CLIP text prompt when non-empty
+    # Similarity under which a prediction of this class becomes "unknown"; overrides the task's
+    # reject_below (classes differ in how tightly their images cluster). Not used zero-shot.
+    reject_below: float | None = None
 
 
 class ImageRef(BaseModel):
@@ -484,6 +487,22 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods  
             self.config.classes = [c for c in self.config.classes if c.name != name]
             self._save(gone=[e.file for e in gone], label=f"delete class {name}")  # files stay while undo needs them
             return len(gone)
+
+    def set_class_thresholds(self, thresholds: dict[str, float | None]) -> None:
+        """Set (or, with None, clear) per-class reject thresholds in one change. Raises ``KeyError``
+        for an unknown class and ``ValueError`` for a value outside -1..1; then nothing changes."""
+        for k, v in thresholds.items():
+            if v is not None and not -1.0 <= v <= 1.0:
+                raise ValueError(f"The threshold of {k!r} must be between -1 and 1, got {v}")
+        with self._writing():
+            for k in thresholds:
+                self._class(k)
+            cfg = self.config
+            cfg.classes = [c.model_copy(update={"reject_below": thresholds[c.name]}) if c.name in thresholds else c
+                           for c in cfg.classes]
+            n = len(thresholds)
+            self._save(label=f"set the threshold of {next(iter(thresholds))}" if n == 1
+                       else f"set thresholds of {n} classes")
 
     def _class(self, name: str) -> ClassDef:
         for c in self.config.classes:

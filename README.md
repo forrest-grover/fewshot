@@ -40,6 +40,8 @@ With a CLIP embedder, class descriptions add `text_weight × 100 × cos(image, d
 
 `reject_below` returns "unknown" when an image's best similarity falls below a threshold. Use similarity for this, not confidence: softmax confidence can be 1.00 for an image of a class the task doesn't contain. The Evaluate tab (and `fewshot eval`) suggests a value that keeps 95% of correct held-out predictions, and shows a histogram of held-out similarities where you can pick another. Zero-shot tasks compare images with text, which scores far lower (about 0.2–0.35 for CLIP), so they use a separate `reject_below_zero_shot`. With a threshold set, a prediction's `labels` lists every class whose own similarity reaches it, best first (multi-label). A task with a single class predicts that class for everything, so with a threshold it tells members from outsiders (one-class or anomaly detection).
 
+Classes differ in how tightly their images cluster, so a class can have its own threshold, which overrides `reject_below` for predictions of that class and decides whether that class is listed in another prediction's `labels`. Evaluation suggests one per class with at least 5 correct held-out predictions (again keeping 95% of them); apply them from the Evaluate tab's per-class table, with `fewshot eval --apply-class-thresholds`, or one at a time with `fewshot class threshold TASK CLASS 0.82` (`--clear` goes back to the task's). Through the API: `PUT .../class-thresholds` with `{"thresholds": {"cat": 0.82, "dog": null}}`. Zero-shot predictions keep using `reject_below_zero_shot`.
+
 A class description can hold several prompts, one per line (`fewshot class describe` and the UI's template accept several); their embeddings are averaged. The `flip` setting averages each image's embedding with its mirror image's, which usually helps a little when left and right don't matter. Predictions can list the labelled examples most like each image as evidence (`?evidence=3`, `predict --evidence 3`; the Predict tab shows them), which helps spot a mislabelled example behind a wrong answer. Confidence can be calibrated: evaluation fits a temperature so that a confidence of 0.9 means right about 90% of the time and reports the calibration error before and after (with at least 50 scored examples); apply it from the Evaluate tab or with `config --temperature`. Predictions don't change, only their confidence. With CLIP and the prototype classifier, uncalibrated confidence is usually far too low. Evaluation reports accuracy, macro-F1, top-2/3/5 accuracy, per-class recall and precision, a confusion matrix with row totals (click a cell in the UI to list its examples, right or wrong) and every held-out prediction (`fewshot eval --csv`, or Export in the UI). Leave-one-out for the prototype and kNN classifiers is computed in closed form instead of refitting per example, for tasks without descriptions. "Find near-duplicate examples" on the Evaluate tab (`fewshot dupes`) lists pairs of examples that look almost the same; pairs with different labels are usually labelling mistakes, and the UI offers to give both the same label.
 
 ## Measured accuracy
@@ -54,6 +56,8 @@ Oxford-IIIT Pets, 5-way episodes, 300 episodes each, ±95% CI under about 0.01:
 
 Use CLIP with descriptions when class names are meaningful words. Use DINOv2 when they aren't (part numbers, defect codes, individual identities), since it is stronger on images alone. Reproduce these numbers with `fewshot bench <folder> --embedder ... --shot 1 --shot 5 [--text-template ...]`.
 
+To choose a model for your own task, compare embedders on its labelled examples: "Compare models" on the Evaluate tab, `fewshot compare TASK -e timm:vit_small_patch14_dinov2.lvd142m` (or `--presets` for all of them), or `POST .../compare/jobs` with `{"embedders": [...]}` (a background job, like evaluation). Each model is cross-validated with the task's other settings, and the results give accuracy, macro-F1 and the time taken (images already in the embedding cache are fast, so the first run of a model is slower). A model that can't be loaded is reported and the others still run. Switch with "Use this model" or `fewshot config TASK --embedder ...`; nothing changes until you do.
+
 ## CLI
 
 ```bash
@@ -62,6 +66,8 @@ fewshot import pets ./photos --shots 5        # ./photos/<class>/<image>
 fewshot add pets Beagle a.jpg b.jpg
 fewshot class describe pets "a photo of a {}, a type of pet"
 fewshot eval pets                             # leave-one-out cross-validation; --csv for every prediction
+fewshot eval pets --apply-class-thresholds    # also set each class's suggested reject threshold
+fewshot compare pets --presets                # cross-validate the task with every preset embedder
 fewshot predict pets new/ https://example.com/cat.jpg --json   # also --csv
 fewshot predict pets --from-file list.txt --jsonl  # a JSON line per image, printed 256 images at a time
 fewshot predict pets new/ --revision 41       # with an earlier version of the task (one kept for undo)

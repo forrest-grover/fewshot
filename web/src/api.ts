@@ -4,7 +4,7 @@ export interface TaskSummary {
   last_evaluation: { at: string; revision: number | null; method: string | null; accuracy: number | null } | null;
   warnings: string[];
 }
-export interface ClassInfo { name: string; description: string; count: number }
+export interface ClassInfo { name: string; description: string; count: number; reject_below: number | null } // reject_below: the class's own threshold
 export interface Example {
   id: string; label: string; file: string; source: string; added: string; tags: string[]; note: string;
 }
@@ -29,8 +29,15 @@ export interface EvalReport {
   top_k_accuracy: Record<string, number>; classes: string[]; confusion: number[][];
   per_class: Record<string, { support: number; recall: number | null; precision: number | null }>;
   mistakes: HeldOut[]; predictions: HeldOut[]; suggested_reject_below: number | null;
+  suggested_class_thresholds: Record<string, number>; // per class, for classes with 5+ correct predictions
   calibration: { temperature: number; ece: number; ece_calibrated: number } | null;
 }
+/** One embedder's cross-validation on a task, or why it couldn't be used. */
+export interface CompareResult {
+  embedder: string; accuracy: number | null; macro_f1: number | null; top_k_accuracy: Record<string, number>;
+  n_scored: number; seconds: number | null; method: string | null; error: string | null;
+}
+export interface CompareReport { revision: number; current: string; n_examples: number; results: CompareResult[]; best: string | null }
 export interface InboxEntry {
   id: string; file: string; source: string; added: string;
   prediction?: Prediction | null; margin?: number | null; // absent while the task has no classes
@@ -132,6 +139,9 @@ export const api = {
   dismissInbox: (n: string, ids: string[]) => req<TaskDetail>("POST", `${t(n)}/inbox/dismiss`, { ids }),
   evaluate: (n: string) => req<EvalReport>("POST", `${t(n)}/evaluate`),
   startEvaluation: (n: string) => req<Job<EvalReport>>("POST", `${t(n)}/evaluate/jobs`),
+  startComparison: (n: string, embedders: string[]) => req<Job<CompareReport>>("POST", `${t(n)}/compare/jobs`, { embedders }),
+  setClassThresholds: (n: string, thresholds: Record<string, number | null>) =>
+    req<TaskDetail>("PUT", `${t(n)}/class-thresholds`, { thresholds }),
   job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${id}`),
   cancelJob: (id: string) => req<Job<unknown>>("DELETE", `/api/jobs/${id}`),
   login: (token: string) => req<undefined>("POST", "/api/login", { token }),

@@ -180,7 +180,7 @@ def test_delete_missing_task(client):
 def test_add_class(client, task):
     """Adding a class with a description; blank names are 400."""
     t = client.post(f"/api/tasks/{task}/classes", json={"name": "green", "description": "a green thing"}).json()
-    assert {"name": "green", "description": "a green thing", "count": 0} in t["classes"]
+    assert {"name": "green", "description": "a green thing", "count": 0, "reject_below": None} in t["classes"]
     r = client.post(f"/api/tasks/{task}/classes", json={"name": "  "})
     assert r.status_code == 400
     assert r.json()["detail"] == "Class name is empty"
@@ -191,12 +191,12 @@ def test_patch_class(client, task):
     """Rename and describe classes; failures are atomic and unknown classes are 404."""
     url = f"/api/tasks/{task}/classes"
     t = client.patch(f"{url}/red", json={"description": "reddish"}).json()
-    assert {"name": "red", "description": "reddish", "count": 3} in t["classes"]
+    assert {"name": "red", "description": "reddish", "count": 3, "reject_below": None} in t["classes"]
 
     t = client.patch(f"{url}/red", json={"name": "crimson", "description": "deep red"}).json()
     classes = {c["name"]: c for c in t["classes"]}
     assert "red" not in classes
-    assert classes["crimson"] == {"name": "crimson", "description": "deep red", "count": 3}
+    assert classes["crimson"] == {"name": "crimson", "description": "deep red", "count": 3, "reject_below": None}
     assert sum(e["label"] == "crimson" for e in t["examples"]) == 3
 
     # the same name (after trimming) is a no-op rename; an empty one is an error

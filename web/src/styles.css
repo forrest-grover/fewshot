@@ -1298,3 +1298,45 @@ label.inline {
 .fold {
   padding: 0 4px;
 }
+
+/* model comparison */
+.compare-pick {
+  border: 0;
+  padding: 0;
+  margin: 8px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+
+.compare-pick legend {
+  padding: 0;
+  margin-bottom: 6px;
+}
+
+.table.compare th, .table.compare button {
+  white-space: nowrap;
+}
+
+.compare tr.best td {
+  background: var(--accent-soft);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.badge.ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.danger-text {
+  color: var(--danger);
+}

@@ -139,7 +139,8 @@ def show(name: str, as_json: bool = JSON_OPT, root: Path | None = ROOT_OPT) -> N
                f"temperature: {c.temperature or 1}")
     for cd in c.classes:
         desc = "  " + " | ".join(f'"{line}"' for line in cd.description.splitlines() if line.strip())
-        typer.echo(f"  {cd.name:24} {counts.get(cd.name, 0):5}{desc.rstrip()}")
+        thr = "" if cd.reject_below is None else f"  reject_below {cd.reject_below}"
+        typer.echo(f"  {cd.name:24} {counts.get(cd.name, 0):5}{thr}{desc.rstrip()}")
 
 
 def _parse_params(param: list[str], base: dict[str, Any]) -> dict[str, Any]:
@@ -338,6 +339,24 @@ def class_describe(
     typer.echo(f"Set {n} descriptions")
 
 
+@cls_app.command("threshold")
+def class_threshold(
+    name: str,
+    label: str,
+    value: float | None = typer.Argument(None, min=-1, max=1, help="Similarity under which predictions of "
+                                                                     "this class become 'unknown'"),
+    clear: bool = typer.Option(False, "--clear", help="Use the task's --reject-below for this class again"),
+    root: Path | None = ROOT_OPT,
+) -> None:
+    """Set a class's own reject threshold, overriding the task's (see `eval` for suggestions)."""
+    if (value is None) == (not clear):
+        _fail("Give either a threshold or --clear")
+    try:
+        _task(root, name).set_class_thresholds({label: value})
+    except KeyError as e:
+        _fail(_error_text(e))
+
+
 @cls_app.command("rm")
 def class_rm(name: str, label: str, root: Path | None = ROOT_OPT) -> None:
     """Delete a class and its examples."""
@@ -439,6 +458,46 @@ def predict(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     if failed:
         typer.secho(f"{failed} of {len(files)} images could not be read", fg="red", err=True)
         raise typer.Exit(1)
+
+
+@app.command()
+def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
+    name: str,
+    embedder: list[str] = typer.Option([], "--embedder", "-e", help="An embedder to try (repeatable); the task's "
+                                                                   "own is always included"),
+    presets: bool = typer.Option(False, "--presets", help="Also try every preset (see `fewshot models`)"),
+    folds: int | None = typer.Option(None, min=2, help="Number of folds [default: as for eval]"),
+    as_json: bool = JSON_OPT,
+    root: Path | None = ROOT_OPT,
+) -> None:
+    """Cross-validate the task with other embedders, to choose a model on its own labelled examples."""
+    from .evaluate import compare_embedders  # pylint: disable=import-outside-toplevel  # torch-backed
+
+    t = _task(root, name)
+    specs = [t.config.embedder, *embedder, *([p.spec for p in PRESETS] if presets else [])]
+    if len(set(specs)) < 2:
+        _fail("Give another --embedder to compare with, or --presets")
+    try:
+        with _progress("Comparing") as update:
+            r = compare_embedders(_pipe(_ws(root)), t, specs, folds,
+                                  progress=lambda _stage, done, total: update(done, total))
+    except ValueError as e:
+        _fail(str(e))
+    if as_json:
+        _echo_json(r)
+        return
+    for x in r["results"]:
+        mark = ("*" if x["embedder"] == r["best"] else " ") + ("<" if x["embedder"] == r["current"] else " ")
+        if x.get("error"):
+            typer.echo(f"{mark} {'failed':>8}  {x['embedder']}: {x['error']}")
+        elif x["accuracy"] is None:
+            typer.echo(f"{mark} {'-':>8}  {x['embedder']}: nothing scored")
+        else:
+            typer.echo(f"{mark} {x['accuracy']:8.3f}  macro-F1 {x['macro_f1']:.3f}  {x['seconds']:7.1f}s  "
+                       f"{x['embedder']}")
+    typer.echo(f"* most accurate, < current ({r['n_examples']} examples)")
+    if r["best"] and r["best"] != r["current"]:
+        typer.echo(f"To switch: fewshot config {name} --embedder {r['best']}")
 
 
 @app.command()
@@ -579,10 +638,14 @@ def _print_eval(r: dict[str, Any]) -> None:
     if cal := r["calibration"]:
         typer.echo(f"Calibration error {cal['ece']:.3f}; --temperature {cal['temperature']} would make it "
                    f"{cal['ece_calibrated']:.3f}")
+    suggested = r["suggested_class_thresholds"]
     for c, m in r["per_class"].items():
         rec = "-" if m["recall"] is None else f"{m['recall']:.2f}"
         prec = "-" if m["precision"] is None else f"{m['precision']:.2f}"
-        typer.echo(f"  {c:24} n={m['support']:<4} recall={rec:5} precision={prec}")
+        thr = f"  suggested threshold {suggested[c]}" if c in suggested else ""
+        typer.echo(f"  {c:24} n={m['support']:<4} recall={rec:5} precision={prec:5}{thr}")
+    if suggested:
+        typer.echo("(--apply-class-thresholds sets the suggested per-class thresholds)")
     if r["mistakes"]:
         typer.echo(f"{len(r['mistakes'])} mistakes; most confident:")
         for m in r["mistakes"][:10]:
@@ -590,12 +653,14 @@ def _print_eval(r: dict[str, Any]) -> None:
 
 
 @app.command("eval")
-def eval_cmd(
+def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     name: str,
     folds: int | None = typer.Option(
         None, help="Number of folds [default: leave-one-out up to 300 examples, else 5]"),
     as_json: bool = JSON_OPT,
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: each example's held-out prediction"),
+    apply_class_thresholds: bool = typer.Option(
+        False, "--apply-class-thresholds", help="Set each class's reject threshold to the one suggested"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Cross-validate a task on its own examples."""
@@ -609,6 +674,9 @@ def eval_cmd(
     except ValueError as e:
         _fail(str(e))
     t.record_evaluation(r)
+    if apply_class_thresholds and r["suggested_class_thresholds"]:
+        t.set_class_thresholds(r["suggested_class_thresholds"])
+        typer.echo(f"Set the thresholds of {len(r['suggested_class_thresholds'])} classes", err=True)
     if as_json:
         _echo_json(r)
     elif as_csv:

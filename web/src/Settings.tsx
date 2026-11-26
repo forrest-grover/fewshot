@@ -144,6 +144,10 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
           Images whose best similarity falls below this value are returned as "unknown". Start near 0.7 for image examples, and tune it
           with the similarity values shown on the Predict tab, or use the value the Evaluate tab suggests. Several classes above it are
           all listed (multi-label). With a single class, this is what separates members from everything else.
+          {task.classes.some((c) => c.reject_below !== null) && (
+            <> Classes with their own threshold (set on the Evaluate tab) use that instead: {task.classes
+              .filter((c) => c.reject_below !== null).map((c) => `${c.name} ${String(c.reject_below)}`).join(", ")}.</>
+          )}
         </small>
       </label>
 

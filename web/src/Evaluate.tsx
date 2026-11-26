@@ -1,7 +1,9 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
-import { api, type DuplicatePair, type EvalReport, type Job, type TaskDetail } from "./api";
+import { useState, type Dispatch, type SetStateAction } from "react";
+import { api, type DuplicatePair, type EvalReport, type Job, type ModelInfo, type TaskDetail } from "./api";
+import Compare, { type CompareRun } from "./Compare";
 import { downloadCsv } from "./csv";
 import { pct } from "./format";
+import { usePollJob } from "./hooks";
 import Lightbox from "./Lightbox";
 import Threshold from "./Threshold";
 
@@ -16,12 +18,12 @@ export interface EvalRun {
 interface Props {
   task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
   state: EvalRun | null; setState: Dispatch<SetStateAction<EvalRun | null>>;
+  models: ModelInfo | null; compare: CompareRun | null; setCompare: Dispatch<SetStateAction<CompareRun | null>>;
 }
 
-const POLL_MS = 500;
 const STAGES: Record<string, string> = { starting: "Starting", embedding: "Embedding images", evaluating: "Cross-validating" };
 
-export default function Evaluate({ task, setTask, run, state, setState }: Props) {
+export default function Evaluate({ task, setTask, run, state, setState, models, compare, setCompare }: Props) {
   const mine = state?.task === task.name ? state : null; // never show another task's report
   const report = mine?.report ?? null;
   const job = mine?.job ?? null;
@@ -42,28 +44,19 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
   };
   // Poll the running job until it ends. Leaving the tab stops polling; coming back resumes it.
   const jobId = job?.id;
-  useEffect(() => {
-    if (!jobId) return;
-    let live = true;
-    const timer = setInterval(() => {
-      void api.job<EvalReport>(jobId).then((j) => {
-        if (!live) return;
-        setState((s) => {
-          if (!s || s.job?.id !== jobId) return s;
-          if (j.status === "running") return { ...s, job: j };
-          // Only a finished run replaces the report (and its revision): a cancelled or failed one
-          // leaves the old report, still marked as out of date if the task changed.
-          return j.status === "done" ? { ...s, job: null, report: j.result, rev: s.jobRev } : { ...s, job: null };
-        });
-        if (j.status === "failed") void run(Promise.reject(new Error(`Evaluation failed: ${j.error ?? "unknown error"}`)));
-      }, (e: unknown) => {
-        if (!live) return;
-        setState((s) => (s && s.job?.id === jobId ? { ...s, job: null } : s)); // e.g. the server restarted
-        void run(Promise.reject(e instanceof Error ? e : new Error(String(e))));
-      });
-    }, POLL_MS);
-    return () => { live = false; clearInterval(timer); };
-  }, [jobId, run, setState]);
+  usePollJob<EvalReport>(jobId, (j) => {
+    setState((s) => {
+      if (!s || s.job?.id !== jobId) return s;
+      if (j.status === "running") return { ...s, job: j };
+      // Only a finished run replaces the report (and its revision): a cancelled or failed one
+      // leaves the old report, still marked as out of date if the task changed.
+      return j.status === "done" ? { ...s, job: null, report: j.result, rev: s.jobRev } : { ...s, job: null };
+    });
+    if (j.status === "failed") void run(Promise.reject(new Error(`Evaluation failed: ${j.error ?? "unknown error"}`)));
+  }, (e) => {
+    setState((s) => (s && s.job?.id === jobId ? { ...s, job: null } : s)); // e.g. the server restarted
+    void run(Promise.reject(e));
+  });
 
   const fix = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
   const filter = cell?.task === task.name ? cell : null;
@@ -86,6 +79,11 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
     ]);
   };
   const stale = report && rev !== task.revision;
+  const classThreshold = (c: string) => task.classes.find((k) => k.name === c)?.reject_below ?? null;
+  const exists = (c: string) => task.classes.some((k) => k.name === c);
+  const applicable = report
+    ? Object.entries(report.suggested_class_thresholds).filter(([c, v]) => exists(c) && classThreshold(c) !== v).map(([c]) => c)
+    : [];
   const maxCell = report ? Math.max(1, ...report.confusion.flat()) : 1;
 
   return (
@@ -149,16 +147,50 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
             onSet={(v) => { void fix(api.updateTask(task.name, { reject_below: v })); }} />
 
           <h3>Per class</h3>
+          <p className="muted">
+            Classes differ in how tightly their images cluster, so each can have its own reject threshold, overriding the one above.
+            The suggestion keeps 95% of the class's correct predictions (given for classes with at least 5).
+          </p>
           <div className="scroll-x">
           <table className="table">
-            <thead><tr><th>Class</th><th>Examples</th><th>Recall</th><th>Precision</th></tr></thead>
+            <thead><tr><th>Class</th><th>Examples</th><th>Recall</th><th>Precision</th><th>Threshold</th><th>Suggested</th></tr></thead>
             <tbody>
-              {Object.entries(report.per_class).map(([c, m]) => (
-                <tr key={c}><td>{c}</td><td>{m.support}</td><td>{pct(m.recall)}</td><td>{pct(m.precision)}</td></tr>
-              ))}
+              {Object.entries(report.per_class).map(([c, m]) => {
+                const own = classThreshold(c);
+                const suggested = report.suggested_class_thresholds[c] as number | undefined;
+                return (
+                  <tr key={c}>
+                    <td>{c}</td><td>{m.support}</td><td>{pct(m.recall)}</td><td>{pct(m.precision)}</td>
+                    <td>
+                      {own === null
+                        ? <span className="muted" title="The task's reject threshold applies">{task.reject_below?.toFixed(3) ?? "none"}</span>
+                        : <span className="row">{own.toFixed(3)}
+                            <button className="ghost small" title="Use the task's threshold for this class"
+                              onClick={() => { void fix(api.setClassThresholds(task.name, { [c]: null })); }}>Clear</button>
+                          </span>}
+                    </td>
+                    <td>
+                      {suggested === undefined ? <span className="muted">–</span> : (
+                        <span className="row">{suggested.toFixed(3)}
+                          {own !== suggested && exists(c) && (
+                            <button className="ghost small" onClick={() => { void fix(api.setClassThresholds(task.name, { [c]: suggested })); }}>Apply</button>
+                          )}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
           </div>
+          {applicable.length > 0 && (
+            <p className="row">
+              <button className="small" onClick={() => {
+                void fix(api.setClassThresholds(task.name, Object.fromEntries(applicable.map((c) => [c, report.suggested_class_thresholds[c]]))));
+              }}>Apply {applicable.length === 1 ? "the suggested class threshold" : `${String(applicable.length)} suggested class thresholds`}</button>
+            </p>
+          )}
 
           <h3>Confusion matrix <span className="muted">(rows: true class, columns: predicted; click a cell to list its examples)</span></h3>
           <div className="scroll-x">
@@ -226,6 +258,8 @@ export default function Evaluate({ task, setTask, run, state, setState }: Props)
           }))}
           index={Math.min(viewing, listed.length - 1)} onIndex={setViewing} onClose={() => { setViewing(null); }} />
       )}
+
+      <Compare task={task} models={models} setTask={setTask} run={run} state={compare} setState={setCompare} />
 
       <h3>Near-duplicates</h3>
       <div className="row">

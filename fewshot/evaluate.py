@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -279,6 +281,22 @@ def _suggest_threshold(h: HeldOut, truth: np.ndarray) -> float | None:
     return round(float(np.quantile(h.sim[ok], 1 - KEEP_CORRECT)), 3)
 
 
+MIN_CLASS_THRESHOLD = 5  # correct held-out predictions of a class needed to suggest its own threshold
+
+
+def _suggest_class_thresholds(h: HeldOut, truth: np.ndarray, classes: list[str]) -> dict[str, float]:
+    """Like ``_suggest_threshold``, one per class: the similarity that keeps ``KEEP_CORRECT`` of
+    the class's correct held-out predictions. Classes with fewer than ``MIN_CLASS_THRESHOLD`` correct
+    predictions get none (the estimate would be noise)."""
+    ok = (h.pred >= 0) & (h.pred == truth)
+    out = {}
+    for i, c in enumerate(classes):
+        sims = h.sim[ok & (truth == i)]
+        if len(sims) >= MIN_CLASS_THRESHOLD:
+            out[c] = round(float(np.quantile(sims, 1 - KEEP_CORRECT)), 3)
+    return out
+
+
 def _confusion(truth: np.ndarray, pred: np.ndarray, n_classes: int) -> np.ndarray:
     """Confusion matrix: rows are true classes, columns predicted ones."""
     cm = np.zeros((n_classes, n_classes), int)
@@ -293,16 +311,17 @@ def _stage(progress: EvalProgress | None, stage: str) -> Callable[[int, int], No
     return lambda done, total: progress(stage, done, total)
 
 
-def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: int = 0,
-                  progress: EvalProgress | None = None) -> dict[str, Any]:
-    """Cross-validate the task's current settings on its own labelled examples.
+def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: int = 0,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                  progress: EvalProgress | None = None, cfg: TaskConfig | None = None) -> dict[str, Any]:
+    """Cross-validate the task's current settings (or ``cfg``, a variant of them) on its own
+    labelled examples.
 
     Defaults to leave-one-out for up to 300 examples, otherwise 5-fold. Every
     held-out example is predicted by a classifier that never saw it.
     ``progress(stage, done, total)`` is called with stage ``"embedding"`` (images) and then
     ``"evaluating"`` (folds); it may raise to cancel.
     """
-    cfg = task.config  # one snapshot, so a concurrent edit can't misalign examples and results
+    cfg = cfg or task.config  # one snapshot, so a concurrent edit can't misalign examples and results
     if folds is not None and folds < 2:
         raise ValueError(f"folds must be at least 2, got {folds}")
     data = pipe.class_data(task, cfg=cfg, progress=_stage(progress, "embedding"))
@@ -329,8 +348,52 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
         "mistakes": sorted((p for p in predictions if not p["correct"]), key=lambda m: -m["confidence"]),
         "predictions": predictions,
         "suggested_reject_below": _suggest_threshold(h, data.y),
+        "suggested_class_thresholds": _suggest_class_thresholds(h, data.y, data.classes),
         "calibration": _calibration(h, data.y, cfg.temperature or 1.0),
     }
+
+
+def compare_embedders(pipe: Pipeline, task: Task, embedders: Sequence[str], folds: int | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                      seed: int = 0, progress: EvalProgress | None = None) -> dict[str, Any]:
+    """Cross-validate the task with each embedder in turn (its other settings unchanged, except the
+    calibration temperature, which belongs to one model), to choose a model on the task's own labels.
+
+    Each result has ``embedder``, ``accuracy``, ``macro_f1``, ``top_k_accuracy``, ``n_scored`` and
+    ``seconds`` (embedding and evaluation; images already in the cache embed almost instantly), or
+    ``error`` if that model couldn't be used. ``best`` is the most accurate. ``progress`` gets stages
+    like ``"2/3 embedding"`` and may raise to cancel.
+    """
+    specs = list(dict.fromkeys(embedders))
+    if not specs:
+        raise ValueError("Give at least one embedder to compare")
+    base = task.config  # one snapshot for every run
+    if not base.examples:
+        raise ValueError("Task has no examples to evaluate")
+    results = []
+    for n, spec in enumerate(specs, 1):
+        def step(stage: str, done: int, total: int, n: int = n) -> None:
+            if progress:
+                progress(f"{n}/{len(specs)} {stage}", done, total)
+
+        cfg = base.model_copy(update={"embedder": spec, "temperature": None})
+        results.append(_compare_one(partial(evaluate_task, pipe, task, folds, seed, step, cfg=cfg), spec))
+    scored = [r for r in results if r.get("accuracy") is not None]
+    best = max(scored, key=lambda r: (r["accuracy"], r["macro_f1"] or 0.0), default=None)
+    return {"revision": base.revision, "current": base.embedder, "n_examples": len(base.examples),
+            "results": results, "best": best["embedder"] if best else None}
+
+
+def _compare_one(run: Callable[[], dict[str, Any]], spec: str) -> dict[str, Any]:
+    """The headline of ``run()``, an evaluation with embedder ``spec``, timed; or the error that
+    stopped it, for a model that can't load or run."""
+    start = time.perf_counter()
+    try:
+        r = run()
+    except (ValueError, OSError, RuntimeError) as e:
+        return {"embedder": spec, "error": str(e) or type(e).__name__}
+    return {"embedder": spec, "accuracy": r["accuracy"], "macro_f1": r["macro_f1"],
+            "top_k_accuracy": r["top_k_accuracy"], "n_scored": r["n_scored"],
+            "seconds": round(time.perf_counter() - start, 2), "method": r["method"]}
 
 
 def load_folder_dataset(folder: Path) -> dict[str, list[Path]]:

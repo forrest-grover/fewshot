@@ -1,10 +1,14 @@
-"""Response models of the REST API, so /docs shows (and clients can generate) exact types."""
+"""Request and response models of the REST API, so /docs shows (and clients can generate) exact types."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+
+from .store import MAX_NOTE
+
+MAX_URLS = 100  # per request
 
 
 class Health(BaseModel):
@@ -67,6 +71,7 @@ class ClassOut(BaseModel):
     name: str
     description: str  # text prompts, one per line
     count: int  # examples
+    reject_below: float | None  # the class's own reject threshold (None: the task's)
 
 
 class ExampleOut(BaseModel):
@@ -246,7 +251,31 @@ class EvalReport(BaseModel):
     mistakes: list[HeldOutPrediction]  # most confident first
     predictions: list[HeldOutPrediction]  # every scored example, in task order
     suggested_reject_below: float | None  # keeps 95% of correct predictions
+    suggested_class_thresholds: dict[str, float]  # the same per class, for classes with 5+ correct
     calibration: Calibration | None  # None with fewer than 50 scored examples
+
+
+class CompareResult(BaseModel):
+    """One embedder's cross-validation on the task (or why it couldn't be used)."""
+
+    embedder: str
+    accuracy: float | None = None
+    macro_f1: float | None = None
+    top_k_accuracy: dict[str, float] = {}
+    n_scored: int = 0
+    seconds: float | None = None  # embedding (cached images are fast) and evaluation
+    method: str | None = None
+    error: str | None = None
+
+
+class CompareReport(BaseModel):
+    """Several embedders evaluated on the same labelled examples."""
+
+    revision: int
+    current: str  # the task's embedder
+    n_examples: int
+    results: list[CompareResult]  # in the order asked for
+    best: str | None  # the most accurate embedder
 
 
 class JobOut(BaseModel):
@@ -259,5 +288,130 @@ class JobOut(BaseModel):
     stage: str
     done: int
     total: int
-    result: EvalReport | None
+    result: EvalReport | CompareReport | None
     error: str | None
+
+
+# ---- request bodies -----------------------------------------------------
+class _Body(BaseModel):
+    """Request bodies refuse unknown fields, so a misspelt setting is an error, not a no-op."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class Login(_Body):
+    """Body of POST /api/login."""
+
+    token: str
+
+
+class TaskCreate(_Body):
+    """Body of POST /api/tasks."""
+
+    name: str
+    embedder: str | None = None
+    classifier: str = "prototype"
+
+
+class TaskSettings(_Body):
+    """Body of PATCH /api/tasks/{name}; omitted fields are left unchanged."""
+
+    embedder: str | None = None
+    classifier: str | None = None
+    classifier_params: dict[str, Any] | None = None
+    text_weight: float | None = None
+    reject_below: float | None = None
+    clear_reject: bool = False
+    reject_below_zero_shot: float | None = None
+    clear_reject_zero_shot: bool = False
+    flip: bool | None = None
+    temperature: float | None = None
+    clear_temperature: bool = False
+
+
+class Rename(_Body):
+    """Body of POST .../rename."""
+
+    name: str
+
+
+class Duplicate(_Body):
+    """Body of POST .../duplicate."""
+
+    name: str
+    examples: bool = True  # copy the examples (else only settings and classes)
+    inbox: bool = False
+
+
+class ClassBody(_Body):
+    """Body of POST .../classes."""
+
+    name: str
+    description: str | None = None
+
+
+class ClassPatch(_Body):
+    """Body of PATCH .../classes/{label}: rename and/or set the description."""
+
+    name: str | None = None
+    description: str | None = None
+
+
+class Describe(_Body):
+    """Body of POST .../describe."""
+
+    template: str = "a photo of a {}"
+    overwrite: bool = False
+
+
+class ClassThresholds(_Body):
+    """Body of PUT .../class-thresholds."""
+
+    thresholds: dict[str, float | None]  # class -> similarity (-1 to 1), or null to use the task's
+
+
+class Urls(_Body):
+    """Body of POST .../predict/urls."""
+
+    urls: list[str] = Field(min_length=1, max_length=MAX_URLS)
+
+
+class LabelledUrls(Urls):
+    """Body of POST .../examples/urls."""
+
+    label: str
+
+
+class ExampleEdit(_Body):
+    """Body of PATCH .../examples/{eid}: any of a new label, tags (replacing them) and a note."""
+
+    label: str | None = None
+    tags: list[str] | None = None
+    note: str | None = Field(None, max_length=MAX_NOTE)
+
+
+class ExampleIds(_Body):
+    """Body of POST .../examples/delete."""
+
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkEdit(ExampleIds):
+    """Body of PATCH .../examples: a new label and/or tags to add or remove."""
+
+    label: str | None = None
+    add_tags: list[str] = Field(default_factory=list)
+    remove_tags: list[str] = Field(default_factory=list)
+
+
+class InboxLabels(_Body):
+    """Body of POST .../inbox/accept: the class for each inbox image to label."""
+
+    labels: dict[str, str] = Field(min_length=1)
+
+
+class Compare(_Body):
+    """Body of POST .../compare/jobs."""
+
+    embedders: list[str]
+    folds: int | None = None

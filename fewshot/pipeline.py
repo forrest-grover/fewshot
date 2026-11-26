@@ -336,10 +336,17 @@ def new_classifier(cfg: TaskConfig) -> Classifier:
     return clf
 
 
-def threshold_for(cfg: TaskConfig, clf: Classifier) -> float | None:
-    """The reject threshold that applies to ``clf``'s predictions: the zero-shot one for a task
-    without images, otherwise ``reject_below``."""
-    return cfg.reject_below_zero_shot if clf.zero_shot else cfg.reject_below
+def threshold_for(cfg: TaskConfig, clf: Classifier) -> np.ndarray | None:
+    """The reject threshold for each of ``clf``'s classes (NaN: none), or None if no class has one:
+    the zero-shot one for a task without images; otherwise the class's own ``reject_below``, else
+    the task's."""
+    if clf.zero_shot:
+        thr = {c: cfg.reject_below_zero_shot for c in clf.classes}
+    else:
+        own = {c.name: c.reject_below for c in cfg.classes}
+        thr = {c: own.get(c) if own.get(c) is not None else cfg.reject_below for c in clf.classes}
+    out = np.array([np.nan if v is None else v for v in thr.values()], float)
+    return None if np.isnan(out).all() else out
 
 
 def _keyed(images: Sequence[ImageInput], errors: dict[int, str]) -> list[tuple[str | None, ImageInput]]:
@@ -360,18 +367,19 @@ def _keyed(images: Sequence[ImageInput], errors: dict[int, str]) -> list[tuple[s
     return items
 
 
-def _to_pred(clf: Classifier, thr: float | None, row: tuple[np.ndarray, float, np.ndarray],
+def _to_pred(clf: Classifier, thr: np.ndarray | None, row: tuple[np.ndarray, float, np.ndarray],
              top_k: int | None) -> Prediction:
     """The prediction from one image's (probabilities, similarity to the predicted class,
-    similarity per class)."""
+    similarity per class), given each class's reject threshold (see ``threshold_for``). Other
+    classes the image is at least as similar to as their threshold are listed in ``labels`` too."""
     p, s, per_class = row
     j = int(p.argmax())
-    rejected = thr is not None and float(s) < thr
+    rejected = thr is not None and bool(float(s) < thr[j])  # NaN (no threshold) never rejects
     label = None if rejected else clf.classes[j]
     labels = [] if label is None else [label]
     if thr is not None and label is not None:
         order = np.argsort(-per_class, kind="stable")
-        labels += [clf.classes[i] for i in order if i != j and per_class[i] >= thr]
+        labels += [clf.classes[i] for i in order if i != j and per_class[i] >= thr[i]]
     ranked = sorted(zip(clf.classes, p.tolist(), strict=True), key=lambda cv: -cv[1])
     return Prediction(
         label=label,

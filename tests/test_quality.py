@@ -493,7 +493,7 @@ def test_threshold_applies_to_the_predicted_class():
     assert per_class[0] > per_class[1]  # nearer to a...
     assert probs[0].argmax() == 1  # ...but b's description wins
     assert sims[0] == pytest.approx(per_class[1])
-    p = _to_pred(clf, 0.7, (probs[0], float(sims[0]), per_class), None)
+    p = _to_pred(clf, np.array([0.7, 0.7]), (probs[0], float(sims[0]), per_class), None)
     assert (p.rejected, p.label, p.labels) == (True, None, [])
 
 

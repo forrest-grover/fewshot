@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, AUTH_EVENT, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
+import type { CompareRun } from "./Compare";
 import Evaluate, { type EvalRun } from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
@@ -47,6 +48,7 @@ export default function App() {
   // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
   const predictState = usePredictResults(route.task);
   const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
+  const [compareRun, setCompareRun] = useState<CompareRun | null>(null);
 
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
     const from = currentTask.current;
@@ -102,6 +104,7 @@ export default function App() {
     setMenuOpen(false);
     setToast(null);
     setEvalRun((s) => (s?.task === route.task ? s : null)); // kept when this is the task's new name
+    setCompareRun((s) => (s?.task === route.task ? s : null));
     setError(null);
     setTask(null);
     setLoadFailed(false);
@@ -235,7 +238,8 @@ export default function App() {
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
               {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} />}
               {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
-              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun} />}
+              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun}
+                models={models} compare={compareRun} setCompare={setCompareRun} />}
               {route.tab === "settings" && (
                 <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }}
                   onDuplicated={(t) => { void refreshTasks(); go(t.name); }}
@@ -243,6 +247,7 @@ export default function App() {
                     // Results move with the task to its new name.
                     predictState.rename(t.name);
                     setEvalRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
+                    setCompareRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
                     void refreshTasks();
                     go(t.name, "settings");
                   }} />

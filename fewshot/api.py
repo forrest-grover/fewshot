@@ -42,7 +42,6 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
 
 from .archive import export_task as write_export
 from .archive import import_task as read_export
@@ -57,7 +56,7 @@ from .embedders import (
     max_models,
     spec_supports_text,
 )
-from .evaluate import evaluate_task
+from .evaluate import compare_embedders, evaluate_task
 from .fetch import fetch_url
 from .guard import LimitBody, cross_site, host_name
 from .images import thumbnail
@@ -65,19 +64,35 @@ from .jobs import Job, Jobs
 from .pipeline import Pipeline, Prediction
 from .schemas import (
     AddResult,
+    BulkEdit,
+    ClassBody,
+    ClassPatch,
+    ClassThresholds,
+    Compare,
+    Describe,
+    Duplicate,
     DuplicatePair,
     EvalReport,
+    ExampleEdit,
+    ExampleIds,
     ExamplePage,
     Health,
     InboxAdded,
+    InboxLabels,
     InboxPage,
     JobOut,
+    LabelledUrls,
+    Login,
     ModelsOut,
     PredictionOut,
+    Rename,
+    TaskCreate,
     TaskDetail,
+    TaskSettings,
     TaskSummary,
+    Urls,
 )
-from .store import MAX_NOTE, Task, Workspace
+from .store import Task, Workspace
 from .text import check_class_name, check_tag
 
 log = logging.getLogger(__name__)
@@ -86,7 +101,6 @@ TOKEN = os.environ.get("FEWSHOT_TOKEN") or None
 ALLOW_ANY_MODEL = os.environ.get("FEWSHOT_ALLOW_ANY_MODEL") == "1"
 WARM = os.environ.get("FEWSHOT_WARM") == "1"
 ALLOW_URLS = os.environ.get("FEWSHOT_ALLOW_URLS") == "1"
-MAX_URLS = 100  # per request
 URL_FETCH_SECONDS = 120.0  # time budget for all of one request's URLs
 URL_FETCH_WORKERS = 4  # URLs fetched at once
 MAX_JOBS = 4  # background jobs running at once
@@ -183,16 +197,21 @@ def _check_embedder(spec: str) -> None:
     Unless ``ALLOW_ANY_MODEL``, a spec that isn't a preset, registered, or already used by a task
     is refused (403) before anything is downloaded.
     """
+    _allowed_embedder(spec)
+    try:
+        check_embedder(spec)
+    except ValueError as e:
+        raise _bad(e) from e
+
+
+def _allowed_embedder(spec: str) -> None:
+    """Refuse an empty spec (400), or one ``_check_embedder``'s allowlist doesn't allow (403)."""
     if not spec.strip():
         raise HTTPException(400, "Embedder spec is empty")
     if not (ALLOW_ANY_MODEL or spec in {p.spec for p in PRESETS} or is_registered(spec)
             or any(t.config.embedder == spec for t in ws.list_tasks())):
         raise HTTPException(403, f"Embedder {spec!r} is not a preset. To use other models, start the "
                                  "server with --allow-any-model (FEWSHOT_ALLOW_ANY_MODEL=1).")
-    try:
-        check_embedder(spec)
-    except ValueError as e:
-        raise _bad(e) from e
 
 
 # Largest accepted upload per image; FEWSHOT_MAX_UPLOAD_MB overrides it.
@@ -207,12 +226,6 @@ def _read_upload(f: UploadFile) -> bytes | None:
 
 def _too_large() -> str:
     return f"File is larger than the {MAX_UPLOAD_BYTES / 1024 / 1024:g} MB upload limit"
-
-
-class _Body(BaseModel):
-    """Request bodies refuse unknown fields, so a misspelt setting is an error, not a no-op."""
-
-    model_config = ConfigDict(extra="forbid")
 
 
 def _detail(t: Task) -> dict[str, Any]:
@@ -235,7 +248,8 @@ def _detail(t: Task) -> dict[str, Any]:
         "can_redo": t.can_redo(),
         "undo_label": t.undo_label(),
         "redo_label": t.redo_label(),
-        "classes": [{"name": k.name, "description": k.description, "count": counts.get(k.name, 0)} for k in c.classes],
+        "classes": [{"name": k.name, "description": k.description, "count": counts.get(k.name, 0),
+                     "reject_below": k.reject_below} for k in c.classes],
         "examples": [e.model_dump() for e in c.examples],
     }
 
@@ -248,12 +262,6 @@ def health() -> dict[str, Any]:
     running = len(jobs.running())
     return {"status": "ok", "auth_required": TOKEN is not None, "models_loaded": loaded_embedders(),
             "jobs_running": running, "url_fetch": ALLOW_URLS}
-
-
-class Login(_Body):
-    """Body of POST /api/login."""
-
-    token: str
 
 
 _failed_logins: dict[str, deque[float]] = {}  # client address -> times of recent wrong tokens
@@ -300,36 +308,6 @@ def models() -> dict[str, Any]:
 
 
 # ---- tasks --------------------------------------------------------------
-class TaskCreate(_Body):
-    """Body of POST /api/tasks."""
-
-    name: str
-    embedder: str | None = None
-    classifier: str = "prototype"
-
-
-class TaskSettings(_Body):
-    """Body of PATCH /api/tasks/{name}; omitted fields are left unchanged."""
-
-    embedder: str | None = None
-    classifier: str | None = None
-    classifier_params: dict[str, Any] | None = None
-    text_weight: float | None = None
-    reject_below: float | None = None
-    clear_reject: bool = False
-    reject_below_zero_shot: float | None = None
-    clear_reject_zero_shot: bool = False
-    flip: bool | None = None
-    temperature: float | None = None
-    clear_temperature: bool = False
-
-
-class Rename(_Body):
-    """Body of POST .../rename."""
-
-    name: str
-
-
 @app.get("/api/tasks", response_model=list[TaskSummary])
 def list_tasks() -> list[dict[str, Any]]:
     """Summaries of all tasks."""
@@ -398,14 +376,6 @@ def rename_task(name: str, body: Rename) -> dict[str, Any]:
         raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
-
-
-class Duplicate(_Body):
-    """Body of POST .../duplicate."""
-
-    name: str
-    examples: bool = True  # copy the examples (else only settings and classes)
-    inbox: bool = False
 
 
 @app.post("/api/tasks/{name}/duplicate", status_code=201, response_model=TaskDetail)
@@ -484,20 +454,6 @@ def import_task(file: UploadFile = File(...), name: str | None = Form(None),
 
 
 # ---- classes ------------------------------------------------------------
-class ClassBody(_Body):
-    """Body of POST .../classes."""
-
-    name: str
-    description: str | None = None
-
-
-class ClassPatch(_Body):
-    """Body of PATCH .../classes/{label}: rename and/or set the description."""
-
-    name: str | None = None
-    description: str | None = None
-
-
 @app.post("/api/tasks/{name}/classes", status_code=201, response_model=TaskDetail)
 def add_class(name: str, body: ClassBody) -> dict[str, Any]:
     """Add a class, or update the description of an existing one."""
@@ -527,19 +483,28 @@ def patch_class(name: str, label: str, body: ClassPatch) -> dict[str, Any]:
     return _detail(t)
 
 
-class Describe(_Body):
-    """Body of POST .../describe."""
-
-    template: str = "a photo of a {}"
-    overwrite: bool = False
-
-
 @app.post("/api/tasks/{name}/describe", response_model=TaskDetail)
 def describe_classes(name: str, body: Describe) -> dict[str, Any]:
     """Fill class descriptions from a template such as 'a photo of a {}'."""
     t = _task(name)
     try:
         t.describe_classes(body.template, body.overwrite)
+    except ValueError as e:
+        raise _bad(e) from e
+    return _detail(t)
+
+
+@app.put("/api/tasks/{name}/class-thresholds", response_model=TaskDetail)
+def set_class_thresholds(name: str, body: ClassThresholds) -> dict[str, Any]:
+    """Set or clear the reject thresholds of the named classes (one undoable change); classes not
+    named keep theirs. An unknown class (404) or a value outside -1..1 (400) changes nothing."""
+    t = _task(name)
+    if not body.thresholds:
+        raise HTTPException(400, "Give at least one class")
+    try:
+        t.set_class_thresholds(body.thresholds)
+    except KeyError as e:
+        raise _missing(e) from e
     except ValueError as e:
         raise _bad(e) from e
     return _detail(t)
@@ -636,18 +601,6 @@ def add_examples(name: str, label: str = Form(...), files: list[UploadFile] = Fi
     return _add_blobs(t, label, _uploads(files))
 
 
-class Urls(_Body):
-    """Body of POST .../predict/urls."""
-
-    urls: list[str] = Field(min_length=1, max_length=MAX_URLS)
-
-
-class LabelledUrls(Urls):
-    """Body of POST .../examples/urls."""
-
-    label: str
-
-
 @app.post("/api/tasks/{name}/examples/urls", status_code=201, response_model=AddResult)
 def add_examples_by_url(name: str, body: LabelledUrls) -> dict[str, Any]:
     """Download images (server started with --allow-urls) and add them as examples of ``label``."""
@@ -663,14 +616,6 @@ def _check_tags(tags: list[str]) -> None:
     """Raise ``ValueError`` for the first bad tag."""
     for tag in tags:
         check_tag(tag)
-
-
-class ExampleEdit(_Body):
-    """Body of PATCH .../examples/{eid}: any of a new label, tags (replacing them) and a note."""
-
-    label: str | None = None
-    tags: list[str] | None = None
-    note: str | None = Field(None, max_length=MAX_NOTE)
 
 
 @app.patch("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail)
@@ -700,20 +645,6 @@ def delete_example(name: str, eid: str) -> dict[str, Any]:
     except KeyError as e:
         raise _missing(e) from e
     return _detail(t)
-
-
-class ExampleIds(_Body):
-    """Body of POST .../examples/delete."""
-
-    ids: list[str] = Field(min_length=1)
-
-
-class BulkEdit(ExampleIds):
-    """Body of PATCH .../examples: a new label and/or tags to add or remove."""
-
-    label: str | None = None
-    add_tags: list[str] = Field(default_factory=list)
-    remove_tags: list[str] = Field(default_factory=list)
 
 
 @app.patch("/api/tasks/{name}/examples", response_model=TaskDetail)
@@ -815,12 +746,6 @@ def list_inbox(name: str, sort: str = Query("uncertain", pattern="^(uncertain|co
     except ValueError as e:
         raise _bad(e) from e
     return {"total": len(items), "offset": offset, "items": items[offset : offset + limit]}
-
-
-class InboxLabels(_Body):
-    """Body of POST .../inbox/accept: the class for each inbox image to label."""
-
-    labels: dict[str, str] = Field(min_length=1)
 
 
 @app.post("/api/tasks/{name}/inbox/accept", response_model=TaskDetail)
@@ -936,6 +861,30 @@ def start_evaluation(name: str, folds: int | None = None) -> dict[str, Any]:
         raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
     job = Job(task=name, kind=kind, revision=t.config.revision)
     return jobs.start(job, lambda progress: _evaluated(t, evaluate_task(pipe, t, folds, progress=progress))).to_dict()
+
+
+MAX_COMPARED = 8  # embedders per comparison
+
+
+@app.post("/api/tasks/{name}/compare/jobs", status_code=202, response_model=JobOut)
+def start_comparison(name: str, body: Compare) -> dict[str, Any]:
+    """Start cross-validating the task with each of ``embedders`` in the background (the same
+    allowlist as choosing a task's embedder applies); the job's result compares their accuracy.
+    Stages are like "2/3 embedding"."""
+    t = _task(name)
+    specs = list(dict.fromkeys(s.strip() for s in body.embedders if s.strip()))
+    if not 1 <= len(specs) <= MAX_COMPARED:
+        raise HTTPException(400, f"Give between 1 and {MAX_COMPARED} embedders")
+    if body.folds is not None and body.folds < 2:
+        raise HTTPException(400, f"folds must be at least 2, got {body.folds}")
+    if not t.config.examples:
+        raise HTTPException(400, "Task has no examples to evaluate")
+    for s in specs:
+        _allowed_embedder(s)  # loaded by the job: a model that fails is reported in its result
+    if len(jobs.running()) >= MAX_JOBS:
+        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished")
+    job = Job(task=name, kind="compare", revision=t.config.revision)
+    return jobs.start(job, lambda progress: compare_embedders(pipe, t, specs, body.folds, progress=progress)).to_dict()
 
 
 @app.get("/api/jobs/{jid}", response_model=JobOut)

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Prediction } from "./api";
+import { api, type Job, type Prediction } from "./api";
 
 const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
 
@@ -131,4 +131,29 @@ export async function filesFromDrop(dt: DataTransfer): Promise<File[]> {
   };
   for (const e of entries) await walk(e);
   return out;
+}
+
+const POLL_MS = 500;
+
+/** Poll job ``jobId`` (if any) every half second, passing each state to ``onJob`` (the last one is
+ * finished); a failed request goes to ``onError`` and stops polling. Unmounting stops polling too. */
+export function usePollJob<T>(jobId: string | undefined, onJob: (j: Job<T>) => void, onError: (e: Error) => void) {
+  const latest = useRef({ onJob, onError });
+  latest.current = { onJob, onError };
+  useEffect(() => {
+    if (!jobId) return;
+    let live = true;
+    const timer = setInterval(() => {
+      void api.job<T>(jobId).then((j) => {
+        if (!live) return;
+        if (j.status !== "running") { live = false; clearInterval(timer); }
+        latest.current.onJob(j);
+      }, (e: unknown) => {
+        if (!live) return;
+        live = false; clearInterval(timer);
+        latest.current.onError(e instanceof Error ? e : new Error(String(e)));
+      });
+    }, POLL_MS);
+    return () => { live = false; clearInterval(timer); };
+  }, [jobId]);
 }
