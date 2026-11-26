@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, AUTH_EVENT, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
-import type { CompareRun } from "./Compare";
-import Evaluate, { type EvalRun } from "./Evaluate";
+import { api, AUTH_EVENT, HttpError, type CompareReport, type EvalReport, type ModelInfo, type TaskDetail, type TaskSummary } from "./api";
+import Evaluate from "./Evaluate";
 import Dashboard from "./Dashboard";
 import Examples from "./Examples";
 import Inbox from "./Inbox";
-import { topModal, usePredictResults } from "./hooks";
+import { Gate, Latest, stepToast, taskUndoKey, typingAt, useByTask, usePredictResults } from "./hooks";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
-import { ErrorBox } from "./ui";
+import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
+import { ErrorBox, JobPoller } from "./ui";
+import { isAbort } from "./upload";
 
 const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -45,26 +46,52 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false); // the task list, on narrow screens
   const [help, setHelp] = useState(false); // the keyboard shortcuts
   const currentTask = useRef(route.task); // read by responses that arrive after the user moved on
-  // Prediction and evaluation results live here so they survive switching tabs; both reset per task.
+  // Prediction results live here so they survive switching tabs (they reset per task).
   const predictState = usePredictResults(route.task);
-  const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
-  const [compareRun, setCompareRun] = useState<CompareRun | null>(null);
+  // Each task's last evaluation and comparison, and their running jobs, which are polled here
+  // until they end, whatever is open, so a run can still be followed or cancelled after leaving it.
+  const evals = useByTask<EvalRun>();
+  const compares = useByTask<CompareRun>();
+
+  const taskLoads = useRef(new Latest()).current;
+  /** Fetch the open task again, e.g. after it was changed elsewhere (the CLI, another tab); a
+   * response older than the task shown is ignored. If it is gone, say so. */
+  const reloadTask = useCallback(() => {
+    const name = currentTask.current;
+    if (!name) return;
+    const latest = taskLoads.begin();
+    api.task(name).then((t) => {
+      if (!latest() || currentTask.current !== name) return;
+      setTask((cur) => (cur && cur.name === t.name && cur.revision >= t.revision ? cur : t));
+    }, (e: unknown) => {
+      if (!latest() || currentTask.current !== name || !(e instanceof HttpError && e.status === 404)) return;
+      setTask(null);
+      setLoadFailed(true);
+      setError(e.message);
+    });
+  }, [taskLoads]);
 
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
     const from = currentTask.current;
     try {
       return await p;
     } catch (e) {
-      // An error from a task the user has since left would only confuse the one now shown.
-      if (currentTask.current === from) setError(e instanceof Error ? e.message : String(e));
+      // An error from a task the user has since left would only confuse the one now shown, and
+      // a cancelled request was meant to stop.
+      if (currentTask.current !== from || isAbort(e)) return undefined;
+      setError(e instanceof Error ? e.message : String(e));
+      // Refused (say, an example or class that is gone): the task may have changed elsewhere.
+      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) reloadTask();
       return undefined;
     }
-  }, []);
+  }, [reloadTask]);
 
-  const refreshTasks = useCallback(
-    () => run(api.tasks()).then((t) => { if (t) setTasks(t); }),
-    [run],
-  );
+  const taskLists = useRef(new Latest()).current;
+  const refreshTasks = useCallback(async () => {
+    const latest = taskLists.begin();
+    const t = await run(api.tasks());
+    if (t && latest()) setTasks(t); // not an older list that arrived after a newer one
+  }, [run, taskLists]);
 
   useEffect(() => {
     const auth = () => { setSignIn(true); };
@@ -91,7 +118,7 @@ export default function App() {
   useEffect(() => { // "?" shows the keyboard shortcuts
     const on = (e: KeyboardEvent) => {
       if (e.key !== "?" || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      if (typingAt(e.target)) return;
       e.preventDefault();
       setHelp(true);
     };
@@ -103,23 +130,31 @@ export default function App() {
     currentTask.current = route.task;
     setMenuOpen(false);
     setToast(null);
-    setEvalRun((s) => (s?.task === route.task ? s : null)); // kept when this is the task's new name
-    setCompareRun((s) => (s?.task === route.task ? s : null));
     setError(null);
     setTask(null);
     setLoadFailed(false);
     if (!route.task) return;
-    let current = true; // false once the user opens another task: a late response must not show
+    const latest = taskLoads.begin(); // false once the user opens another task: a late response must not show
     api.task(route.task).then(
-      (t) => { if (current) setTask(t); },
+      (t) => { if (latest()) setTask(t); },
       (e: unknown) => {
-        if (!current) return;
+        if (!latest()) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoadFailed(true);
       },
     );
-    return () => { current = false; };
-  }, [route.task]);
+  }, [route.task, taskLoads]);
+
+  // The task list (fetched again whenever the window comes back, and after each change) shows
+  // the open task changed elsewhere, or gone: fetch it again.
+  const listed = tasks.find((s) => s.name === task?.name);
+  const listedRevision = tasks.length && task ? listed?.revision ?? -1 : null; // -1: not listed
+  useEffect(() => {
+    if (task && listedRevision !== null && (listedRevision > task.revision || listedRevision === -1)) reloadTask();
+  }, [listedRevision, task?.revision, reloadTask]); // eslint-disable-line react-hooks/exhaustive-deps -- only on these changes
+
+  /** A background job of task ``name`` failed: say so if that task is open. */
+  const jobFailed = (name: string, message: string) => { if (currentTask.current === name) setError(message); };
 
   /** Show a task returned by a mutation, unless it is for another task or older than what is shown. */
   const updateTask = (t: TaskDetail) => {
@@ -129,19 +164,17 @@ export default function App() {
     void refreshTasks();
   };
 
-  /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse. */
-  const step = async (which: "undo" | "redo") => {
+  /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse.
+   * One step at a time: presses while one is in flight are ignored, so a double press or a held
+   * key doesn't walk back several versions. */
+  const stepGate = useRef(new Gate()).current;
+  const step = (which: "undo" | "redo") => stepGate.run(async () => {
     if (!task || !(which === "undo" ? task.can_undo : task.can_redo)) return;
-    const what = which === "undo" ? task.undo_label : task.redo_label;
     const t = await run(which === "undo" ? api.undo(task.name) : api.redo(task.name));
     if (!t) return;
     updateTask(t);
-    setToast({
-      text: `${which === "undo" ? "Undid" : "Redid"} ${what || "the last change"}`,
-      then: which === "undo" ? (t.can_redo ? "redo" : null) : (t.can_undo ? "undo" : null),
-      key: Date.now(),
-    });
-  };
+    setToast({ ...stepToast(which, t, which === "undo" ? task.undo_label : task.redo_label), key: Date.now() });
+  });
   const undo = () => step("undo");
   useEffect(() => { // the toast goes after a few seconds
     if (!toast) return;
@@ -149,16 +182,15 @@ export default function App() {
     return () => { clearTimeout(timer); };
   }, [toast]);
   // Ctrl/Cmd+Z undoes the task's last change and Ctrl/Cmd+Shift+Z (or Ctrl+Y) redoes it, unless
-  // typing in a field (where they undo the typing).
+  // typing in a field (where they undo the typing); see taskUndoKey.
   const stepRef = useRef(step);
   stepRef.current = step;
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      if (!(e.ctrlKey || e.metaKey) || e.altKey || (key !== "z" && key !== "y") || topModal()) return;
-      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      const which = taskUndoKey(e);
+      if (!which) return;
       e.preventDefault();
-      void stepRef.current(key === "y" || e.shiftKey ? "redo" : "undo");
+      if (!e.repeat) void stepRef.current(which); // a held key steps once
     };
     window.addEventListener("keydown", on);
     return () => { window.removeEventListener("keydown", on); };
@@ -238,16 +270,17 @@ export default function App() {
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
               {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} />}
               {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
-              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run} state={evalRun} setState={setEvalRun}
-                models={models} compare={compareRun} setCompare={setCompareRun} />}
+              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run}
+                state={evals.map[task.name] ?? null} setState={evals.setFor(task.name)}
+                models={models} compare={compares.map[task.name] ?? null} setCompare={compares.setFor(task.name)} />}
               {route.tab === "settings" && (
-                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { void refreshTasks(); go(null); }}
+                <Settings task={task} models={models} setTask={updateTask} run={run} onDeleted={() => { evals.setFor(task.name)(null); compares.setFor(task.name)(null); void refreshTasks(); go(null); }}
                   onDuplicated={(t) => { void refreshTasks(); go(t.name); }}
                   onRenamed={(t) => {
                     // Results move with the task to its new name.
                     predictState.rename(t.name);
-                    setEvalRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
-                    setCompareRun((s) => (s?.task === task.name ? { ...s, task: t.name } : s));
+                    evals.rename(task.name, t.name);
+                    compares.rename(task.name, t.name);
                     void refreshTasks();
                     go(t.name, "settings");
                   }} />
@@ -256,6 +289,16 @@ export default function App() {
           </>
         )}
       </main>
+      {Object.entries(evals.map).map(([name, r]) => r?.job && (
+        <JobPoller<EvalReport> key={r.job.id} id={r.job.id}
+          onJob={(j) => { evals.setFor(name)((s) => evalAfter(s, j)); if (j.status === "failed") jobFailed(name, `Evaluation failed: ${j.error ?? "unknown error"}`); }}
+          onError={(e) => { const id = r.job?.id ?? ""; evals.setFor(name)((s) => jobLost(s, id)); jobFailed(name, e.message); }} />
+      ))}
+      {Object.entries(compares.map).map(([name, r]) => r?.job && (
+        <JobPoller<CompareReport> key={r.job.id} id={r.job.id}
+          onJob={(j) => { compares.setFor(name)((s) => compareAfter(s, j)); if (j.status === "failed") jobFailed(name, `Comparison failed: ${j.error ?? "unknown error"}`); }}
+          onError={(e) => { const id = r.job?.id ?? ""; compares.setFor(name)((s) => jobLost(s, id)); jobFailed(name, e.message); }} />
+      ))}
       {help && <Shortcuts onClose={() => { setHelp(false); }} />}
       {toast && (
         <div className="toast" role="status" key={toast.key}>

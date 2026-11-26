@@ -1,9 +1,10 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, type Prediction, type TaskDetail } from "./api";
 import { downloadCsv } from "./csv";
-import { revoke, usePasteImages, usePredictResults, useShortcuts, type Item, type Results } from "./hooks";
+import { usePasteImages, usePredictResults, useShortcuts, type Item, type Results } from "./hooks";
 import { shrinkImages } from "./images";
-import { Bar, DropZone } from "./ui";
+import { Bar, ClassSelect, DropZone } from "./ui";
+import { progressText, sendInBatches } from "./upload";
 
 type ResultsState = ReturnType<typeof usePredictResults>;
 
@@ -40,30 +41,49 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
   };
   const cardRefs = useRef(new Map<number, HTMLElement>());
   // "Added" only while that example is still in the task, so an undone add can be made again.
-  const addedAs = (it: Item) => (it.added && task.examples.some((e) => e.id === it.added?.id) ? it.added.label : null);
+  const exampleIds = useMemo(() => new Set(task.examples.map((e) => e.id)), [task.examples]);
+  const classNames = useMemo(() => task.classes.map((c) => c.name), [task.classes]);
+  const addedAs = (it: Item) => (it.added && exampleIds.has(it.added.id) ? it.added.label : null);
   const actionable = (it: Item) => !it.pred.error && !addedAs(it);
   const current = items.find((it) => it.key === results.current && actionable(it)) ?? items.find(actionable);
 
-  const show = (batch: number, added: Item[]) => {
-    finish(batch, (r) => ({ ...r, items: [...added, ...r.items], current: null }));
+  /** Show the results ``added`` on top, below earlier ones of the same classification (keys in
+   * ``mine``, if it came in batches). */
+  const show = (batch: number, added: Item[], mine = new Set<number>()) => {
+    const first = mine.size === 0;
+    finish(batch, (r) => {
+      const at = r.items.findIndex((it) => !mine.has(it.key));
+      const split = at < 0 ? r.items.length : at;
+      return { ...r, items: [...r.items.slice(0, split), ...added, ...r.items.slice(split)], current: first ? null : r.current };
+    });
+    added.forEach((it) => mine.add(it.key));
     // Focus the new top result, so Enter and the number keys act on it rather than on the drop zone.
     const top = added[0].key;
-    requestAnimationFrame(() => { cardRefs.current.get(top)?.focus(); });
+    if (first) requestAnimationFrame(() => { cardRefs.current.get(top)?.focus(); });
   };
+  /** Classify images, in batches (see sendInBatches) whose results show as they arrive; Cancel
+   * or opening another task stops it. */
   const classify = async (originals: File[]) => {
     const batch = begin();
+    const req = state.abortable();
+    const mine = new Set<number>();
+    let sent = 0;
     try {
-      const files = await shrinkImages(originals);
-      const preds = await run(api.predict(task.name, files));
-      if (preds) {
-        const added = files.map((f, i) => ({
-          key: nextKey++, name: originals[i].name, file: f, url: URL.createObjectURL(f), pred: preds[i],
-        }));
-        added.forEach((it) => urls.current.add(it.url));
-        show(batch, added);
-      }
+      await run(sendInBatches(originals, (fs, signal) => api.predict(task.name, fs, signal), {
+        signal: req.signal, prepare: shrinkImages,
+        onProgress: (done, total) => { finish(batch, (r) => ({ ...r, progress: { done, total } })); },
+        onBatch: (preds, files) => {
+          const added = files.map((f, i) => ({
+            key: nextKey++, name: originals[sent + i].name, file: f, url: URL.createObjectURL(f), pred: preds[i],
+          }));
+          sent += files.length;
+          added.forEach((it) => urls.current.add(it.url));
+          show(batch, added, mine);
+        },
+      }));
     } finally {
-      finish(batch, (r) => ({ ...r, batch: null }));
+      req.done();
+      finish(batch, (r) => ({ ...r, batch: null, progress: undefined }));
     }
   };
   const classifyUrls = async () => {
@@ -102,13 +122,15 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     patch(it.key, added ? { adding: false, added: { label, id: added.id } } : { adding: false }); // a failure shows in the error box
     if (r) setTask(r.task);
   };
-  const clear = () => {
-    revoke(urls.current);
-    update((r) => ({ ...r, items: [], current: null }));
-  };
+  const clear = () => { update((r) => ({ ...r, items: [], current: null })); }; // their preview URLs are released
 
   const ready = task.classes.length >= 1;
-  usePasteImages((fs) => { if (ready && !busy) void classify(fs); });
+  const fail = (message: string) => { void run(Promise.reject(new Error(message))); };
+  usePasteImages((fs) => {
+    if (!ready) fail("Add classes on the Examples tab before classifying images.");
+    else if (busy) fail("Still classifying the last images: paste again when they are done.");
+    else void classify(fs);
+  });
 
   // 1-9: add the highlighted result as that class. Enter: as its prediction. Up/Down (or k/j): move.
   useShortcuts((e) => {
@@ -122,6 +144,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
       void addAs(current, c.name);
       move = 1;
     } else if (e.key === "Enter") {
+      if (current.pred.rejected) return; // "unknown": a number key says which class it is
       void addAs(current, current.pred.top_label);
       move = 1;
     } else if (e.key === "ArrowDown" || e.key === "j") move = 1;
@@ -137,8 +160,11 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
     <div>
       {!ready && <p className="hint">Add classes on the Examples tab first (one class works too, with a reject threshold, to tell members from outsiders).</p>}
       <DropZone disabled={!ready || busy} onFiles={(fs) => { void classify(fs); }}>
-        {busy ? "Classifying… (the first run loads the model, which can take several seconds)" : "Drop images to classify, click to choose, or paste"}
+        {busy
+          ? `Classifying${results.progress && results.progress.total > 1 ? ` ${progressText(results.progress)}` : ""}… (the first run loads the model, which can take several seconds)`
+          : "Drop images to classify, click to choose, or paste"}
       </DropZone>
+      {busy && <div className="row"><button className="ghost small" onClick={state.cancel}>Cancel</button></div>}
       {urlFetch && (
         <form className="row url-form" onSubmit={(e) => { e.preventDefault(); void classifyUrls(); }}>
           <input value={urlText} onChange={(e) => { setUrlText(e.target.value); }} className="url-input" placeholder="Or image URLs (https://…), separated by spaces"
@@ -158,7 +184,7 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
           {current && (
             <p className="muted keys">
               Keys for the highlighted result: <kbd>1</kbd>–<kbd>{Math.min(9, task.classes.length)}</kbd> add it as that class,{" "}
-              <kbd>Enter</kbd> accepts the prediction, <kbd>↑</kbd>/<kbd>↓</kbd> move.
+              {current.pred.rejected ? "" : <><kbd>Enter</kbd> accepts the prediction, </>}<kbd>↑</kbd>/<kbd>↓</kbd> move.
             </p>
           )}
         </>
@@ -184,7 +210,8 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
               key={it.key}
               ref={(el) => { if (el) cardRefs.current.set(it.key, el); else cardRefs.current.delete(it.key); }}
               className={`result ${it === current ? "current" : ""}`}
-              tabIndex={-1}
+              tabIndex={it === current ? 0 : -1} // Tab reaches the highlighted result; arrows move between them
+              onFocus={() => { if (actionable(it) && it !== current) update((r) => ({ ...r, current: it.key })); }}
               onClick={() => { if (actionable(it)) update((r) => ({ ...r, current: it.key })); }}
             >
               <img src={it.url} alt={it.name} />
@@ -220,13 +247,12 @@ export default function Predict({ task, setTask, run, state, urlFetch }: Props) 
                     <span className="ok">Added as {addedAs(it)}</span>
                   ) : (
                     <>
-                      <button className="small" disabled={it.adding} onClick={() => { void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
-                      <select className="small" value="" disabled={it.adding} onChange={(e) => { if (e.target.value) void addAs(it, e.target.value); }} aria-label="Add as another class">
-                        <option value="">Add as other…</option>
-                        {task.classes.map((c, i) => c.name === it.pred.top_label ? null : (
-                          <option key={c.name} value={c.name}>{i < 9 ? `${String(i + 1)} · ` : ""}{c.name}</option>
-                        ))}
-                      </select>
+                      {!it.pred.rejected && (
+                        <button className="small" disabled={it.adding} onClick={() => { void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
+                      )}
+                      <ClassSelect className="small" classes={classNames} numbered disabled={it.adding} aria-label="Add as another class"
+                        placeholder={it.pred.rejected ? "Add as…" : "Add as other…"} exclude={it.pred.rejected ? undefined : it.pred.top_label}
+                        onPick={(c) => { void addAs(it, c); }} />
                     </>
                   )}
                 </div>

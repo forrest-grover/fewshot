@@ -56,7 +56,7 @@ export default function Lightbox({ items, index, onIndex, onClose, onKey, footer
   if (!item) return null;
   return (
     <div className="modal-backdrop lightbox" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div ref={box} className="lightbox-box" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`} tabIndex={-1}>
+      <div ref={box} className="lightbox-box" role="dialog" aria-modal="true" data-allows-undo aria-labelledby={`${id}-title`} tabIndex={-1}>
         <div className="row lightbox-head">
           <strong id={`${id}-title`}>{item.title}</strong>
           <span className="muted">{index + 1} / {items.length}</span>

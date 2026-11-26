@@ -1,44 +1,35 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
-import { api, type CompareReport, type Job, type ModelInfo, type TaskDetail } from "./api";
+import { useRef, useState } from "react";
+import { api, type ModelInfo, type TaskDetail } from "./api";
 import { pct } from "./format";
-import { usePollJob } from "./hooks";
-
-/** The last model comparison of a task, kept by the App so it survives switching tabs. */
-export interface CompareRun { task: string; report: CompareReport | null; job: Job<CompareReport> | null }
+import { Gate, type SetFor } from "./hooks";
+import type { CompareRun } from "./runs";
 
 interface Props {
   task: TaskDetail; models: ModelInfo | null; setTask: (t: TaskDetail) => void;
   run: <T>(p: Promise<T>) => Promise<T | undefined>;
-  state: CompareRun | null; setState: Dispatch<SetStateAction<CompareRun | null>>;
+  // This task's comparison, kept (and its job polled) by the App.
+  state: CompareRun | null; setState: SetFor<CompareRun>;
 }
 
 /** Cross-validate the task with other embedders and switch to the most accurate. */
 export default function Compare({ task, models, setTask, run, state, setState }: Props) {
-  const mine = state?.task === task.name ? state : null;
-  const report = mine?.report ?? null;
-  const job = mine?.job ?? null;
+  const report = state?.report ?? null;
+  const [starting, setStarting] = useState(false);
+  const job = state?.job ?? null;
+  const busy = job !== null || starting;
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const label = (spec: string) => models?.embedders.find((e) => e.spec === spec)?.label ?? spec;
   const others = (models?.embedders ?? []).filter((e) => e.spec !== task.embedder);
   const chosen = others.map((e) => e.spec).filter((s) => picked.has(s)); // not the current model, if it was picked before
 
-  const jobId = job?.id;
-  usePollJob<CompareReport>(jobId, (j) => {
-    setState((s) => {
-      if (!s || s.job?.id !== jobId) return s;
-      if (j.status === "running") return { ...s, job: j };
-      return j.status === "done" ? { ...s, job: null, report: j.result } : { ...s, job: null };
-    });
-    if (j.status === "failed") void run(Promise.reject(new Error(`Comparison failed: ${j.error ?? "unknown error"}`)));
-  }, (e) => {
-    setState((s) => (s && s.job?.id === jobId ? { ...s, job: null } : s));
-    void run(Promise.reject(e));
-  });
-
-  const go = async () => {
+  const starts = useRef(new Gate()).current;
+  /** Start a comparison; a second click while it is starting does nothing. */
+  const go = () => starts.run(async () => {
+    setStarting(true);
     const j = await run(api.startComparison(task.name, [task.embedder, ...chosen]));
-    if (j) setState((s) => ({ task: task.name, report: s?.task === task.name ? s.report : null, job: j }));
-  };
+    setStarting(false);
+    if (j) setState((s) => ({ report: s?.report ?? null, job: j }));
+  });
   const toggle = (spec: string) => {
     setPicked((p) => { const n = new Set(p); if (n.has(spec)) n.delete(spec); else n.add(spec); return n; });
   };
@@ -57,7 +48,7 @@ export default function Compare({ task, models, setTask, run, state, setState }:
         images. A model not used before is downloaded first, which can take a few minutes.
       </p>
       {others.length > 0 && (
-        <fieldset className="compare-pick" disabled={job !== null}>
+        <fieldset className="compare-pick" disabled={busy}>
           <legend className="muted">Compare {label(task.embedder)} (current) with:</legend>
           {others.map((e) => (
             <label key={e.spec} className="check" title={e.notes}>
@@ -68,9 +59,9 @@ export default function Compare({ task, models, setTask, run, state, setState }:
         </fieldset>
       )}
       <div className="row">
-        <button className="secondary" disabled={job !== null || chosen.length === 0 || task.examples.length < 2}
+        <button className="secondary" disabled={busy || chosen.length === 0 || task.examples.length < 2}
           onClick={() => { void go(); }}>
-          {job ? "Comparing…" : "Compare"}
+          {busy ? "Comparing…" : "Compare"}
         </button>
       </div>
       {job && (

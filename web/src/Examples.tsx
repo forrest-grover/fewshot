@@ -1,10 +1,11 @@
-import { useRef, useState, type DragEvent } from "react";
-import { api, type Example, type TaskDetail } from "./api";
-import { EXAMPLE_DRAG, filesFromDrop, isImage, usePasteImages, useShortcuts } from "./hooks";
+import { memo, useMemo, useRef, useState, type DragEvent } from "react";
+import { api, HttpError, type AddResult, type Example, type TaskDetail } from "./api";
+import { EXAMPLE_DRAG, filesFromDrop, isImage, useAbortOnLeave, usePasteImages, useShortcuts } from "./hooks";
 import { shrinkImages, THUMB_SIZE } from "./images";
 import Lightbox from "./Lightbox";
 import TagEditor, { type TagEdit } from "./TagEditor";
-import { DropZone } from "./ui";
+import { ClassSelect, DropZone } from "./ui";
+import { progressText, sendInBatches } from "./upload";
 
 interface Props { task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined> }
 interface Skipped { file: string | null; error: string }
@@ -15,7 +16,8 @@ const PAGE = 60;
 
 export default function Examples({ task, setTask, run }: Props) {
   const [newClass, setNewClass] = useState("");
-  const [uploading, setUploading] = useState<Partial<Record<string, number>>>({}); // class -> uploads in flight
+  // class -> the upload in progress: images sent so far, and how to stop it
+  const [uploading, setUploading] = useState<Partial<Record<string, { done: number; total: number; cancel: () => void }>>>({});
   const [skipped, setSkipped] = useState<Partial<Record<string, Skipped[]>>>({}); // class -> files the last upload skipped
   const [shown, setShown] = useState<Partial<Record<string, number>>>({}); // class -> thumbnails shown
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set()); // selected example ids
@@ -29,19 +31,34 @@ export default function Examples({ task, setTask, run }: Props) {
   const pointed = useRef<string | null>(null); // class card last hovered or focused: where a paste goes
   const anchor = useRef<string | null>(null); // last ticked example, for Shift+click ranges
 
-  const busy = (label: string, delta: number) => {
-    setUploading((u) => ({ ...u, [label]: (u[label] ?? 0) + delta }));
-  };
+  const newUpload = useAbortOnLeave(task.name); // uploads stop when the task is closed
+  /** Add images to class ``label``, in batches (see sendInBatches): each shows as it lands, and
+   * Cancel (or leaving the task) stops the rest. A class takes one upload at a time. */
   const upload = async (label: string, files: File[]) => {
-    busy(label, 1);
-    try {
-      const r = await run(shrinkImages(files).then((fs) => api.addExamples(task.name, label, fs)));
-      if (r) {
-        setTask(r.task);
-        setSkipped((s) => ({ ...s, [label]: r.errors }));
+    if (uploading[label]) { fail(`Still adding images to ${label}: wait for it or cancel it first.`); return; }
+    const req = newUpload();
+    const skips: Skipped[] = [];
+    setSkipped((s) => ({ ...s, [label]: [] }));
+    /** One batch; one whose images were all unusable (400) is skipped, not the end of the upload. */
+    const send = async (fs: File[], signal: AbortSignal): Promise<AddResult | null> => {
+      try {
+        return await api.addExamples(task.name, label, fs, signal);
+      } catch (e) {
+        if (!(e instanceof HttpError && e.status === 400)) throw e;
+        skips.push({ file: null, error: e.message });
+        return null;
       }
+    };
+    try {
+      await run(sendInBatches(files, send, {
+        signal: req.signal, prepare: shrinkImages,
+        onProgress: (done, total) => { setUploading((u) => ({ ...u, [label]: { done, total, cancel: req.cancel } })); },
+        onBatch: (r) => { if (r) { setTask(r.task); skips.push(...r.errors); } },
+      }));
     } finally {
-      busy(label, -1);
+      req.done();
+      setUploading((u) => ({ ...u, [label]: undefined }));
+      setSkipped((s) => ({ ...s, [label]: skips }));
     }
   };
   /** Run a mutation and show its result; resolves to whether it succeeded. */
@@ -150,7 +167,10 @@ export default function Examples({ task, setTask, run }: Props) {
       const ids = e.dataTransfer.getData(EXAMPLE_DRAG);
       if (ids) {
         e.preventDefault();
-        void move(JSON.parse(ids) as string[], c);
+        // From this page, or another tab (maybe another task): only this task's examples move.
+        const mine = draggedIds(ids).filter((id) => labelOf.has(id));
+        if (mine.length) void move(mine, c);
+        else fail("Only this task's examples can be dragged here.");
       } else if (e.dataTransfer.types.includes("Files")) {
         e.preventDefault(); // files dropped anywhere on the card, not only on its drop zone
         void filesFromDrop(e.dataTransfer).then((fs) => {
@@ -160,6 +180,37 @@ export default function Examples({ task, setTask, run }: Props) {
       }
     },
   });
+
+  // What a thumbnail does, as one object that never changes (calling the latest handlers), so
+  // memoised thumbnails only re-render when their own example or tick changes.
+  const thumbHandlers = {
+    dragStart: (ex: Example, e: DragEvent) => {
+      // Dragging a ticked thumbnail moves every ticked example.
+      const ids = picked.has(ex.id) ? selection : [ex.id];
+      e.dataTransfer.setData(EXAMPLE_DRAG, JSON.stringify(ids));
+      e.dataTransfer.effectAllowed = "move";
+    },
+    tick: (ex: Example, shift: boolean) => { toggle(ex, shift); },
+    open: (ex: Example, shift: boolean) => {
+      if (selection.length) toggle(ex, shift); else open(byClass.get(ex.label) ?? [ex], ex);
+    },
+    view: (ex: Example) => { open(byClass.get(ex.label) ?? [ex], ex); },
+    relabel: (ex: Example, label: string) => { void save(api.relabel(task.name, ex.id, label)); },
+    annotate: (ex: Example) => { annotate(ex); },
+    remove: (ex: Example) => { void save(api.deleteExample(task.name, ex.id)); },
+  };
+  const latestThumb = useRef(thumbHandlers);
+  latestThumb.current = thumbHandlers;
+  const [thumbActions] = useState<ThumbActions>(() => ({
+    dragStart: (ex, e) => { latestThumb.current.dragStart(ex, e); },
+    tick: (ex, shift) => { latestThumb.current.tick(ex, shift); },
+    open: (ex, shift) => { latestThumb.current.open(ex, shift); },
+    view: (ex) => { latestThumb.current.view(ex); },
+    relabel: (ex, label) => { latestThumb.current.relabel(ex, label); },
+    annotate: (ex) => { latestThumb.current.annotate(ex); },
+    remove: (ex) => { latestThumb.current.remove(ex); },
+  }));
+  const classNames = useMemo(() => task.classes.map((c) => c.name), [task.classes]);
 
   const nFolded = task.classes.filter((c) => folded.has(c.name)).length; // ``folded`` may name deleted classes
   const editedIds = editing ? ("one" in editing ? [editing.one.id] : editing.ids) : [];
@@ -302,6 +353,7 @@ export default function Examples({ task, setTask, run }: Props) {
       {task.classes.map((c, ci) => {
         const limit = shown[c.name] ?? PAGE;
         const skip = skipped[c.name] ?? [];
+        const up = uploading[c.name]; // an upload in progress
         const list = byClass.get(c.name) ?? [];
         const allPicked = list.length > 0 && list.every((e) => picked.has(e.id));
         return (
@@ -358,53 +410,7 @@ export default function Examples({ task, setTask, run }: Props) {
             )}
             {!folded.has(c.name) && <div className="thumbs">
               {list.slice(0, limit).map((ex) => (
-                <figure
-                  key={ex.id}
-                  className={`thumb ${picked.has(ex.id) ? "picked" : ""}`}
-                  draggable
-                  onDragStart={(e) => {
-                    // Dragging a ticked thumbnail moves every ticked example.
-                    const ids = picked.has(ex.id) ? selection : [ex.id];
-                    e.dataTransfer.setData(EXAMPLE_DRAG, JSON.stringify(ids));
-                    e.dataTransfer.effectAllowed = "move";
-                  }}
-                >
-                  <label className="pick" title="Tick to select (Shift+click for a range)">
-                    <input
-                      type="checkbox"
-                      checked={picked.has(ex.id)}
-                      aria-label={`Select ${ex.source || ex.id}`}
-                      onClick={(e) => { toggle(ex, e.shiftKey); }}
-                      onChange={() => { /* handled on click, which knows about Shift */ }}
-                    />
-                  </label>
-                  {(ex.tags.length > 0 || ex.note) && (
-                    <span className="tags" title={[ex.tags.join(", "), ex.note].filter(Boolean).join("\n")}>
-                      {ex.tags.length > 0 ? ex.tags.join(", ") : "note"}
-                    </span>
-                  )}
-                  <img
-                    src={api.imageUrl(task.name, ex.id, THUMB_SIZE)}
-                    title={[ex.source, ex.note].filter(Boolean).join(" · ") || undefined}
-                    alt={ex.source || ex.id}
-                    loading="lazy"
-                    draggable={false}
-                    tabIndex={0}
-                    onClick={(e) => { if (selection.length) toggle(ex, e.shiftKey); else open(list, ex); }}
-                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); open(list, ex); } }}
-                  />
-                  <figcaption>
-                    <select
-                      value={ex.label}
-                      aria-label="Move to class"
-                      onChange={(e) => { void save(api.relabel(task.name, ex.id, e.target.value)); }}
-                    >
-                      {task.classes.map((k) => <option key={k.name}>{k.name}</option>)}
-                    </select>
-                    <button className="ghost small" aria-label="Tags and note" title="Tags and note" onClick={() => { annotate(ex); }}>✎</button>
-                    <button className="ghost small danger" aria-label="Delete example" onClick={() => { void save(api.deleteExample(task.name, ex.id)); }}>×</button>
-                  </figcaption>
-                </figure>
+                <Thumb key={ex.id} ex={ex} task={task.name} picked={picked.has(ex.id)} classes={classNames} on={thumbActions} />
               ))}
               {list.length > limit && (
                 <button
@@ -414,9 +420,10 @@ export default function Examples({ task, setTask, run }: Props) {
                   Show more ({list.length - limit} hidden)
                 </button>
               )}
-              <DropZone compact onFiles={(fs) => { void upload(c.name, fs); }}>
-                {uploading[c.name] ? "Uploading…" : "+ Add images"}
+              <DropZone compact disabled={!!up} onFiles={(fs) => { void upload(c.name, fs); }}>
+                {up ? `Uploading ${progressText(up)}…` : "+ Add images"}
               </DropZone>
+              {up && <button className="ghost small" onClick={up.cancel}>Cancel upload</button>}
             </div>}
             {skip.length > 0 && (
               <div className="error skipped" role="alert">
@@ -433,6 +440,63 @@ export default function Examples({ task, setTask, run }: Props) {
     </div>
   );
 }
+
+/** The example ids in an EXAMPLE_DRAG payload; none if it is malformed. */
+function draggedIds(data: string): string[] {
+  try {
+    const v: unknown = JSON.parse(data);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+interface ThumbActions {
+  dragStart: (ex: Example, e: DragEvent) => void; tick: (ex: Example, shift: boolean) => void;
+  open: (ex: Example, shift: boolean) => void; view: (ex: Example) => void; relabel: (ex: Example, label: string) => void;
+  annotate: (ex: Example) => void; remove: (ex: Example) => void;
+}
+
+/** One example's thumbnail: tick box, image (click, Enter or Space opens it), class menu, edit
+ * and delete. Memoised: a class can show hundreds. */
+const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: {
+  ex: Example; task: string; picked: boolean; classes: string[]; on: ThumbActions;
+}) {
+  return (
+    <figure className={`thumb ${picked ? "picked" : ""}`} draggable onDragStart={(e) => { on.dragStart(ex, e); }}>
+      <label className="pick" title="Tick to select (Shift+click for a range)">
+        <input
+          type="checkbox"
+          checked={picked}
+          aria-label={`Select ${ex.source || ex.id}`}
+          onClick={(e) => { on.tick(ex, e.shiftKey); }}
+          onChange={() => { /* handled on click, which knows about Shift */ }}
+        />
+      </label>
+      {(ex.tags.length > 0 || ex.note) && (
+        <span className="tags" title={[ex.tags.join(", "), ex.note].filter(Boolean).join("\n")}>
+          {ex.tags.length > 0 ? ex.tags.join(", ") : "note"}
+        </span>
+      )}
+      <img
+        src={api.imageUrl(task, ex.id, THUMB_SIZE)}
+        title={[ex.source, ex.note].filter(Boolean).join(" · ") || undefined}
+        alt={ex.source || ex.id}
+        loading="lazy"
+        draggable={false}
+        tabIndex={0}
+        role="button"
+        onClick={(e) => { on.open(ex, e.shiftKey); }}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); on.view(ex); } }}
+      />
+      <figcaption>
+        <ClassSelect value={ex.label} classes={classes} aria-label="Move to class" onPick={(label) => { on.relabel(ex, label); }} />
+        <button className="ghost small" aria-label="Tags and note" title="Tags and note" onClick={() => { on.annotate(ex); }}>✎</button>
+        <button className="ghost small danger" aria-label="Delete example" onClick={() => { on.remove(ex); }}>×</button>
+      </figcaption>
+    </figure>
+  );
+});
 
 const FOLD_KEY = "fewshot:folded:";
 

@@ -1,74 +1,43 @@
-import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
-import { api, type DuplicatePair, type EvalReport, type Job, type ModelInfo, type TaskDetail } from "./api";
-import Compare, { type CompareRun } from "./Compare";
+import { useMemo, useRef, useState } from "react";
+import { api, type DuplicatePair, type ModelInfo, type TaskDetail } from "./api";
+import Compare from "./Compare";
 import { downloadCsv } from "./csv";
 import { pct } from "./format";
-import { usePollJob } from "./hooks";
+import { Gate, type SetFor } from "./hooks";
 import Lightbox from "./Lightbox";
+import { NO_EVAL, type CompareRun, type EvalRun } from "./runs";
 import Threshold from "./Threshold";
-
-/** The last evaluation of a task, kept by the App so it survives switching tabs. While it runs,
- * ``job`` is the server's background job, polled for progress. */
-export interface EvalRun {
-  task: string;
-  report: EvalReport | null; rev: number | null; // the report shown, and the task revision it is of
-  job: Job<EvalReport> | null; // a run in progress
-}
 
 interface Props {
   task: TaskDetail; setTask: (t: TaskDetail) => void; run: <T>(p: Promise<T>) => Promise<T | undefined>;
-  state: EvalRun | null; setState: Dispatch<SetStateAction<EvalRun | null>>;
-  models: ModelInfo | null; compare: CompareRun | null; setCompare: Dispatch<SetStateAction<CompareRun | null>>;
+  // This task's evaluation and comparison, kept (and their jobs polled) by the App.
+  state: EvalRun | null; setState: SetFor<EvalRun>;
+  models: ModelInfo | null; compare: CompareRun | null; setCompare: SetFor<CompareRun>;
 }
 
 const STAGES: Record<string, string> = { starting: "Starting", embedding: "Embedding images", evaluating: "Cross-validating" };
 
 export default function Evaluate({ task, setTask, run, state, setState, models, compare, setCompare }: Props) {
-  const mine = state?.task === task.name ? state : null; // never show another task's report
-  const report = mine?.report ?? null;
-  const job = mine?.job ?? null;
-  const busy = job !== null;
-  const rev = mine?.rev ?? null;
+  const report = state?.report ?? null;
+  const job = state?.job ?? null;
+  const rev = state?.rev ?? null;
+  const [starting, setStarting] = useState(false);
+  const busy = job !== null || starting;
   const [cell, setCell] = useState<{ task: string; t: string; p: string } | null>(null); // confusion cell filtering mistakes
   const [dupes, setDupes] = useState<{ task: string; pairs: DuplicatePair[] } | null>(null);
   const [finding, setFinding] = useState(false);
   const [viewing, setViewing] = useState<number | null>(null); // index into the listed examples, full size
-  // The task this view shows, or null once it is gone: read by responses that arrive later.
-  const shown = useRef<string | null>(task.name);
-  useEffect(() => {
-    shown.current = task.name;
-    return () => { shown.current = null; };
-  }, [task.name]);
-  const update = (p: Partial<EvalRun>) => {
-    const name = task.name;
-    setState((s) => {
-      if (s?.task === name) return { ...s, ...p };
-      // A response that arrives after the user opened another task is dropped; while this task is
-      // shown, it replaces whatever another task left.
-      if (shown.current !== name) return s;
-      return { task: name, report: null, rev: null, job: null, ...p };
-    });
-  };
+  // ``setState`` belongs to this task, so a response that arrives after switching task still
+  // lands on the task it is for.
+  const update = (p: Partial<EvalRun>) => { setState((s) => ({ ...(s ?? NO_EVAL), ...p })); };
 
-  const go = async () => {
+  const starts = useRef(new Gate()).current;
+  /** Start an evaluation; a second click while it is starting does nothing. */
+  const go = () => starts.run(async () => {
+    setStarting(true);
     const j = await run(api.startEvaluation(task.name));
+    setStarting(false);
     if (j) update({ job: j });
-  };
-  // Poll the running job until it ends. Leaving the tab stops polling; coming back resumes it.
-  const jobId = job?.id;
-  usePollJob<EvalReport>(jobId, (j) => {
-    setState((s) => {
-      if (!s || s.job?.id !== jobId) return s;
-      if (j.status === "running") return { ...s, job: j };
-      // Only a finished run replaces the report (and its revision): a cancelled or failed one
-      // leaves the old report, still marked as out of date if the task changed.
-      // The report says which revision it evaluated (the task may have changed while it ran).
-      return j.status === "done" ? { ...s, job: null, report: j.result, rev: j.result?.revision ?? null } : { ...s, job: null };
-    });
-    if (j.status === "failed") void run(Promise.reject(new Error(`Evaluation failed: ${j.error ?? "unknown error"}`)));
-  }, (e) => {
-    setState((s) => (s && s.job?.id === jobId ? { ...s, job: null } : s)); // e.g. the server restarted
-    void run(Promise.reject(e));
   });
 
   const fix = async (p: Promise<TaskDetail>) => { const t = await run(p); if (t) setTask(t); };
@@ -101,8 +70,11 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
     ]);
   };
   const stale = report && rev !== task.revision;
-  const classThreshold = (c: string) => task.classes.find((k) => k.name === c)?.reject_below ?? null;
-  const exists = (c: string) => task.classes.some((k) => k.name === c);
+  // Looked up per listed example and per class: built once per task version.
+  const examples = useMemo(() => new Map(task.examples.map((e) => [e.id, e])), [task.examples]);
+  const classes = useMemo(() => new Map(task.classes.map((c) => [c.name, c])), [task.classes]);
+  const classThreshold = (c: string) => classes.get(c)?.reject_below ?? null;
+  const exists = (c: string) => classes.has(c);
   const applicable = report
     ? Object.entries(report.suggested_class_thresholds).filter(([c, v]) => exists(c) && classThreshold(c) !== v).map(([c]) => c)
     : [];
@@ -247,13 +219,13 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
               )}
               <div className="thumbs">
                 {listed.map((m) => {
-                  const exists = task.examples.find((e) => e.id === m.id);
+                  const exists = examples.get(m.id);
                   return (
                     <figure key={m.id} className="thumb wide">
                       {/* 400 px: 2x the 200 px tile */}
                       <img src={api.imageUrl(task.name, m.id, 400)} alt={`${m.true} example${m.correct ? "" : `, predicted ${m.pred}`}`} loading="lazy" tabIndex={0} className="zoomable"
                         onClick={() => { setViewing(listed.indexOf(m)); }}
-                        onKeyDown={(e) => { if (e.key === "Enter") setViewing(listed.indexOf(m)); }} />
+                        role="button" onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setViewing(listed.indexOf(m)); } }} />
                       <figcaption className="col">
                         <span><b>{m.true}</b>{m.correct ? " ✓" : ` → ${m.pred}`} ({pct(m.confidence)})</span>
                         {exists && exists.label === m.true ? (
@@ -294,7 +266,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
       {pairs && pairs.length > 0 && (
         <div className="dupes">
           {pairs.map((d) => {
-            const now = (id: string) => task.examples.find((e) => e.id === id); // labels as they are now
+            const now = (id: string) => examples.get(id); // labels as they are now
             const exists = (id: string) => now(id) !== undefined;
             const [la, lb] = [now(d.a)?.label ?? d.labels[0], now(d.b)?.label ?? d.labels[1]];
             const same = la === lb;

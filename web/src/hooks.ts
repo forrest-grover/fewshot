@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { api, HttpError, type Job, type Prediction } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, HttpError, type Job, type Prediction, type TaskDetail } from "./api";
 
 const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i;
 
@@ -8,22 +8,99 @@ export const EXAMPLE_DRAG = "application/x-fewshot-examples";
 
 export const isImage = (f: File) => f.type.startsWith("image/") || IMAGE_RE.test(f.name);
 
-/** Elements that take typed keys; a focused checkbox or button doesn't. */
-const TYPING = "textarea, select, [contenteditable=''], [contenteditable='true'], "
+/** Elements that hold typed text (and their own Ctrl+Z); a focused checkbox or button doesn't. */
+const TEXT_ENTRY = "textarea, [contenteditable=''], [contenteditable='true'], "
   + "input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]):not([type=file])";
+/** Elements that take typed keys: text entry, and a select (typing picks an option). */
+const TYPING = `select, ${TEXT_ENTRY}`;
 
-/** True when keys typed now belong to a form field or dialog rather than to page shortcuts. */
-function typing(e: Event): boolean {
+/** True when keys typed at ``target`` belong to a form field rather than to page shortcuts. */
+export function typingAt(target: EventTarget | null): boolean {
   // The target is the window or document when nothing is focused.
-  return e.target instanceof Element
-    && !!e.target.closest(TYPING);
+  return target instanceof Element && !!target.closest(TYPING);
 }
+const typing = (e: Event) => typingAt(e.target);
 
 /** The dialog in front, if one is open: the last modal in the document (a nested or later one
  * opened over an earlier one). While one is open, page shortcuts must not act behind it. */
 export function topModal(): Element | null {
   const all = document.querySelectorAll("[aria-modal='true']");
   return all.length ? all[all.length - 1] : null;
+}
+
+/** Marks a dialog (the image viewer) in which Ctrl+Z still undoes the task's last change. */
+export const ALLOWS_UNDO = "data-allows-undo";
+
+/** What Ctrl/Cmd+Z (undo), Ctrl/Cmd+Shift+Z or Ctrl+Y (redo) should do to the task: null when it
+ * isn't one of those, when a text field has focus (where it undoes the typing; a select, checkbox
+ * or button left focused after using it doesn't count), or when a dialog other than the image
+ * viewer is in front. */
+export function taskUndoKey(e: KeyboardEvent): "undo" | "redo" | null {
+  const key = e.key.toLowerCase();
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || (key !== "z" && key !== "y")) return null;
+  const top = topModal();
+  if (top && !top.hasAttribute(ALLOWS_UNDO)) return null;
+  if (e.target instanceof Element && e.target.closest(TEXT_ENTRY)) return null;
+  return key === "y" || e.shiftKey ? "redo" : "undo";
+}
+
+/** The toast after an undo or redo that returned ``t``: what was undone is now what redo would do
+ * (and the reverse), so the label comes from the response, not from the task as shown before it
+ * (``fallback``), which may be out of date. ``then`` offers the reverse if it is possible. */
+export function stepToast(which: "undo" | "redo", t: TaskDetail, fallback: string) {
+  const what = (which === "undo" ? t.redo_label : t.undo_label) || fallback || "the last change";
+  return {
+    text: `${which === "undo" ? "Undid" : "Redid"} ${what}`,
+    then: which === "undo" ? (t.can_redo ? "redo" as const : null) : (t.can_undo ? "undo" as const : null),
+  };
+}
+
+/** A state setter for one task's value in ``useByTask``. */
+export type SetFor<V> = (f: V | null | ((v: V | null) => V | null)) => void;
+
+/** A value per task (e.g. its last evaluation and the job computing the next), kept by the App so
+ * it survives switching tabs and tasks. ``setFor(name)`` is a state setter for one task's value;
+ * setting null forgets it. */
+export function useByTask<V>() {
+  const [map, setMap] = useState<Partial<Record<string, V>>>({});
+  const setFor = useCallback((task: string): SetFor<V> => (f) => {
+    setMap((m) => {
+      const cur = m[task] ?? null;
+      const next = typeof f === "function" ? (f as (v: V | null) => V | null)(cur) : f;
+      return next === cur ? m : { ...m, [task]: next ?? undefined };
+    });
+  }, []);
+  /** Move a task's value to its new name. */
+  const rename = useCallback((from: string, to: string) => {
+    setMap((m) => (m[from] === undefined ? m : { ...m, [from]: undefined, [to]: m[from] }));
+  }, []);
+  return { map, setFor, rename };
+}
+
+/** Orders overlapping requests for the same thing: ``begin`` returns a check that is true only
+ * while no later request has begun, so an older response arriving last can't overwrite a newer one. */
+export class Latest {
+  private seq = 0;
+  begin(): () => boolean {
+    const mine = ++this.seq;
+    return () => mine === this.seq;
+  }
+}
+
+/** Lets one async action run at a time: ``run`` ignores calls (resolving to undefined) while an
+ * earlier one is still in flight, e.g. a held-down Ctrl+Z. */
+export class Gate {
+  private busy = false;
+  get running(): boolean { return this.busy; }
+  async run<T>(f: () => Promise<T>): Promise<T | undefined> {
+    if (this.busy) return undefined;
+    this.busy = true;
+    try {
+      return await f();
+    } finally {
+      this.busy = false;
+    }
+  }
 }
 
 const FOCUSABLE = "button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), "
@@ -110,6 +187,7 @@ export interface Results {
   task: string;
   items: Item[];
   batch: number | null; // the classification in progress, if any (it lands here even if the task is renamed meanwhile)
+  progress?: { done: number; total: number }; // of that classification: images classified so far
   current: number | null; // key of the result that keyboard shortcuts act on
 }
 
@@ -126,23 +204,60 @@ export function usePredictResults(task: string | null) {
   // (say, a duplicate) starts with fresh results.
   if (renamed.current?.to === name) renamed.current = null;
   const moving = renamed.current?.from === name && renamed.current.to === results.task;
+  const [epoch, setEpoch] = useState(0); // counts the times results were dropped for another task
   if (results.task !== name && !moving) { // another task: adjust during render, as React recommends
-    revoke(urls.current);
     setResults({ task: name, items: [], batch: null, current: null });
+    setEpoch((e) => e + 1);
   }
+  // Preview URLs of results no longer shown are released. In an effect, not during render, which
+  // React may repeat or throw away.
+  useEffect(() => {
+    const shown = new Set(results.items.map((it) => it.url));
+    urls.current.forEach((u) => { if (!shown.has(u)) { URL.revokeObjectURL(u); urls.current.delete(u); } });
+  }, [results.items]);
   useEffect(() => {
     const live = urls.current;
     return () => { revoke(live); };
   }, []);
+  // Classifications in flight stop when another task is opened (not on a rename, nor on leaving
+  // the tab: their results are kept) and when the App unmounts.
+  const inFlight = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const live = inFlight.current;
+    return () => { live.forEach((c) => { c.abort(); }); live.clear(); };
+  }, [epoch]);
+  /** Start an abortable classification; call ``done`` when it ends. */
+  const abortable = useCallback(() => {
+    const c = new AbortController();
+    inFlight.current.add(c);
+    return { signal: c.signal, done: () => { inFlight.current.delete(c); } };
+  }, []);
+  /** Stop every classification in flight (the Cancel button). */
+  const cancel = useCallback(() => { inFlight.current.forEach((c) => { c.abort(); }); inFlight.current.clear(); }, []);
   /** Keep the results when their task is renamed. */
   const rename = (to: string) => {
     renamed.current = { from: name, to };
     setResults((r) => (r.task === name ? { ...r, task: to } : r));
   };
-  return { results, setResults, urls, rename };
+  return { results, setResults, urls, rename, abortable, cancel };
 }
 
-export function revoke(urls: Set<string>) {
+/** Abort controllers for requests made for task ``key`` (uploads, say), all aborted when ``key``
+ * changes or the component unmounts. ``start`` makes one; call its ``done`` when the request ends. */
+export function useAbortOnLeave(key: string) {
+  const live = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const set = live.current;
+    return () => { set.forEach((c) => { c.abort(); }); set.clear(); };
+  }, [key]);
+  return useCallback(() => {
+    const c = new AbortController();
+    live.current.add(c);
+    return { signal: c.signal, cancel: () => { c.abort(); }, done: () => { live.current.delete(c); } };
+  }, []);
+}
+
+function revoke(urls: Set<string>) {
   urls.forEach((u) => { URL.revokeObjectURL(u); });
   urls.clear();
 }
