@@ -8,11 +8,15 @@ export const EXAMPLE_DRAG = "application/x-fewshot-examples";
 
 export const isImage = (f: File) => f.type.startsWith("image/") || IMAGE_RE.test(f.name);
 
-/** Elements that hold typed text (and their own Ctrl+Z); a focused checkbox or button doesn't. */
-const TEXT_ENTRY = "textarea, [contenteditable=''], [contenteditable='true'], "
+/** Form fields that take keys (typing, or arrows for a slider or date); a checkbox or button doesn't. */
+const FIELD = "textarea, [contenteditable=''], [contenteditable='true'], "
   + "input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]):not([type=file])";
-/** Elements that take typed keys: text entry, and a select (typing picks an option). */
-const TYPING = `select, ${TEXT_ENTRY}`;
+/** Fields that hold typed text, and so their own Ctrl+Z: not a slider, colour or date picker. */
+const TEXT_ENTRY = FIELD.split(", ").map((s) => (s.startsWith("input")
+  ? s + ":not([type=range]):not([type=color]):not([type=date]):not([type=datetime-local]):not([type=month]):not([type=week]):not([type=time])"
+  : s)).join(", ");
+/** Elements that take typed keys: those fields, and a select (typing picks an option). */
+const TYPING = `select, ${FIELD}`;
 
 /** True when keys typed at ``target`` belong to a form field rather than to page shortcuts. */
 export function typingAt(target: EventTarget | null): boolean {

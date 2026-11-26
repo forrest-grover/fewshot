@@ -457,11 +457,17 @@ interface ThumbActions {
   annotate: (ex: Example) => void; remove: (ex: Example) => void;
 }
 
+interface ThumbProps { ex: Example; task: string; picked: boolean; classes: string[]; on: ThumbActions }
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+/** Whether a thumbnail would show the same: every response brings new example objects and class
+ * lists, so they are compared by what is shown, not by identity. */
+const sameThumb = (a: ThumbProps, b: ThumbProps) => a.task === b.task && a.picked === b.picked && a.on === b.on
+  && a.ex.id === b.ex.id && a.ex.label === b.ex.label && a.ex.source === b.ex.source && a.ex.note === b.ex.note
+  && sameList(a.ex.tags, b.ex.tags) && sameList(a.classes, b.classes);
+
 /** One example's thumbnail: tick box, image (click, Enter or Space opens it), class menu, edit
- * and delete. Memoised: a class can show hundreds. */
-const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: {
-  ex: Example; task: string; picked: boolean; classes: string[]; on: ThumbActions;
-}) {
+ * and delete. Memoised (see sameThumb): a class can show hundreds. */
+const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: ThumbProps) {
   return (
     <figure className={`thumb ${picked ? "picked" : ""}`} draggable onDragStart={(e) => { on.dragStart(ex, e); }}>
       <label className="pick" title="Tick to select (Shift+click for a range)">
@@ -496,7 +502,7 @@ const Thumb = memo(function Thumb({ ex, task, picked, classes, on }: {
       </figcaption>
     </figure>
   );
-});
+}, sameThumb);
 
 const FOLD_KEY = "fewshot:folded:";
 

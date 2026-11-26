@@ -270,7 +270,7 @@ export default function App() {
               {route.tab === "examples" && <Examples task={task} setTask={updateTask} run={run} />}
               {route.tab === "inbox" && <Inbox task={task} setTask={updateTask} run={run} />}
               {route.tab === "predict" && <Predict task={task} setTask={updateTask} run={run} state={predictState} urlFetch={urlFetch} />}
-              {route.tab === "evaluate" && <Evaluate task={task} setTask={updateTask} run={run}
+              {route.tab === "evaluate" && <Evaluate key={task.name} task={task} setTask={updateTask} run={run}
                 state={evals.map[task.name] ?? null} setState={evals.setFor(task.name)}
                 models={models} compare={compares.map[task.name] ?? null} setCompare={compares.setFor(task.name)} />}
               {route.tab === "settings" && (

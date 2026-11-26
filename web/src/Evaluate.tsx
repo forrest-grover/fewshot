@@ -253,7 +253,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
           index={Math.min(viewing, listed.length - 1)} onIndex={setViewing} onClose={() => { setViewing(null); }} />
       )}
 
-      <Compare task={task} models={models} setTask={setTask} run={run} state={compare} setState={setCompare} />
+      <Compare key={task.name} task={task} models={models} setTask={setTask} run={run} state={compare} setState={setCompare} />
 
       <h3>Near-duplicates</h3>
       <div className="row">
