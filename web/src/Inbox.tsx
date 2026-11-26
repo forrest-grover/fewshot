@@ -15,12 +15,15 @@ const SORTS: Record<InboxSort, string> = {
   novel: "Least like any example first (new kinds of image)",
   added: "Oldest first",
 };
-const PAGE = 60;
+const PAGE = 60; // cards rendered at first, and added by each "Show more"
+const INBOX_PAGE = 1000; // images fetched per request (the server's most)
 
 /** Unlabelled images waiting in the task's inbox, with the model's suggestion for each. */
 export default function Inbox({ task, setTask, run }: Props) {
   const [sort, setSort] = useState<InboxSort>("uncertain");
-  const [items, setItems] = useState<{ key: string; list: InboxEntry[] } | null>(null);
+  // The images loaded so far (a page at a time, in the chosen order), of ``total`` waiting.
+  const [items, setItems] = useState<{ key: string; list: InboxEntry[]; total: number } | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const [current, setCurrent] = useState<string | null>(null);
   const [minConfText, setMinConfText] = useState("0.9");
@@ -35,13 +38,22 @@ export default function Inbox({ task, setTask, run }: Props) {
   const key = `${task.name}\u0000${String(task.revision)}\u0000${sort}`;
   useEffect(() => {
     let live = true;
-    void run(api.inbox(task.name, sort)).then((r) => {
-      if (live && r) { setItems({ key, list: r.items }); setGone(new Set()); }
+    void run(api.inbox(task.name, sort, 0, INBOX_PAGE)).then((r) => {
+      if (live && r) { setItems({ key, list: r.items, total: r.total }); setGone(new Set()); }
     });
     return () => { live = false; };
   }, [key, task.name, sort, run]);
   const list = (items?.list ?? []).filter((i) => !gone.has(i.id));
   const stale = items?.key !== key;
+  const unloaded = items ? Math.max(0, items.total - items.list.length) : 0; // waiting beyond the pages loaded
+  /** Load the next page, unless the list has been reloaded (the task changed) meanwhile. */
+  const loadMore = async () => {
+    if (!items) return;
+    setLoadingMore(true);
+    const r = await run(api.inbox(task.name, sort, items.list.length, INBOX_PAGE));
+    setLoadingMore(false);
+    if (r) setItems((cur) => (cur?.key === key ? { ...cur, list: [...cur.list, ...r.items], total: r.total } : cur));
+  };
   const locked = busy || stale; // a change is being saved, or the list is reloading after one
   if (viewing !== null && list.length === 0) setViewing(null); // emptied: don't reopen when the list refills
 
@@ -193,11 +205,11 @@ export default function Inbox({ task, setTask, run }: Props) {
             </label>
             <button disabled={locked || sure.length === 0}
               onClick={() => { void label(Object.fromEntries(sure.map((i) => [i.id, suggested(i) ?? ""]))); }}>
-              Accept {sure.length} suggestion{sure.length === 1 ? "" : "s"}
+              Accept {sure.length} suggestion{sure.length === 1 ? "" : "s"}{unloaded ? " loaded" : ""}
             </button>
           </div>
           <p className="muted keys">
-            {task.inbox_count} waiting. Keys for the highlighted image: <kbd>Enter</kbd> accepts the suggestion,{" "}
+            {task.inbox_count} waiting{unloaded ? ` (${String(list.length)} loaded; accepting only acts on those)` : ""}. Keys for the highlighted image: <kbd>Enter</kbd> accepts the suggestion,{" "}
             <kbd>1</kbd>–<kbd>{Math.min(9, Math.max(1, task.classes.length))}</kbd> label it as that class, <kbd>Delete</kbd> dismisses it,
             {" "}<kbd>←</kbd>/<kbd>→</kbd> move.
           </p>
@@ -261,6 +273,11 @@ export default function Inbox({ task, setTask, run }: Props) {
           </div>
           {list.length > shown && (
             <button className="secondary more" onClick={() => { setShown((v) => v + PAGE * 4); }}>Show more ({list.length - shown} hidden)</button>
+          )}
+          {list.length <= shown && unloaded > 0 && (
+            <button className="secondary more" disabled={loadingMore || stale} onClick={() => { void loadMore(); }}>
+              {loadingMore ? "Loading…" : `Load more (${String(unloaded)} not loaded yet)`}
+            </button>
           )}
         </>
       )}
