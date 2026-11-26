@@ -4,7 +4,6 @@ after that point, and what a failure on either side of it leaves behind."""
 import multiprocessing
 import os
 import threading
-import time
 from typing import Any
 
 import pytest
@@ -97,20 +96,30 @@ def test_readers_never_see_a_change_in_progress(task, monkeypatch):
     assert task.config.revision == before.revision + 1
 
 
-def test_readers_do_not_wait_for_a_writer(tmp_path):
+def test_readers_do_not_wait_for_a_writer(tmp_path, monkeypatch):
     """While a writer waits for another process's lock, reads of the task still answer at once."""
     a, b = Workspace(tmp_path / "ws"), Workspace(tmp_path / "ws")
     a.create("t")
     ta = a.get("t")
     with fsutil.file_lock(ta.path / ".lock"):  # the "other process" holds the task
+        waiting = threading.Event()
+        real_lock = fsutil._lock  # pylint: disable=protected-access
+
+        def lock(fd, shared=False):
+            if not shared:
+                waiting.set()  # the writer holds b's in-process lock and now waits for the file lock
+            real_lock(fd, shared)
+
+        monkeypatch.setattr(fsutil, "_lock", lock)
         writer = threading.Thread(target=b.get("t").upsert_class, args=("blue",))
         writer.start()
-        time.sleep(0.1)  # the writer now holds b's in-process lock, waiting for the file lock
+        assert waiting.wait(5)
         seen: list[list[str]] = []
         reader = threading.Thread(target=lambda: seen.append(b.get("t").class_names()), daemon=True)
         reader.start()
         reader.join(1)
         assert seen == [[]], "a read waited for the writer"
+        assert writer.is_alive(), "the writer didn't wait for the lock"
     writer.join(5)
     assert b.get("t").class_names() == ["blue"]
 

@@ -374,21 +374,24 @@ def test_uvicorn_app_string_loads(tmp_path):
 @pytest.mark.usefixtures("task_t")
 def test_healthz_answers_while_every_thread_is_busy(client, monkeypatch):
     """With Starlette's thread pool used up by slow requests, /healthz still answers."""
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
     real = Task.summary
-    monkeypatch.setattr(Task, "summary", lambda self: release.wait(10) and real(self))
+    monkeypatch.setattr(Task, "summary", lambda self: entered.set() or (release.wait(10) and real(self)))
     with client:  # one event loop, whose thread limit is set to one
         client.portal.call(lambda: setattr(anyio.to_thread.current_default_thread_limiter(), "total_tokens", 1))
         stuck = threading.Thread(target=lambda: client.get("/api/tasks"))
         stuck.start()
-        time.sleep(0.2)
-        answered = []
-        probe = threading.Thread(target=lambda: answered.append(client.get("/healthz").status_code))
-        probe.start()
-        probe.join(5)
-        release.set()
-        stuck.join(10)
-    assert answered == [200]
+        try:
+            assert entered.wait(5)  # the one thread is taken
+            answered = []
+            probe = threading.Thread(target=lambda: answered.append(client.get("/healthz").status_code))
+            probe.start()
+            probe.join(5)
+            assert answered == [200]  # answered while the thread was still taken
+            assert stuck.is_alive()
+        finally:
+            release.set()
+            stuck.join(10)
 
 
 def test_heavy_work_waits_on_its_own_threads(tmp_path, monkeypatch):
@@ -396,22 +399,36 @@ def test_heavy_work_waits_on_its_own_threads(tmp_path, monkeypatch):
     c = api_client(tmp_path, workers=1)
     c.post("/api/tasks", json={"name": "t", "embedder": "fake:color"})
     c.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(1))
-    release = threading.Event()
-    monkeypatch.setattr(fewshot.services, "predict", lambda _pipe, _t, blobs, **k: release.wait(10) and
-                        [Prediction.failed("not really") for _ in blobs])
+    entered, release, calls = threading.Event(), threading.Event(), []
+
+    def slow_predict(_pipe, _t, blobs, **_kw):
+        calls.append(1)
+        entered.set()
+        return release.wait(10) and [Prediction.failed("not really") for _ in blobs]
+
+    monkeypatch.setattr(fewshot.services, "predict", slow_predict)
     with c:  # one event loop for every request
         slow = [threading.Thread(target=lambda: c.post("/api/tasks/t/predict", files=query_files(1))) for _ in range(3)]
         for th in slow:
             th.start()
-        time.sleep(0.2)
-        done = []
-        probe = threading.Thread(target=lambda: done.append(c.get("/api/tasks/t").status_code))
-        probe.start()
-        probe.join(5)
-        release.set()
-        for th in slow:
-            th.join(10)
-    assert done == [200]
+        try:
+            assert entered.wait(5)  # the one worker is busy
+            queue = c.srv.heavy._work_queue  # pylint: disable=protected-access
+            deadline = time.monotonic() + 5
+            while queue.qsize() < 2:  # and the other two wait for it
+                assert time.monotonic() < deadline, "the other predictions never queued"
+                time.sleep(0.01)
+            done = []
+            probe = threading.Thread(target=lambda: done.append(c.get("/api/tasks/t").status_code))
+            probe.start()
+            probe.join(5)
+            assert done == [200]  # answered while the heavy work was still waiting
+            assert len(calls) == 1
+            assert queue.qsize() == 2
+        finally:
+            release.set()
+            for th in slow:
+                th.join(10)
 
 
 def test_the_app_can_be_started_again(tmp_path):
