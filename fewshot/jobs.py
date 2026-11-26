@@ -18,7 +18,7 @@ class Cancelled(Exception):
 
 
 class TooManyJobs(Exception):
-    """Raised by ``Jobs.start`` when ``limit`` jobs are already running."""
+    """Raised by ``Jobs.start`` when ``limit`` jobs are already running or stopping."""
 
 
 @dataclass
@@ -81,7 +81,9 @@ class Jobs:
 
         If the same work (the same task, by uid, and kind, revision and key) is already running and not being
         cancelled, that job is returned instead and nothing starts. Otherwise, if ``limit`` jobs
-        are running already (cancelling ones don't count), raises ``TooManyJobs``. Both are
+        are running already, raises ``TooManyJobs``. Jobs being cancelled count too: their threads
+        run until the work's next progress step, which may be a while (loading a model has none),
+        so not counting them would let start-and-cancel pile up threads without bound. Both are
         decided under one lock, so concurrent starts can't pass the limit or duplicate a job.
         A ``ValueError`` or ``KeyError`` fails the job with its message; anything else with
         "Internal error" (details go to the log only: they can hold server paths)."""
@@ -104,7 +106,7 @@ class Jobs:
             for j in self._jobs.values():
                 if j.status == "running" and (j.uid or j.task, j.kind, j.revision, j.key) == same:
                     return j
-            if limit is not None and sum(j.status == "running" for j in self._jobs.values()) >= limit:
+            if limit is not None and sum(j.finished is None for j in self._jobs.values()) >= limit:
                 raise TooManyJobs
             self._jobs[job.id] = job
             self._forget_old()
@@ -130,3 +132,8 @@ class Jobs:
         """Jobs running and not asked to stop."""
         with self._lock:
             return [j for j in self._jobs.values() if j.status == "running"]
+
+    def stopping(self) -> list[Job]:
+        """Jobs asked to stop whose threads haven't yet."""
+        with self._lock:
+            return [j for j in self._jobs.values() if j.status == "cancelling"]

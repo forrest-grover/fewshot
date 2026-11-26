@@ -196,15 +196,17 @@ def test_the_same_job_is_shared_under_the_lock():
     gate.set()
 
 
-def test_a_cancelled_job_frees_its_place_at_once():
-    """A job asked to stop is "cancelling" and no longer counts towards the limit."""
+def test_a_cancelled_job_keeps_its_place_until_it_stops():
+    """A job asked to stop is "cancelling", and still counts towards the limit until its thread
+    ends: else starting and cancelling jobs whose work has no progress step for a while (a model
+    loading) would pile up threads without bound."""
     jobs, gate = Jobs(), threading.Event()
     first = jobs.start(Job(task="t", kind="a"), lambda _p: gate.wait(5), limit=1)
     first.request_cancel()
     assert first.to_dict()["status"] == "cancelling"
-    second = jobs.start(Job(task="t", kind="b"), lambda _p: gate.wait(5), limit=1)
-    assert second.status == "running"
-    assert jobs.running() == [second]
+    with pytest.raises(TooManyJobs):
+        jobs.start(Job(task="t", kind="b"), lambda _p: None, limit=1)
+    assert (jobs.running(), jobs.stopping()) == ([], [first])
     gate.set()
     deadline = time.time() + 5
     while first.finished is None and time.time() < deadline:
@@ -212,6 +214,33 @@ def test_a_cancelled_job_frees_its_place_at_once():
     assert first.status == "done"  # it finished without another progress step: its result stands
     first.request_cancel()  # too late: nothing changes
     assert first.status == "done"
+    assert jobs.start(Job(task="t", kind="b"), lambda _p: None, limit=1).kind == "b"  # its place is free
+
+
+def test_cancelled_jobs_are_capped_and_reported(client, monkeypatch):
+    """Over the API: cancelled jobs whose work hasn't reached a progress step still count towards
+    MAX_JOBS (429), and health reports them."""
+    task = api_task(client, n=1)
+    release = threading.Event()
+
+    def stuck(*_args, **_kw):
+        release.wait(5)  # no progress step, like a model loading
+
+    monkeypatch.setattr(fewshot.evaluate, "evaluate_task", stuck)
+    monkeypatch.setattr(fewshot.api, "MAX_JOBS", 2)
+    ids = []
+    for folds in (2, 3):
+        ids.append(client.post(f"/api/tasks/{task}/evaluate/jobs", params={"folds": folds}).json()["id"])
+        assert client.delete(f"/api/jobs/{ids[-1]}").json()["status"] == "cancelling"
+    r = client.post(f"/api/tasks/{task}/evaluate/jobs", params={"folds": 4})
+    assert r.status_code == 429
+    assert "being cancelled" in r.json()["detail"]
+    health = client.get("/api/health").json()
+    assert (health["jobs_running"], health["jobs_cancelling"]) == (0, 2)
+    release.set()
+    for jid in ids:
+        wait_for_job(client, jid)
+    assert client.get("/api/health").json()["jobs_cancelling"] == 0
 
 
 def test_only_recent_results_are_kept():

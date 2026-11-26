@@ -287,7 +287,8 @@ async def health(srv: Srv) -> dict[str, Any]:
     """Liveness check; also lists loaded models and running jobs. Needs no token, and no thread, so
     it answers even while every thread is busy."""
     return {"status": "ok", "auth_required": srv.settings.token is not None, "models_loaded": loaded_embedders(),
-            "jobs_running": len(srv.jobs.running()), "url_fetch": srv.settings.allow_urls,
+            "jobs_running": len(srv.jobs.running()), "jobs_cancelling": len(srv.jobs.stopping()),
+            "url_fetch": srv.settings.allow_urls,
             "max_request_bytes": srv.settings.max_request_bytes, "max_upload_bytes": srv.settings.max_upload_bytes}
 
 
@@ -896,11 +897,13 @@ def _job(srv: Server, jid: str) -> Job:
 
 
 def _start(srv: Server, job: Job, work: Callable[[Callable[[str, int, int], None]], Any]) -> Response:
-    """Start ``job``, or return the same one already running; 429 if ``MAX_JOBS`` are running."""
+    """Start ``job``, or return the same one already running; 429 if ``MAX_JOBS`` are running or
+    being cancelled."""
     try:
         return json_response(JobOut, srv.jobs.start(job, work, limit=MAX_JOBS).to_dict(), 202)
     except TooManyJobs:
-        raise HTTPException(429, f"{MAX_JOBS} jobs are already running; try again when one has finished") from None
+        raise HTTPException(429, f"{MAX_JOBS} jobs are already running or being cancelled; try again when one "
+                                 "has finished") from None
 
 
 @router.post("/api/tasks/{name}/evaluate/jobs", status_code=202, response_model=JobOut)
@@ -950,8 +953,8 @@ def get_job(srv: Srv, jid: str) -> Response:
 
 @router.delete("/api/jobs/{jid}", response_model=JobOut)
 def cancel_job(srv: Srv, jid: str) -> Response:
-    """Ask a running job to stop: its status becomes "cancelling" (no longer counted against the
-    job limit), then "cancelled" at its next progress step."""
+    """Ask a running job to stop: its status becomes "cancelling", then "cancelled" at its next
+    progress step. Until then it still counts towards the job limit."""
     job = _job(srv, jid)
     job.request_cancel()
     return json_response(JobOut, job.to_dict())

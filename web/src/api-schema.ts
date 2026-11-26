@@ -43,8 +43,8 @@ export interface paths {
         post?: never;
         /**
          * Cancel Job
-         * @description Ask a running job to stop: its status becomes "cancelling" (no longer counted against the
-         *     job limit), then "cancelled" at its next progress step.
+         * @description Ask a running job to stop: its status becomes "cancelling", then "cancelled" at its next
+         *     progress step. Until then it still counts towards the job limit.
          */
         delete: operations["cancel_job"];
         options?: never;
@@ -1122,6 +1122,8 @@ export interface components {
         Health: {
             /** Auth Required */
             auth_required: boolean;
+            /** Jobs Cancelling */
+            jobs_cancelling: number;
             /** Jobs Running */
             jobs_running: number;
             /** Max Request Bytes */

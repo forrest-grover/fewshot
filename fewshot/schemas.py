@@ -19,6 +19,7 @@ class Health(BaseModel):
     auth_required: bool
     models_loaded: list[str]
     jobs_running: int
+    jobs_cancelling: int  # asked to stop, still running until their next progress step
     url_fetch: bool  # whether the .../urls endpoints are enabled
     max_request_bytes: int  # largest upload request accepted (fewshot.client batches below it)
     max_upload_bytes: int  # largest image accepted
