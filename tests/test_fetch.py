@@ -62,7 +62,7 @@ def test_fetch_public_only(server, monkeypatch):
     with pytest.raises(ValueError, match="not a public address"):
         fetch.fetch_url(server + "/img", 10_000, public_only=True)
     real_check = fetch.check_public
-    monkeypatch.setattr(fetch, "check_public", lambda url: None if url.endswith("/redirect") else real_check(url))
+    monkeypatch.setattr(fetch, "check_public", lambda url, timeout=None: None if url.endswith("/redirect") else real_check(url, timeout))
     with pytest.raises(ValueError, match="not a public address"):
         fetch.fetch_url(server + "/redirect", 10_000, public_only=True)
 
@@ -121,6 +121,10 @@ def _resolves_to(monkeypatch, ip):
     "::ffff:10.0.0.1",  # IPv4-mapped private
     "64:ff9b::7f00:1",  # NAT64 of 127.0.0.1
     "64:ff9b::a9fe:a9fe",  # NAT64 of 169.254.169.254
+    "::7f00:1",  # IPv4-compatible 127.0.0.1 (deprecated, but a host may still deliver it)
+    "::ffff:0:7f00:1",  # SIIT (IPv4-translated) 127.0.0.1
+    "::ffff:0:a9fe:a9fe",  # SIIT 169.254.169.254
+    "fec0::1",  # site-local (deprecated, but routed within a site)
 ])
 def test_every_kind_of_non_public_address_is_refused(monkeypatch, ip):
     """Anything but a globally routable address is refused, not just private and loopback ones."""
@@ -129,7 +133,8 @@ def test_every_kind_of_non_public_address_is_refused(monkeypatch, ip):
         fetch.public_addresses("inside.test", 80)
 
 
-@pytest.mark.parametrize("ip", ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"])
+@pytest.mark.parametrize("ip", ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808",
+                                "::ffff:0:808:808"])
 def test_public_addresses_pass(monkeypatch, ip):
     """Globally routable addresses, also IPv4-mapped or through NAT64, pass."""
     _resolves_to(monkeypatch, ip)
@@ -143,7 +148,7 @@ def test_fetch_connects_to_the_checked_address(server, monkeypatch):
     port = int(server.rsplit(":", 1)[1])
     looked_up = []
 
-    def checked(host, _port):
+    def checked(host, _port, _timeout=None):
         looked_up.append(host)
         return ["127.0.0.1"]  # pretend this passed the public-address check
 
@@ -172,7 +177,7 @@ def test_fetch_https_is_pinned_too(server, monkeypatch):
     port = int(server.rsplit(":", 1)[1])
     looked_up: list[str] = []
 
-    def checked(host, _port):
+    def checked(host, _port, _timeout=None):
         looked_up.append(host)
         return ["127.0.0.1"]
 
@@ -194,7 +199,7 @@ def test_public_only_fetches_ignore_proxy_settings(server, monkeypatch, scheme):
         monkeypatch.setenv(var, "http://127.0.0.1:1")
     connected_for: list[str] = []
 
-    def checked(host, _port):
+    def checked(host, _port, _timeout=None):
         connected_for.append(host)
         return ["127.0.0.1"]
 
@@ -262,7 +267,7 @@ def test_redirects_only_to_http(hostile, monkeypatch):
     """A redirect to ftp:// (which no address check covers) is refused, with or without public_only."""
     with pytest.raises(ValueError, match="isn't http"):
         fetch.fetch_url(hostile + "/ftp", 10_000)
-    monkeypatch.setattr(fetch, "public_addresses", lambda host, port: ["127.0.0.1"])
+    monkeypatch.setattr(fetch, "public_addresses", lambda host, port, timeout=None: ["127.0.0.1"])
     with pytest.raises(ValueError, match="isn't http"):
         fetch.fetch_url(hostile + "/ftp", 10_000, public_only=True)
 
@@ -282,6 +287,41 @@ def test_timeout_bounds_the_headers_too(hostile, path):
     with pytest.raises(ValueError, match=r"took longer than 0\.5 s"):
         fetch.fetch_url(hostile + path, 10_000, timeout=TIMEOUT)
     assert TIMEOUT <= time.monotonic() - t0 < TRICKLE_FOR / 3
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_timeout_bounds_host_name_lookups(monkeypatch, pinned):
+    """A resolver that doesn't answer can't hold the caller past the timeout either: neither in
+    the check before connecting nor in the lookup the connection is pinned to."""
+    release = threading.Event()
+    calls = []
+
+    def slow(host, port, *_args, **_kw):
+        calls.append(host)
+        if pinned and len(calls) == 1:  # the check passes; the connection's own lookup hangs
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        release.wait(10)
+        raise socket.gaierror(-2, "too late")
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(ValueError, match=r"Can't resolve slow\.test: no answer within"):
+            fetch.fetch_url("http://slow.test/x.png", 10_000, timeout=TIMEOUT, public_only=True)
+        assert time.monotonic() - t0 < TIMEOUT + 1
+    finally:
+        release.set()
+    assert len(calls) == (2 if pinned else 1)
+
+
+def test_lookup_errors_reach_the_caller(monkeypatch):
+    """A lookup that fails (with a timeout set) is reported as for one without."""
+    def fail(*_a, **_k):
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    with pytest.raises(ValueError, match="Can't resolve nowhere.test: .*not known"):
+        fetch.public_addresses("nowhere.test", 80, timeout=5)
 
 
 def test_deadline_shuts_late_sockets_at_once():
