@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api, type ModelInfo, type TaskDetail } from "./api";
-import { afterSave, formOf, settingsPatch, type Edits, type SettingsForm } from "./settingsForm";
+import { afterSave, formOf, pickClassifier, settingsPatch, type Edits, type SettingsForm } from "./settingsForm";
 
 interface Props {
   task: TaskDetail; models: ModelInfo | null; setTask: (t: TaskDetail) => void;
@@ -71,7 +71,7 @@ export default function Settings({ task, models, setTask, run, onDeleted, onRena
 
       <label>
         <span>Classifier</span>
-        <select value={classifier} onChange={(e) => { edit({ classifier: e.target.value, params: {} }); }}>
+        <select value={classifier} onChange={(e) => { const c = e.target.value; setEdits((old) => pickClassifier(old, task, c)); }}>
           <option value="gda">GDA: class means and shared spread, tuned per task</option>
           <option value="prototype">Prototype: nearest class centroid</option>
           <option value="knn">kNN: vote of nearest examples</option>

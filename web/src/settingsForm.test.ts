@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { afterSave, formOf, settingsPatch } from "./settingsForm";
+import { afterSave, formOf, pickClassifier, settingsPatch } from "./settingsForm";
 import { taskDetail } from "./test-data";
 
 describe("settingsPatch", () => {
@@ -44,6 +44,21 @@ describe("settingsPatch", () => {
     const r = settingsPatch(fitted, { ...formOf(fitted), reject: "abc", temperature: "500", params: { k: "x" } });
     expect(r.problems).toHaveLength(3);
     expect(r.patch).toEqual({ classifier_params: {} });
+  });
+});
+
+describe("pickClassifier", () => {
+  const saved = taskDetail({ classifier: "knn", classifier_params: { k: 7 } });
+
+  it("starts another classifier from its defaults", () => {
+    expect(pickClassifier({ flip: true }, saved, "prototype")).toEqual({ flip: true, classifier: "prototype", params: {} });
+  });
+
+  it("going back to the saved classifier keeps its saved params", () => {
+    const away = pickClassifier({ reject: "0.5" }, saved, "prototype");
+    const back = pickClassifier(away, saved, "knn");
+    expect(back).toEqual({ reject: "0.5" });
+    expect(settingsPatch(saved, { ...formOf(saved), ...back }).patch).toEqual({ reject_below: 0.5 });
   });
 });
 
