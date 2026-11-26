@@ -6,6 +6,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+import fewshot.access
 import fewshot.api
 import fewshot.auth
 import fewshot.guard
@@ -50,7 +51,7 @@ def test_logout_without_a_token_configured(client):
 
 
 def _cookie(value):
-    return {"Cookie": f"{fewshot.api.SESSION_COOKIE}={value}"}
+    return {"Cookie": f"{fewshot.access.SESSION_COOKIE}={value}"}
 
 
 def test_the_session_cookie_is_signed_not_the_token(tmp_path):
@@ -58,7 +59,7 @@ def test_the_session_cookie_is_signed_not_the_token(tmp_path):
     raw token, or a cookie from a server with another token is refused."""
     c = api_client(tmp_path, token="s3cret-s3cret-s3cret")
     r = c.post("/api/login", json={"token": "s3cret-s3cret-s3cret"})
-    cookie = r.cookies[fewshot.api.SESSION_COOKIE]
+    cookie = r.cookies[fewshot.access.SESSION_COOKIE]
     assert "s3cret-s3cret-s3cret" not in r.headers["set-cookie"]
     assert "samesite=strict" in r.headers["set-cookie"].lower()
     fresh = TestClient(c.app)
@@ -107,16 +108,15 @@ def test_wrong_tokens_on_any_request_count_towards_the_limit(tmp_path, monkeypat
     """Guessing with Bearer tokens is limited like /api/login (no token at all isn't a guess, and
     a session cookie can't be guessed), and the limit then covers login too; the right token
     works throughout."""
-    api = fewshot.api
     monkeypatch.setattr(fewshot.auth, "LOGIN_FAILURES", 2)
     c = api_client(tmp_path, token=TOKEN)
     for _ in range(3):
         assert c.get("/api/tasks").status_code == 401
-        assert c.get("/api/tasks", headers={"Cookie": f"{api.SESSION_COOKIE}=b"}).status_code == 401
+        assert c.get("/api/tasks", headers={"Cookie": f"{fewshot.access.SESSION_COOKIE}=b"}).status_code == 401
     assert c.get("/api/tasks", headers={"Authorization": "Bearer a"}).status_code == 401
     assert c.get("/api/tasks", headers={"Authorization": "Bearer b"}).status_code == 401
     r = c.get("/api/tasks", headers={"Authorization": "Bearer c"})
-    assert (r.status_code, r.json()["detail"]) == (429, api.TOO_MANY_TOKENS)
+    assert (r.status_code, r.json()["detail"]) == (429, fewshot.access.TOO_MANY_TOKENS)
     assert c.post("/api/login", json={"token": "d"}).status_code == 429
     assert c.get("/api/tasks", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
     assert c.post("/api/login", json={"token": TOKEN}).status_code == 204

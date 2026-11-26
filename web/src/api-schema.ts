@@ -67,8 +67,8 @@ export interface paths {
          *     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
          *
          *     After LOGIN_FAILURES wrong tokens from one address within LOGIN_WINDOW seconds (here or as
-         *     Bearer headers), token checks from it get 429 until the window has passed, so the token
-         *     can't be guessed quickly.
+         *     Bearer headers), further wrong ones from it get 429 until it has sent none for that long; the
+         *     right token is always accepted.
          */
         post: operations["login"];
         delete?: never;
@@ -132,7 +132,7 @@ export interface paths {
         put?: never;
         /**
          * Create Task
-         * @description Create a task, validating the embedder spec first.
+         * @description Create a task, validating the embedder spec (which loads the model) first.
          */
         post: operations["create_task"];
         delete?: never;
@@ -186,7 +186,8 @@ export interface paths {
         /**
          * Update Task
          * @description Change task settings. ``classifier_params`` replaces the params; switching classifier starts
-         *     its params afresh unless they are given. A temperature of 1 means none.
+         *     its params afresh unless they are given. A temperature of 1 means none. A new embedder is
+         *     loaded first, on the heavy-work threads.
          */
         patch: operations["update_task"];
         trace?: never;

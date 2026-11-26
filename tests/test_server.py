@@ -10,10 +10,12 @@ import threading
 import time
 
 import anyio.to_thread
+import pydantic
 import pytest
 
 import fewshot.api
 import fewshot.guard
+import fewshot.responses
 import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
 from fewshot.pipeline import Prediction
@@ -418,3 +420,65 @@ def test_json_bodies_have_a_small_limit(client):
     assert (r.status_code, r.json()["detail"]) == (413, "Request is larger than the 1 MB limit")
     assert client.post("/api/tasks/t/examples", data={"label": "red"},
                        files=[("files", ("big.png", png(RED, size=800, noise=60), "image/png"))]).status_code == 201
+
+
+# ---- responses -------------------------------------------------------------
+@pytest.mark.usefixtures("task_t")
+def test_responses_are_built_off_the_event_loop(client, monkeypatch):
+    """Validating and serialising a response (which for a large task takes long enough to stall
+    every other request) happens in the request's thread, never on the event loop."""
+    loops = []
+    real = fewshot.responses.render
+
+    def spy(model, content):
+        try:
+            asyncio.get_running_loop()
+            loops.append(model)
+        except RuntimeError:
+            pass
+        return real(model, content)
+
+    monkeypatch.setattr(fewshot.responses, "render", spy)
+    with client:
+        assert client.get("/api/tasks/t").status_code == 200
+        assert client.get("/api/tasks").status_code == 200
+        assert client.post("/api/tasks/t/predict", files=query_files(1)).status_code == 200
+        assert client.post("/api/tasks/t/examples", data={"label": "red"}, files=query_files(1)).status_code == 201
+        jid = client.post("/api/tasks/t/evaluate/jobs").json()["id"]
+        assert client.get(f"/api/jobs/{jid}").status_code == 200
+    assert not loops
+
+
+@pytest.mark.usefixtures("task_t")
+def test_long_lists_are_rendered_in_chunks_with_the_same_result(client, monkeypatch):
+    """A response with a long list is validated and serialised a chunk at a time (so the GIL is
+    let go in between), giving the same JSON as rendering it whole."""
+    client.post("/api/tasks/t/examples", data={"label": "blue"}, files=query_files(5, rgb=(0, 0, 255)))
+    whole = client.get("/api/tasks/t").content
+    preds = client.post("/api/tasks/t/predict", files=query_files(5)).content
+    monkeypatch.setattr(fewshot.responses, "RENDER_CHUNK", 2)
+    assert client.get("/api/tasks/t").content == whole
+    assert client.post("/api/tasks/t/predict", files=query_files(5)).content == preds
+
+    class Listing(pydantic.BaseModel):  # pylint: disable=missing-class-docstring
+        xs: list[int]
+        note: str = "none"
+
+    class Strict(pydantic.BaseModel):  # pylint: disable=missing-class-docstring
+        xs: list[int]
+        note: str
+
+    assert fewshot.responses.render(Listing, {"xs": [1, 2, 3]}) == b'{"xs":[1,2,3],"note":"none"}'
+    with pytest.raises(pydantic.ValidationError, match="note"):
+        fewshot.responses.render(Strict, {"xs": [1, 2, 3]})
+
+
+def test_choosing_a_model_loads_it_on_the_heavy_work_threads(client, monkeypatch):
+    """Creating a task or switching its embedder, which loads the model, waits on the server's
+    own threads, like other heavy work."""
+    threads = []
+    monkeypatch.setattr(client.srv, "check_embedder", lambda _spec: threads.append(threading.current_thread().name))
+    assert client.post("/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 201
+    assert client.patch("/api/tasks/t", json={"embedder": "fake:other"}).status_code == 200
+    assert len(threads) == 2
+    assert all(name.startswith("fewshot-work") for name in threads)
