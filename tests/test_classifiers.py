@@ -364,7 +364,8 @@ def test_gda_leaves_an_image_only_examples_own_text_side_out(monkeypatch):
 
 def test_gda_text_weight_scales_the_tuned_balance():
     """The image term's weight is tuned for text at weight 1; ``text_weight`` then multiplies the
-    text's share, so a small one leaves the image term to decide and a large one the text."""
+    text's share (in the scores and in the means' pull towards it), so a small one leaves the
+    image term to decide and a large one the text."""
     rng = np.random.default_rng(2)
     centres = unit(rng.normal(size=(5, 32)))
     text = dict(enumerate(unit(centres + 0.5 * rng.normal(size=(5, 32)))))
@@ -375,7 +376,6 @@ def test_gda_text_weight_scales_the_tuned_balance():
     fits = {w: GDAClassifier(text_weight=w) for w in (0.001, 1.0, 100.0)}
     for clf in fits.values():
         clf.fit(data)
-    assert fits[0.001].weight == pytest.approx(fits[1.0].weight)
     image_only = fits[0.001]._image_logprobs(Q).argmax(1)  # pylint: disable=protected-access
     text_only = (Q @ np.stack(list(text.values())).T).argmax(1)
     assert (fits[0.001].predict(Q)[0].argmax(1) == image_only).all()
@@ -401,3 +401,51 @@ def test_gda_pulls_class_means_towards_their_text(monkeypatch):
     monkeypatch.setattr(classifiers, "TEXT_PRIOR", 0.0)
     plain = (GDAClassifier().fit(data).predict(Q)[0].argmax(1) == yq).mean()
     assert pulled > plain + 0.02
+
+
+def _prior_strengths(monkeypatch):
+    """The lam values each GDA fit pulls its means with, recorded as the fits run."""
+    seen = []
+    real = classifiers._GDALeaveOneOut.pull_towards  # pylint: disable=protected-access
+
+    def spy(self, anchors, lam):
+        seen.append(lam)
+        real(self, anchors, lam)
+    monkeypatch.setattr(classifiers._GDALeaveOneOut, "pull_towards", spy)  # pylint: disable=protected-access
+    return seen
+
+
+def _noisy_task(text_noise, seed=5, C=20, k=3):
+    rng = np.random.default_rng(seed)
+    centres = unit(rng.normal(size=(C, 32)))
+    text = dict(enumerate(unit(centres + text_noise * rng.normal(size=(C, 32)))))
+    y = np.repeat(np.arange(C), k)
+    return ClassData([str(i) for i in range(C)], unit(centres[y] + 0.6 * rng.normal(size=(len(y), 32))), y, text)
+
+
+def test_gda_prior_needs_text_that_matches_the_images(monkeypatch):
+    """Text whose anchors don't pick out their own class means (here shuffled across classes)
+    doesn't pull the means at all; text that does, does."""
+    seen = _prior_strengths(monkeypatch)
+    data = _noisy_task(0.3)
+    GDAClassifier().fit(data)
+    assert (seen[-1] > 0).all()
+    order = np.roll(np.arange(len(data.classes)), 1)
+    GDAClassifier().fit(ClassData(data.classes, data.X, data.y, {i: data.text[int(j)] for i, j in enumerate(order)}))
+    assert (seen[-1] == 0).all()
+    # A single described class can't show it matches.
+    GDAClassifier().fit(ClassData(data.classes, data.X, data.y, {0: data.text[0]}))
+    assert (seen[-1] == 0).all()
+
+
+def test_gda_text_weight_scales_the_prior(monkeypatch):
+    """The means' pull towards the text scales with ``text_weight``, so a tiny one fits almost
+    as with no text at all."""
+    seen = _prior_strengths(monkeypatch)
+    data = _noisy_task(0.3)
+    GDAClassifier(text_weight=1.0).fit(data)
+    GDAClassifier(text_weight=0.5).fit(data)
+    assert seen[-1] == pytest.approx(seen[-2] * 0.5)
+    tiny, none = GDAClassifier(text_weight=1e-6).fit(data), GDAClassifier(text_weight=0.0).fit(data)
+    Q = data.X + 0.1
+    assert (tiny.predict(Q)[0].argmax(1) == none.predict(Q)[0].argmax(1)).all()

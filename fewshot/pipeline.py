@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import heapq
-import math
 import os
 import threading
 from collections.abc import Callable, Sequence
@@ -13,10 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 from PIL import Image, ImageOps
 
 from .cache import EmbeddingCache
-from .classifiers import ClassData, Classifier, Labels, make_classifier
+from .classifiers import ClassData, Classifier, Labels, binomial_tail, make_classifier
 from .embedders import Embedder, Vectors, cache_namespace, get_embedder, spec_supports_text
 from .images import image_id, load_image, to_rgb
 from .store import Task, TaskConfig, Workspace
@@ -229,9 +229,8 @@ class Pipeline:
         names = self._indexed_texts(cfg.embedder, named)
         candidates = sorted(set(text) | set(names))
         T = np.stack([text[i] if i in text else names[i] for i in candidates])
-        rows = np.isin(y, list(names))
-        guess = np.array(candidates)[(X[rows] @ T.T).argmax(1)]
-        return names if names_match(guess, y[rows]) else {}
+        guess = np.array(candidates)[(X @ T.T).argmax(1)]
+        return names if names_match(guess, y, np.isin(y, list(names)), len(candidates)) else {}
 
     def _indexed_texts(self, spec: str, texts: dict[int, str]) -> dict[int, Vectors]:
         """Embed ``{class index: text}``, keeping the indices."""
@@ -392,28 +391,17 @@ NAME_TEMPLATE = "a photo of a {}."  # text for a class described only by its nam
 NAME_TEST_LEVEL = 0.05  # names are used as text when matching the examples this well is unlikely by chance
 
 
-def names_match(guess: Labels, truth: Labels) -> bool:
-    """Whether text guesses ``guess`` hit the true classes ``truth`` more often than chance would
-    (one-sided binomial test at ``NAME_TEST_LEVEL``). Chance is the hit rate of guesses unrelated
-    to the images: a guess of class c is right with probability (share of examples in c), so
-    texts that send every image to the largest class score no better than chance however
-    unbalanced the classes are."""
-    n = len(truth)
-    share = np.bincount(truth, minlength=int(max(guess.max(), truth.max())) + 1) / n
-    chance = float(share[guess].sum()) / n
-    return binomial_tail(int((guess == truth).sum()), n, chance) < NAME_TEST_LEVEL
-
-
-def binomial_tail(k: int, n: int, p: float) -> float:
-    """P(X >= k) for X ~ Binomial(n, p), computed in log space so large n doesn't overflow."""
-    if k <= 0 or p >= 1:
-        return 1.0
-    if k > n:
-        return 0.0
-    logs = [math.lgamma(n + 1) - math.lgamma(j + 1) - math.lgamma(n - j + 1) + j * math.log(p)
-            + (n - j) * math.log1p(-p) for j in range(k, n + 1)]
-    top = max(logs)
-    return math.exp(top) * sum(math.exp(v - top) for v in logs)
+def names_match(guess: Labels, truth: Labels, named: npt.NDArray[np.bool_], texts: int) -> bool:
+    """Whether text guesses ``guess`` of every example's class ``truth`` hit it, among the examples
+    of the classes described by their names (``named``), more often than chance would (one-sided
+    binomial test at ``NAME_TEST_LEVEL``). Chance is the hit rate of guesses unrelated to the
+    images: one is class c as often as the guesses for all the examples are, so texts that send
+    every image to the largest class score no better than chance however unbalanced the classes
+    are. With every example in one class that rate can't show whether the text tells the class
+    apart, so chance is then one in the number of ``texts`` (classes with text)."""
+    rate = np.bincount(guess, minlength=int(max(guess.max(), truth.max())) + 1) / len(guess)
+    chance = 1.0 / texts if len(set(truth.tolist())) == 1 else float(rate[truth[named]].mean())
+    return binomial_tail(int((guess == truth)[named].sum()), int(named.sum()), chance) < NAME_TEST_LEVEL
 
 
 def _deduplicated(progress: Progress) -> Progress:

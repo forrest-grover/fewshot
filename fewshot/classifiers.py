@@ -29,6 +29,7 @@ vector *is* the text mean, so the shift erases every class difference.
 from __future__ import annotations
 
 import inspect
+import math
 import numbers
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -337,6 +338,7 @@ class LogRegClassifier(Classifier):
 
 GDA_ALPHAS = np.geomspace(0.01, 100, 41)  # image-term weights tried, relative to the text term
 TEXT_PRIOR = 1.5  # multiplies the empirical-Bayes weight of a class's text in its mean
+PRIOR_TEST_LEVEL = 0.05  # the text pulls the means only if its anchors match them this unlikely by chance
 ONE_SHOT_SPREAD = 0.1  # with 1 image per class: share of the image-to-text distance put down to noise
 
 
@@ -407,7 +409,8 @@ class GDAClassifier(Classifier):
         # Each class's text moved across the gap into this space: where the text says its images are.
         gap = (_fitted(self.Pt)[imgs > 0] - raw_mu[imgs > 0]).mean(0)
         anchors = self._centred((_fitted(self.Pt) - gap).astype(np.float32)).astype(np.float64)
-        lam = self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None)
+        # text_weight scales the text's pull on the means as it does its scores, so 0 is no text.
+        lam = self.text_weight * self._prior_strength(loo.mu, anchors, imgs, nu, loo.downdate is not None)
         loo.pull_towards(anchors, lam)
         self._set_means(loo.mu, loo.prec)
         stand_in = anchors.copy()
@@ -430,12 +433,22 @@ class GDAClassifier(Classifier):
         """How many images' worth of weight each class's text anchor gets in its mean (see the
         class doc): ``TEXT_PRIOR`` times sigma^2 / tau^2, the images' spread around their class
         mean over the class means' spread around their anchors (per dimension, estimated from
-        all the classes), or 0 for a class without both images and its own text."""
+        all the classes), or 0 for a class without both images and its own text.
+
+        Or 0 for every class unless the anchors pick out their own class means (each mean's
+        nearest anchor is its own) more often than chance would, by a one-sided binomial test at
+        ``PRIOR_TEST_LEVEL``. The estimate can't tell text unrelated to the images from steady
+        text when the images scatter widely: shuffling the descriptions gave lam about 1 and cut
+        accuracy at 2 images per class from 45% (no pull) to 30%."""
         lam = np.zeros(len(imgs))
         on = _fitted(self.described) & (imgs > 0)
         if not on.any():
             return lam
-        d2 = float(((mu[on] - anchors[on]) ** 2).sum(1).mean()) / mu.shape[1]
+        dist = (mu[on] ** 2).sum(1)[:, None] + (anchors[on] ** 2).sum(1)[None, :] - 2 * mu[on] @ anchors[on].T
+        hits = int((dist.argmin(1) == np.arange(len(dist))).sum())
+        if binomial_tail(hits, len(dist), 1.0 / len(dist)) >= PRIOR_TEST_LEVEL:
+            return lam
+        d2 = float(np.diag(dist).mean()) / mu.shape[1]
         s2 = nu if spread_known else ONE_SHOT_SPREAD * d2  # no spread to measure with 1 image each
         k = float(np.median(imgs[imgs > 0]))
         t2 = max(d2 - s2 / k, 1e-3 * s2, 1e-12)  # a mean of k images is off by s2 / k itself
@@ -604,6 +617,18 @@ class _GDALeaveOneOut:  # pylint: disable=too-many-instance-attributes  # a help
         # Examples of a single class can't show how often the others are mistaken for it, so then
         # the fit only caps the default.
         return fitted if len(set(t.tolist())) > 1 else min(fitted, default)
+
+
+def binomial_tail(k: int, n: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p), computed in log space so large n doesn't overflow."""
+    if k <= 0 or p >= 1:
+        return 1.0
+    if k > n:
+        return 0.0
+    logs = [math.lgamma(n + 1) - math.lgamma(j + 1) - math.lgamma(n - j + 1) + j * math.log(p)
+            + (n - j) * math.log1p(-p) for j in range(k, n + 1)]
+    top = max(logs)
+    return math.exp(top) * sum(math.exp(v - top) for v in logs)
 
 
 def _log_softmax(z: Scores) -> Scores:

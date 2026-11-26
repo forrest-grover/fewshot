@@ -8,10 +8,10 @@ import pytest
 from PIL import Image
 
 import fewshot.pipeline as pipeline_mod
-from fewshot.classifiers import KNNClassifier
+from fewshot.classifiers import KNNClassifier, binomial_tail
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.images import image_id
-from fewshot.pipeline import Pipeline, Prediction, binomial_tail, names_match
+from fewshot.pipeline import Pipeline, Prediction, names_match
 from tests.conftest import ColorEmbedder, png
 
 RED, GREEN, BLUE = (220, 30, 30), (30, 220, 30), (30, 30, 220)
@@ -209,16 +209,34 @@ def test_binomial_tail():
     assert binomial_tail(500, 1000, 0.5) == pytest.approx(0.5126, abs=1e-3)
 
 
+def _named(guess, truth, texts=10):
+    """``names_match`` with every example in a class described by its name."""
+    return names_match(guess, truth, np.ones(len(truth), bool), texts)
+
+
 def test_names_match_allows_for_unbalanced_classes():
     """Names that send every image to the largest class match no better than chance, however many
     examples that gets right; names that tell the classes apart do, even with one example each."""
     truth = np.repeat([0, 1], [30, 5])
-    assert not names_match(np.zeros(35, int), truth)  # 30/35 right, but so would any constant guess
-    assert names_match(truth.copy(), truth)
+    assert not _named(np.zeros(35, int), truth)  # 30/35 right, but so would any constant guess
+    assert _named(truth.copy(), truth)
     one_each = np.arange(5)
-    assert names_match(one_each.copy(), one_each)
-    assert names_match(np.array([0, 1, 2, 3, 9]), one_each)  # 9: a described class, never right
-    assert not names_match(np.array([1, 2, 3, 4, 0]), one_each)
+    assert _named(one_each.copy(), one_each)
+    assert _named(np.array([0, 1, 2, 3, 9]), one_each)  # 9: a described class, never right
+    assert not _named(np.array([1, 2, 3, 4, 0]), one_each)
+
+
+def test_names_match_one_undescribed_class():
+    """With every other class described, one class's name can still pass: chance comes from how
+    often the texts pick it for every example, including the described classes' examples."""
+    truth = np.repeat([0, 1, 2], 20)  # 0 and 1 described, 2 by its name
+    named = truth == 2
+    assert names_match(truth.copy(), truth, named, 3)
+    assert not names_match(np.full(60, 2), truth, named, 3)  # a name that takes every image
+    # Only that class has examples: the guesses' rate can't tell, so chance is one in three texts.
+    alone = np.full(20, 2)
+    assert names_match(alone.copy(), alone, np.ones(20, bool), 3)
+    assert not names_match(np.repeat([2, 0, 1], [8, 6, 6]), alone, np.ones(20, bool), 3)
 
 
 def test_same_lazy_pil_image_decoded_more_than_once():
