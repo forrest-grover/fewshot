@@ -31,6 +31,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"
 # Serving on all interfaces: set FEWSHOT_TOKEN (and FEWSHOT_ALLOWED_HOSTS to the names clients use).
-# Without a token the server refuses every request from outside the container (FEWSHOT_ALLOW_NO_TOKEN=1
-# allows them).
+# Without a token the server refuses to start (the log says why); FEWSHOT_ALLOW_NO_TOKEN=1 serves
+# without one anyway.
 CMD ["fewshot", "serve", "--host", "0.0.0.0", "--port", "8000"]

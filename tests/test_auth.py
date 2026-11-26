@@ -288,7 +288,7 @@ def test_a_server_without_token_refuses_other_interfaces(tmp_path, monkeypatch, 
     loopback, with a token, or with FEWSHOT_ALLOW_NO_TOKEN=1 it serves."""
     app = api_client(tmp_path).app
     outside = TestClient(app, base_url="http://172.17.0.2:8000")  # the address the request arrived at
-    refused = NO_TOKEN.format(addr="172.17.0.2")
+    refused = NO_TOKEN.format(where="was reached at", addr="172.17.0.2")
     for path in ("/api/tasks", "/api/health", "/"):
         r = outside.get(path)
         assert (r.status_code, r.json()["detail"]) == (403, refused), path
@@ -310,7 +310,7 @@ def test_a_server_without_token_refuses_other_interfaces(tmp_path, monkeypatch, 
 
 def test_exposure_problem():
     """For ``fewshot serve`` to refuse before starting: no token on a non-loopback bind address."""
-    assert exposure_problem("0.0.0.0", None, False) == NO_TOKEN.format(addr="0.0.0.0")
+    assert exposure_problem("0.0.0.0", None, False) == NO_TOKEN.format(where="would listen on", addr="0.0.0.0")
     assert exposure_problem("::", None, False) is not None
     assert exposure_problem("box.lan", None, False) is not None  # a name: whichever interface it is
     for host in ("127.0.0.1", "127.0.0.2", "::1", "localhost"):

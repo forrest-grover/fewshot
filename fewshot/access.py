@@ -26,7 +26,7 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 ALLOW_NO_TOKEN_ENV = "FEWSHOT_ALLOW_NO_TOKEN"
 NO_TOKEN = ("This server has no token, so anyone who can reach it could read and change every task, and it "
-            "was reached at {addr}, which isn't this machine's loopback address. Set FEWSHOT_TOKEN (e.g. to "
+            "{where} {addr}, which isn't this machine's loopback address. Set FEWSHOT_TOKEN (e.g. to "
             "the output of `openssl rand -hex 16`), or set FEWSHOT_ALLOW_NO_TOKEN=1 to serve without one.")
 
 
@@ -51,7 +51,7 @@ def exposure_problem(host: str, token: str | None, allow_no_token: bool) -> str 
     host name other than localhost counts as exposed."""
     if token is not None or allow_no_token or is_loopback(host):
         return None
-    return NO_TOKEN.format(addr=host)
+    return NO_TOKEN.format(where="would listen on", addr=host)
 
 
 def client_address(request: Request) -> str:
@@ -114,9 +114,9 @@ async def guard(request: Request, call_next: Any) -> Response:
         # ``uvicorn --host 0.0.0.0``) with FEWSHOT_TOKEN unset. Only the liveness check answers.
         if not srv.warned_exposed:
             srv.warned_exposed = True
-            log.error("%s", NO_TOKEN.format(addr=local[0]))
+            log.error("%s", NO_TOKEN.format(where="was reached at", addr=local[0]))
         if request.url.path != "/healthz":
-            return JSONResponse({"detail": NO_TOKEN.format(addr=local[0])}, 403)
+            return JSONResponse({"detail": NO_TOKEN.format(where="was reached at", addr=local[0])}, 403)
     if not host_allowed(request.headers.get("host", ""), set(srv.settings.allowed_hosts)):
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
     path = request.url.path

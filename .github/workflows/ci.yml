@@ -174,16 +174,21 @@ jobs:
           asset=$(grep -o '/assets/[^"]*\.js' index.html | head -1)
           curl -fsS -o /dev/null "http://127.0.0.1:8000${asset}"
           test "$(docker inspect -f '{{.Config.User}}' fewshot)" = fewshot
-      - name: Without a token, the image refuses requests from outside the container
+      - name: Without a token the image refuses to start, unless told to serve without one
         run: |
-          docker run -d --name fewshot-open -p 127.0.0.1:8001:8000 -e FEWSHOT_WARM=0 fewshot:ci
+          # No token: the server exits at once and says why.
+          code=$(docker run --name fewshot-open -e FEWSHOT_WARM=0 fewshot:ci >/dev/null 2>&1; echo $?)
+          docker logs fewshot-open 2>&1 | tee open.log
+          test "$code" != 0
+          grep -q "FEWSHOT_TOKEN" open.log
+          # FEWSHOT_ALLOW_NO_TOKEN=1: it serves, from outside the container too.
+          docker run -d --name fewshot-anyone -p 127.0.0.1:8001:8000 -e FEWSHOT_WARM=0 -e FEWSHOT_ALLOW_NO_TOKEN=1 fewshot:ci
           for _ in $(seq 60); do
             if curl -fsS http://127.0.0.1:8001/healthz; then break; fi
             sleep 2
           done
           echo
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8001/api/tasks)" = 403
-          docker exec fewshot-open python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/tasks', timeout=4)"
+          curl -fsS -o /dev/null http://127.0.0.1:8001/api/tasks
       - name: Server log
         if: always()
         run: docker logs fewshot || true
