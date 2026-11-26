@@ -6,10 +6,11 @@ from pathlib import Path
 
 import typer
 
+from . import services
 from .cli_common import (
     JSON_OPT,
     ROOT_OPT,
-    Source,
+    blobs,
     echo_json,
     error_text,
     expand,
@@ -17,9 +18,8 @@ from .cli_common import (
     get_task,
     make_pipeline,
     progress,
-    read_all,
     report_skipped,
-    source_name,
+    usage,
     workspace,
 )
 from .store import Task
@@ -31,9 +31,9 @@ inbox_app = typer.Typer(help="Unlabelled images waiting to be labelled, with the
 
 
 # ---- examples -------------------------------------------------------------
-def _ids(t: Task, ids: list[str]) -> list[str]:
+def _ids(t: Task, ids: list[str], inbox: bool = False) -> list[str]:
     try:
-        return t.resolve_ids(ids)
+        return t.resolve_ids(ids, inbox=inbox)
     except KeyError as e:
         fail(error_text(e))
 
@@ -86,7 +86,7 @@ def example_tag(
 ) -> None:
     """Add or remove tags on examples."""
     if not add_tag and not remove_tag:
-        fail("Give --add and/or --remove")
+        usage("Give --add and/or --remove")
     t = get_task(root, name)
     try:
         n = t.annotate(_ids(t, ids), add_tags=add_tag, remove_tags=remove_tag)
@@ -107,26 +107,13 @@ def example_note(name: str, example_id: str, note: str, root: Path | None = ROOT
 
 
 # ---- inbox ----------------------------------------------------------------
-def _inbox_ids(t: Task, prefixes: list[str]) -> list[str]:
-    ids = [x.id for x in t.config.inbox]
-    out = []
-    for p in prefixes:
-        hits = [i for i in ids if i.startswith(p)] if len(p) >= 4 else []
-        if len(hits) != 1:
-            fail(f"No inbox image {p!r}" if not hits else f"Inbox id {p!r} is ambiguous")
-        out.append(hits[0])
-    return out
-
-
 @inbox_app.command("add")
 def inbox_add(name: str, paths: list[str], root: Path | None = ROOT_OPT) -> None:
     """Put unlabelled images (files, directories or http(s) URLs) in the inbox; exits 1 if none could be."""
     t = get_task(root, name)
     files = expand(paths)
-    read: list[Source] = []
     with progress("Adding to the inbox") as update:
-        results = t.add_to_inbox((data, source_name(f)) for f, data in read_all(files, update, read))
-    n = report_skipped(read, results)
+        n = report_skipped(services.add_to_inbox(t, blobs(files, update)))
     typer.echo(f"{name}: {len(t.config.inbox)} images in the inbox")
     if n == 0:
         fail("Nothing was added to the inbox")
@@ -171,15 +158,12 @@ def inbox_accept(
     if any) above --min-confidence."""
     t = get_task(root, name)
     if (min_confidence is None) == (label is None) or (label is not None and not ids):
-        fail("Give ids with --label, or --min-confidence (with or without ids)")
+        usage("Give ids with --label, or --min-confidence (with or without ids)")
     if label is not None:
-        labels = dict.fromkeys(_inbox_ids(t, ids or []), label)
+        labels = dict.fromkeys(_ids(t, ids or [], inbox=True), label)
     else:
-        wanted = set(_inbox_ids(t, ids)) if ids else None
-        items = make_pipeline(workspace(root)).inbox_suggestions(t, "confident")
-        labels = {i["id"]: i["prediction"]["label"] for i in items if i.get("prediction")
-                  and (wanted is None or i["id"] in wanted)
-                  and not i["prediction"]["rejected"] and i["prediction"]["confidence"] >= (min_confidence or 0)}
+        wanted = _ids(t, ids, inbox=True) if ids else None
+        labels = services.confident_suggestions(make_pipeline(workspace(root)), t, min_confidence or 0.0, wanted)
     if not labels:
         typer.echo("Nothing to accept")
         return
@@ -194,5 +178,5 @@ def inbox_accept(
 def inbox_dismiss(name: str, ids: list[str], root: Path | None = ROOT_OPT) -> None:
     """Remove images from the inbox without labelling them (undo brings them back)."""
     t = get_task(root, name)
-    n = t.dismiss(_inbox_ids(t, ids))
+    n = t.dismiss(_ids(t, ids, inbox=True))
     typer.echo(f"Dismissed {n} images; {len(t.config.inbox)} left")

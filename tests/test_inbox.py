@@ -173,7 +173,7 @@ def test_cli(tmp_path):
     items = json.loads(run("inbox", "ls", "t", "--json").output)
     first = items[0]["id"][:8]
     assert run("inbox", "accept", "t", first, "--label", "blue").output.strip() == "Labelled 1 inbox images; 2 left"
-    assert run("inbox", "accept", "t").exit_code == 1  # neither --label nor --min-confidence
+    assert run("inbox", "accept", "t").exit_code == 2  # neither --label nor --min-confidence
     assert run("inbox", "accept", "t", "zzzz", "--label", "x").exit_code == 1
     assert run("inbox", "accept", "t", "--min-confidence", "1.0").output.strip() == "Nothing to accept"
     second = items[1]["id"][:8]  # with ids, only those are accepted

@@ -12,12 +12,13 @@ from typing import IO, Any
 
 from pydantic import ValidationError
 
+from .embedders import check_embedder
 from .fsutil import dir_lock, fsync_dir
 from .images import image_ext, image_id
 from .models import ClassDef, TaskConfig
 from .settings import check_settings, for_new_embedder
 from .store import Task, Workspace
-from .text import check_class_name
+from .text import check_class_name, check_description
 
 # Limits on what an export zip may unpack to (guards against zip bombs): per image, for task.json,
 # and for all images together.
@@ -57,9 +58,11 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
 
     Every image must decode, have the extension of its real format, and hash to its id; the total
     unpacked size is limited. ``embedder_ok`` is called with the task's embedder spec before
-    anything is written, and may raise to refuse it (the server uses this to apply its model
-    allowlist). ``embedder`` replaces the exported embedder (e.g. one this server doesn't allow).
-    Raises ``ValueError`` if the zip isn't a valid export or the name is bad or taken.
+    anything is written and raises to refuse it: by default ``check_embedder``, which loads the
+    model (``ValueError`` if it can't be); the server passes one that also applies its model
+    allowlist. ``embedder`` replaces the exported embedder (e.g. one this server doesn't allow).
+    Raises ``ValueError`` if the zip isn't a valid export, its embedder can't be loaded, or the
+    name is bad or taken.
     """
     try:
         with zipfile.ZipFile(src) as z:
@@ -67,8 +70,7 @@ def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  
             if embedder and embedder != cfg.embedder:
                 cfg = cfg.model_copy(update={"embedder": embedder})
                 for_new_embedder(cfg)
-            if embedder_ok is not None:
-                embedder_ok(cfg.embedder)
+            (embedder_ok or check_embedder)(cfg.embedder)
             cfg = cfg.model_copy(update={"name": name or cfg.name, "uid": uuid.uuid4().hex, "revision": 0})
             p = ws._reserve(cfg.name)  # pylint: disable=protected-access
             # Built in a hidden folder and moved into place at the end, so a crash part-way leaves
@@ -139,6 +141,7 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
     check_settings(cfg)
     classes: dict[str, ClassDef] = {}  # by cleaned-up name; the first of any duplicates wins
     for c in cfg.classes:
+        check_description(c.description)
         classes.setdefault(check_class_name(c.name), c.model_copy(update={"name": check_class_name(c.name)}))
     examples = [x.model_copy(update={"label": check_class_name(x.label)})
                 for x in {x.id: x for x in cfg.examples}.values()]  # one per id

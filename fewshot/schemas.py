@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .models import MAX_NOTE
+from .text import MAX_DESCRIPTION
 
 MAX_URLS = 100  # per request
 
@@ -346,23 +347,23 @@ class Duplicate(_Body):
 
 
 class ClassBody(_Body):
-    """Body of POST .../classes."""
+    """Body of POST .../classes. A description holds at most ``MAX_PROMPTS`` prompts (lines)."""
 
     name: str
-    description: str | None = None
+    description: str | None = Field(None, max_length=MAX_DESCRIPTION)
 
 
 class ClassPatch(_Body):
     """Body of PATCH .../classes/{label}: rename and/or set the description."""
 
     name: str | None = None
-    description: str | None = None
+    description: str | None = Field(None, max_length=MAX_DESCRIPTION)
 
 
 class Describe(_Body):
     """Body of POST .../describe."""
 
-    template: str = "a photo of a {}"
+    template: str = Field("a photo of a {}", max_length=MAX_DESCRIPTION)
     overwrite: bool = False
 
 

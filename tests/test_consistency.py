@@ -108,7 +108,7 @@ def test_import_with_another_embedder_clears_fitted_settings(ws, embedder):
     buf = io.BytesIO()
     export_task(ws, "t", buf)
     buf.seek(0)
-    cfg = import_task(ws, buf, name="copy", embedder=embedder).config
+    cfg = import_task(ws, buf, name="copy", embedder=embedder, embedder_ok=lambda _spec: None).config
     fitted = (cfg.temperature, cfg.classes[0].reject_below)
     assert fitted == ((None, None) if embedder == "fake:other" else (2.0, 0.8))
 

@@ -150,3 +150,10 @@ def create_exclusive(path: Path, data: bytes) -> bool:
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+
+
+def os_reason(e: Exception) -> str:
+    """The message of ``e``: an OSError's description (with the file), not its repr."""
+    if isinstance(e, OSError) and e.strerror:
+        return f"{e.filename}: {e.strerror}" if e.filename else e.strerror
+    return str(e)

@@ -93,7 +93,7 @@ from .schemas import (
     Urls,
 )
 from .store import Task, Workspace
-from .text import check_class_name, check_tag
+from .text import check_class_name
 
 log = logging.getLogger(__name__)
 
@@ -491,19 +491,15 @@ def add_class(name: str, body: ClassBody) -> dict[str, Any]:
 
 @app.patch("/api/tasks/{name}/classes/{label}", response_model=TaskDetail)
 def patch_class(name: str, label: str, body: ClassPatch) -> dict[str, Any]:
-    """Rename a class (relabelling its examples) and/or set its description."""
+    """Rename a class (relabelling its examples) and/or set its description, as one change (one
+    undo step)."""
     t = _task(name)
-    if label not in t.class_names():
-        raise HTTPException(404, f"No class {label!r}")
-    if body.name is not None and body.name.strip() != label:
-        new = body.name.strip()
-        try:
-            t.rename_class(label, new)
-        except ValueError as e:
-            raise _bad(e) from e
-        label = new
-    if body.description is not None:
-        t.upsert_class(label, body.description)
+    try:
+        t.edit_class(label, body.name, body.description)
+    except KeyError as e:
+        raise _missing(e) from e
+    except ValueError as e:
+        raise _bad(e) from e
     return _detail(t)
 
 
@@ -639,23 +635,15 @@ def add_examples_by_url(name: str, body: LabelledUrls) -> dict[str, Any]:
     return _add_blobs(t, label, _downloads(body.urls))
 
 
-def _check_tags(tags: list[str]) -> None:
-    """Raise ``ValueError`` for the first bad tag."""
-    for tag in tags:
-        check_tag(tag)
-
-
 @app.patch("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail)
 def edit_example(name: str, eid: str, body: ExampleEdit) -> dict[str, Any]:
-    """Move an example to another (possibly new) class, and/or set its tags or note."""
+    """Move an example to another (possibly new) class, and/or set its tags or note, as one change
+    (one undo step)."""
     t = _task(name)
     try:
         t.example(eid)  # 404 for an unknown id, even if the edit is empty
-        _check_tags(body.tags or [])  # all checks before any change, so a bad tag changes nothing
-        if body.label is not None:
-            t.relabel(eid, body.label)
-        if body.tags is not None or body.note is not None:
-            t.annotate([eid], tags=body.tags, note=body.note)
+        if body.label is not None or body.tags is not None or body.note is not None:
+            t.edit_examples([eid], label=body.label, tags=body.tags, note=body.note)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:
@@ -676,17 +664,14 @@ def delete_example(name: str, eid: str) -> dict[str, Any]:
 
 @app.patch("/api/tasks/{name}/examples", response_model=TaskDetail)
 def edit_examples(name: str, body: BulkEdit) -> dict[str, Any]:
-    """Move several examples to another (possibly new) class and/or tag them; an unknown id
-    changes nothing (404)."""
+    """Move several examples to another (possibly new) class and/or tag them, as one change (one
+    undo step); an unknown id changes nothing (404)."""
     t = _task(name)
     try:
         for eid in body.ids:
             t.example(eid)  # 404 for an unknown id, even if the edit is empty
-        _check_tags(body.add_tags + body.remove_tags)
-        if body.label is not None:
-            t.relabel_many(body.ids, body.label)
-        if body.add_tags or body.remove_tags:
-            t.annotate(body.ids, add_tags=body.add_tags, remove_tags=body.remove_tags)
+        if body.label is not None or body.add_tags or body.remove_tags:
+            t.edit_examples(body.ids, label=body.label, add_tags=body.add_tags, remove_tags=body.remove_tags)
     except KeyError as e:
         raise _missing(e) from e
     except ValueError as e:

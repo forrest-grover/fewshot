@@ -48,7 +48,8 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from .classifiers import CLASSIFIERS
-from .fsutil import FileStamp
+from .folders import class_folders, read_or_empty
+from .fsutil import FileStamp, os_reason
 from .fsutil import create_exclusive as _create_exclusive
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import dir_locked as _dir_locked
@@ -57,11 +58,11 @@ from .fsutil import fsync_dir as _fsync_dir
 from .fsutil import stamp as _stamp
 from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
-from .images import IMAGE_EXTS, image_ext, image_id
+from .images import image_ext, image_id
 from .inbox import TaskInbox, chunked, listed, plural
 from .models import MAX_NOTE, ClassDef, Example, TaskConfig, _copy_config, _now, _read_config
 from .settings import THRESHOLDS, check_settings, for_new_embedder, for_new_scoring
-from .text import check_class_name, check_tag, check_template, fill_template, prompts
+from .text import check_class_name, check_description, check_tag, check_template, fill_template, prompts
 
 log = logging.getLogger(__name__)
 
@@ -341,16 +342,27 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                         blob.unlink()
 
     # ---- settings ----------------------------------------------------
-    def update_settings(self, **kw: Any) -> list[str]:
+    def update_settings(self, merge_params: dict[str, Any] | None = None, **kw: Any) -> list[str]:
         """Change embedder/classifier settings (see ``SETTINGS``); unknown keys raise ``ValueError``.
 
-        Changing the embedder also clears the temperature and reject thresholds (task and per
-        class) fitted to the old one, and changing a ``settings.SCORING`` setting the temperature,
-        unless given in ``kw``; returns the names of those cleared. Changing nothing saves nothing."""
+        The rules every interface shares: switching to another classifier starts its params afresh
+        unless ``classifier_params`` is given; ``merge_params`` are then set on top of the params
+        (the given, fresh or current ones) instead of replacing them; a ``temperature`` of 1 means
+        uncalibrated and is stored as None. Changing the embedder also clears the temperature and
+        reject thresholds (task and per class) fitted to the old one, and changing a
+        ``settings.SCORING`` setting the temperature, unless given in ``kw``; returns the names of
+        those cleared. Changing nothing saves nothing."""
         bad = set(kw) - SETTINGS
         if bad:
             raise ValueError(f"Unknown settings: {sorted(bad)}")
+        if kw.get("temperature") == 1:
+            kw["temperature"] = None
         with self._writing():
+            if "classifier_params" not in kw and kw.get("classifier", self.config.classifier) != self.config.classifier:
+                kw["classifier_params"] = {}
+            if merge_params:
+                kw["classifier_params"] = {**kw.get("classifier_params", self.config.classifier_params),
+                                           **merge_params}
             try:
                 new = TaskConfig.model_validate({**self.config.model_dump(), **kw})
             except ValidationError as e:
@@ -380,6 +392,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         Raises ``ValueError`` for a name ``check_class_name`` refuses.
         """
         name = name.strip()
+        if description is not None:
+            check_description(description)
         with self._writing():
             for i, c in enumerate(self.config.classes):
                 if c.name == name:
@@ -391,6 +405,29 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             self.config.classes.append(c)
             self._save(label=f"add class {c.name}")
             return c
+
+    def edit_class(self, name: str, new_name: str | None = None, description: str | None = None) -> ClassDef:
+        """Rename class ``name`` (relabelling its examples) and/or set its description, in one
+        change and one undo step. Raises ``KeyError`` for an unknown class and ``ValueError`` for
+        a bad or taken new name or a description ``check_description`` refuses; then nothing
+        changes."""
+        new = None if new_name is None or new_name.strip() == name else check_class_name(new_name)
+        if description is not None:
+            check_description(description)
+        with self._writing():
+            c = self._class(name)
+            if new is not None and new in self.class_names():
+                raise ValueError(f"Class {new!r} already exists")
+            cfg = self.config
+            update: dict[str, Any] = {} if description is None else {"description": description}
+            if new is not None:
+                update["name"] = new
+                cfg.examples = [e.model_copy(update={"label": new}) if e.label == name else e for e in cfg.examples]
+            edited = c.model_copy(update=update)
+            cfg.classes = [edited if k.name == name else k for k in cfg.classes]
+            self._save(label=f"rename class {name} to {new}" if new is not None and description is None
+                       else f"edit class {name}")
+            return edited
 
     def describe_classes(self, template: str, overwrite: bool = False) -> int:
         """Set descriptions from ``template`` ('{}' -> class name); returns how many changed.
@@ -404,22 +441,17 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             classes = self.config.classes
             for i, c in enumerate(classes):
                 if overwrite or not c.description.strip():
-                    classes[i] = c.model_copy(update={"description": fill_template(template, c.name)})
+                    desc = check_description(fill_template(template, c.name))
+                    classes[i] = c.model_copy(update={"description": desc})
                     n += 1
             self._save(label="describe classes")
         return n
 
     def rename_class(self, old: str, new: str) -> None:
         """Rename a class and relabel its examples."""
-        new = check_class_name(new)
-        with self._writing():
-            if new in self.class_names():
-                raise ValueError(f"Class {new!r} already exists")
-            self._class(old)
-            cfg = self.config
-            cfg.classes = [c.model_copy(update={"name": new}) if c.name == old else c for c in cfg.classes]
-            cfg.examples = [e.model_copy(update={"label": new}) if e.label == old else e for e in cfg.examples]
-            self._save(label=f"rename class {old} to {new}")
+        if check_class_name(new) == old:
+            raise ValueError(f"Class {old!r} already exists")
+        self.edit_class(old, new)
 
     def delete_class(self, name: str) -> int:
         """Delete a class and its examples; returns the number of examples removed."""
@@ -539,18 +571,18 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         if label not in self.class_names():
             self.config.classes.append(ClassDef(name=label))
 
-    def add_examples_from_dir(self, folder: Path) -> int:
-        """Import a folder laid out as ``folder/<class>/<image>``; returns how many images were added.
+    def add_examples_from_dir(self, folder: Path, shots: int | None = None) -> int:
+        """Import a folder laid out as ``folder/<class>/<image>`` (at most ``shots`` images per
+        class; hidden and system folders and files are skipped, see ``folders``); returns how many
+        images were added.
 
         Raises ``ValueError`` for the first image that can't be read (after adding the others).
         """
-        items = ((f.read_bytes(), d.name, f.name)
-                 for d in sorted(p for p in folder.iterdir() if p.is_dir())
-                 for f in sorted(d.iterdir()) if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
-        results = self.add_examples(items)
-        for r in results:
+        files = [(f, label) for label, fs in class_folders(folder, shots).items() for f in fs]
+        results = self.add_examples((read_or_empty(f), label, f.name) for f, label in files)
+        for (f, _), r in zip(files, results, strict=True):
             if isinstance(r, ValueError):
-                raise r
+                raise ValueError(f"{f}: {r}")
         return len(results)
 
     def example(self, eid: str) -> Example:
@@ -571,14 +603,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
 
         Raises ``KeyError`` (changing nothing) if any id is unknown; returns how many moved.
         """
-        with self._writing():
-            ids = {e.id for e in self._examples(eids)}
-            label = check_class_name(label)
-            self._ensure_class(label)
-            self.config.examples = [e.model_copy(update={"label": label}) if e.id in ids else e
-                                    for e in self.config.examples]
-            self._save(label=f"move {_n(len(ids))} to {label}")
-            return len(ids)
+        return self.edit_examples(eids, label=label)
 
     def delete_example(self, eid: str) -> None:
         """Remove an example (its image file goes once undo no longer needs it)."""
@@ -603,22 +628,42 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         Raises ``KeyError`` (changing nothing) if any id is unknown and ``ValueError`` for a bad tag
         or a note over ``MAX_NOTE`` characters; returns how many examples were changed.
         """
+        return self.edit_examples(eids, tags=tags, add_tags=add_tags, remove_tags=remove_tags, note=note)
+
+    def edit_examples(self, eids: Iterable[str], *, label: str | None = None,  # pylint: disable=too-many-arguments  # one per field
+                      tags: Iterable[str] | None = None, add_tags: Iterable[str] = (),
+                      remove_tags: Iterable[str] = (), note: str | None = None) -> int:
+        """Move examples to ``label`` (creating the class) and/or set their tags (replacing them,
+        or adding and removing some) and/or note, all in one change and one undo step.
+
+        Raises ``KeyError`` (changing nothing) if any id is unknown and ``ValueError`` for a bad
+        class name or tag or a note over ``MAX_NOTE`` characters; returns how many examples were
+        changed.
+        """
         add = [check_tag(t) for t in add_tags]
         remove = {check_tag(t) for t in remove_tags}
         base = None if tags is None else [check_tag(t) for t in tags]
         if note is not None and len(note) > MAX_NOTE:
             raise ValueError(f"Note is longer than {MAX_NOTE} characters")
+        label = None if label is None else check_class_name(label)
+        tagging = base is not None or add or remove or note is not None
+
+        def edited(e: Example) -> Example:
+            update: dict[str, Any] = {} if label is None else {"label": label}
+            if tagging:
+                new = [*(e.tags if base is None else base), *add]
+                update["tags"] = tuple(t for t in dict.fromkeys(new) if t not in remove)
+            if note is not None:
+                update["note"] = note.strip()
+            return e.model_copy(update=update)
+
         with self._writing():
             ids = {e.id for e in self._examples(eids)}
-            examples = self.config.examples
-            for i, e in enumerate(examples):
-                if e.id in ids:
-                    new = [*(e.tags if base is None else base), *add]
-                    update: dict[str, Any] = {"tags": tuple(t for t in dict.fromkeys(new) if t not in remove)}
-                    if note is not None:
-                        update["note"] = note.strip()
-                    examples[i] = e.model_copy(update=update)
-            self._save(label=f"tag {_n(len(ids))}" if note is None else f"edit {_n(len(ids))}")
+            if label is not None:
+                self._ensure_class(label)
+            self.config.examples = [edited(e) if e.id in ids else e for e in self.config.examples]
+            verb = "tag" if note is None and label is None else "edit"
+            self._save(label=f"{verb} {_n(len(ids))}" if tagging else f"move {_n(len(ids))} to {label}")
             return len(ids)
 
     def find_examples(self, label: str | None = None, tag: str | None = None) -> list[Example]:
@@ -626,19 +671,21 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         return [e for e in self.config.examples
                 if (label is None or e.label == label) and (tag is None or tag in e.tags)]
 
-    def resolve_ids(self, prefixes: Iterable[str]) -> list[str]:
-        """Full example ids for ids or unique id prefixes (at least 4 characters).
+    def resolve_ids(self, prefixes: Iterable[str], inbox: bool = False) -> list[str]:
+        """Full example ids (with ``inbox``, inbox image ids) for ids or unique id prefixes (at
+        least 4 characters).
 
-        Raises ``KeyError`` for a prefix that matches no example or several.
+        Raises ``KeyError`` for a prefix that is too short or matches no image or several.
         """
-        ids = [e.id for e in self.config.examples]
+        what = "inbox image" if inbox else "example"
+        ids = [x.id for x in (self.config.inbox if inbox else self.config.examples)]
         out = []
         for p in prefixes:
             if len(p) < 4:
-                raise KeyError(f"Example id {p!r} is too short: give at least 4 characters")
+                raise KeyError(f"The {what} id {p!r} is too short: give at least 4 characters")
             hits = [i for i in ids if i.startswith(p)]
             if len(hits) != 1:
-                raise KeyError(f"No example {p!r}" if not hits else f"Example id {p!r} is ambiguous")
+                raise KeyError(f"No {what} {p!r}" if not hits else f"The {what} id {p!r} is ambiguous")
             out.append(hits[0])
         return out
 
@@ -730,15 +777,19 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
 class Workspace:
     """A folder of tasks plus the shared embedding cache."""
 
-    def __init__(self, root: Path | str | None = None) -> None:
+    def __init__(self, root: Path | str | None = None, create: bool = True) -> None:
+        """The workspace in ``root`` (default ``default_root()``), made if missing unless ``create``
+        is False (then a missing one has no tasks)."""
         self.root = Path(root).resolve() if root else default_root()
-        (self.root / "tasks").mkdir(parents=True, exist_ok=True)
+        if create:
+            (self.root / "tasks").mkdir(parents=True, exist_ok=True)
         self.blobs = self.root / "blobs"
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
 
     def list_tasks(self) -> list[Task]:
-        """All readable tasks, sorted by name; a task whose task.json is invalid is logged and skipped."""
+        """All readable tasks, sorted by name; a task whose task.json is invalid or can't be read
+        (say, for lack of permission) is logged and skipped."""
         tasks = []
         for p in self.task_folders():
             if (p / "task.json").exists():
@@ -750,13 +801,16 @@ class Workspace:
 
     def task_folders(self) -> list[Path]:
         """Task folders, sorted by name (leaving out the hidden ones used while creating and deleting)."""
-        return sorted(p for p in (self.root / "tasks").iterdir() if p.is_dir() and not p.name.startswith("."))
+        tasks = self.root / "tasks"
+        if not tasks.is_dir():  # a workspace not made yet (see ``create``)
+            return []
+        return sorted(p for p in tasks.iterdir() if p.is_dir() and not p.name.startswith("."))
 
     def get(self, name: str) -> Task:
         """Load a task, or refresh the cached one if another process changed it.
 
         Raises ``KeyError`` if the task does not exist (or was deleted by another process), or if
-        its task.json is invalid; the message says which.
+        its task.json is invalid or can't be read; the message says which.
         """
         with self._lock:
             t = self._tasks.get(name)
@@ -771,17 +825,17 @@ class Workspace:
                     t = Task(p, *_read_config(p), blobs=self.blobs)
                 except (FileNotFoundError, NotADirectoryError):
                     raise KeyError(f"No task {name!r}") from None
-                except ValueError as e:
-                    raise KeyError(f"Task {name!r} can't be loaded: {e}") from None
+                except (ValueError, OSError) as e:
+                    raise KeyError(f"Task {name!r} can't be loaded: {os_reason(e)}") from None
                 self._tasks[name] = t
                 return t
         try:
             t.refresh()
-        except (FileNotFoundError, ValueError) as e:
+        except (OSError, ValueError) as e:
             with self._lock:
                 self._tasks.pop(name, None)
-            if isinstance(e, ValueError):
-                raise KeyError(f"Task {name!r} can't be loaded: {e}") from None
+            if not isinstance(e, FileNotFoundError):
+                raise KeyError(f"Task {name!r} can't be loaded: {os_reason(e)}") from None
             raise KeyError(f"No task {name!r}") from None
         return t
 

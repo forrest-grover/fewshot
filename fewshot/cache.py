@@ -14,14 +14,21 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .embedders import Vectors
 
+if TYPE_CHECKING:
+    from .store import Workspace
+
 log = logging.getLogger(__name__)
 
 BUSY_TIMEOUT = 30.0  # seconds to wait for another process's write to finish
+# Suffix of the key a flip-averaged image embedding is cached under (as pipeline.FLIP_KEY, which
+# writes them); pruning keeps both keys of each image in use.
+FLIP_KEY = ":flip"
 
 
 # SQLite's primary result codes for a file that isn't a sound database.
@@ -101,7 +108,8 @@ class EmbeddingCache:
 
     def prune(self, keep: set[str], dry_run: bool = False) -> int:
         """Delete image vectors whose key isn't in ``keep`` (text vectors are kept); returns how
-        many rows were (or, with ``dry_run``, would be) deleted. Frees the disk space afterwards."""
+        many rows were (or, with ``dry_run``, would be) deleted. SQLite reuses the space they took;
+        ``vacuum`` gives it back to the file system."""
         with self._lock:
             self._conn.execute("CREATE TEMP TABLE IF NOT EXISTS keep (key TEXT PRIMARY KEY)")
             self._conn.execute("DELETE FROM keep")
@@ -113,6 +121,39 @@ class EmbeddingCache:
                 n = self._conn.execute(f"DELETE FROM emb WHERE {where}").rowcount
             self._conn.execute("DROP TABLE keep")
             self._conn.commit()
-            if n and not dry_run:
-                self._conn.execute("VACUUM")
         return n
+
+    def vacuum(self) -> None:
+        """Rewrite the cache file without its free space. This can take a while for a large cache,
+        and other processes can't write to it meanwhile (they wait up to ``BUSY_TIMEOUT``)."""
+        with self._lock:
+            self._conn.execute("VACUUM")
+
+
+def prune_unused(ws: Workspace, dry_run: bool = False, vacuum: bool = False) -> tuple[int, int]:
+    """Delete the vectors in ``ws``'s cache that no task uses: neither its examples and inbox nor
+    the images undo or redo may bring back (text vectors are kept). Unless ``dry_run``, stored
+    images no task links to go too. Returns how many vectors were (or, with ``dry_run``, would be)
+    deleted, and how many stored images. ``vacuum`` then gives the freed space back to the file
+    system, which rewrites the whole cache and keeps other writers waiting; without it SQLite
+    reuses the space.
+
+    Every task is locked while the vectors to keep are worked out and the others deleted, so an
+    image added meanwhile can't lose its vector. Raises ``ValueError`` if a task can't be read,
+    since its vectors would be lost."""
+    tasks = ws.list_tasks()
+    unreadable = sorted({p.name for p in ws.task_folders() if (p / "task.json").exists()} - {t.name for t in tasks})
+    if unreadable:
+        raise ValueError(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
+    cache = EmbeddingCache(ws.cache_path)
+    with contextlib.ExitStack() as locks:
+        for t in tasks:
+            locks.enter_context(t._writing())  # pylint: disable=protected-access  # one consistent view of every task
+        ids = {e.id for t in tasks for e in [*t.config.examples, *t.config.inbox]}
+        ids |= {f.split("/", 1)[1].rsplit(".", 1)[0] for t in tasks for f in t.kept_files()}
+        n = cache.prune({k for i in ids for k in (i, i + FLIP_KEY)}, dry_run=dry_run)
+    if dry_run:
+        return n, 0
+    if vacuum:
+        cache.vacuum()
+    return n, ws.gc_blobs()

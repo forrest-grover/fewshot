@@ -66,7 +66,7 @@ def test_config_zero_shot_threshold_and_flip(run, task):
     r = run("config", task, "--clear-reject-zero-shot", "--no-flip")
     assert "reject_below_zero_shot: None   flip: False" in r.output
     r = run("config", task, "--clear-reject-zero-shot", "--reject-below-zero-shot", "0.2")
-    assert r.exit_code == 1
+    assert r.exit_code == 2  # a usage error
     assert "either --reject-below-zero-shot or --clear-reject-zero-shot" in r.output
     run("class", "describe", task, "a {} thing\nthe {}")
     assert '"a red thing" | "the red"' in run("show", task).output
@@ -111,7 +111,7 @@ def test_example_commands(run, task, root):
     assert run("example", "relabel", task, " ", ids[0][:8]).exit_code == 1
     assert run("example", "tag", task, ids[0][:8], ids[1][:8], "--add", "hard").output.strip() == "Tagged 2 examples"
     assert run("example", "tag", task, ids[1][:8], "--remove", "hard", "--add", "x").exit_code == 0
-    assert run("example", "tag", task, ids[0][:8]).exit_code == 1
+    assert run("example", "tag", task, ids[0][:8]).exit_code == 2  # a usage error
     assert run("example", "tag", task, ids[0][:8], "--add", "a,b").exit_code == 1
     assert run("example", "note", task, ids[0][:8], "too dark").output.strip() == "Note saved"
     assert run("example", "note", task, ids[0][:8], "x" * 3000).exit_code == 1

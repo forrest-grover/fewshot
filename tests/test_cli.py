@@ -192,7 +192,7 @@ def test_config_and_create_validate_embedders(run, root, task):
     assert load(root).config.embedder == "fake:color"
     assert not (root / "tasks" / "new").exists()
     r = run("config", task, "--reject-below", "0.5", "--clear-reject")
-    assert r.exit_code == 1
+    assert r.exit_code == 2  # a usage error
     assert "not both" in r.output
 
 
@@ -208,7 +208,7 @@ def test_config_and_create_validate_embedders(run, root, task):
 def test_config_errors(run, root, task, args, message):
     """Invalid settings and malformed --param values fail without changing the task."""
     r = run("config", task, *args)
-    assert r.exit_code == 1
+    assert r.exit_code == (2 if message.startswith("Bad --param") else 1)  # 2: a usage error
     assert message in r.output
     assert load(root).config.classifier == "gda"
 
