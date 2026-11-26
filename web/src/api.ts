@@ -71,7 +71,7 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
   if (r.status === 401 && url !== "/api/login") {
     // The server wants its token: the App shows the sign-in form.
     window.dispatchEvent(new Event(AUTH_EVENT));
-    throw new Error("Not signed in");
+    throw new HttpError(401, "Not signed in");
   }
   if (!r.ok) {
     let msg: unknown = `${String(r.status)} ${r.statusText}`;
@@ -155,6 +155,8 @@ export const api = {
   job: <T>(id: string) => req<Job<T>>("GET", `/api/jobs/${id}`),
   cancelJob: (id: string) => req<Job<unknown>>("DELETE", `/api/jobs/${id}`),
   login: (token: string) => req<undefined>("POST", "/api/login", { token }),
+  /** End the session (its cookie stops working, here and in every other tab). */
+  logout: () => req<undefined>("POST", "/api/logout"),
   /** An example's image; with ``size``, a JPEG scaled down to fit in that many pixels. */
   imageUrl: (n: string, id: string, size?: number) =>
     `${t(n)}/examples/${id}/image` + (size ? `?size=${String(size)}` : ""),

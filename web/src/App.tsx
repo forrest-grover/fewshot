@@ -45,7 +45,12 @@ export default function App() {
   const [models, setModels] = useState<ModelInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [signIn, setSignIn] = useState(false); // the server wants its token
+  const [signIn, setSignIn] = useState(false); // the server wants its token: the sign-in dialog is open
+  const [authRequired, setAuthRequired] = useState(false); // the server has a token (so one can log out)
+  const signedIn = useRef(false); // a request has worked: a sign-in after that is "again"
+  // Uploads that stopped for want of a session, said once signed in again (an error said while
+  // the sign-in dialog covers the page would go unseen).
+  const [missed, setMissed] = useState<string[]>([]);
   const [urlFetch, setUrlFetch] = useState(false); // the server downloads image URLs
   const [limits, setLimits] = useState(BATCH); // upload batch sizes the server takes
   // A message for a few seconds. ``then`` offers the reverse of an undo or redo, while the task is
@@ -84,20 +89,37 @@ export default function App() {
     try {
       return await p;
     } catch (e) {
-      // An error from a task the user has since left would only confuse the one now shown, and
-      // a cancelled request was meant to stop.
-      if (currentTask.current !== from || isAbort(e)) return undefined;
+      // An error from a task the user has since left would only confuse the one now shown, a
+      // cancelled request was meant to stop, and one refused for want of a session opens the
+      // sign-in dialog instead.
+      if (currentTask.current !== from || isAbort(e) || (e instanceof HttpError && e.status === 401)) return undefined;
       setError(e instanceof Error ? e.message : String(e));
       // Refused (say, an example or class that is gone): the task may have changed elsewhere.
-      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) reloadTask();
+      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) {
+        reloadTask();
+        if (e.status === 404) {
+          setError(`That is no longer there (${e.message}): it was probably changed in another tab or by the CLI. The task now shows as it is.`);
+        }
+      }
       return undefined;
     }
   }, [reloadTask]);
 
+  /** What the server says about itself, and its tasks: at startup, and again after signing in. */
+  const loadServer = useCallback(() => {
+    void refreshTasks();
+    void run(api.models()).then((m) => { if (m) setModels(m); });
+    void api.health().then((h) => {
+      setUrlFetch(h.url_fetch);
+      setAuthRequired(h.auth_required);
+      setLimits(batchLimits(h.max_request_bytes));
+    }, () => { /* an old server: no URL fetching, default batches */ });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- refreshTasks and run are stable
   const taskLists = useRef(new Latest()).current;
   const refreshTasks = useCallback(async () => {
     const latest = taskLists.begin();
     const t = await run(api.tasks());
+    if (t) signedIn.current = true;
     if (t && latest()) setTasks(t); // not an older list that arrived after a newer one
   }, [run, taskLists]);
 
@@ -110,12 +132,7 @@ export default function App() {
   useEffect(() => {
     const on = () => { setRoute(parseHash()); };
     window.addEventListener("hashchange", on);
-    void refreshTasks();
-    void run(api.models()).then((m) => { if (m) setModels(m); });
-    void api.health().then((h) => {
-      setUrlFetch(h.url_fetch);
-      setLimits(batchLimits(h.max_request_bytes));
-    }, () => { /* an old server: no URL fetching, default batches */ });
+    loadServer();
     // Tasks made or changed elsewhere (the CLI, another tab) show up when the window comes back.
     const back = () => { if (document.visibilityState === "visible") void refreshTasks(); };
     window.addEventListener("focus", back);
@@ -125,7 +142,7 @@ export default function App() {
       window.removeEventListener("focus", back);
       document.removeEventListener("visibilitychange", back);
     };
-  }, [refreshTasks, run]);
+  }, [refreshTasks, loadServer]);
   useEffect(() => { // "?" shows the keyboard shortcuts
     const on = (e: KeyboardEvent) => {
       if (e.key !== "?" || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -137,6 +154,7 @@ export default function App() {
     return () => { window.removeEventListener("keydown", on); };
   }, []);
 
+  const [attempt, setAttempt] = useState(0); // loading the task again after signing in
   useEffect(() => {
     currentTask.current = route.task;
     setMenuOpen(false);
@@ -154,7 +172,7 @@ export default function App() {
         setLoadFailed(true);
       },
     );
-  }, [route.task, taskLoads]);
+  }, [route.task, taskLoads, attempt]);
 
   // The task list (fetched again whenever the window comes back, and after each change) shows
   // the open task changed elsewhere, or gone: fetch it again.
@@ -178,7 +196,8 @@ export default function App() {
   /** An upload stopped part-way: say how much of it got in (of a task the user has left, too). */
   const uploadStopped = ({ task: name, added, total, error }: UploadStop) => {
     const text = `Upload${name === currentTask.current ? "" : ` to “${name}”`} stopped: ${String(added)} of ${String(total)} added`;
-    if (error) setError(`${error.message}. ${text}`);
+    if (error instanceof HttpError && error.status === 401) setMissed((m) => [...m, `${text}; add the other ${String(total - added)} again`]);
+    else if (error) setError(`${error.message}. ${text}`);
     else setToast({ text, key: Date.now() });
   };
   // Uploads live here so they go on while tabs are switched; opening another task stops them.
@@ -232,7 +251,21 @@ export default function App() {
     return () => { window.removeEventListener("keydown", on); };
   }, []);
 
-  if (signIn) return <SignIn />;
+  /** Signed in (again): close the dialog and fetch what failed meanwhile; everything shown stays. */
+  const afterSignIn = () => {
+    setSignIn(false);
+    loadServer();
+    if (task) reloadTask();
+    else setAttempt((n) => n + 1);
+    if (missed.length) { setError(`While you were signed out: ${missed.join(". ")}.`); setMissed([]); }
+  };
+  const logOut = () => {
+    if ((exampleUploads.busy || inboxUploads.busy) && !confirm("An upload is still running. Log out and stop it?")) return;
+    // A fresh page after it: nothing of the session is left on screen.
+    void api.logout().then(() => { location.hash = ""; location.reload(); }, (e: unknown) => {
+      setError(e instanceof Error ? e.message : String(e));
+    });
+  };
 
   return (
     <div className="app">
@@ -254,6 +287,7 @@ export default function App() {
         </nav>
         <button className="secondary" onClick={() => { go(null); }}>+ New task</button>
         <button className="ghost small" onClick={() => { setHelp(true); }} title="Keyboard shortcuts (?)">Keyboard shortcuts <kbd>?</kbd></button>
+        {authRequired && <button className="ghost small" onClick={logOut} title="End this session (in every tab)">Log out</button>}
       </aside>
 
       <main>
@@ -339,6 +373,7 @@ export default function App() {
           onError={(e) => { const id = r.job?.id ?? ""; compares.setFor(name)((s) => jobLost(s, id)); jobFailed(name, e.message); }} />
       ))}
       {help && <Shortcuts onClose={() => { setHelp(false); }} />}
+      {signIn && <SignIn again={signedIn.current} onSignedIn={afterSignIn} />}
       {toast && (
         <div className="toast" role="status" key={toast.key}>
           <span>{toast.text}</span>

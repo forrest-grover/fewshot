@@ -776,9 +776,8 @@ kbd {
   outline: none; /* the highlighted (current) result is the focused one, and is styled above */
 }
 
-.sign-in {
-  margin: 10vh auto 0;
-  max-width: 420px;
+.sign-in form {
+  gap: 12px;
 }
 
 .job {

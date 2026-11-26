@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Prediction, TaskDetail } from "./api";
 import App from "./App";
@@ -80,7 +80,7 @@ describe("App", () => {
     serve((c) => (c.method === "DELETE" ? json({ detail: "No such example" }, status) : undefined));
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Delete example" }));
-    expect(await screen.findByText("No such example")).toBeDefined();
+    expect(await screen.findByText(/No such example/)).toBeDefined();
     await waitFor(() => { expect(taskLoads("pets")).toBe(2); });
   });
 
@@ -160,6 +160,51 @@ describe("App", () => {
     expect(posts).toEqual(["/api/tasks/pets/examples", "/api/tasks/pets/examples", "/api/tasks/pets/undo"]);
     // The toast offers Redo, until the task changes again (then it would redo nothing).
     expect(screen.getByRole("button", { name: "Redo" })).toBeDefined();
+  });
+
+  it("signing in again keeps the page, and says what uploads stopped meanwhile", async () => {
+    let signedOut = false;
+    let posts = 0;
+    serve((c) => {
+      if (c.url === "/api/login") { signedOut = false; return new Response(null, { status: 204 }); }
+      if (signedOut) return json({ detail: "Not signed in" }, 401);
+      if (c.method === "POST" && c.url.endsWith("/examples")) {
+        posts += 1;
+        if (posts === 2) { signedOut = true; return json({ detail: "Not signed in" }, 401); } // the session ended mid-upload
+        return json({ added: Array.from({ length: 100 }, () => ({})), errors: [], task: { ...pets, revision: 4 } }, 201);
+      }
+      return undefined;
+    });
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "cat" });
+    drop(container, 300);
+    const dialog = await screen.findByRole("dialog", { name: "Sign in" });
+    expect(screen.getByText(/Your session has ended/)).toBeDefined();
+    expect(screen.getByRole("heading", { name: "cat" })).toBeDefined(); // the page stays behind it
+    expect(screen.queryByRole("alert")).toBeNull(); // no "Not signed in" error behind the dialog
+    fireEvent.change(within(dialog).getByLabelText("Token"), { target: { value: "secret" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Sign in" }));
+    expect(await screen.findByText("While you were signed out: Upload stopped: 100 of 300 added; add the other 200 again.")).toBeDefined();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("heading", { name: "cat" })).toBeDefined();
+    const login = calls.find((c) => c.url === "/api/login");
+    expect(JSON.parse(login?.body as string)).toEqual({ token: "secret" });
+  });
+
+  it("offers Log out when the server has a token", async () => {
+    serve((c) => {
+      if (c.url === "/api/health") {
+        return json({ status: "ok", auth_required: true, models_loaded: [], jobs_running: 0, url_fetch: false, max_request_bytes: 1 << 30, max_upload_bytes: 1 << 26 });
+      }
+      if (c.url === "/api/logout") return new Response(null, { status: 204 });
+      return undefined;
+    });
+    const reload = vi.fn();
+    vi.spyOn(window, "location", "get").mockReturnValue({ ...window.location, reload, hash: "#/pets/examples" } as Location);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Log out" }));
+    await waitFor(() => { expect(reload).toHaveBeenCalled(); });
+    expect(calls.filter((c) => c.url === "/api/logout").map((c) => c.method)).toEqual(["POST"]);
   });
 
   it("drops the toast's Redo once the task changed", async () => {
