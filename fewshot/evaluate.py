@@ -413,6 +413,9 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
         "suggested_reject_below": _suggest_threshold(h, data.y),
         "suggested_class_thresholds": _suggest_class_thresholds(h, data.y, data.classes),
         "calibration": _calibration(h, data.y, cfg.temperature or 1.0),
+        "warnings": [f"Only one class ({data.classes[0]}): every example is predicted as it, so accuracy is "
+                     "always 1.0; what this tells is how far its images reach (suggested_reject_below, for "
+                     "one-class detection)"] if C == 1 else [],
     }
 
 

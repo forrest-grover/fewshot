@@ -66,7 +66,7 @@ describe("Evaluate on a big task", () => {
     const report = {
       accuracy: 0.5, macro_f1: 0.5, calibration: null, classes: ["a", "b"], confusion: [[0, 500], [0, 0]], method: "loo",
       mistakes, predictions: mistakes, n_examples: 500, n_scored: 500, per_class: {}, revision: 3,
-      suggested_class_thresholds: {}, suggested_reject_below: null, top_k_accuracy: {},
+      suggested_class_thresholds: {}, warnings: [], suggested_reject_below: null, top_k_accuracy: {},
     } as unknown as EvalReport;
     const { container } = render(<Evaluate task={taskDetail()} setTask={vi.fn()} run={(p) => p} models={null}
       state={{ ...NO_EVAL, report, rev: 3 }} setState={vi.fn()} compare={null} setCompare={vi.fn()} />);

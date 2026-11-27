@@ -109,6 +109,7 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
         </p>
       )}
       {stale && <p className="hint">The task changed since this evaluation ran. Re-run it to see the effect.</p>}
+      {report?.warnings.map((w) => <p key={w} className="hint warn">⚠ {w}</p>)}
       {report && (
         <>
           <div className="stats">

@@ -77,6 +77,8 @@ def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-argument
         fail(f"Thresholds not set: {e.args[0]}")
     if apply_class_thresholds and r["suggested_class_thresholds"]:
         say(f"Set the thresholds of {len(r['suggested_class_thresholds'])} classes")
+    for w in r["warnings"]:  # on stderr, whatever the format
+        say(f"Warning: {w}")
     if fmt == "json":
         echo_json(r)
     elif fmt == "csv":

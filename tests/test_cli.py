@@ -509,6 +509,10 @@ def test_eval_edge_cases(run, root):
     t.add_example(png(RED, seed=1), "red")
     t.upsert_class("blue")
     assert "Only one class has examples (red)" in run("list", "--json").output
+    t.add_example(png(RED, seed=2), "red")
+    r = run("eval", "empty")  # ... and so does the report, which is still good for a threshold
+    assert (r.exit_code, "Warning: Only one class (red): every example is predicted as it" in r.output) == (0, True)
+    assert "suggested_reject_below" in json.loads(run("eval", "empty", "--json").stdout)["warnings"][0]
 
     # With one example per class no fold has two classes to train on, so nothing can be scored.
     t.add_example(png(BLUE, seed=3), "blue")

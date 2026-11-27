@@ -93,7 +93,7 @@ def test_k_fold_report(ws):
     assert r["classes"] == ["red", "green", "blue"]
     assert r["confusion"] == [[4, 0, 0], [0, 4, 0], [0, 0, 4]]
     assert r["per_class"]["green"] == {"support": 4, "recall": 1.0, "precision": 1.0}
-    assert r["mistakes"] == []
+    assert (r["mistakes"], r["warnings"]) == ([], [])
 
 
 def test_mislabelled_example_is_reported_as_mistake(ws):

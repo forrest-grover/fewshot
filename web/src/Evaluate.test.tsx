@@ -7,11 +7,11 @@ import { taskDetail } from "./test-data";
 
 afterEach(cleanup);
 
-const withCalibration = (ece: number, eceCalibrated: number, helps: boolean) => ({
+const withCalibration = (ece: number, eceCalibrated: number, helps: boolean, warnings: string[] = []) => ({
   accuracy: 0.9, macro_f1: 0.9, classes: ["a", "b"], confusion: [[9, 1], [1, 9]], method: "loo",
   calibration: { temperature: 2, ece, ece_calibrated: eceCalibrated, temperature_helps: helps, reliability: [], reliability_calibrated: [] },
   mistakes: [], predictions: [], n_examples: 20, n_scored: 20, per_class: {}, revision: 3,
-  suggested_class_thresholds: {}, suggested_reject_below: null, top_k_accuracy: {},
+  suggested_class_thresholds: {}, suggested_reject_below: null, top_k_accuracy: {}, warnings,
 }) as unknown as EvalReport;
 
 const show = (report: EvalReport) => render(<Evaluate task={taskDetail()} setTask={vi.fn()} run={(p) => p} models={null}
@@ -28,5 +28,12 @@ describe("Evaluate's calibration advice", () => {
     show(withCalibration(0.2, 0.198, false));
     expect(screen.getByText(/no temperature would make it noticeably better/)).toBeDefined();
     expect(screen.queryByRole("button", { name: "Apply temperature" })).toBeNull();
+  });
+});
+
+describe("Evaluate's warnings", () => {
+  it("shows what makes the numbers misleading, such as a task with one class", () => {
+    show(withCalibration(0.2, 0.05, true, ["Only one class (a): every example is predicted as it"]));
+    expect(screen.getByText(/Only one class \(a\)/)).toBeDefined();
   });
 });
