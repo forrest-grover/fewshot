@@ -246,6 +246,7 @@ class Calibration(BaseModel):
     temperature: float  # the setting to use (absolute)
     ece: float  # expected calibration error now
     ece_calibrated: float  # ... with ``temperature``
+    temperature_helps: bool  # whether ``temperature`` lowers the error enough to be worth setting
     reliability: list[ReliabilityBin]
     reliability_calibrated: list[ReliabilityBin]
 

@@ -2,6 +2,9 @@
 the API and CLI for it."""
 
 
+from collections.abc import Iterator
+from typing import Any
+
 import numpy as np
 import pytest
 from typer.testing import CliRunner
@@ -57,6 +60,7 @@ def test_evaluation_suggests_a_temperature(ws):
     cal = evaluate_task(pipe, t)["calibration"]
     assert cal["temperature"] > 1
     assert cal["ece_calibrated"] < cal["ece"]
+    assert cal["temperature_helps"] is (cal["ece_calibrated"] < cal["ece"] - ev.TEMPERATURE_MARGIN)
     assert sum(b["count"] for b in cal["reliability"]) == 90
     t.update_settings(temperature=cal["temperature"])
     again = evaluate_task(pipe, t)["calibration"]
@@ -93,6 +97,20 @@ def test_calibration_when_held_out_predictions_are_all_right():
     cal = ev._calibration(_held_out(P, truth), truth, 0.02)  # pylint: disable=protected-access
     assert cal is not None
     assert cal["temperature"] == 0.01  # 0.02 times the fitted one, clamped
+
+
+def test_a_temperature_helps_only_by_more_than_the_margin(monkeypatch):
+    """temperature_helps is set only when the cross-fitted error is lower by more than TEMPERATURE_MARGIN."""
+    n = 60
+    truth = np.arange(n) % 3
+    P = np.full((n, 3), 0.14)
+    P[np.arange(n), truth] = 0.72
+    for before, after, helps in ((0.2, 0.1, True), (0.2, 0.198, False), (0.016, 0.02, False)):
+        errors: Iterator[tuple[float, list[Any]]] = iter([(before, []), (after, [])])
+        monkeypatch.setattr(ev, "_ece", lambda *_, it=errors: next(it))
+        cal = ev._calibration(_held_out(P, truth), truth, 1.0)  # pylint: disable=protected-access
+        assert cal is not None
+        assert cal["temperature_helps"] is helps
 
 
 def test_calibration_counts_wrong_predictions_whose_true_class_underflowed():

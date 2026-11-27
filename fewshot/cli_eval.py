@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     from .pipeline import Pipeline
 
 commands = App()
-TEMPERATURE_MARGIN = 0.005  # how much lower the calibration error must get for a temperature to be suggested
 WELL_CALIBRATED = 0.05  # a calibration error under which confidence is called well calibrated
 
 
@@ -81,9 +80,6 @@ def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-argument
     sources = {e.id: e.source for e in t.config.examples}
     for p in [*r["predictions"], *r["mistakes"]]:
         p["source"] = sources.get(p["id"], "")
-    if r["calibration"]:
-        cal = r["calibration"]
-        cal["temperature_helps"] = cal["ece_calibrated"] < cal["ece"] - TEMPERATURE_MARGIN
     if fmt == "json":
         echo_json(r)
     elif fmt == "csv":

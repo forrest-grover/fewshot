@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 import fewshot.__main__ as entry
 from fewshot import cli, cli_common, cli_eval, services
+from fewshot.evaluate import TEMPERATURE_MARGIN
 from fewshot.store import Workspace
 from tests.conftest import BLUE, RED, PlainResult, png, write_images
 
@@ -400,20 +401,18 @@ def test_eval_json_names_sources(run, task):
     (0.2, 0.198, "Calibration error 0.200; no --temperature would lower it"),
 ])
 def test_a_temperature_is_suggested_only_when_it_helps(run, task, monkeypatch, ece, after, said):  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    """eval suggests a temperature only if it lowers the calibration error by a margin, and
-    says whether it helps in the JSON too."""
+    """eval suggests a temperature only when the evaluation says it helps (lowers the calibration
+    error by a margin), and says why not otherwise."""
     real = services.evaluate
 
     def evaluate(*a, **k):
         r = real(*a, **k)
         r["calibration"] = {"temperature": 2, "ece": ece, "ece_calibrated": after, "reliability": [],
-                            "reliability_calibrated": []}
+                            "reliability_calibrated": [], "temperature_helps": after < ece - TEMPERATURE_MARGIN}
         return r
 
     monkeypatch.setattr(services, "evaluate", evaluate)
     assert said in run("eval", task).stdout
-    helps = json.loads(run("eval", task, "--json").stdout)["calibration"]["temperature_helps"]
-    assert helps == (after < ece - cli_eval.TEMPERATURE_MARGIN)
 
 
 def test_eval_mistakes_and_dupes_show_sources(run, root, tmp_path):

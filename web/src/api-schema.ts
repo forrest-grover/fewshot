@@ -821,6 +821,8 @@ export interface components {
             reliability_calibrated: components["schemas"]["ReliabilityBin"][];
             /** Temperature */
             temperature: number;
+            /** Temperature Helps */
+            temperature_helps: boolean;
         };
         /**
          * ClassBody

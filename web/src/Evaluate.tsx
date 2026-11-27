@@ -126,11 +126,11 @@ export default function Evaluate({ task, setTask, run, state, setState, models, 
             <p className="row calibration">
               <span>
                 Confidence calibration error {pct(report.calibration.ece)}
-                {report.calibration.ece_calibrated < report.calibration.ece
+                {report.calibration.temperature_helps
                   ? `; with temperature ${String(report.calibration.temperature)} it would be ${pct(report.calibration.ece_calibrated)}.`
-                  : " (already about as good as it gets)."}
+                  : " (no temperature would make it noticeably better)."}
               </span>
-              {report.calibration.ece_calibrated < report.calibration.ece && report.calibration.temperature !== (task.temperature ?? 1) && (
+              {report.calibration.temperature_helps && report.calibration.temperature !== (task.temperature ?? 1) && (
                 <button className="small" title="Makes a confidence of 0.9 mean right about 90% of the time; predictions don't change"
                   onClick={() => { void fix(api.updateTask(task.name, { temperature: report.calibration?.temperature })); }}>
                   Apply temperature

@@ -256,6 +256,7 @@ def _ece(conf: np.ndarray, correct: np.ndarray, bins: int = 10) -> tuple[float, 
     return round(ece, 4), table
 
 
+TEMPERATURE_MARGIN = 0.005  # how much lower the calibration error must get for a temperature to be worth setting
 MIN_CALIBRATION = 50  # scored examples needed before a temperature is suggested (fewer: too noisy)
 
 
@@ -285,7 +286,9 @@ def _cross_fitted(P: np.ndarray, t: np.ndarray) -> np.ndarray:
 
 def _calibration(h: HeldOut, truth: np.ndarray, current: float) -> dict[str, Any] | None:
     """A temperature that makes held-out confidence match held-out accuracy (fitted by maximum
-    likelihood over a grid), with the calibration error before and after. ``None`` with too few
+    likelihood over a grid), with the calibration error before and after, and whether setting it
+    is worth it (``temperature_helps``: it lowers the error by more than ``TEMPERATURE_MARGIN``,
+    so no interface suggests one that makes no real difference). ``None`` with too few
     scored examples or classes. The temperature is absolute: ``current`` times the one fitted
     on top of the task's present setting, kept within the range settings allow.
 
@@ -303,6 +306,7 @@ def _calibration(h: HeldOut, truth: np.ndarray, current: float) -> dict[str, Any
     ece_after, table_after = _ece(_cross_fitted(P, t).max(1), correct)
     absolute = min(max(current * best, float(TEMPERATURES[0])), float(TEMPERATURES[-1]))
     return {"temperature": round(absolute, 4), "ece": ece, "ece_calibrated": ece_after,
+            "temperature_helps": bool(ece_after < ece - TEMPERATURE_MARGIN),
             "reliability": table, "reliability_calibrated": table_after}
 
 
