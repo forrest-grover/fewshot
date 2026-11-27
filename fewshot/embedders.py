@@ -358,6 +358,7 @@ _spec_locks: dict[str, threading.Lock] = {}  # one per spec: two loads of one mo
 _registered: set[str] = set()  # specs whose embedder came from register_embedder
 _held: dict[str, int] = {}  # spec -> operations in progress that may embed with it (see ``hold``)
 _namespaces: dict[str, str] = {}  # registered spec -> its cache namespace, once computed
+_reporter: list[Callable[[str], None]] = []  # who is told about loads and downloads (see ``report_loading``)
 
 
 def max_models() -> int:
@@ -472,12 +473,54 @@ def _build(spec: str) -> Embedder:
     if backend == "openclip":
         model, _, pretrained = rest.partition("@")
         if not pretrained:  # open_clip would quietly build the model with random weights
-            raise ValueError(f"{spec!r} names no pretrained weights; add them as 'openclip:{model}@<pretrained>' "
-                             "(open_clip.list_pretrained() lists them)")
-        return OpenCLIPEmbedder(spec, model, pretrained)
+            raise ValueError(f"{spec!r} names no pretrained weights; add them as 'openclip:{model}@<pretrained>'")
+        return _reported(spec, lambda: OpenCLIPEmbedder(spec, model, pretrained))
     if backend == "timm":
-        return TimmEmbedder(spec, rest)
+        return _reported(spec, lambda: TimmEmbedder(spec, rest))
     raise ValueError(f"Unknown embedder backend {backend!r} (use 'openclip' or 'timm')")
+
+
+def report_loading(reporter: Callable[[str], None] | None) -> None:
+    """Have ``reporter(message)`` told when a built-in model starts loading, and when its weights
+    have to be downloaded (``None``: stop). While one is set, a model is first loaded from the
+    Hugging Face cache without contacting the Hub (no request, no warning about it), and downloaded
+    only if that fails; this flips huggingface_hub's offline switch for the whole process meanwhile,
+    so set a reporter only in a program that loads one model at a time, such as the CLI."""
+    _reporter[:] = [reporter] if reporter else []
+
+
+def _reported(spec: str, make: Callable[[], Embedder]) -> Embedder:
+    """``make()``, telling the reporter (if any) about it: see ``report_loading``."""
+    if not _reporter:
+        return make()
+    import huggingface_hub.constants as hub  # pylint: disable=import-outside-toplevel  # comes with open_clip and timm
+
+    report = _reporter[0]
+    report(f"Loading {spec} on {_device()}...")
+    offline = hub.HF_HUB_OFFLINE
+    hub.HF_HUB_OFFLINE = True  # from the cache only
+    try:
+        return make()
+    except Exception as e:  # pylint: disable=broad-exception-caught  # whatever the loader raises
+        if not _not_downloaded(e):
+            raise
+        if offline:
+            raise ValueError("it isn't downloaded, and HF_HUB_OFFLINE=1 is set (unset it to download it)") from e
+    finally:
+        hub.HF_HUB_OFFLINE = offline
+    report(f"Downloading {spec} from the Hugging Face Hub to {hub.HF_HUB_CACHE}...")
+    return make()
+
+
+def _not_downloaded(e: BaseException | None) -> bool:
+    """Whether ``e`` (or an error that led to it) says that weights aren't in the Hugging Face cache."""
+    from huggingface_hub.errors import LocalEntryNotFoundError, OfflineModeIsEnabled  # pylint: disable=import-outside-toplevel
+
+    while e is not None:
+        if isinstance(e, (LocalEntryNotFoundError, OfflineModeIsEnabled)):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
 
 
 def _evict_locked(keep: str | None = None) -> list[str]:

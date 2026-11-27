@@ -186,8 +186,11 @@ class TaskHistory:
         except (OSError, UnicodeDecodeError):
             return ""
 
-    def _save_new(self, created: list[str], record: bool, label: str) -> None:  # pragma: no cover  # Task's
-        raise NotImplementedError
+    def _save_new(self, created: list[str], record: bool, label: str) -> None:
+        """``_save`` after storing new image files; if the save fails before committing, the files
+        ``created`` (named by no saved version) are removed again."""
+        with self._new_files(created):
+            self._save(record=record, label=label)
 
     def _save_in_group(self, created: list[str], group: tuple[str, str], count: int, names: list[str],  # pylint: disable=too-many-arguments,too-many-positional-arguments
                        describe: Callable[[int, list[str]], str]) -> None:
@@ -330,22 +333,29 @@ class TaskHistory:
         for f in gone:
             self._drop_file(f)
 
-    def _drop_unused_images(self) -> int:
-        """Delete image files that neither the task nor any kept version names; returns how many."""
+    def _drop_unused_images(self, dry_run: bool = False) -> int:
+        """Delete image files that neither the task nor any kept version names; returns how many
+        (with ``dry_run``, how many would go, deleting nothing)."""
+        if dry_run:
+            return len(self._unused_images())
         with self._writing():
             for stale in (self.path / "history").glob(".redo-*"):  # set aside by a save that crashed
                 shutil.rmtree(stale, ignore_errors=True)
             for folder in (self.path, self.path / "images", self.path / "history", self.path / "history" / "redo"):
                 for tmp in folder.glob(".*.tmp"):  # half-written by a write that crashed (writes hold the lock)
                     tmp.unlink(missing_ok=True)
-            used = self.config.files() | self._redo_files()
-            used |= set().union(*(self._files_in(p) for _, p in self._history()))
-            images = self.path / "images"
-            unused = [f"images/{f.name}" for f in images.iterdir() if f.is_file()] if images.is_dir() else []
-            unused = [f for f in unused if f not in used]
+            unused = self._unused_images()
             for f in unused:
                 self._drop_file(f)
             return len(unused)
+
+    def _unused_images(self) -> list[str]:
+        """The image files that neither the task nor any kept version names."""
+        used = self.config.files() | self._redo_files()
+        used |= set().union(*(self._files_in(p) for _, p in self._history()))
+        images = self.path / "images"
+        unused = [f"images/{f.name}" for f in images.iterdir() if f.is_file()] if images.is_dir() else []
+        return [f for f in unused if f not in used]
 
     def kept_files(self) -> set[str]:
         """Image files that undo or redo may bring back (named by a kept version, not the current one)."""

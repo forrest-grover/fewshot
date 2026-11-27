@@ -620,3 +620,81 @@ def test_registration_during_a_load_wins(monkeypatch):
     finally:
         unregister_embedder("slow:y")
     assert not embedders.is_registered("slow:y")
+
+
+@pytest.fixture(name="reported")
+def fixture_reported():
+    """Messages about model loads, while the CLI's reporting is on."""
+    messages: list[str] = []
+    embedders.report_loading(messages.append)
+    yield messages
+    embedders.report_loading(None)
+
+
+def _cached_only(monkeypatch, calls, cached):
+    """Make the fake open_clip factory fail as for weights not downloaded while the Hub is offline,
+    unless ``cached``; returns the offline switch's value at each call."""
+    import huggingface_hub.constants as hub  # pylint: disable=import-outside-toplevel
+    from huggingface_hub.errors import LocalEntryNotFoundError  # pylint: disable=import-outside-toplevel
+
+    real = open_clip.create_model_and_transforms
+    seen = []
+
+    def create(*a, **k):
+        seen.append(hub.HF_HUB_OFFLINE)
+        if hub.HF_HUB_OFFLINE and not cached:
+            try:
+                raise LocalEntryNotFoundError("not in the cache")
+            except LocalEntryNotFoundError as e:
+                raise RuntimeError("Failed to download") from e
+        return real(*a, **k)
+
+    monkeypatch.setattr(open_clip, "create_model_and_transforms", create)
+    del calls
+    return seen
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
+def test_loading_is_announced_and_cached_weights_need_no_hub(monkeypatch, calls, reported):
+    """With reporting on, a load is announced and tried from the cache alone (offline) first."""
+    seen = _cached_only(monkeypatch, calls, cached=True)
+    embedders.get_embedder("openclip:ViT-B-32@laion2b")
+    assert reported == ["Loading openclip:ViT-B-32@laion2b on cpu..."]
+    assert seen == [True]
+    import huggingface_hub.constants as hub  # pylint: disable=import-outside-toplevel
+
+    assert hub.HF_HUB_OFFLINE is False  # put back
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
+def test_weights_not_downloaded_are_announced_then_fetched(monkeypatch, calls, reported):
+    """Weights missing from the cache are downloaded, and the download announced."""
+    seen = _cached_only(monkeypatch, calls, cached=False)
+    embedders.get_embedder("openclip:ViT-B-32@laion2b")
+    assert reported[1].startswith("Downloading openclip:ViT-B-32@laion2b from the Hugging Face Hub to ")
+    assert seen == [True, False]
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
+def test_weights_not_downloaded_while_offline_say_so(monkeypatch, calls, reported):
+    """With HF_HUB_OFFLINE set, missing weights fail with a message naming it."""
+    import huggingface_hub.constants as hub  # pylint: disable=import-outside-toplevel
+
+    _cached_only(monkeypatch, calls, cached=False)
+    monkeypatch.setattr(hub, "HF_HUB_OFFLINE", True)
+    with pytest.raises(ValueError, match="isn't downloaded, and HF_HUB_OFFLINE=1 is set"):
+        embedders.get_embedder("openclip:ViT-B-32@laion2b")
+    assert len(reported) == 1
+
+
+@pytest.mark.usefixtures("fake_backends", "cpu")
+def test_other_load_errors_are_not_taken_for_missing_weights(monkeypatch, reported):
+    """An error that isn't about missing weights is raised at once, with no download."""
+
+    def broken(*_a, **_k):
+        raise RuntimeError("Unknown model")
+
+    monkeypatch.setattr(open_clip, "create_model_and_transforms", broken)
+    with pytest.raises(ValueError, match="Unknown model"):
+        embedders.get_embedder("openclip:Nope@x")
+    assert reported == ["Loading openclip:Nope@x on cpu..."]

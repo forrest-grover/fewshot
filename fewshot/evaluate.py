@@ -547,7 +547,8 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     a = np.array(accs)
     return {
         "embedder": embedder, "classifier": classifier, "way": way, "shot": shot, "query": query,
-        "episodes": episodes, "text_template": text_template, "flip": flip,
+        "episodes": episodes, "seed": seed, "text_template": text_template, "flip": flip,
         "accuracy": float(a.mean()),
+        "std": float(a.std(ddof=1)) if len(a) > 1 else 0.0,  # over episodes
         "ci95": float(1.96 * a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0,
     }

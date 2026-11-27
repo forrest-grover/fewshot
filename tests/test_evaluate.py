@@ -180,7 +180,7 @@ def test_benchmark_separable_colours(ws, tmp_path):
     assert r.pop("flip") is False
     assert r == {
         "embedder": "fake:color", "classifier": "gda", "way": 3, "shot": 2, "query": 3,
-        "episodes": 5, "text_template": None, "accuracy": 1.0, "ci95": 0.0,
+        "episodes": 5, "seed": 0, "text_template": None, "accuracy": 1.0, "std": 0.0, "ci95": 0.0,
     }
     assert messages == ["Embedding 24 images with fake:color (cached after first run)"]
 

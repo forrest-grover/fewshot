@@ -152,11 +152,12 @@ def fetch_urls(urls: Sequence[str], max_bytes: int, *, public_only: bool = False
 class Added:
     """What adding images did: the examples (or inbox images) stored, each image left out, and
     which of the stored examples were already examples of another class, so adding them moved
-    them (``added`` includes those too)."""
+    them, or of the same class, so adding them changed nothing (``added`` includes both)."""
 
     added: list[Any] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)  # (name, reason)
     moved: list[tuple[Any, str]] = field(default_factory=list)  # (example, the class it was in)
+    unchanged: list[Any] = field(default_factory=list)  # examples that were there already, in the same class
 
 
 def _added(task_call: Callable[[Iterable[Any]], Sequence[Any]], blobs: Iterable[tuple[Blob, str | None]],
@@ -197,8 +198,11 @@ def _add_labelled(task: Task, blobs: Iterable[tuple[Blob, str | None]], undo_gro
     out = _added(lambda items: task.add_examples(items, undo_group=undo_group), blobs,
                  lambda b, label: (_bytes(b.data), label, b.source or b.name))
     for ex in out.added:  # in order, so an image given twice under two labels counts as moved once
-        if was.get(ex.id, ex.label) != ex.label:
-            out.moved.append((ex, was[ex.id]))
+        before = was.get(ex.id)
+        if before == ex.label:
+            out.unchanged.append(ex)
+        elif before is not None:
+            out.moved.append((ex, before))
         was[ex.id] = ex.label
     return out
 

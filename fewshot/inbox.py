@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .models import TaskConfig
 
 INBOX_CHUNK = 256  # images stored per save while adding
+ALREADY_LABELLED = "Already an example of"  # why an image that is labelled already is kept out of the inbox
 
 
 
@@ -111,7 +112,7 @@ class TaskInbox:
                 if isinstance(c, ValueError):
                     out.append(c)
                 elif c[1] in labelled or c[1][:16] in short:
-                    out.append(ValueError(f"Already an example of {labelled.get(c[1]) or short[c[1][:16]]}"))
+                    out.append(ValueError(f"{ALREADY_LABELLED} {labelled.get(c[1]) or short[c[1][:16]]}"))
                 elif c[1] in waiting:
                     out.append(waiting[c[1]])
                 else:

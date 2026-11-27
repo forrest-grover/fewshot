@@ -107,15 +107,17 @@ def drop_file(task_dir: Path, file: str, blobs: Path | None) -> None:
 GC_MIN_AGE = 60.0
 
 
-def gc_blobs(blobs: Path, min_age: float = GC_MIN_AGE) -> int:
+def gc_blobs(blobs: Path, min_age: float = GC_MIN_AGE, dry_run: bool = False) -> int:
     """Delete shared image copies that no task links to any more, and temporary files a crashed
-    write left, if written over ``min_age`` seconds ago; returns how many."""
+    write left, if written over ``min_age`` seconds ago; returns how many (with ``dry_run``, how
+    many would go, deleting nothing)."""
     n = 0
     now = time.time()
     for f in blobs.glob("*/*") if blobs.is_dir() else []:
         with contextlib.suppress(FileNotFoundError):
             st = f.stat()
             if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and now - st.st_mtime > min_age:
-                f.unlink()
+                if not dry_run:
+                    f.unlink()
                 n += 1
     return n

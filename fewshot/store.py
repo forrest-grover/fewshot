@@ -50,6 +50,7 @@ from .classifiers import CLASSIFIERS
 from .embedders import check_embedder, loaded_embedders
 from .folders import class_folders, read_or_empty, readable_name
 from .fsutil import FileStamp, create_lock_file, move_back, os_reason, reclaim, replace_reserved, spelt_as_listed
+from .fsutil import abandoned as _abandoned
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import file_lock as _file_lock
 from .fsutil import fsync_dir as _fsync_dir
@@ -540,6 +541,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         checked = [_check_item(*item) for item in batch]  # decoding happens here, before locking
         out: list[Example | ValueError] = []
         created: list[str] = []
+        changed: list[str] = []  # the label of each image added or moved (not one there already)
         with self._writing(), self._new_files(created):  # storing some may fail (a full disk)
             examples = self.config.examples
             at = {e.id: i for i, e in enumerate(examples)}  # id -> position
@@ -554,26 +556,21 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                     self.config.inbox = [x for x in self.config.inbox if x.id != c.id]
                     waiting.discard(c.id)
                 i = at.get(c.id, legacy.get(c.id[:16]))
-                if i is not None:  # already stored: just relabel
+                if i is not None:  # already stored: just relabel (if it was in another class)
+                    changed += [c.label] if examples[i].label != c.label else []
                     ex = examples[i] = examples[i].model_copy(update={"label": c.label})
                 else:
+                    changed.append(c.label)
                     ex = Example(id=c.id, label=c.label, file=f"images/{c.id}.{c.ext}", source=c.source)
                     if self._store_image(ex.file, c.data):
                         created.append(ex.file)
                     at[c.id] = len(examples)
                     examples.append(ex)
                 out.append(ex)
-            added = [r.label for r in out if not isinstance(r, ValueError)]
-            if added:
-                self._save_in_group(created, group, len(added), list(dict.fromkeys(added)),
+            if changed:  # a batch of images all there already changes nothing: no save, no undo step
+                self._save_in_group(created, group, len(changed), list(dict.fromkeys(changed)),
                                     lambda n, names: f"add {_n(n)} to {listed(names)}")
         return out
-
-    def _save_new(self, created: list[str], record: bool, label: str) -> None:
-        """``_save`` after storing new image files; if the save fails before committing, the files
-        ``created`` (named by no saved version) are removed again."""
-        with self._new_files(created):
-            self._save(record=record, label=label)
 
     def _ensure_class(self, label: str) -> None:
         """Add class ``label`` (already checked) if missing, without saving."""
@@ -915,19 +912,21 @@ class Workspace:
                 raise ValueError(f"Task {name!r} already exists") from None
         return p
 
-    def gc(self) -> dict[str, int]:
+    def gc(self, dry_run: bool = False) -> dict[str, int]:
         """Clean up what crashes and undo history leave behind: hidden ``.tmp-``/``.trash-``
         folders and task folders without task.json older than ``STALE_SECONDS``, image files no
-        version of their task names, and shared copies no task links to. Returns counts."""
+        version of their task names, and shared copies no task links to. Returns counts (with
+        ``dry_run``, of what would go, removing nothing)."""
         out = {"folders": 0, "images": 0, "blobs": 0}
-        for p in (self.root / "tasks").iterdir():
+        for p in (self.root / "tasks").iterdir() if (self.root / "tasks").is_dir() else []:
             hidden = p.name.startswith((".tmp-", ".trash-"))
-            if p.is_dir() and (hidden or not (p / "task.json").exists()) and reclaim(p, STALE_SECONDS):
+            if p.is_dir() and (hidden or not (p / "task.json").exists()) and (
+                    _abandoned(p, STALE_SECONDS) if dry_run else reclaim(p, STALE_SECONDS)):
                 out["folders"] += 1
         for t in self.list_tasks():
             with contextlib.suppress(KeyError):  # deleted by another process meanwhile
-                out["images"] += t._drop_unused_images()  # pylint: disable=protected-access
-        out["blobs"] = self.gc_blobs()
+                out["images"] += t._drop_unused_images(dry_run)  # pylint: disable=protected-access
+        out["blobs"] = _blobs.gc_blobs(self.blobs, dry_run=dry_run)
         return out
 
     def duplicate(self, name: str, new: str, examples: bool = True, inbox: bool = False) -> Task:
