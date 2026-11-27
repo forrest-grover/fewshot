@@ -91,22 +91,30 @@ PRESETS: list[EmbedderInfo] = [
 DEFAULT_SPEC = PRESETS[0].spec
 
 
+def check_device(device: str, name: str = "FEWSHOT_DEVICE") -> str:
+    """``device`` (e.g. ``cpu``, ``cuda:1``, ``mps``) if it is a torch device this machine has;
+    else ``ValueError`` saying why, naming the setting it came from (``name``)."""
+    import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
+
+    try:
+        dev = torch.device(device)
+    except RuntimeError as e:
+        raise ValueError(f"{name}={device!r} is not a torch device: {e}") from None
+    # Checked now, so a missing device fails with a clear message rather than inside a model load.
+    if dev.type == "cuda" and (dev.index or 0) >= torch.cuda.device_count():
+        raise ValueError(f"{name}={device!r}: this machine has {torch.cuda.device_count()} CUDA devices")
+    if dev.type == "mps" and not torch.backends.mps.is_available():
+        raise ValueError(f"{name}={device!r}: Apple's GPU (MPS) is not available here")
+    return device
+
+
 def _device() -> str:
     """``$FEWSHOT_DEVICE`` if set (e.g. ``cpu``, ``cuda:1``, ``mps``), else CUDA, then Apple's GPU
     (MPS), then the CPU, whichever is available first."""
     import torch  # pylint: disable=import-outside-toplevel  # lazy: keeps CLI startup fast
 
     if forced := os.environ.get("FEWSHOT_DEVICE", "").strip():
-        try:
-            dev = torch.device(forced)
-        except RuntimeError as e:
-            raise ValueError(f"FEWSHOT_DEVICE={forced!r} is not a torch device: {e}") from None
-        # Checked now, so a missing device fails with a clear message rather than inside a model load.
-        if dev.type == "cuda" and (dev.index or 0) >= torch.cuda.device_count():
-            raise ValueError(f"FEWSHOT_DEVICE={forced!r}: this machine has {torch.cuda.device_count()} CUDA devices")
-        if dev.type == "mps" and not torch.backends.mps.is_available():
-            raise ValueError(f"FEWSHOT_DEVICE={forced!r}: Apple's GPU (MPS) is not available here")
-        return forced
+        return check_device(forced)
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -426,6 +434,7 @@ def get_embedder(spec: str = DEFAULT_SPEC) -> Embedder:
         with _load_lock:
             if spec in _loaded:  # another thread loaded it while we waited
                 return _loaded[spec]
+        _device()  # a bad FEWSHOT_DEVICE is reported as such, not as a model that couldn't load
         try:
             emb = _build(spec)
         # Model loaders (open_clip, timm, hub downloads) raise many unrelated exception types.

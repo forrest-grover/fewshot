@@ -8,6 +8,7 @@ import csv
 import difflib
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -39,7 +40,10 @@ ClassifierName = Literal["gda", "knn", "logreg", "prototype"]  # classifiers.CLA
 CLASSIFIER_LIST = " | ".join(get_args(ClassifierName))
 InboxSort = Literal["uncertain", "confident", "novel", "added"]  # Pipeline.inbox_suggestions's orders
 JSON_OPT = typer.Option(False, "--json", help="Print JSON")
-ROOT_OPT = typer.Option(None, "--root", envvar="FEWSHOT_HOME", help="Workspace directory [default: ./fewshot_data]")
+ROOT_HELP = "Workspace directory [default: $FEWSHOT_HOME, else ./fewshot_data]"
+ROOT_OPT = typer.Option(None, "--root", help=ROOT_HELP)  # FEWSHOT_HOME is read by the Workspace itself
+DEVICE_HELP = ("Torch device models run on, e.g. cpu, cuda:1, mps [default: $FEWSHOT_DEVICE, else CUDA, then "
+               "Apple's GPU, then the CPU]")
 TASK_ARG = typer.Argument(..., metavar="TASK", help="Task name; see `fewshot list`", show_default=False)
 CLASS_ARG = typer.Argument(..., metavar="CLASS", help="Class name", show_default=False)
 IMAGES_ARG = typer.Argument(..., metavar="IMAGE", help="Image files, folders or http(s) URLs", show_default=False)
@@ -65,15 +69,19 @@ HELP_OPTIONS: dict[str, Any] = {"help_option_names": ["-h", "--help"]}
 
 @dataclass
 class Flags:
-    """Options that hold for the whole run: set by the root command and by each command's own -q/--debug."""
+    """Options that hold for the whole run: set by the root command and by each command's own
+    -q/--debug/--device (and --root, which each command takes as an argument)."""
 
     quiet: bool = False
     debug: bool = False
+    device: str | None = None  # --device (FEWSHOT_DEVICE alone isn't copied here)
+    root: Path | None = None  # --root given before the command
     interrupt_note: str = ""  # what to say after "Interrupted"; set by commands that know what was saved
 
     def reset(self) -> None:
         """Back to the defaults."""
         self.quiet = self.debug = False
+        self.device = self.root = None
         self.interrupt_note = ""
 
 
@@ -81,8 +89,8 @@ FLAGS = Flags()
 
 
 def shared_options() -> list[Any]:
-    """The -q/--quiet and --debug options every command takes (the root command too), as Typer
-    makes them."""
+    """The -q/--quiet, --debug and --device options every command takes (the root command too),
+    as Typer makes them."""
     holder = typer.Typer(add_completion=False)
 
     @holder.command()
@@ -91,8 +99,9 @@ def shared_options() -> list[Any]:
                                    help="Print no status messages, only results and errors"),
         debug: bool = typer.Option(False, "--debug", envvar="FEWSHOT_DEBUG", show_envvar=True,
                                    help="Show tracebacks and the warnings of the libraries used"),
+        device: str | None = typer.Option(None, "--device", help=DEVICE_HELP),
     ) -> None:
-        del quiet, debug
+        del quiet, debug, device
 
     return list(typer.main.get_command(holder).params)
 
@@ -107,12 +116,21 @@ class Command(TyperCommand):
     def invoke(self, ctx: Any) -> Any:
         FLAGS.quiet |= ctx.params.pop("quiet")  # a command's option adds to the root's, never turns it off
         FLAGS.debug |= ctx.params.pop("debug")
+        FLAGS.device = ctx.params.pop("device") or FLAGS.device  # after the command wins over before it
+        before = os.environ.get("FEWSHOT_DEVICE")
         try:
+            if FLAGS.device:
+                check_device()  # now, even for a command whose embeddings are all cached
+                os.environ["FEWSHOT_DEVICE"] = FLAGS.device  # where the library reads it
             with library_output():
                 return super().invoke(ctx)
         except KeyboardInterrupt:
             interrupted()
         finally:
+            if before is None:
+                os.environ.pop("FEWSHOT_DEVICE", None)
+            else:
+                os.environ["FEWSHOT_DEVICE"] = before
             FLAGS.reset()  # back to the defaults for whatever runs next in this process
 
 
@@ -298,9 +316,11 @@ def stdout_is_terminal() -> bool:
 
 # ---- the workspace and tasks ---------------------------------------------------------
 def workspace(root: Path | None, create: bool = False) -> Workspace:
-    """The workspace at ``root`` (default from FEWSHOT_HOME or ./fewshot_data). Unless ``create``
+    """The workspace at ``root`` (default: the --root given before the command, else FEWSHOT_HOME,
+    else ./fewshot_data). Unless ``create``
     (for commands that make tasks), a missing one isn't made: it reads as empty, so a mistyped
     --root doesn't leave a new folder behind. Making one is announced."""
+    root = root or FLAGS.root
     ws = Workspace(root, create=False)
     if create and not (ws.root / "tasks").is_dir():
         ws = Workspace(root, create=True)
@@ -323,10 +343,26 @@ def get_task(root: Path | None, name: str) -> Task:
              "or set --root/FEWSHOT_HOME")
 
 
+def check_device() -> None:
+    """Exit with a usage error unless the device asked for (by --device, else FEWSHOT_DEVICE) is one
+    this machine has, naming the one of them that was used."""
+    from .embedders import check_device as check  # pylint: disable=import-outside-toplevel  # imports torch
+
+    device = FLAGS.device or os.environ.get("FEWSHOT_DEVICE", "").strip()
+    if device:
+        try:
+            check(device, "--device" if FLAGS.device else "FEWSHOT_DEVICE")
+        except ValueError as e:
+            usage(str(e))
+
+
 def make_pipeline(ws: Workspace) -> Pipeline:
-    """A pipeline for ``ws``; imported lazily, since it imports torch and `fewshot --help` should be fast."""
+    """A pipeline for ``ws``, once the device is checked (models may not be loaded at all if every
+    embedding is cached, but a bad device should still be reported). Imported lazily, since it
+    imports torch and `fewshot --help` should be fast."""
     from .pipeline import Pipeline  # pylint: disable=import-outside-toplevel
 
+    check_device()
     return Pipeline(ws)
 
 

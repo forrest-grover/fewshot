@@ -16,7 +16,7 @@ import fewshot.__main__ as entry
 from fewshot import cli, cli_common, cli_eval, services
 from fewshot.evaluate import TEMPERATURE_MARGIN
 from fewshot.store import Workspace
-from tests.conftest import BLUE, RED, PlainResult, png, write_images
+from tests.conftest import BLUE, RED, PlainResult, png, served, write_images
 
 
 @pytest.fixture(name="photos")
@@ -149,12 +149,51 @@ def test_main_with_debug_raises_file_system_errors(monkeypatch):
         cli.main()
 
 
-def test_device_option_sets_the_device():
-    """--device (before the command) sets FEWSHOT_DEVICE for the run, and the help names the variable."""
-    r = plain("--device", "cpu", "list")
-    assert r.exit_code == 0
-    assert os.environ["FEWSHOT_DEVICE"] == "cpu"  # the restore_environment fixture puts it back
+def test_device_option_sets_the_device(monkeypatch):
+    """--device, before or after the command, sets FEWSHOT_DEVICE while the command runs (and only
+    then); the help names the variable."""
+    seen = []
+    monkeypatch.setattr(cli_common, "report_loading", lambda r: seen.append(os.environ.get("FEWSHOT_DEVICE")))
+    monkeypatch.delenv("FEWSHOT_DEVICE", raising=False)
+    for args in (["--device", "cpu", "list"], ["list", "--device", "cpu"]):
+        seen.clear()
+        assert plain(*args).exit_code == 0
+        assert seen[0] == "cpu"
+        assert "FEWSHOT_DEVICE" not in os.environ
+    seen.clear()
+    assert plain("--device", "meta", "list", "--device", "cpu").exit_code == 0
+    assert seen[0] == "cpu"  # after the command wins
+    monkeypatch.setenv("FEWSHOT_DEVICE", "meta")
+    assert plain("list", "--device", "cpu").exit_code == 0
+    assert os.environ["FEWSHOT_DEVICE"] == "meta"  # put back
     assert "FEWSHOT_DEVICE" in plain("-h").output
+
+
+def test_a_bad_device_is_reported_up_front_under_its_own_name(run, task, monkeypatch, tmp_path):
+    """A bad --device fails before the command does anything, naming --device; a bad
+    FEWSHOT_DEVICE fails any command that may use a model, even with every embedding cached,
+    naming FEWSHOT_DEVICE. Neither points at `fewshot models`."""
+    q = tmp_path / "q.png"
+    q.write_bytes(png(RED, seed=9))
+    assert run("predict", task, q).exit_code == 0  # every embedding cached now
+    for args, said in ((["--device", "cpux", "list"], "Error: --device='cpux' is not a torch device"),
+                       (["predict", task, q, "--device", "cuda:7"], "Error: --device='cuda:7': this machine has")):
+        r = run(*args)
+        assert (r.exit_code, said in r.output, "fewshot models" in r.output) == (2, True, False), r.output
+    monkeypatch.setenv("FEWSHOT_DEVICE", "cpux")
+    r = run("predict", task, q)
+    assert (r.exit_code, "Error: FEWSHOT_DEVICE='cpux' is not a torch device" in r.output) == (2, True)
+    assert "fewshot models" not in r.output
+    assert run("list").exit_code == 0  # no model involved: not checked
+
+
+def test_root_goes_before_or_after_the_command(root, task, monkeypatch):
+    """--root works before the command as after it; after it wins."""
+    assert plain("--root", root, "show", task).exit_code == 0
+    assert plain("--root", root / "nowhere", "show", task, "--root", root).exit_code == 0
+    assert "No task 't'" in plain("--root", root, "show", task, "--root", root / "nowhere").output
+    _, server, _ = served(monkeypatch, before=["--root", root])
+    assert server.ws.root == root.resolve()
 
 
 def test_ctrl_c(run, task, tmp_path, monkeypatch):

@@ -287,11 +287,11 @@ def run_fixture(root):
     return invoke
 
 
-def served(monkeypatch, *args):
-    """Run `fewshot serve ARGS` with uvicorn stubbed out; returns (result, the server, uvicorn's options)."""
+def served(monkeypatch, *args, before=()):
+    """Run `fewshot BEFORE serve ARGS` with uvicorn stubbed out; returns (result, the server, uvicorn's options)."""
     calls = []
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls.append((app, kw)))
-    r = CliRunner().invoke(cli.app, ["serve", *args])
+    r = CliRunner().invoke(cli.app, [*map(str, before), "serve", *args])
     assert r.exit_code == 0, r.output
     app, kw = calls[-1]
     return PlainResult(r), app.state.server, kw

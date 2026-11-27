@@ -292,7 +292,7 @@ def test_names_that_arent_utf8_are_printed_as_their_bytes(monkeypatch):
     out = io.TextIOWrapper(raw, encoding="utf-8")
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    cli.run_command(False, None, False, False)
+    cli.run_command(False, None, None, False, False)
     print(os.fsdecode(b"q\xfe.png"), end="")
     out.flush()
     assert raw.getvalue() == b"q\xfe.png"

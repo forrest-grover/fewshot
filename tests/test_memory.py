@@ -27,6 +27,17 @@ def test_device_from_environment_and_mps(monkeypatch):
         assert not torch.is_autocast_enabled("cpu")
 
 
+def test_a_bad_device_is_not_reported_as_a_model_that_wont_load(monkeypatch):
+    """get_embedder reports a bad FEWSHOT_DEVICE as such, before trying to build the model;
+    check_device names the setting it is given."""
+    monkeypatch.setenv("FEWSHOT_DEVICE", "warp-drive")
+    monkeypatch.setattr(embedders, "_build", lambda spec: pytest.fail("built"))
+    with pytest.raises(ValueError, match=r"^FEWSHOT_DEVICE='warp-drive' is not a torch device"):
+        embedders.get_embedder("timm:not_loaded_yet")
+    with pytest.raises(ValueError, match=r"^--device='warp-drive' is not"):
+        embedders.check_device("warp-drive", "--device")
+
+
 def test_device_and_model_limit_checks(monkeypatch):
     """A device that isn't there, or a bad FEWSHOT_MAX_MODELS, fails with a clear message."""
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)

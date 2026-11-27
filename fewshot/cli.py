@@ -21,9 +21,11 @@ from . import cli_common, cli_eval, cli_label, cli_predict, services
 from .classifiers import CLASSIFIERS, SETTING_MAX
 from .cli_common import (
     CLASSIFIER_HELP,
+    DEVICE_HELP,
     FAILED,
     FLAGS,
     JSON_OPT,
+    ROOT_HELP,
     ROOT_OPT,
     TASK_ARG,
     ClassifierName,
@@ -59,7 +61,8 @@ Environment:
 Exit status: 0 done; 1 failed, or failed for some inputs (each is reported);
 2 called wrongly (a usage error); 130 interrupted (Ctrl-C).
 
-Every command takes -h, -q and --debug. More: {README}"""
+-q, --debug, --device and --root go before or after the command's name;
+every command takes -h. More: {README}"""
 
 app = command_group("Few-shot image classification from a handful of labelled examples per class.\n\n"
                     "A workspace holds tasks; a task holds classes, labelled example images, an inbox of "
@@ -98,9 +101,8 @@ def _version(value: bool) -> None:
 def run_command(  # pylint: disable=too-many-arguments  # one per root option
     _version_opt: bool = typer.Option(False, "--version", is_eager=True, callback=_version,
                                       help="Print the versions of fewshot, torch, open_clip and Python, and exit"),
-    device: str | None = typer.Option(None, "--device", envvar="FEWSHOT_DEVICE", show_envvar=True,
-                                      help="Torch device models run on, e.g. cpu, cuda:1, mps [default: CUDA, then "
-                                           "Apple's GPU, then the CPU]"),
+    device: str | None = typer.Option(None, "--device", help=DEVICE_HELP),
+    root: Path | None = typer.Option(None, "--root", help=ROOT_HELP),
     quiet: bool = typer.Option(False, "-q", "--quiet", envvar="FEWSHOT_QUIET", show_envvar=True,
                                help="Print no status messages, only results and errors"),
     debug: bool = typer.Option(False, "--debug", envvar="FEWSHOT_DEBUG", show_envvar=True,
@@ -111,9 +113,7 @@ def run_command(  # pylint: disable=too-many-arguments  # one per root option
     lone surrogates in Python) is printed as its bytes, and read back from a piped list, instead of
     raising ``UnicodeError``. (The group's help is set on ``app``, which takes precedence.)"""
     FLAGS.reset()
-    FLAGS.quiet, FLAGS.debug = quiet, debug
-    if device:
-        os.environ["FEWSHOT_DEVICE"] = device
+    FLAGS.quiet, FLAGS.debug, FLAGS.device, FLAGS.root = quiet, debug, device, root
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):  # a text stream (not a plain StringIO)
             stream.reconfigure(errors="surrogateescape")

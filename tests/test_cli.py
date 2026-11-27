@@ -63,7 +63,7 @@ def load(root, name="colors"):
     (["class", "add"], "[default: keep an existing class's]"),
     (["bench"], f"[default: {embedders.DEFAULT_SPEC}]"),
     (["serve"], "[default: $FEWSHOT_ALLOWED_HOSTS"),
-    (["list"], "[default: ./fewshot_data]"),
+    (["list"], "[default: $FEWSHOT_HOME, else ./fewshot_data]"),
     (["predict"], f"{cli_predict.PREDICT_CHUNK} at a time"),
     (["watch"], f"until it is {cli_predict.WATCH_SETTLE:g} seconds old"),
 ])

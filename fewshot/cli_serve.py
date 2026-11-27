@@ -9,6 +9,7 @@ from typing import Any
 
 import typer
 
+from .cli_common import FLAGS as _FLAGS
 from .cli_common import ROOT_OPT
 from .cli_common import fail as _fail
 from .cli_common import workspace as _ws
@@ -68,6 +69,7 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
     from .embedders import report_loading  # pylint: disable=import-outside-toplevel
     from .server_settings import LOCAL_HOSTS, ServerSettings  # pylint: disable=import-outside-toplevel
 
+    root = root or _FLAGS.root  # --root given before `serve`
     given: dict[str, Any] = {k: v for k, v in {
         "home": root, "token": token, "allow_no_token": no_token or None, "allow_any_model": allow_any_model,
         "warm": warm, "allow_urls": allow_urls,
