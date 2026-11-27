@@ -277,8 +277,9 @@ def test_class_commands_and_aliases(run, task, root):
     """class ls lists classes (also as `list`, and as JSON); class commands confirm what they did;
     rm and delete say how to undo; unknown classes suggest the closest."""
     rows = json.loads(run("class", "ls", task, "--json").stdout)
-    assert rows == [{"class": "blue", "count": 3, "description": "", "threshold": None},
-                    {"class": "red", "count": 3, "description": "", "threshold": None}]
+    assert rows == [{"name": "blue", "count": 3, "description": "", "reject_below": None},
+                    {"name": "red", "count": 3, "description": "", "reject_below": None}]
+    assert rows == json.loads(run("show", task, "--json").stdout)["classes"]  # the same keys as show and the API
     assert run("class", "list", task).stdout.split() == ["blue", "3", "-", "red", "3", "-"]
     assert "Set the description of red" in run("class", "add", task, "red", "--desc", "a red thing").stderr
     assert run("class", "add", task, "red").output == ""  # nothing changed
@@ -324,6 +325,32 @@ def test_a_class_name_close_to_another_is_taken_for_a_typo(run, task, root, tmp_
     assert run("inbox", "accept", task, item[:8], "--label", "Gold").exit_code == 1
     r = run("inbox", "accept", task, item[:8], "--label", "amber")
     assert "Created class amber in t" in r.stderr
+
+
+def test_import_refuses_folders_close_to_existing_classes(run, task, root, tmp_path):
+    """import refuses (importing nothing) class folders whose names are near misses of existing
+    classes unless --new-class is given, and says which classes it created."""
+    more = tmp_path / "more"
+    write_images(more / "Red", RED, 1, start=40)
+    write_images(more / "Blue", BLUE, 1, start=50)
+    write_images(more / "green", BLUE, 1, start=60)
+    rev = load(root).config.revision
+    r = run("import", task, more)
+    assert r.exit_code == 1
+    assert "'Blue' (close to 'blue'), 'Red' (close to 'red')" in r.output
+    assert "pass --new-class" in r.output
+    assert load(root).config.revision == rev
+    r = run("import", task, more, "--new-class")
+    assert (r.exit_code, "Created 3 classes in t: Blue, Red, green" in r.stderr) == (0, True)
+    write_images(more / "violet", RED, 1, start=70)
+    assert "Created 1 class in t: violet" in run("import", task, more).stderr
+    many = tmp_path / "many"
+    for i in range(12):
+        write_images(many / f"kind{i:02}", RED, 1, start=100 + i)
+    assert run("create", "u", "--embedder", "fake:color").exit_code == 0
+    r = run("import", "u", many)  # names close to each other, but no existing class to be a typo of
+    assert "Created 12 classes in u: kind00, kind01" in r.stderr
+    assert "kind09 and 2 more" in r.stderr
 
 
 def test_near_miss():

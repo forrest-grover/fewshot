@@ -27,6 +27,7 @@ from .cli_common import (
     finish_adding,
     get_task,
     moved_text,
+    near_miss,
     outcome,
     progress,
     say,
@@ -34,6 +35,8 @@ from .cli_common import (
 )
 from .cli_common import FLAGS as _FLAGS
 from .cli_common import add_files as _add_files
+from .folders import class_folders
+from .store import Task
 from .text import check_class_name
 
 commands = App()  # the top-level commands defined here
@@ -78,33 +81,46 @@ def add(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # 
 
 @commands.command("import", rich_help_panel="Labelling", epilog=examples(
     "fewshot import pets ./photos               # ./photos/<class>/<image>",
-    "fewshot import pets ./photos --shots 5     # at most 5 images per class"))
-def import_dir(
+    "fewshot import pets ./photos --shots 5     # at most 5 images per class",
+    "fewshot import pets ./more --new-class     # even though more/pug/ is close to an existing 'Pug'"))
+def import_dir(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     name: str = TASK_ARG,
     folder: Path = typer.Argument(..., metavar="FOLDER", help="A folder of class folders: FOLDER/<class>/<image>",
                                   show_default=False),
     shots: int | None = typer.Option(None, min=1, help="Take at most this many images per class"),
+    new_class: bool = typer.Option(False, "--new-class", help="Create a class for every folder, even one whose name "
+                                                             "is close to an existing class's (without it, a near "
+                                                             "miss such as 'beagle/' for 'Beagle' is refused as a "
+                                                             "likely typo)"),
     strict: bool = STRICT_OPT,
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Import a folder of class folders (FOLDER/<class>/<image>) into a task.
 
     Each subfolder's name is the class of the images in it; hidden and system folders such as
-    __MACOSX and .ipynb_checkpoints are skipped. The whole import is one undo step. Images that are
-    examples of their class already are skipped, so importing the same folder again adds only what
-    is new. Exits 1 if any image couldn't be read or imported, or with --strict if any was skipped.
+    __MACOSX and .ipynb_checkpoints are skipped. Classes the task doesn't have are created (and
+    said so), but if a folder's name is close to an existing class's, nothing is imported: it is
+    taken for a typo unless --new-class is given. The whole import is one undo step. Images that
+    are examples of their class already are skipped, so importing the same folder again adds only
+    what is new. Exits 1 if any image couldn't be read or imported, or with --strict if any was
+    skipped.
     """
     t = get_task(root, name)
     if folder.is_file() and folder.suffix.lower() == ".zip":
         fail(f"{folder} looks like an export; use `fewshot import-task {folder}`")
     if not folder.is_dir():
         fail(f"Not a directory: {folder}")
-    before = len(t.config.examples)
+    before, classes = len(t.config.examples), t.class_names()
+    if not new_class:
+        _check_folder_names(t, folder, shots)
     _FLAGS.interrupt_note = f"images stored before it are kept (`fewshot undo {name}` takes them back)"
     with progress("Importing") as update:
         o = outcome(services.import_folder(t, folder, shots, update))
     if o.added == 0 and o.failed == 0 and o.skipped == 0:
         fail(f"No images were imported; expected {folder}/<class>/<image>")
+    if created := [c for c in t.class_names() if c not in classes]:
+        shown = ", ".join(created[:10]) + (f" and {len(created) - 10} more" if len(created) > 10 else "")
+        say(f"Created {len(created)} {'class' if len(created) == 1 else 'classes'} in {name}: {shown}")
     if o.added:
         skipped = f", skipped {o.skipped} already in the task" if o.skipped else ""
         say(f"Imported {o.added} images into {name}{moved_text(o.moved)}{skipped}; {name} now has "
@@ -114,22 +130,32 @@ def import_dir(
     finish_adding(o, strict, f"Nothing new: all {o.skipped} images are already in {name}", "imported")
 
 
+def _check_folder_names(t: Task, folder: Path, shots: int | None) -> None:
+    """Refuse an import whose new classes include names close to an existing class's (likely typos)."""
+    names = t.class_names()
+    close = [(f, c) for f in class_folders(folder, shots) if f not in names and (c := near_miss(f, names))]
+    if close:
+        pairs = ", ".join(f"{f!r} (close to {c!r})" for f, c in close)
+        fail(f"Nothing imported: {folder} has class folders whose names are close to existing classes of {t.name}: "
+             f"{pairs}. Rename the folders to match, or pass --new-class to create them as new classes")
+
+
 # ---- classes ---------------------------------------------------------------------
 @cls_app.command("ls", epilog=examples("fewshot class ls pets", "fewshot class ls pets --json"))
 def class_ls(name: str = TASK_ARG, as_json: bool = JSON_OPT, root: Path | None = ROOT_OPT) -> None:
     """List a task's classes: name, examples, threshold and description (alias: list)."""
     t = get_task(root, name)
     counts = t.summary()["counts"]
-    rows = [{"class": c.name, "count": counts.get(c.name, 0), "description": c.description,
-             "threshold": c.reject_below} for c in t.config.classes]
+    rows = [{"name": c.name, "description": c.description, "count": counts.get(c.name, 0),
+             "reject_below": c.reject_below} for c in t.config.classes]  # as `show --json` and the API's ClassOut
     if as_json:
         echo_json(rows)
         return
-    width = max((len(r["class"]) for r in rows), default=0)
+    width = max((len(r["name"]) for r in rows), default=0)
     for r in rows:
-        thr = "-" if r["threshold"] is None else f"{r['threshold']:g}"
+        thr = "-" if r["reject_below"] is None else f"{r['reject_below']:g}"
         desc = " | ".join(line for line in r["description"].splitlines() if line.strip())
-        typer.echo(f"{r['class']:{width}}  {r['count']:5}  {thr:>6}  {desc}".rstrip())
+        typer.echo(f"{r['name']:{width}}  {r['count']:5}  {thr:>6}  {desc}".rstrip())
 
 
 cls_app.command("list", hidden=True)(class_ls)
