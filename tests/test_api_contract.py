@@ -2,15 +2,21 @@
 merge-patch settings, near-miss class names, deduplicated uploads, ETag/If-Match, jobs,
 versioning and an OpenAPI schema fit for generated clients."""
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
 import fewshot
 import fewshot.api
+import fewshot.routing
 import fewshot.services
+from fewshot import preconditions
 from fewshot.api import create_app
 from fewshot.errors import CODES, violation
-from fewshot.exceptions import NoExamples
+from fewshot.exceptions import NoExamples, RevisionChanged, error_code, http_status
 from fewshot.jobs import Job, Jobs
 from fewshot.server_settings import ServerSettings
 from tests.conftest import BLUE, RED, api_client, api_task, png, query_files, wait_for_job
@@ -44,7 +50,7 @@ def test_every_error_is_a_problem(client, task):
     """Route, method, domain, validation and access errors all answer the same envelope."""
     r = client.get("/api/tasks/pets")
     body = _problem(r, 404, "TASK_NOT_FOUND")
-    assert body == {"type": "https://fewshot.dev/problems/task-not-found", "title": "No such task", "status": 404,
+    assert body == {"type": "urn:fewshot:problem:task-not-found", "title": "No such task", "status": 404,
                     "code": "TASK_NOT_FOUND", "instance": "/api/tasks/pets", "task": "pets", "similar_to": [],
                     "detail": "No task 'pets'; create it with POST /api/tasks (fewshot.client: create_task)"}
     body = _problem(client.get("/api/tasks/C"), 404, "TASK_NOT_FOUND")
@@ -109,7 +115,19 @@ def test_violation_messages():
     assert violation({"loc": ("header", "x-a"), "input": True})["parameter"] == "x-a"
     assert violation({"loc": (), "input": None})["detail"] == "the body is invalid; got null"
     assert violation({"loc": ("query", "on"), "msg": "Bad", "input": False})["detail"] == "on bad; got false"
+    assert violation({"loc": ("query", "on"), "msg": "JSON is bad"})["detail"] == "on JSON is bad; got null"  # not jSON
+    assert violation({"type": "json_invalid", "loc": ("body",), "msg": "JSON decode error"})["detail"] == (
+        "the body isn't valid JSON")
     assert set(CODES) >= {"TASK_NOT_FOUND", "CLASS_NAME_NEAR_MISS", "VALIDATION_FAILED", "PRECONDITION_FAILED"}
+
+
+def test_a_body_that_isnt_json_says_where_it_stopped(client):
+    """Malformed JSON is a 422 saying where parsing stopped, pointing at the whole body, not at a
+    'field' named by the character offset."""
+    r = client.post("/api/tasks", content=b'{"name":', headers={"Content-Type": "application/json"})
+    body = _problem(r, 422, "VALIDATION_FAILED")
+    assert body["detail"] == "1 problem with the request: the body isn't valid JSON (at character 8): Expecting value"
+    assert (body["errors"][0]["pointer"], body["errors"][0]["code"]) == ("", "json_invalid")
 
 
 def test_access_errors_are_problems(tmp_path):
@@ -142,6 +160,22 @@ def test_payload_too_large_and_unsupported_media_type(client, task):
     for path in ("examples", "inbox", "predict"):
         r = client.post(f"/api/tasks/{task}/{path}", json={"label": "red", "files": []})
         assert "expects multipart/form-data" in _problem(r, 415, "UNSUPPORTED_MEDIA_TYPE")["detail"]
+
+
+def test_a_json_route_sent_another_kind_of_body_is_415(client, task):
+    """A form, or a body without a content type (curl -d without -H), sent to a JSON route is 415
+    saying what to send; JSON and +json types are read, and a route without a body ignores it."""
+    body = _problem(client.post("/api/tasks", data={"name": "x"}), 415, "UNSUPPORTED_MEDIA_TYPE")
+    assert body["detail"] == ("/api/tasks expects a JSON body sent as application/json, not "
+                              "application/x-www-form-urlencoded (with curl: -H 'content-type: application/json')")
+    r = client.patch(f"/api/tasks/{task}", content=b'{"flip": true}')
+    assert "not one without a content type" in _problem(r, 415, "UNSUPPORTED_MEDIA_TYPE")["detail"]
+    _problem(client.post("/api/tasks", files=_files("x", [1])), 415, "UNSUPPORTED_MEDIA_TYPE")
+    r = client.patch(f"/api/tasks/{task}", content=b'{"flip": true}',
+                     headers={"Content-Type": "application/merge-patch+json; charset=utf-8"})
+    assert (r.status_code, r.json()["flip"]) == (200, True)
+    assert client.post(f"/api/tasks/{task}/undo", data={"x": "y"}).status_code == 200
+    _problem(client.post("/api/tasks"), 422, "VALIDATION_FAILED")  # no body at all: the body is required
 
 
 # ---- status codes -------------------------------------------------------------------------
@@ -211,9 +245,15 @@ def test_labels_close_to_a_class_are_refused_on_every_route(client, task):
     r = client.post(f"/api/tasks/{task}/examples", data={"label": "green"}, files=_files("g", [8]))
     assert (r.status_code, r.json()["created_classes"]) == (201, ["green"])
     t = client.post(f"/api/tasks/{task}/inbox/accept", json={"labels": {inbox[1]: "Blue"}, "new_class": True}).json()
-    assert "Blue" in [c["name"] for c in t["classes"]]
+    assert ("Blue" in [c["name"] for c in t["classes"]], t["created_classes"]) == (True, ["Blue"])
     t = client.patch(f"/api/tasks/{task}/examples/{ex[0]['id']}", json={"label": "redd", "new_class": True}).json()
-    assert "redd" in [c["name"] for c in t["classes"]]
+    assert ("redd" in [c["name"] for c in t["classes"]], t["created_classes"]) == (True, ["redd"])
+    t = client.patch(f"/api/tasks/{task}/examples", json={"ids": [ex[1]["id"]], "label": "Sphynx"}).json()
+    assert t["created_classes"] == ["Sphynx"]
+    t = client.patch(f"/api/tasks/{task}/examples", json={"ids": [ex[1]["id"]], "label": "red"}).json()
+    assert t["created_classes"] == []
+    assert client.post(f"/api/tasks/{task}/inbox/accept", json={"labels": {inbox[0]: "blue"}}).json()[
+        "created_classes"] == []
     _problem(client.patch(f"/api/tasks/{task}/examples/{ex[1]['id']}", json={"label": " "}), 400, "INVALID_REQUEST")
 
 
@@ -233,6 +273,12 @@ def test_uploads_say_what_was_new_unchanged_or_moved(client, task):
     assert (r.status_code, r.json()["added"], len(r.json()["unchanged"])) == (200, [], 1)
     body = _problem(client.post(f"/api/tasks/{task}/inbox", files=_files("red", [0])), 400, "NO_IMAGES_ADDED")
     assert body["detail"].startswith("Nothing added to the inbox: red0.png: ")
+    assert [e["file"] for e in body["errors"]] == ["red0.png"]  # every readable image is an example already
+    r = client.post(f"/api/tasks/{task}/examples", data={"label": "red"},
+                    files=[("files", ("bad.png", b"junk", "image/png")), ("files", ("worse.png", b"", "image/png"))])
+    body = _problem(r, 400, "NO_IMAGES_ADDED")
+    assert [e["file"] for e in body["errors"]] == ["bad.png", "worse.png"]
+    assert all(e["error"] for e in body["errors"])
 
 
 # ---- settings as a merge patch -------------------------------------------------------------
@@ -279,6 +325,61 @@ def test_if_match_refuses_changes_to_a_task_changed_since(client, task):
         r = client.post(f"/api/tasks/{task}/describe", json={"overwrite": True}, headers={"If-Match": tag.format(now)})
         assert r.status_code == 200
     _problem(client.delete("/api/tasks/nope", headers={"If-Match": '"1"'}), 404, "TASK_NOT_FOUND")
+
+
+def test_if_match_is_checked_with_the_change_under_the_task_lock(client, task, monkeypatch):
+    """A change that passed the check on arrival is still refused if the task moved on before it
+    took the task's lock, on Starlette's threads and the heavy-work ones alike."""
+    rev = client.get(f"/api/tasks/{task}").json()["revision"]
+    client.post(f"/api/tasks/{task}/classes", json={"name": "green"})  # lands between the two checks
+
+    async def as_on_arrival(*_a):  # the task as the check on arrival saw it
+        return SimpleNamespace(config=SimpleNamespace(revision=rev))
+
+    monkeypatch.setattr(fewshot.routing, "run_in_threadpool", as_on_arrival)
+    r = client.post(f"/api/tasks/{task}/classes", json={"name": "amber"}, headers={"If-Match": f'"{rev}"'})
+    body = _problem(r, 412, "PRECONDITION_FAILED")
+    assert (body["task"], body["revision"]) == (task, rev + 1)
+    r = client.post(f"/api/tasks/{task}/examples", data={"label": "red"}, files=_files("x", [9]),
+                    headers={"If-Match": f'"{rev}"'})
+    _problem(r, 412, "PRECONDITION_FAILED")
+    after = client.get(f"/api/tasks/{task}").json()
+    assert (after["revision"], len(after["classes"]), len(after["examples"])) == (rev + 1, 3, 6)
+    monkeypatch.undo()
+    r = client.post(f"/api/tasks/{task}/classes", json={"name": "amber"}, headers={"If-Match": f'"{rev + 1}"'})
+    assert r.status_code == 201  # only the first change of a request is checked: it moved the revision on
+
+
+def test_concurrent_changes_with_one_if_match_make_one_change(client, task):
+    """Twenty changes sent at once naming the same revision: exactly one is made."""
+    rev = client.get(f"/api/tasks/{task}").json()["revision"]
+
+    def add(i):
+        return client.post(f"/api/tasks/{task}/classes", json={"name": f"class {i}"},
+                           headers={"If-Match": f'"{rev}"'}).status_code
+
+    with ThreadPoolExecutor(8) as pool:
+        codes = sorted(pool.map(add, range(20)))
+    assert codes == [201] + [412] * 19
+    assert client.get(f"/api/tasks/{task}").json()["revision"] == rev + 1
+
+
+def test_an_if_match_is_checked_by_the_first_change_to_its_task_only():
+    """Outside a request nothing is checked; inside one, the first change to the task named."""
+
+    def changes():
+        preconditions.check("a", 1)  # nothing expected
+        preconditions.expect("a", '"1"')
+        preconditions.check("b", 5)  # another task
+        preconditions.check("a", 1)
+        preconditions.check("a", 7)  # checked once: the first change moved the revision on
+        preconditions.expect("a", 'W/"1"')
+        with pytest.raises(RevisionChanged, match="at revision 2, not W/\"1\"") as e:
+            preconditions.check("a", 2)
+        assert (e.value.fields, http_status(e.value), error_code(e.value)) == (
+            {"task": "a", "revision": 2}, 412, "PRECONDITION_FAILED")
+
+    contextvars.copy_context().run(changes)
 
 
 # ---- jobs ---------------------------------------------------------------------------------
@@ -354,6 +455,28 @@ def test_openapi_fits_generated_clients(client):
     assert {t["name"] for t in spec["tags"]} == {"tasks", "classes", "examples", "inbox", "predict", "evaluate",
                                                   "jobs", "auth", "system"}
     assert "examples" in schemas["TaskCreate"]
+
+
+def test_openapi_declares_problem_json_if_match_and_etag(client):
+    """Errors are declared as application/problem+json (as sent), changes take an If-Match header,
+    responses carrying a task declare its ETag, and JSON routes their 415."""
+    spec = client.get("/openapi.json").json()
+    assert client.get("/openapi.json").json() == spec  # amended once
+    for item in spec["paths"].values():
+        for op in item.values():
+            for code, resp in op["responses"].items():
+                if code[0] in "45":
+                    assert list(resp["content"]) == ["application/problem+json"], (op["operationId"], code)
+    op = spec["paths"]["/api/tasks/{name}/classes"]["post"]
+    header = next(p for p in op["parameters"] if p["in"] == "header")
+    assert (header["name"], header["required"]) == ("If-Match", False)
+    assert set(op["responses"]["201"]["headers"]) == {"ETag"}
+    assert "415" in op["responses"]
+    assert "ETag" in spec["paths"]["/api/tasks/{name}/examples"]["post"]["responses"]["201"]["headers"]
+    assert "ETag" in spec["paths"]["/api/tasks/{name}/inbox/accept"]["post"]["responses"]["200"]["headers"]
+    assert "headers" not in spec["paths"]["/api/health"]["get"]["responses"]["200"]
+    assert not any(p["in"] == "header" for p in spec["paths"]["/api/tasks/{name}"]["get"].get("parameters", []))
+    assert "415" not in spec["paths"]["/api/tasks/{name}/undo"]["post"]["responses"]
 
 
 def test_failed_predictions_have_null_scores(client, task):

@@ -22,12 +22,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .exceptions import ClassNameNearMiss, error_code, http_status, message
+from .exceptions import ClassNameNearMiss, RevisionChanged, error_code, http_status, message
 
 log = logging.getLogger(__name__)
 
 PROBLEM_JSON = "application/problem+json"
-PROBLEM_TYPES = "https://fewshot.dev/problems/"
+PROBLEM_TYPES = "urn:fewshot:problem:"  # names, not links: the README lists the codes
 
 # ---- the codes ------------------------------------------------------------------
 TASK_NOT_FOUND = "TASK_NOT_FOUND"
@@ -188,7 +188,11 @@ def violation(error: Mapping[str, Any]) -> dict[str, Any]:
     kind = str(error.get("type", "invalid"))
     msg = str(error.get("msg", "Is invalid"))
     name = ".".join(map(str, path)) or ("the body" if where == "body" else str(where))
-    if kind == "missing":
+    if kind == "json_invalid":  # loc is ("body", the character offset), not a field
+        why = (error.get("ctx") or {}).get("error")
+        at = f" (at character {path[0]})" if path else ""
+        detail, path = f"the body isn't valid JSON{at}" + (f": {why}" if why else ""), []
+    elif kind == "missing":
         detail = f"{name} is required"
     elif kind == "extra_forbidden":
         detail = f"unknown field {name!r}"
@@ -197,7 +201,7 @@ def violation(error: Mapping[str, Any]) -> dict[str, Any]:
     elif kind in OWN_TYPES:
         detail = msg
     else:
-        rule = msg[0].lower() + msg[1:] if msg else "is invalid"
+        rule = msg[0].lower() + msg[1:] if msg[:2].istitle() else msg or "is invalid"  # "Input should", not "JSON"
         detail = f"{name} {rule.replace('input should be', 'must be', 1)}"
         value = error.get("input")
         got = value if where != "body" and isinstance(value, str) and len(value) <= 80 else _short(value)
@@ -241,6 +245,12 @@ async def validation_problem(request: Request, exc: Exception) -> JSONResponse:
     return problem_response(422, VALIDATION_FAILED, violations_detail(errors), request.url.path, errors=errors)
 
 
+async def precondition_problem(request: Request, exc: Exception) -> JSONResponse:
+    """412 for a change asked for at a revision the task has moved on from (see ``preconditions``)."""
+    assert isinstance(exc, RevisionChanged)
+    return problem_response(412, PRECONDITION_FAILED, message(exc), request.url.path, **exc.fields)
+
+
 async def internal_problem(request: Request, exc: Exception) -> JSONResponse:
     """500 for an unexpected error, noted in the log (the server then logs its traceback, as
     Starlette raises it on), while the body says only that it happened: the details can hold
@@ -253,4 +263,5 @@ def install(app: FastAPI) -> None:
     """Answer every error of ``app`` as a problem."""
     app.add_exception_handler(StarletteHTTPException, http_problem)
     app.add_exception_handler(RequestValidationError, validation_problem)
+    app.add_exception_handler(RevisionChanged, precondition_problem)
     app.add_exception_handler(Exception, internal_problem)

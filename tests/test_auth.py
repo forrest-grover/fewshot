@@ -417,5 +417,5 @@ def test_schema_declares_the_access_errors(client):
     paths = client.get("/openapi.json").json()["paths"]
     for op in (paths["/api/tasks"]["post"], paths["/api/tasks/{name}/examples"]["post"]):
         assert {"401", "403", "413", "429"} <= set(op["responses"]), op["operationId"]
-        schema = op["responses"]["403"]["content"]["application/json"]["schema"]
+        schema = op["responses"]["403"]["content"]["application/problem+json"]["schema"]
         assert schema == {"$ref": "#/components/schemas/Problem"}

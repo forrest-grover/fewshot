@@ -15,17 +15,15 @@ possible the task gets its own copy. A blob is removed when the last task file l
 The last ``HISTORY_KEPT`` versions of ``task.json`` are kept for ``Task.undo``. Image files of
 deleted examples stay until no kept version names them, so undoing a delete brings them back.
 
-Example ids are the first 32 hex chars (128 bits) of the SHA-256 of the image
-bytes (16 in tasks created before that; both are accepted), so
-adding the same image twice is a no-op (or a relabel), and cached embeddings
-are reused across tasks.
+Example ids are the first 32 hex chars (128 bits) of the SHA-256 of the image bytes (16 in tasks
+created before that; both are accepted), so adding the same image twice is a no-op (or a
+relabel), and cached embeddings are reused across tasks.
 
-Several processes (say ``fewshot serve`` and the CLI) can share a workspace.
-Each change to a task holds an exclusive lock on ``<task>/.lock``, re-reads
-``task.json`` if another process changed it, and replaces the file atomically,
-so no process overwrites another's changes. Reads pick up other processes'
-changes on the next ``Workspace.get``. The file lock needs ``fcntl`` (Linux,
-macOS); elsewhere only threads within one process are serialised.
+Several processes (say ``fewshot serve`` and the CLI) can share a workspace. Each change to a task
+holds an exclusive lock on ``<task>/.lock``, re-reads ``task.json`` if another process changed it,
+and replaces the file atomically, so no process overwrites another's changes. Reads pick up other
+processes' changes on the next ``Workspace.get``. The file lock needs ``fcntl`` (Linux, macOS);
+elsewhere only threads within one process are serialised.
 """
 
 from __future__ import annotations
@@ -47,6 +45,7 @@ from pydantic import ValidationError
 
 from . import blobs as _blobs
 from . import exceptions as exc
+from . import preconditions
 from .classifiers import CLASSIFIERS
 from .embedders import check_embedder, loaded_embedders
 from .folders import class_folders, read_or_empty, readable_name
@@ -201,6 +200,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
                     raise exc.TaskNotFound(f"No task {self.name!r}", task=self.name) from e
+                preconditions.check(self._published.name, self._published.revision)  # If-Match, atomically
                 self._draft = _copy_config(self._published)
                 self._writer = threading.get_ident()
                 self._depth = 1

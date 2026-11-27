@@ -5,7 +5,7 @@ afterEach(() => { vi.restoreAllMocks(); });
 
 describe("api errors", () => {
   it("reads a problem's code and one-line detail", async () => {
-    const problem = { type: "https://fewshot.dev/problems/task-not-found", title: "No such task", status: 404,
+    const problem = { type: "urn:fewshot:problem:task-not-found", title: "No such task", status: 404,
       code: "TASK_NOT_FOUND", detail: "No task 'pest'; did you mean 'pets'?", instance: "/api/tasks/pest" };
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(problem), {
       status: 404, headers: { "Content-Type": "application/problem+json" } }));

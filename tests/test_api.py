@@ -10,6 +10,7 @@ from PIL import Image
 
 import fewshot.api
 import fewshot.history
+import fewshot.routing
 from fewshot import models
 from fewshot.images import image_id
 from fewshot.store import Task, Workspace
@@ -614,7 +615,7 @@ def test_an_upload_whose_files_are_closed_stops_cleanly(client, monkeypatch, cap
     files = [UploadFile(io.BytesIO(png(RED, noise=10, seed=i)), filename=f"r{i}.png") for i in range(5)]
     files[3].file.close()
     with pytest.raises(HTTPException) as e:
-        fewshot.api._add_examples(client.srv, "t", "red", fewshot.api._uploads(client.srv, files))  # pylint: disable=protected-access
+        fewshot.api._add_examples(client.srv, "t", "red", fewshot.routing.uploads(client.srv, files))  # pylint: disable=protected-access
     assert (e.value.status_code, e.value.detail) == (
         400, "The upload stopped at file 4 of 5 (r3.png): it could no longer be read; images before it may have "
              "been stored")

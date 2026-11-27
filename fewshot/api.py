@@ -16,6 +16,7 @@ serialised in those threads too (``_json``), not on the event loop as FastAPI wo
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 import mimetypes
@@ -65,11 +66,17 @@ from .routing import (
     JOB_STARTED,
     MULTIPART,
     TAGS,
+    added_status,
+    amend_openapi,
     check_label,
+    edited_json,
     etag,
+    file_errors,
+    json_only,
     known_params,
     task_detail,
     task_json,
+    uploads,
 )
 from .schemas import (
     CLEAR_FLAGS,
@@ -101,6 +108,7 @@ from .schemas import (
     Rename,
     TaskCreate,
     TaskDetail,
+    TaskEdited,
     TaskSettings,
     TaskSummary,
     Urls,
@@ -157,7 +165,8 @@ class Server:  # pylint: disable=too-many-instance-attributes  # the server's pa
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """``fn(*args)`` on the heavy-work threads, so it waits there, not in Starlette's pool."""
-        return await asyncio.get_running_loop().run_in_executor(self.heavy, functools.partial(fn, *args))
+        ctx = contextvars.copy_context()  # the request's (see ``preconditions``), as Starlette's pool does
+        return await asyncio.get_running_loop().run_in_executor(self.heavy, ctx.run, functools.partial(fn, *args))
 
     async def render(self, model: Any, fn: Callable[..., Any], *args: Any, status: int = 200) -> Response:
         """``fn(*args)`` on the heavy-work threads, as JSON validated as ``model`` (see ``_json``)."""
@@ -249,6 +258,7 @@ def create_app(settings: ServerSettings | None = None, workspace: Workspace | No
     app.include_router(router)
     app.middleware("http")(guard)
     errors.install(app)
+    amend_openapi(app)
     # Added last, so it runs first.
     app.add_middleware(LimitBody, limit=functools.partial(body_limit, server.settings.max_request_bytes))
     mount_ui(app, Path(__file__).resolve().parent.parent / "web" / "dist")
@@ -272,7 +282,7 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-router = APIRouter(responses=ERRORS, dependencies=[Depends(known_params)])
+router = APIRouter(responses=ERRORS, dependencies=[Depends(known_params), Depends(json_only)])
 
 
 # ---- metadata -----------------------------------------------------------
@@ -551,29 +561,6 @@ def list_examples(srv: Srv, name: str, offset: int = Query(0, ge=0), limit: int 
                                "examples": [e.model_dump() for e in found[offset : offset + limit]]})
 
 
-def _uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
-    """The uploaded files, each read only when it is needed, so a big upload is never held in
-    memory whole; one over the upload limit carries an error instead of its bytes. A file that
-    can't be read any more (closed as the request was abandoned) stops the upload with a 400 and
-    a log line: the batch being read isn't stored, batches stored before it stay."""
-    limit = srv.settings.max_upload_bytes
-    for i, f in enumerate(files):
-        # Browsers (and fewshot.client) send a '"' in a file name as %22, per the HTML standard;
-        # the multipart parser leaves it encoded.
-        name = f.filename.replace("%22", '"') if f.filename else ""
-        try:
-            data = f.file.read(limit + 1)
-        except (ValueError, OSError) as e:  # ValueError: read of a closed file
-            log.warning("Stopped an upload at file %d of %d (%s): it can't be read any more (%s), most likely as "
-                        "the client went away; batches stored before it are kept", i + 1, len(files), name, e)
-            raise ApiProblem(400, errors.UPLOAD_INTERRUPTED, f"The upload stopped at file {i + 1} of {len(files)} "
-                             f"({name}): it could no longer be read; images before it may have been stored") from None
-        if len(data) > limit:
-            yield services.Blob(name, None, f"File is larger than the {limit / 1024 / 1024:g} MB upload limit")
-        else:
-            yield services.Blob(name, data)
-
-
 def _downloads(srv: Server, urls: list[str]) -> list[services.Blob]:
     """Fetch image URLs for the server (public addresses only); 403 unless it allows URLs. A few
     at a time, with a budget for the whole request: at most the request size limit in all and
@@ -590,30 +577,17 @@ UNDO_GROUP = Form(None, max_length=64, description=(
     "to the task with the same id, with no other change in between, are one undo step"))
 NEW_CLASS = Form(False, description="Create the class even if its name is close to an existing class's (which is "
                                     "otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)")
-def _errors(r: services.Added) -> list[dict[str, str]]:
-    return [{"file": f, "error": why} for f, why in r.errors]
-
-
-def _added_status(r: services.Added, what: str) -> int:
-    """201 if anything new was stored, 200 if every readable image was there already, else 400."""
-    if r.new:
-        return 201
-    if r.added:
-        return 200
-    raise ApiProblem(400, errors.NO_IMAGES_ADDED, f"{what}: " + "; ".join(f"{f}: {why}" for f, why in r.errors))
-
-
 def _add_examples(srv: Server, name: str, label: str,  # pylint: disable=too-many-arguments,too-many-positional-arguments
                   blobs: Iterator[services.Blob] | list[services.Blob], undo_group: str | None = None,
                   new_class: bool = False) -> Response:
-    """Add the readable ``blobs`` as examples of ``label`` (see ``_added_status``)."""
+    """Add the readable ``blobs`` as examples of ``label`` (see ``routing.added_status``)."""
     t = srv.task(name)
     check_label(t, label, new_class, "/label")
     with refusals():
         r = services.add_examples(t, label, blobs, undo_group, new_class=new_class)
-    status = _added_status(r, "No images added")
+    status = added_status(r, "No images added")
     return json_response(AddResult, {
-        "added": [e.model_dump() for e in r.new], "task": task_detail(t), "errors": _errors(r),
+        "added": [e.model_dump() for e in r.new], "task": task_detail(t), "errors": file_errors(r),
         "unchanged": [e.model_dump() for e in r.unchanged],
         "moved": [{"id": e.id, "previous_label": was} for e, was in r.moved], "created_classes": r.created},
         status, etag(t))
@@ -628,7 +602,7 @@ async def add_examples(srv: Srv, name: str, label: str = Form(...), files: list[
     an existing class's needs ``new_class``). Images are deduplicated by content, so sending an
     upload again is safe: 201 if anything was new, 200 if every image was there already, 400
     NO_IMAGES_ADDED if none could be read; unreadable files are listed in ``errors``."""
-    return await srv.run(_add_examples, srv, name, label, _uploads(srv, files), undo_group or None, new_class)
+    return await srv.run(_add_examples, srv, name, label, uploads(srv, files), undo_group or None, new_class)
 
 
 def _add_examples_by_url(srv: Server, name: str, body: LabelledUrls) -> Response:
@@ -645,12 +619,14 @@ async def add_examples_by_url(srv: Srv, name: str, body: LabelledUrls) -> Respon
     return await srv.run(_add_examples_by_url, srv, name, body)
 
 
-@router.patch("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail, tags=["examples"],
+@router.patch("/api/tasks/{name}/examples/{eid}", response_model=TaskEdited, tags=["examples"],
               summary="Relabel, tag or annotate an example", dependencies=IF_MATCH, responses=PRECONDITION)
 def edit_example(srv: Srv, name: str, eid: str, body: ExampleEdit) -> Response:
     """Move an example to another (possibly new) class, and/or set its tags or note, as one change
-    (one undo step). A new class name close to an existing class's needs ``new_class``."""
+    (one undo step). A new class name close to an existing class's needs ``new_class``;
+    ``created_classes`` names the class if this created it."""
     t = srv.task(name)
+    before = t.class_names()
     with refusals():
         t.example(eid)  # 404 for an unknown id, even if the edit is empty
     if body.label is not None:
@@ -658,7 +634,7 @@ def edit_example(srv: Srv, name: str, eid: str, body: ExampleEdit) -> Response:
     with refusals():
         if body.label is not None or body.tags is not None or body.note is not None:
             t.edit_examples([eid], label=body.label, tags=body.tags, note=body.note)
-    return task_json(t)
+    return edited_json(t, before)
 
 
 @router.delete("/api/tasks/{name}/examples/{eid}", response_model=TaskDetail, tags=["examples"],
@@ -671,13 +647,14 @@ def delete_example(srv: Srv, name: str, eid: str) -> Response:
     return task_json(t)
 
 
-@router.patch("/api/tasks/{name}/examples", response_model=TaskDetail, tags=["examples"],
+@router.patch("/api/tasks/{name}/examples", response_model=TaskEdited, tags=["examples"],
               summary="Relabel or tag several examples", dependencies=IF_MATCH, responses=PRECONDITION)
 def edit_examples(srv: Srv, name: str, body: BulkEdit) -> Response:
     """Move several examples to another (possibly new) class and/or tag them, as one change (one
     undo step); an unknown id changes nothing (404). A new class name close to an existing
-    class's needs ``new_class``."""
+    class's needs ``new_class``; ``created_classes`` names the class if this created it."""
     t = srv.task(name)
+    before = t.class_names()
     with refusals():
         # 404 for an unknown id, even if the edit is empty; by dict, not one scan per id (minutes for many)
         t._examples(body.ids)  # pylint: disable=protected-access
@@ -686,7 +663,7 @@ def edit_examples(srv: Srv, name: str, body: BulkEdit) -> Response:
     with refusals():
         if body.label is not None or body.add_tags or body.remove_tags:
             t.edit_examples(body.ids, label=body.label, add_tags=body.add_tags, remove_tags=body.remove_tags)
-    return task_json(t)
+    return edited_json(t, before)
 
 
 @router.post("/api/tasks/{name}/examples/delete", response_model=TaskDetail, tags=["examples"],
@@ -733,14 +710,14 @@ async def example_image(srv: Srv, name: str, eid: str,
 # ---- inbox --------------------------------------------------------------
 def _add_inbox(srv: Server, name: str, blobs: Iterator[services.Blob] | list[services.Blob],
                undo_group: str | None = None) -> Response:
-    """Put the readable ``blobs`` in the inbox (see ``_added_status``)."""
+    """Put the readable ``blobs`` in the inbox (see ``routing.added_status``)."""
     t = srv.task(name)
     with refusals():
         r = services.add_to_inbox(t, blobs, undo_group)
-    status = _added_status(r, "Nothing added to the inbox")
+    status = added_status(r, "Nothing added to the inbox")
     return json_response(InboxAdded, {"added": [x.model_dump() for x in r.new],
                                       "unchanged": [x.model_dump() for x in r.unchanged],
-                                      "errors": _errors(r), "task": task_detail(t)}, status, etag(t))
+                                      "errors": file_errors(r), "task": task_detail(t)}, status, etag(t))
 
 
 @router.post("/api/tasks/{name}/inbox", status_code=201, response_model=InboxAdded, tags=["inbox"],
@@ -751,7 +728,7 @@ async def add_to_inbox(srv: Srv, name: str, files: list[UploadFile] = File(...),
     """Upload unlabelled images to the task's inbox, to label later with the model's suggestions.
     Deduplicated by content, as examples are: 201 if anything was new, 200 if every image was
     waiting already; an image that is an example already is listed in ``errors``."""
-    return await srv.run(_add_inbox, srv, name, _uploads(srv, files), undo_group or None)
+    return await srv.run(_add_inbox, srv, name, uploads(srv, files), undo_group or None)
 
 
 def _add_inbox_by_url(srv: Server, name: str, urls: list[str]) -> Response:
@@ -782,12 +759,14 @@ async def list_inbox(srv: Srv, name: str, sort: InboxSort = "uncertain",
     return await srv.render(InboxPage, _inbox_page, srv, name, sort, offset, limit)
 
 
-@router.post("/api/tasks/{name}/inbox/accept", response_model=TaskDetail, tags=["inbox"],
+@router.post("/api/tasks/{name}/inbox/accept", response_model=TaskEdited, tags=["inbox"],
              summary="Label inbox images", dependencies=IF_MATCH, responses=PRECONDITION)
 def accept_inbox(srv: Srv, name: str, body: InboxLabels) -> Response:
     """Label inbox images, moving them to the examples (one undo step); 404 if an id isn't
-    waiting. A new class name close to an existing class's needs ``new_class``."""
+    waiting. A new class name close to an existing class's needs ``new_class``;
+    ``created_classes`` names the classes this created."""
     t = srv.task(name)
+    before = t.class_names()
     first: dict[str, str] = {}  # each label, with the first id given it
     for iid, label in body.labels.items():
         first.setdefault(label, iid)
@@ -795,7 +774,7 @@ def accept_inbox(srv: Srv, name: str, body: InboxLabels) -> Response:
         check_label(t, label, body.new_class, "/labels/" + errors.escape(iid))
     with refusals():
         t.accept(body.labels)
-    return task_json(t)
+    return edited_json(t, before)
 
 
 def _accept_confident(srv: Server, name: str, body: AcceptConfident) -> Response:
@@ -852,7 +831,7 @@ async def predict(srv: Srv, name: str, files: list[UploadFile] = File(...),  # p
                   revision: int | None = REVISION) -> Response:
     """Classify uploaded images, in the order sent; an unreadable file gets ``error`` set and its
     other fields empty (null scores). Each prediction says which ``revision`` of the task made it."""
-    return await srv.render(list[PredictionOut], _predict, srv, name, _uploads(srv, files), top_k, evidence, revision)
+    return await srv.render(list[PredictionOut], _predict, srv, name, uploads(srv, files), top_k, evidence, revision)
 
 
 def _predict_urls(srv: Server, name: str, urls: list[str], top_k: int | None, evidence: int,  # pylint: disable=too-many-arguments,too-many-positional-arguments

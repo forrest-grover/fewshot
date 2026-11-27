@@ -25,6 +25,7 @@ from fewshot.client import (
     JobFailedError,
     JobResultExpiredError,
     NotFoundError,
+    PermissionDeniedError,
     ServerError,
     ValidationError,
     _batches,
@@ -92,6 +93,7 @@ def test_client_errors(server):
     with pytest.raises(AuthenticationError) as e:
         Client(server, token="wrong").tasks()
     assert (e.value.status, e.value.status_code, e.value.code) == (401, 401, "WRONG_TOKEN")
+    assert not issubclass(PermissionDeniedError, AuthenticationError)  # a 403 isn't about the token
     fs = Client(server, token="secret-0123456789")
     fs.create_task("pets", embedder="fake:color")
     with pytest.raises(NotFoundError, match=r"^TASK_NOT_FOUND: No task 'pest'") as nf:
@@ -165,10 +167,10 @@ def test_a_refused_batch_doesnt_lose_the_others(server, monkeypatch):
     fs.create_task("refused", embedder="fake:color")
     bad = [("x.png", b"junk"), ("y.png", b"junk")]
     r = fs.add_examples("refused", "red", [*bad, ("r.png", png(RED))])
-    assert (len(r["added"]), r["errors"][0]["file"], len(r["task"]["examples"])) == (1, None, 1)
-    assert "No images added" in r["errors"][0]["error"]
+    assert (len(r["added"]), [e["file"] for e in r["errors"]], len(r["task"]["examples"])) == (1, ["x.png", "y.png"], 1)
+    assert "Not a readable image" in r["errors"][0]["error"]  # each file's reason, as the server lists them
     i = fs.add_to_inbox("refused", [("r.png", png(RED)), ("r2.png", png(RED)), ("u.png", png(BLUE))])
-    assert (len(i["added"]), len(i["errors"])) == (1, 1)  # the first batch is all examples already
+    assert (len(i["added"]), [e["file"] for e in i["errors"]]) == (1, ["r.png", "r2.png"])  # examples already
     with pytest.raises(ApiError) as e:
         fs.add_examples("refused", "red", [*bad, *bad])
     assert e.value.status == 400
@@ -438,8 +440,8 @@ def test_jobs(server):
     assert (report["method"], job.status(), job.result()["accuracy"]) == ("3-fold", "done", 1.0)
     assert set(seen) <= {"running"}
     assert fs.job(job.id).result() == report
-    assert fs.evaluate("jobs", timeout=30, poll=0.01)["n_examples"] == 6
-    assert fs.compare("jobs", ["fake:color"], folds=2, poll=0.01)["best"] == "fake:color"
+    assert fs.evaluate("jobs", None, 0.01, timeout=30)["n_examples"] == 6  # poll stays positional, as it was
+    assert fs.compare("jobs", ["fake:color"], 2, 0.01)["best"] == "fake:color"
     assert fs.start_compare("jobs", ["fake:color"]).wait(poll=0.01)["results"][0]["embedder"] == "fake:color"
     with pytest.raises(NotFoundError, match="JOB_NOT_FOUND"):
         fs.job("nope")
@@ -544,7 +546,8 @@ def test_typed_dicts_mirror_the_schemas():
 
     pairs = {"Health": "Health", "LastEvaluation": "LastEvaluation", "TaskSummary": "TaskSummary",
              "ClassInfo": "ClassOut", "Example": "ExampleOut", "InboxItem": "InboxItemOut",
-             "TaskDetail": "TaskDetail", "ExamplePage": "ExamplePage", "FileError": "FileError",
+             "TaskDetail": "TaskDetail", "TaskEdited": "TaskEdited", "ExamplePage": "ExamplePage",
+             "FileError": "FileError",
              "MovedExample": "MovedExample", "AddResult": "AddResult", "InboxAdded": "InboxAdded",
              "Evidence": "Evidence", "Prediction": "PredictionOut", "InboxEntry": "InboxEntry",
              "InboxPage": "InboxPage", "DuplicatePair": "DuplicatePair", "ClassMetrics": "ClassMetrics",

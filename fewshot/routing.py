@@ -1,27 +1,33 @@
 """What the API's routes share besides the server itself: the checks that run before them
-(unknown query parameters, If-Match, multipart bodies), the near-miss class name check, a task's
-detail and ETag, and OpenAPI metadata (tags, extra responses)."""
+(unknown query parameters, the kind of body, If-Match), reading uploads and reporting what they
+added, the near-miss class name check, a task's detail and ETag, and OpenAPI metadata (tags,
+extra responses, and what FastAPI can't declare: see ``amend_openapi``)."""
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from fastapi import Depends, Request
+from fastapi import Depends, FastAPI, Header, Request, UploadFile, params
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response
 from fastapi.routing import APIRoute
+from starlette.concurrency import run_in_threadpool
 
-from . import errors, services
+from . import errors, preconditions, services
 from .embedders import spec_supports_text
 from .errors import ApiProblem, from_error
 from .exceptions import ClassNameNearMiss
 from .responses import json_response
-from .schemas import AddResult, InboxAdded, TaskDetail
+from .schemas import AddResult, InboxAdded, TaskDetail, TaskEdited
 from .store import Task
 from .text import check_class_name, closest
 
 if TYPE_CHECKING:
     from .api import Server
+
+log = logging.getLogger(__name__)
 
 TAGS = [
     {"name": "tasks", "description": "Create, configure, rename, copy, export and import tasks; undo and redo"},
@@ -52,6 +58,27 @@ async def known_params(request: Request) -> None:
             for k in unknown])
 
 
+async def json_only(request: Request) -> None:
+    """415 for a route that takes a JSON body sent a body of another kind, or of none (a form, or
+    ``curl -d`` without ``-H 'content-type: application/json'``), as upload routes refuse JSON: the
+    framework would read it as no body at all, or one that isn't an object (422)."""
+    route = request.scope.get("route")
+    kind = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    sent = request.headers.get("content-length", "0") != "0" or "transfer-encoding" in request.headers
+    is_json = kind == "application/json" or (kind.startswith("application/") and kind.endswith("+json"))
+    if is_json or not (kind or sent) or not isinstance(route, APIRoute) or not takes_json(route):
+        return
+    raise ApiProblem(415, errors.UNSUPPORTED_MEDIA_TYPE, f"{request.url.path} expects a JSON body sent as "
+                     f"application/json, not {kind or 'one without a content type'} (with curl: -H "
+                     "'content-type: application/json')")
+
+
+def takes_json(route: APIRoute) -> bool:
+    """Whether ``route`` takes a JSON body (not a form, not none)."""
+    return bool(route.dependant.body_params) and not any(
+        isinstance(p.field_info, params.Form) for p in route.dependant.body_params)
+
+
 def query_names(route: APIRoute) -> list[str]:
     """The query parameters ``route`` takes, its dependencies' among them (kept on the route)."""
     names: list[str] | None = getattr(route, "fewshot_query_names", None)
@@ -77,20 +104,28 @@ def task_json(t: Task, status: int = 200) -> Response:
     return json_response(TaskDetail, task_detail(t), status, etag(t))
 
 
-def _if_match(name: str, request: Request) -> None:
+def edited_json(t: Task, before: list[str]) -> Response:
+    """The task's detail after a change that may create classes, naming the classes it has that
+    it didn't have ``before`` (see ``TaskEdited``)."""
+    known = set(before)
+    created = [c for c in t.class_names() if c not in known]
+    return json_response(TaskEdited, {**task_detail(t), "created_classes": created}, 200, etag(t))
+
+
+async def _if_match(name: str, request: Request, if_match: str | None = Header(
+        None, alias="If-Match", description='Change the task only if it is still at this revision: its ETag, '
+                                            'such as "12" (412 PRECONDITION_FAILED if it moved on)')) -> None:
     """412 if the request has an If-Match header that doesn't name the task's current revision
-    (as its ETag gives it), so a client can change a task only as it last saw it. Checked when the
-    request arrives; without If-Match, changes are made whatever the revision."""
-    given = request.headers.get("if-match")
-    if given is None:
+    (as its ETag gives it), so a client can change a task only as it last saw it. Checked now, and
+    again by the change itself under the task's write lock (see ``preconditions``), so of several
+    changes sent with the same If-Match at once only one is made. Without If-Match, changes are made
+    whatever the revision. Async, so ``expect`` holds for the request's whole context."""
+    if if_match is None:
         return
+    preconditions.expect(name, if_match)
     srv: Server = request.app.state.server
-    current = srv.task(name).config.revision
-    tags = [g.strip().removeprefix("W/").strip('"') for g in given.split(",")]
-    if "*" not in tags and str(current) not in tags:
-        raise ApiProblem(412, errors.PRECONDITION_FAILED, f"Task {name!r} is at revision {current}, not {given}: it "
-                         f"changed since; get it again (GET /api/tasks/{name}) and redo the change if it still applies",
-                         task=name, revision=current)
+    t = await run_in_threadpool(srv.task, name)
+    preconditions.require(name, if_match, t.config.revision)  # also when the request changes nothing
 
 
 IF_MATCH = [Depends(_if_match)]
@@ -104,6 +139,46 @@ async def _multipart(request: Request) -> None:
 
 
 MULTIPART = [Depends(_multipart)]
+
+
+def uploads(srv: Server, files: list[UploadFile]) -> Iterator[services.Blob]:
+    """The uploaded files, each read only when it is needed, so a big upload is never held in
+    memory whole; one over the upload limit carries an error instead of its bytes. A file that
+    can't be read any more (closed as the request was abandoned) stops the upload with a 400 and
+    a log line: the batch being read isn't stored, batches stored before it stay."""
+    limit = srv.settings.max_upload_bytes
+    for i, f in enumerate(files):
+        # Browsers (and fewshot.client) send a '"' in a file name as %22, per the HTML standard;
+        # the multipart parser leaves it encoded.
+        name = f.filename.replace("%22", '"') if f.filename else ""
+        try:
+            data = f.file.read(limit + 1)
+        except (ValueError, OSError) as e:  # ValueError: read of a closed file
+            log.warning("Stopped an upload at file %d of %d (%s): it can't be read any more (%s), most likely as "
+                        "the client went away; batches stored before it are kept", i + 1, len(files), name, e)
+            raise ApiProblem(400, errors.UPLOAD_INTERRUPTED, f"The upload stopped at file {i + 1} of {len(files)} "
+                             f"({name}): it could no longer be read; images before it may have been stored") from None
+        if len(data) > limit:
+            yield services.Blob(name, None, f"File is larger than the {limit / 1024 / 1024:g} MB upload limit")
+        else:
+            yield services.Blob(name, data)
+
+
+def file_errors(r: services.Added) -> list[dict[str, str]]:
+    """Each file that couldn't be used, and why."""
+    return [{"file": f, "error": why} for f, why in r.errors]
+
+
+def added_status(r: services.Added, what: str) -> int:
+    """201 if anything new was stored, 200 if every readable image was there already, else 400
+    (no image could be read, or for the inbox every one is an example already), listing each
+    file and why in ``errors``."""
+    if r.new:
+        return 201
+    if r.added:
+        return 200
+    raise ApiProblem(400, errors.NO_IMAGES_ADDED, f"{what}: " + "; ".join(f"{f}: {why}" for f, why in r.errors),
+                     errors=file_errors(r))
 
 
 def check_label(t: Task, label: str, new_class: bool, pointer: str) -> None:
@@ -158,3 +233,40 @@ INBOX_ADDED: dict[int | str, dict[str, Any]] = {
 JOB_STARTED: dict[int | str, dict[str, Any]] = {202: {"headers": {
     "Location": {"description": "The job, to poll", "schema": {"type": "string"}},
     "Retry-After": {"description": "Seconds to wait before polling", "schema": {"type": "integer"}}}}}
+
+
+# Responses that carry a task, and so its ETag.
+WITH_ETAG = {"TaskDetail", "TaskEdited", "AddResult", "InboxAdded"}
+REF = "#/components/schemas/"
+
+
+def amend_openapi(app: FastAPI) -> None:
+    """Make ``app``'s schema say what the server sends, which FastAPI can't declare: errors as
+    ``application/problem+json``, the ETag of responses that carry a task, and 415 for a route
+    whose body is of the wrong kind (see ``json_only``)."""
+    build = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is None:
+            for item in build()["paths"].values():
+                for op in item.values():
+                    _amend(op)
+        assert app.openapi_schema is not None
+        return app.openapi_schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
+
+
+def _amend(op: dict[str, Any]) -> None:
+    responses: dict[str, dict[str, Any]] = op["responses"]
+    if "application/json" in op.get("requestBody", {}).get("content", {}):
+        responses.setdefault("415", {"description": "Not an application/json body (application/problem+json)",
+                                     "content": {"application/json": {"schema": {"$ref": REF + "Problem"}}}})
+    for status, r in responses.items():
+        content = r.get("content", {})
+        ref = content.get("application/json", {}).get("schema", {}).get("$ref", "")
+        if status[0] in "45" and ref == REF + "Problem":
+            r["content"] = {errors.PROBLEM_JSON: content.pop("application/json"), **content}
+        elif status[0] == "2" and ref.removeprefix(REF) in WITH_ETAG:
+            r.setdefault("headers", {})["ETag"] = {"schema": {"type": "string"}, "description": (
+                'The task\'s revision, such as "12", to send back as If-Match')}

@@ -114,10 +114,22 @@ class NoExamples(Refused):
     code = "NO_EXAMPLES"
 
 
+class RevisionChanged(Exception):
+    """A change asked for only at a revision the task has moved on from (the API's If-Match; see
+    ``preconditions``). Not a ``ValueError``, so nothing that reports refused items swallows it."""
+
+    code = "PRECONDITION_FAILED"
+
+    def __init__(self, text: str, **fields: Any) -> None:
+        super().__init__(text)
+        self.fields = fields
+
 
 def http_status(e: BaseException) -> int:
     """The HTTP status that answers ``e``: 404 for a missing thing, 409 for a conflict, 422 for a
-    likely typo of a class name, 400 for another refusal, else 500."""
+    likely typo of a class name, 412 for a revision moved on from, 400 for another refusal, else 500."""
+    if isinstance(e, RevisionChanged):
+        return 412
     if isinstance(e, KeyError):
         return 404
     if isinstance(e, Conflict):

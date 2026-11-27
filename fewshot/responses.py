@@ -61,13 +61,20 @@ class Violation(BaseModel):
     msg: str = Field(json_schema_extra={"deprecated": True})  # pydantic's message: use detail
 
 
+class FileError(BaseModel):
+    """A file (or URL) that could not be used."""
+
+    file: str | None
+    error: str
+
+
 class Problem(BaseModel):
     """An error (RFC 9457, sent as ``application/problem+json``). ``code`` is stable and meant for
     programs; ``detail`` is one line for people. The other members are present when they apply."""
 
     model_config = ConfigDict(extra="allow")  # clients must ignore members they don't know
 
-    type: str  # https://fewshot.dev/problems/<code>, or about:blank for plain HTTP errors
+    type: str  # urn:fewshot:problem:<code> (a name, not a link), or about:blank for plain HTTP errors
     title: str  # the code's (or status's) short summary
     status: int
     detail: str
@@ -81,7 +88,8 @@ class Problem(BaseModel):
     limit_bytes: int | None = None  # the size limit passed (413)
     similar_to: list[str] | None = None  # the closest existing names
     pointer: str | None = None  # the body member concerned
-    errors: list[Violation] | None = None  # every problem of a request that doesn't validate (422)
+    # every problem of a request that doesn't validate (422), or each file that couldn't be added (400 NO_IMAGES_ADDED)
+    errors: list[Violation] | list[FileError] | None = None
 
 
 def json_response(model: Any, content: Any, status: int = 200, headers: dict[str, str] | None = None) -> Response:
@@ -93,7 +101,7 @@ def json_response(model: Any, content: Any, status: int = 200, headers: dict[str
 
 
 def _problem(description: str) -> dict[str, Any]:
-    return {"model": Problem, "description": description + " (application/problem+json)"}
+    return {"model": Problem, "description": description}
 
 
 # What every route may answer: the access checks and body limits (``access``, ``guard``) and the

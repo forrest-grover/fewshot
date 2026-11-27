@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .classifiers import CLASSIFIERS, SETTING_MAX
 from .models import MAX_NOTE
-from .responses import Problem
+from .responses import FileError, Problem
 from .text import MAX_DESCRIPTION
 
 MAX_URLS = 100  # per request
@@ -128,19 +128,19 @@ class TaskDetail(BaseModel):
     examples: list[ExampleOut]
 
 
+class TaskEdited(TaskDetail):
+    """The task after labelling inbox images or relabelling examples, which creates a class named
+    for the first time: ``created_classes`` names those this change created."""
+
+    created_classes: list[str]
+
+
 class ExamplePage(BaseModel):
     """GET .../examples: ``examples`` is the page starting at ``offset`` of ``total`` matches."""
 
     total: int
     offset: int
     examples: list[ExampleOut]
-
-
-class FileError(BaseModel):
-    """A file (or URL) that could not be used."""
-
-    file: str | None
-    error: str
 
 
 class MovedExample(BaseModel):
@@ -288,6 +288,7 @@ class EvalReport(BaseModel):
     suggested_reject_below: float | None  # keeps 95% of correct predictions
     suggested_class_thresholds: dict[str, float]  # the same per class, for classes with 5+ correct
     calibration: Calibration | None  # None with fewer than 50 scored examples
+    warnings: list[str]  # what makes the numbers misleading, such as a task with one class
 
 
 class CompareResult(BaseModel):

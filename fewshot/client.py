@@ -152,6 +152,12 @@ class TaskDetail(TypedDict):
     examples: list[Example]
 
 
+class TaskEdited(TaskDetail):
+    """``accept_inbox()``: the task, and the classes the change created."""
+
+    created_classes: list[str]
+
+
 class ExamplePage(TypedDict):
     """One page of ``examples()``."""
 
@@ -301,6 +307,7 @@ class EvalReport(TypedDict):
     suggested_reject_below: float | None
     suggested_class_thresholds: dict[str, float]
     calibration: Calibration | None
+    warnings: list[str]
 
 
 class CompareResult(TypedDict):
@@ -369,11 +376,12 @@ class BadRequestError(ApiError):
 
 
 class AuthenticationError(ApiError):
-    """401: not signed in, or a wrong token (403 too: see ``PermissionDeniedError``)."""
+    """401: not signed in, or a wrong token."""
 
 
-class PermissionDeniedError(AuthenticationError):
-    """403: refused by the server's settings (a model or URL fetching it doesn't allow, a cross-site request)."""
+class PermissionDeniedError(ApiError):
+    """403: refused by the server's settings (a model or URL fetching it doesn't allow, a cross-site
+    request), whatever the token: not an ``AuthenticationError``."""
 
 
 class NotFoundError(ApiError):
@@ -761,7 +769,8 @@ class Client:  # pylint: disable=too-many-public-methods  # one method per commo
         """POST ``images`` a batch at a time, all one undo step (``if_match`` goes with the first);
         ``added``, ``unchanged``, ``moved``, ``created_classes`` and ``errors`` are combined,
         ``task`` is the last. A file that can't be read is listed in ``errors``. A batch refused
-        with 400 or 413 (nothing in it added) adds its reason to ``errors``; if every batch was
+        with 400 or 413 (nothing in it added) adds its files' reasons to ``errors`` (or the
+        batch's, with ``file`` None, when the server gives none per file); if every batch was
         refused, the first refusal is raised (``BadRequestError`` if no file could be read)."""
         out: dict[str, Any] = {"added": [], "unchanged": [], "errors": []}
         refused: ApiError | None = None
@@ -779,7 +788,8 @@ class Client:  # pylint: disable=too-many-public-methods  # one method per commo
                 if e.status not in {400, 413}:
                     raise
                 refused = refused or e
-                out["errors"] += [{"file": None, "error": e.detail}]
+                listed = e.fields.get("errors") if e.code == "NO_IMAGES_ADDED" else None  # each file, and why
+                out["errors"] += listed if isinstance(listed, list) else [{"file": None, "error": e.detail}]
                 continue
             if_match = None  # the first batch changed the revision
             _merge(out, r)
@@ -828,11 +838,12 @@ class Client:  # pylint: disable=too-many-public-methods  # one method per commo
                 return
 
     def accept_inbox(self, task: str, labels: dict[str, str], *, new_class: bool = False,
-                     if_match: int | None = None) -> TaskDetail:
+                     if_match: int | None = None) -> TaskEdited:
         """Label inbox images (``{id: class}``), moving them to the task's examples; a new class
-        name close to an existing class's needs ``new_class`` (as for ``add_examples``)."""
+        name close to an existing class's needs ``new_class`` (as for ``add_examples``), and
+        ``created_classes`` names the classes created."""
         body: dict[str, Any] = {"labels": labels, **({"new_class": True} if new_class else {})}
-        return cast(TaskDetail, self.request("POST", f"/tasks/{_seg(task)}/inbox/accept", json_body=body,
+        return cast(TaskEdited, self.request("POST", f"/tasks/{_seg(task)}/inbox/accept", json_body=body,
                                              headers=_if_match(if_match)))
 
     # ---- inference -----------------------------------------------------
@@ -871,16 +882,15 @@ class Client:  # pylint: disable=too-many-public-methods  # one method per commo
         body: dict[str, Any] = {"embedders": list(embedders), **({"folds": folds} if folds is not None else {})}
         return Job(self, self.request("POST", f"/tasks/{_seg(task)}/compare/jobs", json_body=body))
 
-    def evaluate(self, task: str, folds: int | None = None, *, timeout: float | None = None, poll: float = 1.0,
+    def evaluate(self, task: str, folds: int | None = None, poll: float = 1.0, *, timeout: float | None = None,
                  on_progress: Callable[[JobInfo], None] | None = None) -> EvalReport:
         """Cross-validate the task and return the report (accuracy, per-class metrics, mistakes...),
         as a background job (``start_evaluate``), so a long evaluation isn't cut off by the request
         timeout; see ``Job.wait`` for ``timeout``, ``poll`` and ``on_progress`` and the errors."""
         return _waited(self.start_evaluate(task, folds), timeout, on_progress, poll)
 
-    def compare(self, task: str, embedders: Sequence[str], folds: int | None = None, *,  # pylint: disable=too-many-arguments
-                timeout: float | None = None, poll: float = 1.0,
-                on_progress: Callable[[JobInfo], None] | None = None) -> CompareReport:
+    def compare(self, task: str, embedders: Sequence[str], folds: int | None = None, poll: float = 1.0, *,  # pylint: disable=too-many-arguments
+                timeout: float | None = None, on_progress: Callable[[JobInfo], None] | None = None) -> CompareReport:
         """Compare ``embedders`` on the task's own labelled examples and return the report, as
         ``evaluate`` does."""
         return _waited(self.start_compare(task, embedders, folds), timeout, on_progress, poll)
