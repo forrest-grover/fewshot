@@ -10,6 +10,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .exceptions import error_code, http_status, message
+
 log = logging.getLogger(__name__)
 
 
@@ -37,6 +39,8 @@ class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job'
     total: int = 0
     result: Any = None
     error: str | None = None
+    code: str | None = None  # the error's stable code (see ``exceptions``), when failed
+    error_status: int | None = None  # the HTTP status that would answer the error
     expired: bool = False  # finished long enough ago that its result is no longer kept
     finished: float | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -60,10 +64,13 @@ class Job:  # pylint: disable=too-many-instance-attributes  # a record of a job'
             if self.status == "running":
                 self.status = "cancelling"
 
-    def end(self, status: str, error: str | None = None) -> None:
-        """Record how the job ended."""
+    def end(self, status: str, error: BaseException | None = None) -> None:
+        """Record how the job ended, and the error that failed it."""
         with self._state:
-            self.status, self.error, self.finished = status, error, time.time()
+            self.status, self.finished = status, time.time()
+            if error is not None:
+                self.code, self.error_status = error_code(error), http_status(error)
+                self.error = message(error) if self.error_status < 500 else "Internal error; see the server log"
 
 
 class Jobs:
@@ -94,10 +101,10 @@ class Jobs:
             except Cancelled:
                 job.end("cancelled")
             except (ValueError, KeyError) as e:
-                job.end("failed", str(e.args[0]) if e.args else str(e))
-            except Exception:  # pylint: disable=broad-exception-caught  # reported to the poller
+                job.end("failed", e)
+            except Exception as e:  # pylint: disable=broad-exception-caught  # reported to the poller
                 log.exception("Job %s failed", job.id)
-                job.end("failed", "Internal error; see the server log")
+                job.end("failed", e)
             with self._lock:
                 self._forget_old()
 

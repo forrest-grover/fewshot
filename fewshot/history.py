@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from .exceptions import NothingToRedo, NothingToUndo, RevisionNotKept
 from .fsutil import fsync_dir as _fsync_dir
 from .fsutil import write_atomic as _write_atomic
 
@@ -382,7 +383,8 @@ class TaskHistory:
                 except (OSError, ValidationError):
                     break
                 return cfg.model_copy(update={"name": self.config.name})
-        raise KeyError(f"Revision {revision} of {self.config.name!r} is not kept (the last {HISTORY_KEPT} are)")
+        raise RevisionNotKept(f"Revision {revision} of {self.config.name!r} is not kept (the last {HISTORY_KEPT} are)",
+                              task=self.config.name)
 
     def can_undo(self) -> bool:
         """Whether there is an earlier version to go back to."""
@@ -421,7 +423,7 @@ class TaskHistory:
             while True:
                 snaps = self._history()
                 if not snaps:
-                    raise ValueError("Nothing to undo")
+                    raise NothingToUndo("Nothing to undo", task=self.config.name)
                 rev, snap = snaps[-1]
                 old = self._restorable(snap, "undo")
                 if not self._same(old):
@@ -455,7 +457,7 @@ class TaskHistory:
             while True:
                 redo = self._redo_list()
                 if not redo:
-                    raise ValueError("Nothing to redo")
+                    raise NothingToRedo("Nothing to redo", task=self.config.name)
                 rev, snap = redo[-1]
                 new = self._restorable(snap, "redo")
                 if not self._same(new):

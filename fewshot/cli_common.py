@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import difflib
 import json
 import logging
 import os
@@ -26,11 +25,13 @@ from typer.core import TyperCommand, TyperGroup
 from . import services
 from .classifiers import NotReady
 from .embedders import report_loading
+from .exceptions import ClassNameNearMiss
 from .fetch import fetch_url, is_url
 from .folders import image_files, readable_name
 from .inbox import ALREADY_LABELLED
 from .services import Added, Blob
 from .store import Task, Workspace
+from .text import closest
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline
@@ -262,40 +263,18 @@ def fail_on(e: Exception, task: str = "TASK") -> NoReturn:
 
 def did_you_mean(name: str, names: Sequence[str]) -> str:
     """``"; did you mean 'x'?"`` for the names closest to ``name`` (the same but for case first), or ``""``."""
-    same_case = [n for n in names if n.lower() == name.lower()]
-    close = same_case or difflib.get_close_matches(name, names, n=3, cutoff=0.6)
+    close = closest(name, names)
     return f"; did you mean {' or '.join(map(repr, close))}?" if close else ""
-
-
-def _edits(a: str, b: str) -> int:
-    """The edit (Levenshtein) distance between ``a`` and ``b``."""
-    row = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        prev, row[0] = row[0], i
-        for j, cb in enumerate(b, 1):
-            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (ca != cb))
-    return row[-1]
-
-
-def near_miss(name: str, names: Sequence[str]) -> str | None:
-    """An existing class name that ``name`` (not one of them) is probably a typo of: the same but
-    for case, or within 2 edits (1 for names of 4 characters or fewer)."""
-    allowed = 1 if len(name) <= 4 else 2
-    for n in names:
-        if n.lower() == name.lower() or _edits(n.lower(), name.lower()) <= allowed:
-            return n
-    return None
 
 
 def check_new_class(t: Task, label: str, new_class: bool) -> bool:
     """Before labelling images as ``label``: whether it is a new class. Unless ``new_class``, a
-    new name close to an existing class's is refused as a likely typo."""
-    names = t.class_names()
-    if label in names:
-        return False
-    if not new_class and (close := near_miss(label, names)):
-        fail(f"No class {label!r} in {t.name}; did you mean {close!r}? Pass --new-class to create it")
-    return True
+    new name close to an existing class's is refused as a likely typo (see
+    ``services.check_new_class``)."""
+    try:
+        return services.check_new_class(t, label, new_class)
+    except ClassNameNearMiss as e:
+        fail(f"{e} Pass --new-class to create it")
 
 
 def check_class(t: Task, label: str) -> None:
@@ -506,7 +485,7 @@ def add_files(task: Task, label: str, files: Sequence[Source]) -> Outcome:
     printing each; returns what was done."""
     FLAGS.interrupt_note = f"images stored before it are kept (`fewshot undo {task.name}` takes them back)"
     with progress(f"Adding to {label}") as update:
-        result = services.add_examples(task, label, blobs(files, update))
+        result = services.add_examples(task, label, blobs(files, update), new_class=True)  # callers check the name
     return outcome(result)
 
 

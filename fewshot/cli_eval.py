@@ -77,9 +77,6 @@ def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-argument
         fail(f"Thresholds not set: {e.args[0]}")
     if apply_class_thresholds and r["suggested_class_thresholds"]:
         say(f"Set the thresholds of {len(r['suggested_class_thresholds'])} classes")
-    sources = {e.id: e.source for e in t.config.examples}
-    for p in [*r["predictions"], *r["mistakes"]]:
-        p["source"] = sources.get(p["id"], "")
     if fmt == "json":
         echo_json(r)
     elif fmt == "csv":
@@ -201,9 +198,6 @@ def dupes(
         pairs = make_pipeline(workspace(root)).near_duplicates(t, threshold, limit)
     except ValueError as e:  # the model can't be loaded, say
         fail_on(e, name)
-    sources = {e.id: e.source for e in t.config.examples}
-    for d in pairs:
-        d["sources"] = [sources.get(d["a"], ""), sources.get(d["b"], "")]
     if as_json:
         echo_json(pairs)
         return

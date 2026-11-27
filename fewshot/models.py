@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from .embedders import DEFAULT_SPEC
+from .exceptions import NoExamples
 from .fsutil import FileStamp
 from .fsutil import stamp as _stamp
 from .settings import STORED_DEFAULTS
@@ -163,3 +164,9 @@ class TaskConfig(BaseModel):
     def files(self) -> set[str]:
         """Every image file this version uses: examples' and the inbox's."""
         return {e.file for e in self.examples} | {i.file for i in self.inbox}
+
+
+def check_evaluable(cfg: TaskConfig) -> None:
+    """Refuse (``NoExamples``) to evaluate a task without examples."""
+    if not cfg.examples:
+        raise NoExamples("Task has no examples to evaluate", task=cfg.name)

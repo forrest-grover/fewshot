@@ -84,8 +84,8 @@ def test_prediction_to_dict():
     assert p.to_dict() == {"label": "a", "top_label": "a", "confidence": 0.9, "similarity": 0.8,
                            "rejected": False, "scores": {"a": 0.9, "b": 0.1}, "labels": ["a"], "evidence": [],
                            "error": None, "revision": None}
-    assert Prediction.failed("bad").to_dict() == {"label": None, "top_label": "", "confidence": 0.0,
-                                                  "similarity": 0.0, "rejected": False, "scores": {},
+    assert Prediction.failed("bad").to_dict() == {"label": None, "top_label": None, "confidence": None,
+                                                  "similarity": None, "rejected": False, "scores": {},
                                                   "labels": [], "evidence": [], "error": "bad", "revision": None}
 
 

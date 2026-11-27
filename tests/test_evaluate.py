@@ -302,6 +302,8 @@ def test_folds_that_leave_out_a_class(ws):
     t.add_example(png(BLUE), "blue")
     r = evaluate_task(Pipeline(ws), t, folds=2)
     assert r["n_scored"] < 4
+    with pytest.raises(ValueError, match="folds must be at least 2, got 1"):
+        evaluate_task(Pipeline(ws), t, folds=1)
     assert ev._macro_f1(np.zeros((2, 2), int)) is None  # pylint: disable=protected-access
     empty = ev.HeldOut.empty(2, 2)
     assert ev._suggest_threshold(empty, np.array([0, 1])) is None  # pylint: disable=protected-access

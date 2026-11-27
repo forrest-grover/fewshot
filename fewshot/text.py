@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import difflib
+from collections.abc import Sequence
+
 MAX_CLASS_NAME = 200
 MAX_TAG = 50
 # A description's prompts are each embedded (and averaged): cap how many, and how long.
@@ -75,3 +78,30 @@ def check_template(template: str) -> None:
     lines = prompts(template)
     if not lines or any("{}" not in line for line in lines):
         raise ValueError("Template must contain '{}' (on every line, for several prompts)")
+
+
+def closest(name: str, names: Sequence[str]) -> list[str]:
+    """The names among ``names`` closest to ``name``, best first: those the same but for case,
+    else up to 3 similar ones (``[]`` if none is)."""
+    same_case = [n for n in names if n.lower() == name.lower()]
+    return same_case or difflib.get_close_matches(name, names, n=3, cutoff=0.6)
+
+
+def _edits(a: str, b: str) -> int:
+    """The edit (Levenshtein) distance between ``a`` and ``b``."""
+    row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, cb in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (ca != cb))
+    return row[-1]
+
+
+def near_miss(name: str, names: Sequence[str]) -> str | None:
+    """An existing class name that ``name`` (not one of them) is probably a typo of: the same but
+    for case, or within 2 edits (1 for names of 4 characters or fewer)."""
+    allowed = 1 if len(name) <= 4 else 2
+    for n in names:
+        if n.lower() == name.lower() or _edits(n.lower(), name.lower()) <= allowed:
+            return n
+    return None

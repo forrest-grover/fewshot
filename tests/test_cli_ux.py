@@ -16,6 +16,7 @@ import fewshot.__main__ as entry
 from fewshot import cli, cli_common, cli_eval, services
 from fewshot.evaluate import TEMPERATURE_MARGIN
 from fewshot.store import Workspace
+from fewshot.text import near_miss
 from tests.conftest import BLUE, RED, PlainResult, png, served, write_images
 
 
@@ -356,12 +357,12 @@ def test_import_refuses_folders_close_to_existing_classes(run, task, root, tmp_p
 def test_near_miss():
     """A near miss is the same name but for case, or 1 edit away for short names and 2 for longer ones."""
     names = ["cat", "Abyssinian", "Basset_Hound"]
-    assert cli_common.near_miss("CAT", names) == "cat"
-    assert cli_common.near_miss("cats", names) == "cat"
-    assert cli_common.near_miss("dog", names) is None
-    assert cli_common.near_miss("abysinian", names) == "Abyssinian"
-    assert cli_common.near_miss("Basset_Hund", names) == "Basset_Hound"
-    assert cli_common.near_miss("Bulldog", names) is None
+    assert near_miss("CAT", names) == "cat"
+    assert near_miss("cats", names) == "cat"
+    assert near_miss("dog", names) is None
+    assert near_miss("abysinian", names) == "Abyssinian"
+    assert near_miss("Basset_Hund", names) == "Basset_Hound"
+    assert near_miss("Bulldog", names) is None
     assert cli_common.did_you_mean("x", names) == ""
 
 

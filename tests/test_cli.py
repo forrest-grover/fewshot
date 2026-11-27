@@ -504,11 +504,14 @@ def test_eval_edge_cases(run, root):
     assert r.exit_code == 1
     assert "no examples" in r.output
 
-    # With one class no fold has two classes to train on, so nothing can be scored.
+    # With one class every prediction is right, which measures nothing: the task says so.
     t = load(root, "empty")
     t.add_example(png(RED, seed=1), "red")
-    t.add_example(png(RED, seed=2), "red")
     t.upsert_class("blue")
+    assert "Only one class has examples (red)" in run("list", "--json").output
+
+    # With one example per class no fold has two classes to train on, so nothing can be scored.
+    t.add_example(png(BLUE, seed=3), "blue")
     r = run("eval", "empty")
     assert r.exit_code == 0
     assert "Nothing scored" in r.output

@@ -46,6 +46,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from . import blobs as _blobs
+from . import exceptions as exc
 from .classifiers import CLASSIFIERS
 from .embedders import check_embedder, loaded_embedders
 from .folders import class_folders, read_or_empty, readable_name
@@ -62,7 +63,7 @@ from .images import image_ext, image_id
 from .inbox import TaskInbox, chunked, listed, plural
 from .models import MAX_NOTE, ClassDef, Example, TaskConfig, _copy_config, _now, _read_config
 from .settings import THRESHOLDS, check_settings, for_new_embedder, for_new_scoring
-from .text import check_class_name, check_description, check_tag, check_template, fill_template, prompts
+from .text import check_class_name, check_description, check_tag, check_template, closest, fill_template, prompts
 
 log = logging.getLogger(__name__)
 
@@ -199,7 +200,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                     stack.enter_context(_file_lock(self.path / ".lock", guard=self.path / "task.json"))
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
-                    raise KeyError(f"No task {self.name!r}") from e
+                    raise exc.TaskNotFound(f"No task {self.name!r}", task=self.name) from e
                 self._draft = _copy_config(self._published)
                 self._writer = threading.get_ident()
                 self._depth = 1
@@ -225,7 +226,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                     stack.enter_context(_file_lock(self.path / ".lock", shared=True, guard=self.path / "task.json"))
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
-                    raise KeyError(f"No task {self.name!r}") from e
+                    raise exc.TaskNotFound(f"No task {self.name!r}", task=self.name) from e
                 self._reader = threading.get_ident()
                 try:
                     yield self._published
@@ -433,7 +434,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         with self._writing():
             c = self._class(name)
             if new is not None and new in self.class_names():
-                raise ValueError(f"Class {new!r} already exists")
+                raise exc.ClassExists(f"Class {new!r} already exists", label=new)
             cfg = self.config
             update: dict[str, Any] = {} if description is None else {"description": description}
             if new is not None:
@@ -466,7 +467,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
     def rename_class(self, old: str, new: str) -> None:
         """Rename a class and relabel its examples."""
         if check_class_name(new) == old:
-            raise ValueError(f"Class {old!r} already exists")
+            raise exc.ClassExists(f"Class {old!r} already exists", label=old)
         self.edit_class(old, new)
 
     def delete_class(self, name: str) -> int:
@@ -504,7 +505,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         for c in self.config.classes:
             if c.name == name:
                 return c
-        raise KeyError(f"No class {name!r}")
+        raise exc.ClassNotFound(f"No class {name!r}", label=name, similar_to=closest(name, self.class_names()))
 
     # ---- examples ----------------------------------------------------
     def add_example(self, data: bytes, label: str, source: str = "") -> Example:
@@ -597,7 +598,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         for e in self.config.examples:
             if e.id == eid:
                 return e
-        raise KeyError(f"No example {eid!r}")
+        raise exc.ExampleNotFound(f"No example {eid!r}", example_id=eid)
 
     def relabel(self, eid: str, label: str) -> Example:
         """Move an example to ``label``, creating the class if needed."""
@@ -689,10 +690,10 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         out = []
         for p in prefixes:
             if len(p) < 4:
-                raise KeyError(f"The {what} id {p!r} is too short: give at least 4 characters")
+                raise exc.ExampleNotFound(f"The {what} id {p!r} is too short: give at least 4 characters", example_id=p)
             hits = [i for i in ids if i.startswith(p)]
             if len(hits) != 1:
-                raise KeyError(f"No {what} {p!r}" if not hits else f"The {what} id {p!r} is ambiguous")
+                raise exc.ExampleNotFound(f"No {what} {p!r}" if not hits else f"The {what} id {p!r} is ambiguous")
             out.append(hits[0])
         return out
 
@@ -702,7 +703,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         wanted = list(dict.fromkeys(eids))
         for eid in wanted:
             if eid not in by_id:
-                raise KeyError(f"No example {eid!r}")
+                raise exc.ExampleNotFound(f"No example {eid!r}", example_id=eid)
         keep = set(wanted)
         return [e for e in self.config.examples if e.id in keep]
 
@@ -759,6 +760,8 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             out.append(f"Classes are unbalanced ({min(sizes)} to {max(sizes)} examples)")
         if len(counts) < 2 and not self.config.examples:
             out.append("Add classes and examples to start")
+        elif len(with_examples := [c for c, n in counts.items() if n]) == 1:
+            out.append(f"Only one class has examples ({with_examples[0]}): evaluation's accuracy is always 1.0")
         return out
 
     def summary(self) -> dict[str, Any]:
@@ -831,14 +834,14 @@ class Workspace:
                 t = None
             if t is None:
                 if not NAME_RE.fullmatch(name) or not spelt_as_listed(self.root / "tasks", name):
-                    raise KeyError(f"No task {name!r}")
+                    raise exc.TaskNotFound(f"No task {name!r}", task=name)
                 p = self.root / "tasks" / name
                 try:
                     t = Task(p, *_read_config(p), blobs=self.blobs, embedder_ok=self.embedder_ok)
                 except (FileNotFoundError, NotADirectoryError):
-                    raise KeyError(f"No task {name!r}") from None
+                    raise exc.TaskNotFound(f"No task {name!r}", task=name) from None
                 except (ValueError, OSError) as e:
-                    raise KeyError(f"Task {name!r} can't be loaded: {os_reason(e)}") from None
+                    raise exc.TaskUnreadable(f"Task {name!r} can't be loaded: {os_reason(e)}", task=name) from None
                 self._tasks[name] = t
                 return t
         try:
@@ -847,8 +850,8 @@ class Workspace:
             with self._lock:
                 self._tasks.pop(name, None)
             if not isinstance(e, FileNotFoundError):
-                raise KeyError(f"Task {name!r} can't be loaded: {os_reason(e)}") from None
-            raise KeyError(f"No task {name!r}") from None
+                raise exc.TaskUnreadable(f"Task {name!r} can't be loaded: {os_reason(e)}", task=name) from None
+            raise exc.TaskNotFound(f"No task {name!r}", task=name) from None
         return t
 
     def create(self, name: str, **settings: Any) -> Task:
@@ -857,7 +860,7 @@ class Workspace:
         a refused embedder."""
         cfg = TaskConfig(name=name, **settings)
         if cfg.classifier not in CLASSIFIERS:
-            raise ValueError(f"Unknown classifier {cfg.classifier!r}")
+            raise exc.UnknownClassifier(f"Unknown classifier {cfg.classifier!r}; choose from {sorted(CLASSIFIERS)}")
         if "embedder" in settings:
             self.embedder_ok(cfg.embedder)
         return self.build_task(cfg)
@@ -905,11 +908,11 @@ class Workspace:
             p.mkdir()  # atomic: of two concurrent creates, exactly one succeeds
         except FileExistsError:
             if not reclaim(p, STALE_SECONDS):  # unless left by a crash: then take the name back
-                raise ValueError(f"Task {name!r} already exists") from None
+                raise exc.TaskExists(f"Task {name!r} already exists", task=name) from None
             try:
                 p.mkdir()
             except FileExistsError:  # pragma: no cover  # another process took it in between
-                raise ValueError(f"Task {name!r} already exists") from None
+                raise exc.TaskExists(f"Task {name!r} already exists", task=name) from None
         return p
 
     def gc(self, dry_run: bool = False) -> dict[str, int]:
@@ -951,7 +954,7 @@ class Workspace:
             return t
         with t._writing():  # pylint: disable=protected-access  # the workspace owns its tasks' folders
             if t.path.name != old:  # a concurrent rename got there first
-                raise KeyError(f"No task {old!r}")
+                raise exc.TaskNotFound(f"No task {old!r}", task=old)
             dest = self._reserve(new)
             src = t.path
             try:

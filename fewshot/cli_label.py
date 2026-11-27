@@ -27,7 +27,6 @@ from .cli_common import (
     finish_adding,
     get_task,
     moved_text,
-    near_miss,
     outcome,
     progress,
     say,
@@ -37,7 +36,7 @@ from .cli_common import FLAGS as _FLAGS
 from .cli_common import add_files as _add_files
 from .folders import class_folders
 from .store import Task
-from .text import check_class_name
+from .text import check_class_name, near_miss
 
 commands = App()  # the top-level commands defined here
 cls_app = command_group("Manage a task's classes: list, add, describe, rename, delete, set thresholds.")

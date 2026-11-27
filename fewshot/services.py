@@ -3,7 +3,8 @@ problems the same way: creating tasks, changing settings, fetching and adding im
 evaluating and labelling from the inbox.
 
 Errors are raised as ``ValueError`` (bad input) and ``KeyError`` (unknown task, class or id), for
-each interface to report in its own way. Nothing here imports torch until it is used, so the
+each interface to report in its own way; most are the typed ones of ``exceptions``, which carry a
+stable code. Nothing here imports torch until it is used, so the
 command line stays quick to start.
 """
 
@@ -20,9 +21,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .classifiers import SETTING_MAX
 from .embedders import check_embedder
+from .exceptions import ClassNameNearMiss
 from .fetch import fetch_url
 from .folders import class_folders, read_or_empty, readable_name
-from .text import check_class_name
+from .text import check_class_name, near_miss
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline, Prediction
@@ -116,6 +118,21 @@ def check_specs(specs: Iterable[str], limit: int | None = None) -> list[str]:
     return out
 
 
+# ---- class names -------------------------------------------------------------
+def check_new_class(task: Task, label: str, new_class: bool = False) -> bool:
+    """Before labelling images as ``label`` (stripped): whether it is a new class. Unless
+    ``new_class``, a new name close to an existing class's (the same but for case, or 1-2 edits
+    away) is refused with ``ClassNameNearMiss`` as a likely typo: every interface that labels
+    images applies this one rule."""
+    names = task.class_names()
+    if label in names:
+        return False
+    if not new_class and (close := near_miss(label, names)):
+        raise ClassNameNearMiss(f"No class {label!r} in {task.name}; did you mean {close!r}?", task=task.name,
+                                label=label, similar_to=[close])
+    return True
+
+
 # ---- images in --------------------------------------------------------------
 def fetch_urls(urls: Sequence[str], max_bytes: int, *, public_only: bool = False,  # pylint: disable=too-many-arguments
                seconds: float | None = None, max_total: int | None = None, workers: int = 4) -> list[Blob]:
@@ -152,12 +169,15 @@ def fetch_urls(urls: Sequence[str], max_bytes: int, *, public_only: bool = False
 class Added:
     """What adding images did: the examples (or inbox images) stored, each image left out, and
     which of the stored examples were already examples of another class, so adding them moved
-    them, or of the same class, so adding them changed nothing (``added`` includes both)."""
+    them, or of the same class (or waiting in the inbox already), so adding them changed nothing
+    (``added`` includes both; ``new`` is the rest). ``created`` names the classes made for them."""
 
     added: list[Any] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)  # (name, reason)
     moved: list[tuple[Any, str]] = field(default_factory=list)  # (example, the class it was in)
     unchanged: list[Any] = field(default_factory=list)  # examples that were there already, in the same class
+    new: list[Any] = field(default_factory=list)  # the items stored that weren't there before, in any class
+    created: list[str] = field(default_factory=list)  # classes created
 
 
 def _added(task_call: Callable[[Iterable[Any]], Sequence[Any]], blobs: Iterable[tuple[Blob, str | None]],
@@ -195,6 +215,7 @@ def _add_labelled(task: Task, blobs: Iterable[tuple[Blob, str | None]], undo_gro
     with contextlib.suppress(FileNotFoundError):  # deleted: adding raises KeyError
         task.refresh()
     was = {e.id: e.label for e in task.config.examples}
+    classes = set(task.class_names())
     out = _added(lambda items: task.add_examples(items, undo_group=undo_group), blobs,
                  lambda b, label: (_bytes(b.data), label, b.source or b.name))
     for ex in out.added:  # in order, so an image given twice under two labels counts as moved once
@@ -203,16 +224,24 @@ def _add_labelled(task: Task, blobs: Iterable[tuple[Blob, str | None]], undo_gro
             out.unchanged.append(ex)
         elif before is not None:
             out.moved.append((ex, before))
+        else:
+            out.new.append(ex)
         was[ex.id] = ex.label
+        if ex.label not in classes:
+            classes.add(ex.label)
+            out.created.append(ex.label)
     return out
 
 
-def add_examples(task: Task, label: str, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:
+def add_examples(task: Task, label: str, blobs: Iterable[Blob], undo_group: str | None = None,
+                 new_class: bool = False) -> Added:
     """Add the readable ``blobs`` as examples of ``label``, one undo step for all of them (and for
     the calls just before with the same ``undo_group``: see ``Task.add_examples``); ``ValueError``
-    for a bad label. Images that can't be added are reported, not raised; images that were
-    examples of another class are moved to ``label`` and listed in ``moved``."""
+    for a bad label, and ``ClassNameNearMiss`` for a new one close to an existing class's unless
+    ``new_class`` (see ``check_new_class``). Images that can't be added are reported, not raised;
+    images that were examples of another class are moved to ``label`` and listed in ``moved``."""
     label = check_class_name(label)
+    check_new_class(task, label, new_class)
     return _add_labelled(task, ((b, label) for b in blobs), undo_group)
 
 
@@ -237,9 +266,16 @@ def import_folder(task: Task, folder: Path, shots: int | None = None,
 def add_to_inbox(task: Task, blobs: Iterable[Blob], undo_group: str | None = None) -> Added:
     """Put the readable ``blobs`` in the task's inbox, one undo step for all of them (and for the
     calls just before with the same ``undo_group``). Images that can't be added (unreadable, or
-    labelled already) are reported, not raised."""
-    return _added(lambda items: task.add_to_inbox(items, undo_group=undo_group), ((b, None) for b in blobs),
-                  lambda b, _: (_bytes(b.data), b.source or b.name))
+    labelled already) are reported, not raised; those waiting there already are ``unchanged``."""
+    with contextlib.suppress(FileNotFoundError):  # deleted: adding raises KeyError
+        task.refresh()
+    waiting = {x.id for x in task.config.inbox}
+    out = _added(lambda items: task.add_to_inbox(items, undo_group=undo_group), ((b, None) for b in blobs),
+                 lambda b, _: (_bytes(b.data), b.source or b.name))
+    for item in out.added:
+        (out.unchanged if item.id in waiting else out.new).append(item)
+        waiting.add(item.id)
+    return out
 
 
 # ---- predictions and evaluation ---------------------------------------------
@@ -258,7 +294,8 @@ def evaluate(pipe: Pipeline, task: Task, folds: int | None = None, progress: Pro
     """Cross-validate ``task`` and record the result for the dashboard. With
     ``apply_class_thresholds``, each class then gets its suggested reject threshold (thresholds
     don't change what evaluation measures, so the report stays current). Raises ``ValueError`` if
-    the task can't be evaluated, and ``KeyError`` if a class went away before its threshold was set."""
+    the task can't be evaluated (see ``models.check_evaluable``), and ``KeyError`` if a class went away
+    before its threshold was set."""
     from .evaluate import evaluate_task  # pylint: disable=import-outside-toplevel  # torch-backed
 
     report = evaluate_task(pipe, task, folds, progress=progress)

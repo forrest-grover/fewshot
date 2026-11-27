@@ -50,8 +50,12 @@ class Prediction:  # pylint: disable=too-many-instance-attributes  # one field p
         return cls(label=None, top_label="", confidence=0.0, similarity=0.0, rejected=False, scores={}, error=error)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON-ready dict of the fields."""
-        return asdict(self)
+        """JSON-ready dict of the fields; for an image that couldn't be read, ``top_label``,
+        ``confidence`` and ``similarity`` are None, so they can't pass for real scores."""
+        out = asdict(self)
+        if self.error is not None:
+            out.update(top_label=None, confidence=None, similarity=None)
+        return out
 
 
 class Pipeline:
@@ -386,7 +390,8 @@ class Pipeline:
             pairs += [(float(flat[h]), start + h // len(X), h % len(X)) for h in hits.tolist()]
             pairs = heapq.nlargest(limit, pairs)
         return [{"a": exs[i].id, "b": exs[j].id, "similarity": round(sim, 4),
-                 "labels": [exs[i].label, exs[j].label], "same_label": exs[i].label == exs[j].label}
+                 "labels": [exs[i].label, exs[j].label], "sources": [exs[i].source, exs[j].source],
+                 "same_label": exs[i].label == exs[j].label}
                 for sim, i, j in pairs[:limit]]
 
 

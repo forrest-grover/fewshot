@@ -24,7 +24,7 @@ from .classifiers import (
     top_k,
 )
 from .folders import class_folders
-from .models import TaskConfig
+from .models import TaskConfig, check_evaluable
 from .pipeline import Pipeline, new_classifier
 from .store import Task
 from .text import fill_template
@@ -235,7 +235,7 @@ def _per_class(classes: list[str], cm: np.ndarray) -> dict[str, dict[str, Any]]:
 def _predictions(cfg: TaskConfig, data: ClassData, h: HeldOut) -> list[dict[str, Any]]:
     """The held-out prediction for every scored example, in task order."""
     exs = cfg.examples
-    return [{"id": exs[i].id, "true": data.classes[data.y[i]], "pred": data.classes[h.pred[i]],
+    return [{"id": exs[i].id, "source": exs[i].source, "true": data.classes[data.y[i]], "pred": data.classes[h.pred[i]],
              "confidence": round(float(h.conf[i]), 4), "similarity": round(float(h.sim[i]), 4),
              "correct": bool(h.pred[i] == data.y[i])}
             for i in np.flatnonzero(h.pred >= 0)]
@@ -388,10 +388,9 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
     cfg = cfg or task.config  # one snapshot, so a concurrent edit can't misalign examples and results
     if folds is not None and folds < 2:
         raise ValueError(f"folds must be at least 2, got {folds}")
+    check_evaluable(cfg)
     data = pipe.class_data(task, cfg=cfg, progress=_stage(progress, "embedding"))
     n, C = len(data.y), len(data.classes)
-    if n == 0:
-        raise ValueError("Task has no examples to evaluate")
     k = folds or (n if n <= (300 if cfg.classifier in {"prototype", "knn"} else 100) else 10 if n <= 300 else 5)
     h = _cross_val_predict(data, cfg, k, seed, _stage(progress, "evaluating"))
 
@@ -431,8 +430,7 @@ def compare_embedders(pipe: Pipeline, task: Task, embedders: Sequence[str], fold
     if not specs:
         raise ValueError("Give at least one embedder to compare")
     base = task.config  # one snapshot for every run
-    if not base.examples:
-        raise ValueError("Task has no examples to evaluate")
+    check_evaluable(base)
     results = []
     for n, spec in enumerate(specs, 1):
         def step(stage: str, done: int, total: int, n: int = n) -> None:

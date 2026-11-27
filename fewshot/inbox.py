@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
+from .exceptions import ExampleNotFound
 from .images import image_ext, image_id
 from .models import Example, InboxItem
 from .text import check_class_name
@@ -133,7 +134,7 @@ class TaskInbox:
         try:
             return [by_id[iid] for iid in ids]
         except KeyError as e:
-            raise KeyError(f"No inbox image {e.args[0]!r}") from None
+            raise ExampleNotFound(f"No inbox image {e.args[0]!r}", example_id=e.args[0]) from None
 
     def accept(self, labels: Mapping[str, str]) -> int:
         """Label inbox images (``{id: class}``), moving them to the examples in one save and undo
