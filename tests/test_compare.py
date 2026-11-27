@@ -149,7 +149,11 @@ def run_fixture(tmp_path):
 
 def test_cli_compare(run, monkeypatch):
     """compare prints a line per embedder, marks the best and current, and says how to switch."""
-    out = run("compare", "t", "-e", "fake:noise", "-e", "fake:broken").output
+    r = run("compare", "t", "-e", "fake:noise", "-e", "fake:broken")
+    assert (r.exit_code, "Error: Failed: fake:broken" in r.output) == (1, True)  # failed for one input
+    r2 = run("compare", "t", "-e", "fake:broken", "--json")
+    assert (r2.exit_code, "Error: Failed: fake:broken" in r2.output) == (1, True)
+    out = r.output
     lines = out.splitlines()
     assert lines[0].startswith("*<")
     assert lines[0].endswith("fake:color")

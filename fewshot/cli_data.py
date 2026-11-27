@@ -114,14 +114,17 @@ def example_note(name: str, example_id: str, note: str, root: Path | None = ROOT
 # ---- inbox ----------------------------------------------------------------
 @inbox_app.command("add")
 def inbox_add(name: str, paths: list[str], root: Path | None = ROOT_OPT) -> None:
-    """Put unlabelled images (files, directories or http(s) URLs) in the inbox; exits 1 if none could be."""
+    """Put unlabelled images (files, directories or http(s) URLs) in the inbox; exits 1 if any couldn't be."""
     t = get_task(root, name)
     files = expand(paths)
     with progress("Adding to the inbox") as update:
-        n = report_skipped(services.add_to_inbox(t, blobs(files, update)))
+        result = services.add_to_inbox(t, blobs(files, update))
+    n = report_skipped(result)
     typer.echo(f"{name}: {len(t.config.inbox)} images in the inbox")
     if n == 0:
         fail("Nothing was added to the inbox")
+    if result.errors:
+        fail(f"Not added to the inbox: {len(result.errors)} of {n + len(result.errors)} images")
 
 
 @inbox_app.command("ls")
@@ -135,7 +138,10 @@ def inbox_ls(
 ) -> None:
     """List inbox images with the model's suggestion, in the order to label them."""
     t = get_task(root, name)
-    items = make_pipeline(workspace(root)).inbox_suggestions(t, sort)[:limit]
+    try:
+        items = make_pipeline(workspace(root)).inbox_suggestions(t, sort)[:limit]
+    except ValueError as e:  # the model can't be loaded, say
+        fail(str(e))
     if as_json:
         echo_json(items)
         return
@@ -153,8 +159,9 @@ def inbox_accept(
     ids: list[str] = typer.Argument(None, help="Inbox ids to label as --label (or to choose from)"),
     label: str | None = typer.Option(None, help="Class for the given ids"),
     min_confidence: float | None = typer.Option(
-        None, min=0, max=1, help="Instead, accept every suggestion (of the given ids, if any) at least this "
-                                 "confident (not rejected)"),
+        None, min=0, max=1,
+        help="Instead, accept every suggestion (of the given ids, if any) at least this "
+             "confident (not rejected)"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Label inbox images as examples: the given ids as --label, or every suggestion (of the given ids,
@@ -166,7 +173,10 @@ def inbox_accept(
         labels = dict.fromkeys(_ids(t, ids or [], inbox=True), label)
     else:
         wanted = _ids(t, ids, inbox=True) if ids else None
-        labels = services.confident_suggestions(make_pipeline(workspace(root)), t, min_confidence or 0.0, wanted)
+        try:
+            labels = services.confident_suggestions(make_pipeline(workspace(root)), t, min_confidence or 0.0, wanted)
+        except ValueError as e:  # the model can't be loaded, say
+            fail(str(e))
     if not labels:
         typer.echo("Nothing to accept")
         return

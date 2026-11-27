@@ -3,12 +3,15 @@
 import csv
 import io
 import json
+import os
 import sys
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from fewshot import cli, cli_common, services
+from fewshot.folders import readable_name
 from fewshot.store import Workspace
 from tests.conftest import ANSI, BLUE, RED, png, served
 
@@ -194,12 +197,15 @@ def test_cache_prune_removes_unused_images(run, task, root):
 
 
 def test_export_to_a_bad_path(run, task, tmp_path):
-    """export to a missing folder or onto a folder fails cleanly, leaving no partial file."""
+    """export to a missing folder fails cleanly, leaving no partial file; onto a folder (``.``
+    too, whose name is empty) is a usage error naming a file to give instead."""
     r = run("export", task, tmp_path / "no" / "such" / "t.zip")
     assert r.exit_code == 1
     assert "Error: Can't write" in r.output
-    r = run("export", task, tmp_path)
-    assert r.exit_code == 1
+    for folder in (tmp_path, Path(".")):
+        r = run("export", task, folder)
+        assert r.exit_code == 2
+        assert f"is a folder; give the zip file's name, e.g. {folder / (task + '.zip')}" in r.output
     assert not list(tmp_path.glob("*.part"))
 
 
@@ -213,7 +219,9 @@ def test_more_cli_options(run, task, tmp_path, root):
     t = Workspace(root).get(task)
     (t.path / t.config.examples[0].file).unlink()
     out = tmp_path / "t.zip"
-    assert "1 examples were left out" in run("export", task, out).output
+    r = run("export", task, out)
+    assert (r.exit_code, "Left out 1 of 6 examples: their image files are missing" in r.output) == (1, True)
+    assert out.exists()  # the rest are exported
     r = run("import-task", out, "--name", "copy", "--embedder", "fake:color")
     assert r.exit_code == 0
     assert Workspace(root).get("copy").config.embedder == "fake:color"
@@ -238,3 +246,65 @@ def test_serve_keeps_settings_from_the_environment(monkeypatch):
     assert (st.max_upload_mb, st.max_request_mb) == (5, 7)
     st = served(monkeypatch, "--warm", "--max-upload-mb", "9")[1].settings
     assert (st.warm, st.max_upload_mb) == (True, 9)
+
+
+def _not_utf8(folder, raw: bytes):
+    """``folder`` / the file name with bytes ``raw`` (not UTF-8), as Python names it."""
+    return folder / os.fsdecode(raw)
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="APFS refuses names that aren't UTF-8")
+def test_names_that_arent_utf8(run, task, root, tmp_path):
+    """Files and class folders whose names aren't UTF-8 are added and imported (each bad byte read
+    as U+FFFD) rather than failing the save and losing the batch; such a class name given on the
+    command line is refused; --from-file lists naming such files are read."""
+    odd = _not_utf8(tmp_path, b"q\xfe.png")
+    odd.write_bytes(png(RED, noise=15, seed=40))
+    r = run("add", task, "red", odd)
+    assert r.exit_code == 0, r.output
+    assert "q�.png" in {e.source for e in Workspace(root).get(task).config.examples}
+    folder = tmp_path / "classes"
+    for name, rgb in ((b"a", RED), (b"cl\xe9", BLUE)):
+        (folder / os.fsdecode(name)).mkdir(parents=True)
+        (folder / os.fsdecode(name) / os.fsdecode(b"x\xff.png")).write_bytes(png(rgb, noise=15, seed=41))
+    r = run("import", task, folder)
+    assert (r.exit_code, "Imported 2 images" in r.output) == (0, True)
+    assert "cl�" in Workspace(root).get(task).class_names()
+    r = run("add", task, os.fsdecode(b"c\xfe"), odd)
+    assert (r.exit_code, "isn't valid UTF-8" in r.output) == (1, True)
+    listed = tmp_path / "list.txt"
+    listed.write_bytes(os.fsencode(odd) + b"\n")
+    r = run("predict", task, "--from-file", listed, "--csv")
+    assert r.exit_code == 0, r.output
+    assert Workspace(root).get(task).add_examples_from_dir(str(folder)) == 2  # a str folder too
+    assert readable_name("\ud800") == "?"  # a lone surrogate not from a file name's bytes
+
+
+def test_names_that_arent_utf8_are_printed_as_their_bytes(monkeypatch):
+    """The standard streams pass a file name's bytes through, as the C locale does, rather than
+    raising UnicodeEncodeError; a stream without ``reconfigure`` (a test's capture) is left alone."""
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="utf-8")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    cli.pass_file_names_through()
+    print(os.fsdecode(b"q\xfe.png"), end="")
+    out.flush()
+    assert raw.getvalue() == b"q\xfe.png"
+
+
+@pytest.mark.parametrize(("args", "target"), [
+    (["dupes", "t"], "fewshot.pipeline.Pipeline.near_duplicates"),
+    (["inbox", "ls", "t"], "fewshot.pipeline.Pipeline.inbox_suggestions"),
+    (["inbox", "accept", "t", "--min-confidence", "0.5"], "fewshot.services.confident_suggestions"),
+])
+def test_model_errors_are_reported_not_raised(run, task, monkeypatch, args, target):
+    """A ValueError from the model (one that can't be loaded, a bad device) is an error message."""
+    assert task == "t"
+
+    def broken(*_a, **_k):
+        raise ValueError("Can't load model nope")
+
+    monkeypatch.setattr(target, broken)
+    r = run(*args)
+    assert (r.exit_code, "Error: Can't load model nope" in r.output) == (1, True)

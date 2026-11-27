@@ -48,7 +48,7 @@ from pydantic import ValidationError
 from . import blobs as _blobs
 from .classifiers import CLASSIFIERS
 from .embedders import check_embedder, loaded_embedders
-from .folders import class_folders, read_or_empty
+from .folders import class_folders, read_or_empty, readable_name
 from .fsutil import FileStamp, os_reason, reclaim
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import file_lock as _file_lock
@@ -76,8 +76,8 @@ SETTINGS = {"embedder", "classifier", "classifier_params", "text_weight", "rejec
 
 
 def default_root() -> Path:
-    """Workspace root from ``$FEWSHOT_HOME``, defaulting to ``./fewshot_data``."""
-    return Path(os.environ.get("FEWSHOT_HOME", "./fewshot_data")).resolve()
+    """Workspace root from ``$FEWSHOT_HOME``, defaulting (also when it is empty) to ``./fewshot_data``."""
+    return Path(os.environ.get("FEWSHOT_HOME", "").strip() or "./fewshot_data").resolve()
 
 
 def embedder_loads(spec: str) -> None:
@@ -580,15 +580,16 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         if label not in self.class_names():
             self.config.classes.append(ClassDef(name=label))
 
-    def add_examples_from_dir(self, folder: Path, shots: int | None = None) -> int:
+    def add_examples_from_dir(self, folder: Path | str, shots: int | None = None) -> int:
         """Import a folder laid out as ``folder/<class>/<image>`` (at most ``shots`` images per
         class; hidden and system folders and files are skipped, see ``folders``); returns how many
         images were added.
 
         Raises ``ValueError`` for the first image that can't be read (after adding the others).
         """
+        folder = Path(folder)
         files = [(f, label) for label, fs in class_folders(folder, shots).items() for f in fs]
-        results = self.add_examples((read_or_empty(f), label, f.name) for f, label in files)
+        results = self.add_examples((read_or_empty(f), label, readable_name(f.name)) for f, label in files)
         for (f, _), r in zip(files, results, strict=True):
             if isinstance(r, ValueError):
                 raise ValueError(f"{f}: {r}")

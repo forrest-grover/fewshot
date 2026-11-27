@@ -16,6 +16,16 @@ SYSTEM_NAMES = {"__MACOSX", "@eaDir", "$RECYCLE.BIN", "System Volume Information
                 "desktop.ini", "__pycache__"}
 
 
+def readable_name(name: str) -> str:
+    """``name`` (a file or folder name) as valid Unicode: on Linux a name that isn't UTF-8 comes
+    with its bytes escaped as lone surrogates, which can't be saved in task.json or sent; each
+    such byte becomes U+FFFD (a name written in Latin-1 keeps its ASCII letters)."""
+    try:
+        return name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except UnicodeEncodeError:  # a surrogate not from a file name's bytes
+        return name.encode("utf-8", "replace").decode("utf-8")
+
+
 def skipped(path: Path) -> bool:
     """Whether ``path`` is hidden or a system file or folder, which imports leave out."""
     return path.name.startswith(".") or path.name in SYSTEM_NAMES
@@ -33,12 +43,13 @@ def image_files(folder: Path, recursive: bool = False) -> list[Path]:
 
 def class_folders(folder: Path, shots: int | None = None) -> dict[str, list[Path]]:
     """Each class folder of ``folder`` (``<folder>/<class>/<image>``) mapped to its sorted image
-    files, at most ``shots`` of them; classes without images are left out."""
+    files, at most ``shots`` of them; classes without images are left out. A folder name that
+    isn't UTF-8 is read as by ``readable_name``."""
     out = {}
     for d in sorted(p for p in folder.iterdir() if p.is_dir() and not skipped(p)):
         files = image_files(d)[:shots]
         if files:
-            out[d.name] = files
+            out[readable_name(d.name)] = files
     return out
 
 

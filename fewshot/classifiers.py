@@ -276,6 +276,11 @@ def _modality_gap(data: ClassData) -> Vectors:
 PREDICT_CELLS = 4_000_000
 
 
+class NotReady(ValueError):
+    """A task that can't classify yet: no class has an image or a description, or one has
+    neither. Adding examples (or descriptions) makes it ready, so ``fewshot watch`` waits."""
+
+
 class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted state plus settings
     """Base class: handles text fusion and modality-gap anchors; subclasses score images."""
 
@@ -345,11 +350,11 @@ class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted stat
         """Fit on ``data``; every class needs at least one image or a text embedding."""
         C = len(data.classes)
         if C < 1:
-            raise ValueError("Need at least 1 class with examples or a description")
+            raise NotReady("Need at least 1 class with examples or a description")
         with_images = set(data.y.tolist())
         missing = [c for i, c in enumerate(data.classes) if i not in with_images and i not in data.text]
         if missing:
-            raise ValueError(f"Classes with no images and no text description: {missing}")
+            raise NotReady(f"Classes with no images and no text description: {missing}")
         self._reset()
         described = len(data.text)
         data = with_names(data)

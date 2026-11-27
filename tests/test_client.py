@@ -1,13 +1,16 @@
 """fewshot.client against a real server, and the API's operation ids."""
 
+import http.server
 import socket
 import threading
 import time
+from typing import ClassVar
 
 import pytest
 import uvicorn
 
 import fewshot.api
+import fewshot.client
 from fewshot.api import create_app
 from fewshot.client import BATCH_BYTES, ApiError, Client, _batches
 from fewshot.server_settings import ServerSettings
@@ -85,7 +88,7 @@ def test_non_json_error_body(monkeypatch):
     def fail(*_a, **_k):
         raise HTTPError("http://x", 502, "Bad Gateway", {}, io.BytesIO(b"<html>bad gateway</html>"))  # type: ignore[arg-type]
 
-    monkeypatch.setattr("fewshot.client.urlopen", fail)
+    monkeypatch.setattr(fewshot.client._OPENER, "open", fail)  # pylint: disable=protected-access
     with pytest.raises(ApiError, match="HTTP 502: <html>bad gateway</html>"):
         Client().health()
 
@@ -184,7 +187,7 @@ def test_a_reset_upload_hints_at_the_size_limit(monkeypatch):
     def reset(*_a, **_k):
         raise ConnectionResetError(104, "Connection reset by peer")
 
-    monkeypatch.setattr("fewshot.client.urlopen", reset)
+    monkeypatch.setattr(fewshot.client._OPENER, "open", reset)  # pylint: disable=protected-access
     monkeypatch.setattr(Client, "batch_bytes", lambda self: 10**9)
     with pytest.raises(ApiError, match="larger than the server accepts"):
         Client().predict("t", [("a.png", b"x" * (2 * 1024 * 1024))])
@@ -206,3 +209,102 @@ def test_evaluate_runs_as_a_job(server, monkeypatch):
     with pytest.raises(ApiError, match="no longer keeps its report") as e:
         fs.evaluate("empty", poll=0)
     assert e.value.status == 410
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Answers every request with ``reply`` (status, headers, body), noting each one's method and
+    Authorization header in ``seen``."""
+
+    reply: ClassVar[tuple[int, dict[str, str], bytes]] = (200, {}, b"")
+    seen: ClassVar[list[tuple[str, str | None]]] = []
+
+    def _answer(self) -> None:
+        type(self).seen.append((self.command, self.headers.get("Authorization")))
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        status, headers, body = self.reply
+        self.send_response(status)
+        for k, v in {**headers, "Content-Length": str(len(body))}.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _answer  # http.server's names
+
+    def log_message(self, *_args) -> None:  # pylint: disable=arguments-differ  # quiet
+        pass
+
+
+def _recorder(reply):
+    """A local HTTP server answering ``reply``; returns (its URL, the requests it saw, a stop function)."""
+    seen: list[tuple[str, str | None]] = []
+    handler = type("Handler", (_Recorder,), {"reply": reply, "seen": seen})
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", seen, srv.shutdown
+
+
+def test_redirects_are_refused_so_the_token_stays():
+    """A redirect raises ApiError naming the target: the token isn't sent on to it, and a POST
+    isn't repeated there as a GET (which would return the task list as if a task were made)."""
+    other, other_seen, stop_other = _recorder((200, {"Content-Type": "application/json"}, b"[]"))
+    url, seen, stop = _recorder((301, {"Location": f"{other}/api/tasks"}, b""))
+    try:
+        for call in (lambda fs: fs.tasks(), lambda fs: fs.create_task("new")):
+            with pytest.raises(ApiError, match=f"redirected to {other}/api/tasks") as e:
+                call(Client(url, token="s3cret-token"))
+            assert e.value.status == 301
+        assert [m for m, _ in seen] == ["GET", "POST"]
+        assert not other_seen
+    finally:
+        stop()
+        stop_other()
+
+
+def test_a_response_that_isnt_json_raises_api_error():
+    """A 200 page that isn't JSON (an auth proxy's login page, say) raises ApiError, not JSONDecodeError."""
+    url, _, stop = _recorder((200, {"Content-Type": "text/html"}, b"<html>sign in</html>"))
+    try:
+        with pytest.raises(ApiError, match="isn't JSON: '<html>sign in</html>'") as e:
+            Client(url).health()
+        assert e.value.status == 200
+    finally:
+        stop()
+
+
+def test_files_that_cant_be_read_are_errors_not_exceptions(server, tmp_path):
+    """An unreadable path among the images is listed in ``errors`` (or as an error result, in its
+    place, by predict) while the others are sent; with none readable, ApiError 400."""
+    fs = Client(server, token="secret-0123456789")
+    fs.create_task("t", embedder="fake:color")
+    good, missing = tmp_path / "r.png", tmp_path / "missing.png"
+    good.write_bytes(png(RED, noise=15, seed=1))
+    r = fs.add_examples("t", "red", [missing, good])
+    assert (len(r["added"]), r["errors"][0]["file"]) == (1, str(missing))
+    assert "No such file" in r["errors"][0]["error"]
+    preds = fs.predict("t", [good, missing, ("q.png", png(RED, seed=3))])
+    assert [p.get("label") for p in preds] == ["red", None, "red"]
+    assert preds[1]["file"] == str(missing)
+    assert fs.predict("t", [missing])[0]["file"] == str(missing)
+    with pytest.raises(ApiError, match="No image could be read") as e:
+        fs.add_to_inbox("t", [missing])
+    assert e.value.status == 400
+    with pytest.raises(ApiError, match="Can't read") as e:
+        fs.request("POST", "/tasks/t/inbox", files=[missing])
+    assert e.value.status == 0
+
+
+def test_a_batch_too_large_for_the_server_doesnt_lose_the_others(small_server):
+    """An image larger than the server's request limit goes alone and is refused (413): that
+    becomes an error, and the other images are still added."""
+    fs = Client(small_server, token="secret-0123456789")
+    fs.create_task("t", embedder="fake:color")
+    r = fs.add_examples("t", "red", [("small.png", png(RED)), ("huge.png", b"x" * (100 * 1024))])
+    assert (len(r["added"]), r["errors"][0]["file"]) == (1, None)
+
+
+def test_names_that_arent_utf8_are_sent():
+    """A file name that isn't UTF-8 (escaped as lone surrogates) goes into the form with U+FFFD."""
+    body, _ = fewshot.client._multipart({"label": "caf\udce9"}, [("caf\udce9.png", b"x")])  # pylint: disable=protected-access
+    assert 'filename="caf�.png"'.encode() in body
+    assert "caf�\r\n".encode() in body
+    assert fewshot.client._text("\ud800") == "?"  # pylint: disable=protected-access  # not from a file name

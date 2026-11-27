@@ -43,6 +43,9 @@ def test_default_root_uses_env_or_local_folder(monkeypatch, tmp_path):
     monkeypatch.delenv("FEWSHOT_HOME")
     monkeypatch.chdir(tmp_path)
     assert store.default_root() == (tmp_path / "fewshot_data").resolve()
+    for empty in ("", " "):  # empty counts as unset, not as the current folder
+        monkeypatch.setenv("FEWSHOT_HOME", empty)
+        assert store.default_root() == (tmp_path / "fewshot_data").resolve()
 
 
 def test_image_id_is_content_hash():

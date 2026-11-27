@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: "3.12"
       - name: Install the newest versions (no constraints)
@@ -32,6 +32,32 @@ jobs:
         run: pylint --fail-under=10 fewshot tests
       - name: pytest
         run: pytest -q --cov --cov-report=term-missing
+
+  latest-web-dependencies:
+    # The UI's checks with the newest releases its package.json allows, instead of package-lock.json's.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "22"
+      - name: Install the newest versions (no lock file)
+        run: |
+          rm package-lock.json
+          npm install
+          npm ls --depth=0
+      - name: tsc
+        run: npm run typecheck
+      - name: eslint + stylelint
+        run: npm run lint
+      - name: vitest
+        run: npm test
+      - name: build
+        run: npm run build
 
   real-models:
     # The opt-in @pytest.mark.model tests: every preset loads and embeds an image and a text for
@@ -49,8 +75,8 @@ jobs:
       FEWSHOT_MAX_MODELS: "1"
       CONSTRAINTS: ${{ matrix.deps == 'pinned' && '-c constraints.txt' || '' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: "3.12"
       - name: Install (CPU-only torch; the SigLIP preset needs transformers)
@@ -58,7 +84,7 @@ jobs:
           pip install --no-deps $CONSTRAINTS torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install $CONSTRAINTS -e ".[dev,siglip]"
           pip list
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ~/.cache/huggingface
           # One cache per leg: both legs saving under one key would race, and only one would win.

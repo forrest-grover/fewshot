@@ -16,7 +16,7 @@ import typer
 
 from . import services
 from .fetch import fetch_url, is_url
-from .folders import image_files
+from .folders import image_files, readable_name
 from .services import Added, Blob
 from .store import Task, Workspace
 
@@ -126,8 +126,8 @@ def read_source(src: Source) -> bytes:
 
 
 def source_name(src: Source) -> str:
-    """The file name of a path or URL."""
-    return src.name if isinstance(src, Path) else src.rstrip("/").rsplit("/", 1)[-1]
+    """The file name of a path or URL (as valid Unicode, see ``readable_name``)."""
+    return readable_name(src.name if isinstance(src, Path) else src.rstrip("/").rsplit("/", 1)[-1])
 
 
 @contextlib.contextmanager
@@ -165,11 +165,12 @@ def report_skipped(result: Added) -> int:
     return len(result.added)
 
 
-def add_files(task: Task, label: str, files: Sequence[Source]) -> int:
+def add_files(task: Task, label: str, files: Sequence[Source]) -> tuple[int, int]:
     """Add ``files`` (paths or URLs) as examples of ``label``, skipping unreadable images; returns
-    how many were added."""
+    how many were added and how many were left out."""
     with progress(f"Adding to {label}") as update:
-        return report_skipped(services.add_examples(task, label, blobs(files, update)))
+        result = services.add_examples(task, label, blobs(files, update))
+    return report_skipped(result), len(result.errors)
 
 
 def echo_json(obj: Any) -> None:

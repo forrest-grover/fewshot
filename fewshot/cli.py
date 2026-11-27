@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from . import services
+from .classifiers import SETTING_MAX, NotReady
 from .cli_common import (
     CLASSIFIER_LIST,
     FAILED,
@@ -57,6 +58,18 @@ app.add_typer(cache_app, name="cache")
 app.add_typer(ex_app, name="example")
 app.add_typer(inbox_app, name="inbox")
 app.command()(serve)
+
+
+@app.callback()
+def pass_file_names_through() -> None:
+    """Before every command: read and write the standard streams with file names' bytes kept as
+    they are, as the C locale does, so a name that isn't UTF-8 (escaped as lone surrogates in
+    Python) is printed as its bytes, and read back from a piped list, instead of raising
+    ``UnicodeError``. (The group's help is set on ``app``, which takes precedence.)"""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):  # a text stream (not a plain StringIO)
+            stream.reconfigure(errors="surrogateescape")
+
 
 def main() -> None:
     """Entry point of the ``fewshot`` command: the CLI, with file system errors (an unreadable
@@ -150,18 +163,21 @@ def config(  # pylint: disable=too-many-arguments,too-many-positional-arguments,
     embedder: str | None = None,
     classifier: ClassifierName | None = None,
     param: list[str] = typer.Option([], help="Classifier param KEY=VALUE (e.g. k=3, scale=20). Repeatable."),
-    text_weight: float | None = None,
-    reject_below: float | None = typer.Option(None, help="Similarity threshold (-1 to 1) for 'unknown'"),
+    text_weight: float | None = typer.Option(None, min=0, max=SETTING_MAX["text_weight"]),
+    reject_below: float | None = typer.Option(None, min=-1, max=1,
+                                              help="Similarity threshold (-1 to 1) for 'unknown'"),
     clear_reject: bool = typer.Option(False, "--clear-reject", help="Turn off the 'unknown' threshold"),
     reject_below_zero_shot: float | None = typer.Option(
-        None, help="Threshold for zero-shot predictions (no example images), e.g. 0.22 for CLIP"),
+        None, min=-1, max=1,
+        help="Threshold for zero-shot predictions (no example images), e.g. 0.22 for CLIP"),
     clear_reject_zero_shot: bool = typer.Option(False, "--clear-reject-zero-shot"),
     flip: bool | None = typer.Option(None, "--flip/--no-flip",
                                      help="Average each image's embedding with its mirror image's"),
     names: bool | None = typer.Option(None, "--names/--no-names",
                                       help="Use class names as text for classes without a description (when "
                                            "the names match the examples)"),
-    temperature: float | None = typer.Option(None, help="Confidence calibration (see `fewshot eval`); 1 = none"),
+    temperature: float | None = typer.Option(None, min=0.01, max=100,
+                                             help="Confidence calibration (see `fewshot eval`); 1 = none"),
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Change task settings; --param sets classifier params on top of the current ones, and switching
@@ -260,11 +276,14 @@ def redo(name: str, root: Path | None = ROOT_OPT) -> None:
 
 @app.command()
 def export(name: str, file: Path, root: Path | None = ROOT_OPT) -> None:
-    """Save a task (settings, classes, labels and images) as a zip, for backup or another workspace."""
+    """Save a task (settings, classes, labels and images) as a zip, for backup or another workspace;
+    exits 1 if examples had to be left out (their images are missing)."""
     from .archive import export_task  # pylint: disable=import-outside-toplevel  # keeps --help fast
 
     ws = _ws(root)
     _task(root, name)
+    if file.is_dir() or not file.name:
+        _usage(f"{file} is a folder; give the zip file's name, e.g. {file / (name + '.zip')}")
     part = file.with_name(file.name + ".part")  # renamed into place when complete
     try:
         with open(part, "wb") as f:
@@ -275,7 +294,7 @@ def export(name: str, file: Path, root: Path | None = ROOT_OPT) -> None:
         _fail(f"Can't write {file}: {e.strerror or e}")
     typer.echo(f"Exported {name} ({n} examples) to {file}")
     if skipped:
-        typer.secho(f"{skipped} examples were left out: their image files are missing", fg="yellow", err=True)
+        _fail(f"Left out {skipped} of {n + skipped} examples: their image files are missing")
 
 
 @app.command("import-task")
@@ -370,16 +389,18 @@ def class_rm(name: str, label: str, root: Path | None = ROOT_OPT) -> None:
 
 @app.command()
 def add(name: str, label: str, paths: list[str], root: Path | None = ROOT_OPT) -> None:
-    """Add images (files, directories or http(s) URLs) as examples of LABEL; exits 1 if none could be added."""
+    """Add images (files, directories or http(s) URLs) as examples of LABEL; exits 1 if any couldn't be added."""
     t = _task(root, name)
     try:
         label = check_class_name(label)
     except ValueError as e:
         _fail(str(e))
-    n = _add_files(t, label, _expand(paths))
+    n, skipped = _add_files(t, label, _expand(paths))
     typer.echo(f"{name}: {len(t.config.examples)} examples")
     if n == 0:
         _fail("No images were added")
+    if skipped:
+        _fail(f"Not added: {skipped} of {n + skipped} images")
 
 
 @app.command("import")
@@ -390,15 +411,18 @@ def import_dir(
     root: Path | None = ROOT_OPT,
 ) -> None:
     """Import FOLDER/<class>/<image> into a task (hidden and system folders such as __MACOSX are
-    skipped), as one undo step; exits 1 if no image could be imported."""
+    skipped), as one undo step; exits 1 if any image couldn't be imported."""
     t = _task(root, name)
     if not folder.is_dir():
         _fail(f"Not a directory: {folder}")
     with _progress("Importing") as update:
-        n = report_skipped(services.import_folder(t, folder, shots, update))
+        result = services.import_folder(t, folder, shots, update)
+    n = report_skipped(result)
     typer.echo(f"Imported {n} images into {name}")
     if n == 0:
         _fail(f"No images were imported; expected {folder}/<class>/<image>")
+    if result.errors:
+        _fail(f"Not imported: {len(result.errors)} of {n + len(result.errors)} images")
 
 
 PREDICT_CHUNK = 256  # images classified (and printed) at a time
@@ -468,7 +492,7 @@ def _listed(from_file: Path) -> Iterator[Source]:
         yield from _named_in(sys.stdin)
         return
     try:
-        f = from_file.open(encoding="utf-8")
+        f = from_file.open(encoding="utf-8", errors="surrogateescape")  # names that aren't UTF-8 as on disk
     except OSError as e:
         _fail(f"Can't read {from_file}: {e.strerror or e}")
     with f:
@@ -498,7 +522,8 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     as_json: bool = JSON_OPT,
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Cross-validate the task with other embedders, to choose a model on its own labelled examples."""
+    """Cross-validate the task with other embedders, to choose a model on its own labelled examples;
+    exits 1 if any of them failed."""
     from .evaluate import compare_embedders  # pylint: disable=import-outside-toplevel  # torch-backed
 
     t = _task(root, name)
@@ -513,6 +538,7 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         _fail(str(e))
     if as_json:
         _echo_json(r)
+        _fail_if_any_failed(r)
         return
     for x in r["results"]:
         mark = ("*" if x["embedder"] == r["best"] else " ") + ("<" if x["embedder"] == r["current"] else " ")
@@ -526,6 +552,13 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     typer.echo(f"* most accurate, < current ({r['n_examples']} examples)")
     if r["best"] and r["best"] != r["current"]:
         typer.echo(f"To switch: fewshot config {name} --embedder {r['best']}")
+    _fail_if_any_failed(r)
+
+
+def _fail_if_any_failed(r: dict[str, Any]) -> None:
+    """Exit 1 if any embedder of a comparison failed."""
+    if failed := [x["embedder"] for x in r["results"] if x.get("error")]:
+        _fail("Failed: " + ", ".join(failed))
 
 
 WATCH_SETTLE = 30.0  # seconds after its last change that an unreadable file is given up on
@@ -546,7 +579,8 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
                                        "enough) or OUT/_error/ (a class named _unknown, _error or "
                                        "predictions.jsonl goes to OUT/_class_<name>/)"),
     copy: bool = typer.Option(False, "--copy", help="Copy instead of moving (then each file is handled once per run)"),
-    min_confidence: float | None = typer.Option(None, min=0, max=1, help="Below this, an image goes to _unknown"),
+    min_confidence: float | None = typer.Option(None, min=0, max=1,
+                                                help="Below this, an image goes to _unknown"),
     interval: float = typer.Option(2.0, min=0.1, help="Seconds between looks at the folder"),
     once: bool = typer.Option(False, "--once", help="Handle what is there now and stop"),
     root: Path | None = ROOT_OPT,
@@ -570,10 +604,12 @@ def watch(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
             try:
                 done |= _sort_files(ws, pipe, name, ready, out, copy, min_confidence,
                                     settle=0 if once else WATCH_SETTLE, retry=retry) if ready else set()
-            except ValueError as e:  # the task can't predict yet (no examples): wait for some
+            except NotReady as e:  # the task can't predict yet (no examples): wait for some
                 if once:
                     _fail(str(e))
                 typer.secho(f"Waiting: {e}", fg="yellow", err=True)
+            except ValueError as e:  # can't ever predict as set up (a bad device, a model that won't load)
+                _fail(str(e))
             if once:
                 return
             time.sleep(interval)
@@ -627,7 +663,8 @@ def _sort_files(ws: Workspace, pipe: Pipeline, name: str, files: list[Path], out
     under ``out``, appending a JSON line per file to ``out/predictions.jsonl``. Returns the files
     handled. An unreadable file changed less than ``settle`` seconds ago may still be arriving and
     is left for next time; a file that can't be moved is noted in ``retry``, to wait before trying
-    again. Raises ``ValueError`` if the task can't predict yet (no examples)."""
+    again. Raises ``NotReady`` if the task can't predict yet (no examples), and ``ValueError``
+    if it can't predict as set up."""
     try:
         preds = pipe.predict(ws.get(name), files)
     except KeyError:
@@ -757,7 +794,7 @@ def _print_eval(r: dict[str, Any]) -> None:
 def eval_cmd(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # one per CLI option
     name: str,
     folds: int | None = typer.Option(
-        None, help="Number of folds [default: leave-one-out up to 100 examples (300 for prototype and "
+        None, min=2, help="Number of folds [default: leave-one-out up to 100 examples (300 for prototype and "
                    "knn), then 10, then 5 above 300]"),
     as_json: bool = JSON_OPT,
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: each example's held-out prediction"),
@@ -800,7 +837,10 @@ def dupes(
 ) -> None:
     """List near-duplicate examples, most similar first; pairs with different labels are marked."""
     t = _task(root, name)
-    pairs = _pipe(_ws(root)).near_duplicates(t, threshold, limit)
+    try:
+        pairs = _pipe(_ws(root)).near_duplicates(t, threshold, limit)
+    except ValueError as e:  # the model can't be loaded, say
+        _fail(str(e))
     if as_json:
         _echo_json(pairs)
         return

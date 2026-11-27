@@ -9,9 +9,11 @@
 
 Images are file paths or ``(filename, bytes)`` pairs. Every method returns the API's JSON; an error
 response raises ``ApiError`` with the HTTP status and the server's ``detail``, and so does a failed
-connection (status 0). Many images are sent in batches of at most ``BATCH`` images (the server
-takes at most 1000 files per request) and at most half the server's request size limit, reading
-only one batch of files at a time; the results are combined.
+connection (status 0), a response that isn't JSON, and a redirect: redirects aren't followed, so the
+token is never sent to another server and a POST is never repeated as a GET. Many images are
+sent in batches of at most ``BATCH`` images (the server takes at most 1000 files per request) and
+at most half the server's request size limit, reading only one batch of files at a time; the
+results are combined.
 
 The methods cover the common work (tasks, adding images, the inbox, predicting, evaluating);
 ``request`` reaches every other endpoint (see the server's /docs).
@@ -29,7 +31,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 Image = str | Path | tuple[str, bytes]
 BATCH = 256  # images per upload request, at most
@@ -71,6 +73,20 @@ class ApiError(Exception):
         self.detail = detail
 
 
+class _NoRedirects(HTTPRedirectHandler):
+    """Refuses every redirect: urllib would send the Authorization header on to whatever server
+    it names, and turn a POST into a GET without its body."""
+
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any,  # pylint: disable=too-many-arguments,too-many-positional-arguments  # urllib's signature
+                         newurl: str) -> None:
+        fp.close()
+        raise ApiError(code, f"The server redirected to {newurl}; give that URL instead (redirects aren't "
+                             "followed, so the token isn't sent elsewhere)")
+
+
+_OPENER = build_opener(_NoRedirects)
+
+
 class Client:
     """Calls the API of the fewshot server at ``url``, sending ``token`` (if the server needs one)."""
 
@@ -87,7 +103,8 @@ class Client:
         """Send a request to ``path`` (under ``/api``) and return the decoded JSON (None if empty).
 
         ``params`` become the query string (None values are left out); ``json_body`` is sent as JSON;
-        ``fields`` and ``files`` as a multipart form, the files under the name ``files``.
+        ``fields`` and ``files`` as a multipart form, the files under the name ``files`` (a file
+        that can't be read raises ``ApiError`` with status 0, and nothing is sent).
         """
         query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
         headers = {"Accept": "application/json"}
@@ -98,19 +115,26 @@ class Client:
             data = json.dumps(json_body).encode()
             headers["Content-Type"] = "application/json"
         elif fields is not None or files:
-            data, headers["Content-Type"] = _multipart(fields or {}, files)
+            loaded, unread = _read(files)
+            if unread:
+                raise ApiError(0, f"Can't read {unread[0][1]}: {unread[0][2]}")
+            data, headers["Content-Type"] = _multipart(fields or {}, loaded)
         req = Request(f"{self.url}/api{path}{'?' + query if query else ''}", data=data, headers=headers,
                       method=method)
         try:
-            with urlopen(req, timeout=self.timeout) as r:
-                body = r.read()
+            with _OPENER.open(req, timeout=self.timeout) as r:
+                status, body = r.status, r.read()
         except HTTPError as e:
             raise _api_error(e) from None
         except (URLError, OSError, http.client.HTTPException) as e:
             reason = getattr(e, "reason", None) or e
             hint = " (the request may be larger than the server accepts)" if data and len(data) > 1024 * 1024 else ""
             raise ApiError(0, f"Connection to {self.url} failed: {reason}{hint}") from None
-        return json.loads(body) if body else None
+        try:
+            return json.loads(body) if body else None
+        except ValueError:  # an HTML page from a proxy, say
+            start = body[:200].decode(errors="replace")
+            raise ApiError(status, f"The response from {self.url} isn't JSON: {start!r}") from None
 
     def batch_bytes(self) -> int:
         """The most bytes of images sent per request: half the server's request size limit (as its
@@ -155,22 +179,30 @@ class Client:
 
     def _upload(self, path: str, images: Iterable[Image], fields: dict[str, str]) -> dict[str, Any]:
         """POST ``images`` a batch at a time, all one undo step; ``added`` and ``errors`` are
-        combined, ``task`` is the last. A batch refused with 400 (nothing in it added) adds its
-        reason to ``errors``; if every batch was refused, the first refusal is raised."""
+        combined, ``task`` is the last. A file that can't be read is listed in ``errors``. A batch
+        refused with 400 or 413 (nothing in it added) adds its reason to ``errors``; if every
+        batch was refused, the first refusal is raised (``ApiError`` 400 if no file could be read)."""
         out: dict[str, Any] = {"added": [], "errors": [], "task": None}
         refused: ApiError | None = None
         fields = {**fields, "undo_group": uuid.uuid4().hex}  # the batches are one undo step
         for batch in _batches(images, self.batch_bytes()):
+            loaded, unread = _read(batch)
+            out["errors"] = out["errors"] + [{"file": name, "error": why} for _, name, why in unread]
+            if not loaded:
+                continue
             try:
-                r = self.request("POST", path, fields=fields, files=batch)
+                r = self.request("POST", path, fields=fields, files=loaded)
             except ApiError as e:
-                if e.status != 400:
+                if e.status not in {400, 413}:
                     raise
                 refused = refused or e
                 out["errors"] = out["errors"] + [{"file": None, "error": str(e.detail)}]
                 continue
             out = {"added": out["added"] + r["added"], "errors": out["errors"] + r["errors"], "task": r["task"]}
         if out["task"] is None:
+            if refused is None and out["errors"]:
+                refused = ApiError(400, f"No image could be read: {out['errors'][0]['file']}: "
+                                        f"{out['errors'][0]['error']}")
             raise refused or ValueError("No images given")
         return out
 
@@ -186,14 +218,19 @@ class Client:
     # ---- inference -----------------------------------------------------
     def predict(self, task: str, images: Iterable[Image], *, top_k: int | None = None, evidence: int = 0,
                 revision: int | None = None) -> list[dict[str, Any]]:
-        """Classify images; each result has ``label``, ``confidence``, ``scores``, ``revision`` (or ``error``).
+        """Classify images; each result has ``label``, ``confidence``, ``scores``, ``revision`` (or
+        ``error``, as has a file that can't be read), in the order given.
 
         ``revision`` predicts with an earlier version of the task that the server still keeps.
         """
         params = {"top_k": top_k, "evidence": evidence or None, "revision": revision}
         out: list[dict[str, Any]] = []
         for batch in _batches(images, self.batch_bytes()):
-            out += self.request("POST", f"/tasks/{_seg(task)}/predict", params=params, files=batch)
+            loaded, unread = _read(batch)
+            preds = iter(self.request("POST", f"/tasks/{_seg(task)}/predict", params=params, files=loaded)
+                         if loaded else [])
+            errors = {i: {"file": name, "error": why} for i, name, why in unread}
+            out += [errors[i] if i in errors else next(preds) for i in range(len(batch))]
         return out
 
     def evaluate(self, task: str, folds: int | None = None, poll: float = 1.0) -> dict[str, Any]:
@@ -229,14 +266,40 @@ def _seg(s: str) -> str:
     return quote(s, safe="")
 
 
-def _multipart(fields: dict[str, str], files: Sequence[Image]) -> tuple[bytes, str]:
-    """A multipart/form-data body with ``fields`` and each image as a ``files`` part, and its content type."""
+def _read(batch: Sequence[Image]) -> tuple[list[tuple[str, bytes]], list[tuple[int, str, str]]]:
+    """The images of ``batch`` that can be read, as ``(name, bytes)``, and ``(position, file, reason)``
+    for each file that can't be."""
+    loaded: list[tuple[str, bytes]] = []
+    unread: list[tuple[int, str, str]] = []
+    for i, img in enumerate(batch):
+        if isinstance(img, tuple):
+            loaded.append((img[0], img[1]))
+            continue
+        try:
+            loaded.append((Path(img).name, Path(img).read_bytes()))
+        except OSError as e:
+            unread.append((i, _text(str(img)), e.strerror or str(e)))
+    return loaded, unread
+
+
+def _text(s: str) -> str:
+    """``s`` as valid Unicode: a file name that isn't UTF-8 (its bytes escaped as lone surrogates)
+    has each such byte replaced by U+FFFD."""
+    try:
+        return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except UnicodeEncodeError:  # a surrogate not from a file name's bytes
+        return s.encode("utf-8", "replace").decode("utf-8")
+
+
+def _multipart(fields: dict[str, str], files: Sequence[tuple[str, bytes]]) -> tuple[bytes, str]:
+    """A multipart/form-data body with ``fields`` and each ``(name, bytes)`` image as a ``files``
+    part, and its content type."""
     boundary = uuid.uuid4().hex
     parts: list[bytes] = []
     for k, v in fields.items():
-        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
-    for img in files:
-        name, data = (img[0], img[1]) if isinstance(img, tuple) else (Path(img).name, Path(img).read_bytes())
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{_text(v)}\r\n'.encode())
+    for name, data in files:
+        name = _text(name)
         ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
         safe = name.replace('"', "%22").replace("\r", "").replace("\n", "")
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{safe}"\r\n'

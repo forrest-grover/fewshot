@@ -192,6 +192,23 @@ def test_watch_waits_for_a_task_that_can_predict(run, root, tmp_path, monkeypatc
     assert (out / "red" / "r.png").exists()
 
 
+def test_watch_stops_on_an_error_waiting_wont_fix(run, task, tmp_path, monkeypatch):
+    """Any other ValueError (a bad device, a model that can't load) stops a watch with an error
+    rather than printing "Waiting" for ever."""
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "r.png").write_bytes(png(RED, seed=9))
+
+    def broken(*_a, **_k):
+        raise ValueError("FEWSHOT_DEVICE='cuda:7' isn't available")
+
+    monkeypatch.setattr("fewshot.pipeline.Pipeline.predict", broken)
+    _watch_looks(monkeypatch, 5)  # a watch that waits would stop here, exiting 0
+    r = run("watch", task, inbox, "--out", out)
+    assert (r.exit_code, "Error: FEWSHOT_DEVICE='cuda:7'" in r.output, "Waiting" in r.output) == (1, True, False)
+    assert (inbox / "r.png").exists()
+
+
 def test_watch_survives_files_that_vanish(run, task, tmp_path, monkeypatch):
     """A file gone before its size is read, or before it is moved, is skipped with a message."""
     inbox, out = tmp_path / "in", tmp_path / "out"

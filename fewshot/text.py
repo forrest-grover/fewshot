@@ -13,11 +13,16 @@ def check_class_name(name: str) -> str:
     """Return ``name`` stripped; raise ``ValueError`` if it can't be a class name.
 
     Class names appear as URL path segments, so ``/``, ``\\``, ``.`` and ``..`` are refused (a
-    client would resolve ``.../classes/..`` to the task itself), as are control characters.
+    client would resolve ``.../classes/..`` to the task itself), as are control characters and
+    text that isn't valid Unicode (a command-line argument that isn't UTF-8).
     """
     name = name.strip()
     if not name:
         raise ValueError("Class name is empty")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"Class name {name!r} isn't valid UTF-8") from None
     if name in {".", ".."} or any(ch in "/\\" or ord(ch) < 32 or ord(ch) == 127 for ch in name):
         raise ValueError(f"Class name {name!r} can't be '.' or '..' or contain '/', '\\' or control characters")
     if len(name) > MAX_CLASS_NAME:

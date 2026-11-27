@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from .classifiers import SETTING_MAX
 from .embedders import check_embedder
 from .fetch import fetch_url
-from .folders import class_folders, read_or_empty
+from .folders import class_folders, read_or_empty, readable_name
 from .text import check_class_name
 
 if TYPE_CHECKING:
@@ -225,7 +225,7 @@ def import_folder(task: Task, folder: Path, shots: int | None = None,
         for i, (f, label) in enumerate(files):
             if update:
                 update(i, len(files))
-            yield Blob(str(f), f, source=f.name), label
+            yield Blob(str(f), f, source=readable_name(f.name)), label
 
     return _add_labelled(task, blobs(), undo_group)
 

@@ -161,6 +161,7 @@ def test_cli(tmp_path):
     r = run("inbox", "add", "t", d)
     assert "3 images in the inbox" in r.output
     assert "skip" in r.output
+    assert (r.exit_code, "Error: Not added to the inbox: 1 of 4 images" in r.output) == (1, True)
     assert run("inbox", "add", "t", d / "bad.png").exit_code == 1
     lines = run("inbox", "ls", "t", "--sort", "confident").output.splitlines()
     assert len(lines) == 4

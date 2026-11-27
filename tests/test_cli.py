@@ -195,8 +195,8 @@ def test_config_and_create_validate_embedders(run, root, task):
     assert r.exit_code == 2
     assert "Give either --reject-below-zero-shot or --clear-reject-zero-shot, not both" in r.output
     r = run("config", task, "--text-weight", "-5")
-    assert r.exit_code == 1
-    assert "Error: text_weight must be between 0 and 100, got -5" in r.output
+    assert r.exit_code == 2  # called wrongly
+    assert "Input should be greater than or equal to 0" in r.output
 
 
 @pytest.mark.parametrize(("args", "message"), [
@@ -206,12 +206,18 @@ def test_config_and_create_validate_embedders(run, root, task):
     (["--param", "k=three"], "Bad --param 'k=three'"),
     (["--param", "bogus=1"], "Unknown parameter 'bogus' for gda"),
     (["--classifier", "knn", "--param", 'k="x"'], "'k' must be an integer"),
-    (["--reject-below", "2"], "reject_below must be between -1 and 1"),
+    (["--reject-below", "2"], "less than or equal to 1"),
+    (["--reject-below-zero-shot", "-3"], "greater than or equal to -1"),
+    (["--temperature", "nan"], "--temperature': Input should be less than or equal to 100"),
+    (["--temperature", "0"], "greater than or equal to 0.01"),
+    (["--text-weight", "inf"], "--text-weight': Input should be less"),
 ])
 def test_config_errors(run, root, task, args, message):
-    """Invalid settings and malformed --param values fail without changing the task."""
+    """Invalid settings and malformed --param values fail without changing the task; values out
+    of an option's range are usage errors (2), like malformed ones."""
     r = run("config", task, *args)
-    assert r.exit_code == (2 if message.startswith(("Bad --param", "'nope'")) else 1)  # 2: a usage error
+    usage = message.startswith(("Bad --param", "'nope'")) or "Input should be" in message or "than or equal" in message
+    assert r.exit_code == (2 if usage else 1)
     assert message in r.output
     assert load(root).config.classifier == "gda"
 
@@ -318,8 +324,9 @@ def test_add(run, root, tmp_path):
     bad.write_bytes(b"junk")
 
     r = run("add", "colors", "red", single, tmp_path / "more", bad)
-    assert r.exit_code == 0
+    assert r.exit_code == 1  # failed for some of its inputs
     assert "colors: 3 examples" in r.output
+    assert "Error: Not added: 1 of 4 images" in r.output
     assert "skip" in r.output
     assert "bad.png" in r.output
     assert "Not a readable image" in r.output
@@ -353,8 +360,9 @@ def test_import_is_one_undo_step(run, root, tmp_path):
     run("create", "many", "--embedder", "fake:color")
     run("class", "add", "many", "first")
     r = run("import", "many", folder)
-    assert r.exit_code == 0
+    assert r.exit_code == 1  # failed for some of its inputs
     assert "Imported 25 images" in r.output
+    assert "Error: Not imported: 1 of 26 images" in r.output
     assert f"skip {folder / 'c00' / 'bad.png'}" in r.output
     assert len(load(root, "many").config.examples) == 25
     assert run("undo", "many").exit_code == 0
@@ -723,7 +731,7 @@ def test_unreadable_file_is_skipped_when_adding(run, task, tmp_path, monkeypatch
 
     monkeypatch.setattr(type(bad), "read_bytes", read_bytes)
     r = run("add", task, "red", good, bad)
-    assert r.exit_code == 0
+    assert r.exit_code == 1
     assert f"skip {bad}: Permission denied" in r.output
 
 
