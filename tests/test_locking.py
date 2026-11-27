@@ -381,7 +381,9 @@ def test_where_case_is_ignored_a_task_opens_only_under_its_own_spelling(ws, monk
     second task; it is no task instead. Other file systems are left alone."""
     ws.create("FOO")
     tasks = ws.root / "tasks"
-    assert not fsutil.folds_case(tasks)  # Linux
+    fsutil.folds_case.cache_clear()  # the real answer differs: macOS ignores case, Linux doesn't
+    monkeypatch.setattr(os.path, "samefile", lambda a, b: False)
+    assert not fsutil.folds_case(tasks)
     fsutil.folds_case.cache_clear()
     monkeypatch.setattr(os.path, "samefile", lambda a, b: True)
     fresh = Workspace(ws.root)
