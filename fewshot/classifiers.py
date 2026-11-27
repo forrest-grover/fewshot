@@ -117,15 +117,12 @@ NAME_EXACT_CLASSES, NAME_PERMUTATIONS = 6, 999  # every order up to 6 classes (7
 
 def names_match(guess: Labels, truth: Labels, named: npt.NDArray[np.bool_], texts: int) -> bool:
     """Whether text guesses ``guess`` of every example's class ``truth`` hit it, among the examples
-    of the classes described by their names (``named``), more often than chance would, at
-    ``NAME_TEST_LEVEL``. With ``NAME_PERMUTATION_CLASSES`` named classes or more, by a permutation
-    test (``names_permutation_p``): a class's examples lie close together and mostly go to the same
-    name whatever it means, so counting each as a trial, as a binomial test does, passed
-    meaningless names 15-19% of the time with 5-10 classes of 4 images; this passes about 5%.
-    With fewer, by a one-sided binomial test over the examples. Chance is the hit rate of guesses
-    unrelated to the images: one is class c as often as the guesses for all the examples are (so
-    sending every image to the largest class scores no better, and a single class's name can pass
-    among described ones), or with every example in one class, one in the ``texts`` (classes with text)."""
+    of the classes described by their names (``named``), more often than chance at ``NAME_TEST_LEVEL``:
+    with ``NAME_PERMUTATION_CLASSES`` named classes or more by a permutation test over the classes
+    (``names_permutation_p``), as a class's examples go to the same name together; with fewer by a
+    one-sided binomial test over the examples, chance being the hit rate of guesses unrelated to the
+    images (one is class c as often as all the guesses are, so sending every image to the largest
+    class scores no better), or with every example in one class, one in the ``texts`` (with text)."""
     if len(np.unique(truth[named])) >= NAME_PERMUTATION_CLASSES:
         return names_permutation_p(guess[named], truth[named]) < NAME_TEST_LEVEL
     rate = np.bincount(guess, minlength=int(max(guess.max(), truth.max())) + 1) / len(guess)
@@ -204,8 +201,7 @@ def with_names(data: ClassData) -> ClassData:
     """``data`` with the names of its classes that have images but no text as their text, if
     ``use_names`` is set and they match the examples: meaningless names (codes, numbers) would
     only pull predictions off. The names together must classify the images better than chance
-    would (see ``names_match``: a permutation test over the classes, or with few of them a
-    binomial test over the examples, guessing among every class with text or such a name), and then
+    would (``names_match``, guessing among every class with text or such a name), and then
     each is tested on its own, since a task can mix names with codes and real names passing the
     first test would otherwise carry the codes with them (on Food-101 with a fifth of the
     classes named, the coded classes fell from 72% to 23% at 2 images per class). A name is
@@ -277,8 +273,7 @@ PREDICT_CELLS = 4_000_000
 
 
 class NotReady(ValueError):
-    """A task that can't classify yet: no class has an image or a description, or one has
-    neither. Adding examples (or descriptions) makes it ready, so ``fewshot watch`` waits."""
+    """A task that can't classify until a class gets images or a description (``watch`` waits)."""
 
 
 class Classifier:  # pylint: disable=too-many-instance-attributes  # fitted state plus settings
