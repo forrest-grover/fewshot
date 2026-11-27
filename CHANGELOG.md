@@ -40,3 +40,33 @@ Behaviour
 
 ### API and web UI
 - **Changed:** the evaluation report's `calibration` has a new field, `temperature_helps`. The Evaluate tab offers a temperature only when it is true, as the CLI does.
+
+Errors
+- **Changed:** every error, the framework's 404 and 405 included, is an RFC 9457 problem (`application/problem+json`): `{type, title, status, detail, instance, code}` plus members such as `task`, `label`, `similar_to` and `pointer`. `detail` stays a one-line string; `code` is stable (see the README's code table). The one break is the 422 body: its list of problems moved from `detail` to `errors` (each entry has `pointer` or `parameter`, `detail` and `code`, and still pydantic's `loc` and `msg`, deprecated, for one version), and `detail` is now a summary sentence. A 422 lists every problem at once.
+- **Changed:** statuses follow one policy (README, Errors): 409 for conflicts (creating, renaming, duplicating or importing onto a task name that is taken, renaming a class onto another, undo or redo with nothing to do), which were 400; 422, which was 400, for a field out of its range or choices (`folds` below 2, `text_weight` outside 0–100, a reject threshold outside -1–1, a temperature outside 0.01–100, an unknown classifier, an empty `class-thresholds` body); 415 for an upload route sent something other than a multipart form; 412 for a failed `If-Match`. `/openapi.json` declares the error responses of every route.
+- A missing task's 404 names the closest tasks (`similar_to`) and how to create one; a missing token (`NOT_SIGNED_IN`) is told apart from a wrong one (`WRONG_TOKEN`). An unexpected error is a 500 `INTERNAL` that is logged and says nothing more.
+
+Requests
+- **Changed:** a label close to an existing class's (the same but for case, or one or two letters off) is refused with 422 `CLASS_NAME_NEAR_MISS` on every route that labels images (uploads, `.../examples/urls`, relabelling one or several examples, accepting inbox images), as the CLI refuses it; send `new_class=true` to create it. Scripts that relied on the API creating such names must send it.
+- **Changed:** unknown query parameters (`?topk=`) are a 422, as unknown body fields are; `GET .../examples?label=` with a class the task doesn't have is a 404 `CLASS_NOT_FOUND`, not an empty page.
+- `PATCH /api/tasks/{name}` is a JSON Merge Patch: `null` clears `reject_below`, `reject_below_zero_shot` or `temperature` (it was ignored), and null for another field is a 422. `clear_reject`, `clear_reject_zero_shot` and `clear_temperature` still work, are deprecated in the schema, and are answered with `Deprecation: true`.
+- Responses carrying a task send `ETag: "<revision>"`, and changes to a task honour `If-Match` (412 `PRECONDITION_FAILED` with the current `revision` if it moved on); without `If-Match` nothing changes.
+
+Responses
+- **Changed:** uploads say what was deduplicated: `added` lists only the examples (or inbox images) new to the task, `unchanged` those there already, `moved` those moved from another class (they were in `added` before), and `created_classes` the class an upload created. An upload that stores nothing new answers 200, not 201; 400 `NO_IMAGES_ADDED` is only for no readable image.
+- **Changed:** a prediction for an unreadable image has `top_label`, `confidence` and `similarity` null (they were `""`, 0.0 and 0.0), in the API and in `fewshot predict --json`.
+- **Changed:** `POST .../evaluate/jobs` and `.../compare/jobs` refuse a task without examples at once (400 `NO_EXAMPLES`) instead of starting a job that fails. A job's 202 carries `Location` and `Retry-After`, a running job's `GET` carries `Retry-After`, `status` is an enum in the schema, and a failed job has `problem` (with its `code`) beside `error`. 429 `TOO_MANY_JOBS` carries `Retry-After`.
+- Evaluation reports give each held-out prediction's `source`, and duplicate pairs their `sources`, as the CLI's JSON does. `/api/health` reports `version` and `api_version` (`1`), every response carries `X-Fewshot-Version`, and the OpenAPI schema has the package version, tags, a summary per route and examples. The README states the compatibility policy.
+- `fewshot list --json` and `GET /api/tasks` warn about a task with only one class that has examples, whose evaluation accuracy is always 1.0.
+
+### Python client
+- `Client()` reads `FEWSHOT_URL` (default `http://127.0.0.1:8000`) and `FEWSHOT_TOKEN`.
+- Errors are a hierarchy under `FewshotError`: `ApiError` (with `status`, `status_code`, `code`, `detail`, `body`, `fields`; `str()` is `CODE: detail`) and its subclasses by status (`BadRequestError`, `AuthenticationError`, `PermissionDeniedError`, `NotFoundError`, `ConflictError`, `PreconditionFailedError`, `ValidationError` with `.errors`, `RateLimitError` with `.retry_after`, `ServerError`); `APIConnectionError` and `APITimeoutError`; `JobFailedError`, `JobCancelledError` and `JobResultExpiredError` (`JobError`s, with `job_id`). **Changed:** a failed connection was `ApiError` with status 0, and a failed, cancelled or expired evaluation `ApiError` with the made-up statuses 400, 409 and 410; they are no longer `ApiError`s (catch `FewshotError`). A file that can't be read given to `request(files=...)` raises `FewshotError` (it was `ApiError` 0).
+- `start_evaluate` and `start_compare` return a `Job` (`.id`, `.status()`, `.wait(timeout=, on_progress=)`, `.cancel()`, `.result()`), `client.job(id)` comes back to one, and `evaluate` and the new `compare` wait for one, with `timeout=` (`APITimeoutError` with the job's id) and a Ctrl-C message naming the job.
+- `inbox()` takes `offset` and `limit`; `iter_inbox`, `examples` and `iter_examples` page through the inbox and the examples.
+- Images may be `bytes`, binary file objects and PIL images too; another type raises `TypeError` naming its index before anything is sent. A `predict` result for a file that can't be read has every key, as the server's.
+- Upload results combine `added`, `unchanged`, `moved`, `created_classes` and `errors` over the batches (`moved` was dropped). `add_examples` and `accept_inbox` take `new_class=`, and the methods that change a task `if_match=`.
+- Methods return `TypedDict`s mirroring the API's schemas (`Prediction`, `TaskDetail`, `AddResult`, `InboxPage`, `EvalReport`, `JobInfo`...); they are plain dicts at runtime.
+
+### Web UI
+- Clearing a setting sends `null`. An "Add as" of an image that is an example already counts it as added, and a refused change reloads the task on 412 too.
