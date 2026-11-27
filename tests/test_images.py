@@ -1,7 +1,9 @@
 """Decoding images (fewshot.images): pixel limits, shrinking before embedding, transparency and
 high bit depths."""
 
+import base64
 import io
+import tracemalloc
 import zlib
 
 import numpy as np
@@ -10,7 +12,7 @@ from PIL import Image
 
 from fewshot import images, pipeline
 from fewshot.images import load_image, to_rgb
-from tests.conftest import RED
+from tests.conftest import RED, query_files
 
 
 def _jpeg_of(size):
@@ -215,3 +217,70 @@ def test_conversion_key_of_files(tmp_path):
     assert images.conversion_key(tmp_path / "a.png") == images.CONVERSION_KEY
     assert images.conversion_key(str(tmp_path / "b.jpg")) == ""
     assert images.conversion_key(tmp_path / "missing.png") == ""
+
+
+# Files found by fuzzing that Pillow fails on with errors other than OSError: a PNG with a broken
+# chunk (SyntaxError) and a damaged TIFF (TypeError). zlib, then base64.
+DAMAGED = {
+    "broken.png": (
+        "eNoBwQE+/olQTkcNChoKAAAADUlIRFIAAAAQAAAAEAgEAAAAtfo36gAAATZJREFUeJwFwT1IlAEAAND3fSkkpaWZaXZeVqCk"
+        "hyJSOGQR2eBSOJS0SeRgGQVaNGRDGA1BRZjgElw/bkoEJgWCSUioRGDcQYXJJRT0I5ihol7vBV3pUx5o9ctXKTOOSHqm2wfr"
+        "ttkh3C8uzztxxQ6ZtM+0Xo+dVW1Vg/CnmEBSSpFxndbcNuS3Nd8tuCjsV+iEA3LdU2ZYm0HNan0RNS1HcDNdqk/MrEeaHcMT"
+        "5c776JuIEmGeXnWOimlw3F0LOmUplfLKGx2CtnSu0HZ1pswr8UJMVEraZ2PahJUGzFsRV2BElk8iNrpvyUmN8oVjolaNK/ZW"
+        "lSUX9EiIibqhXrWwXqhZhbgaKa/9cMe6NUntHpoThmpcUaxDtmUJVUaNKPNSrXyDguF0t0U5Kow6Z5enprR77oxsBf7ImLVT"
+        "uYQKA7bK1OKgCa2GRORbEZ62blGlqKvyxPUoVSRHxIQCmwRN6fcKXbPFdbf8E+iy1wbLmsS1yrisz1+7TbqkOIzDlmy2R6Nu"
+        "czL9B0jMfd8I+RYhAAAAAElFTkSuQmCCXrDI5A=="
+    ),
+    "broken.tif": (
+        "eNrz9NRi4GBgAGFGFgZGIEsAiBmR2MyMzGA2CLMhsQUZ2cF0HhCLIakXh7IVgFgGST0IRE1dt/bqqSSdUNNJl2I1p+ZqdS9N"
+        "nTGlW3vV1VVB0lO3rAQA32cSOA=="
+    ),
+}
+
+
+def _damaged(name):
+    return zlib.decompress(base64.b64decode(DAMAGED[name]))
+
+
+@pytest.mark.parametrize("name", sorted(DAMAGED))
+def test_damaged_files_are_unreadable_images_not_crashes(name):
+    """Whatever error Pillow raises for a damaged file, it is one unreadable image (ValueError)."""
+    data = _damaged(name)
+    with pytest.raises(ValueError, match=r"^Not a readable image: "):
+        load_image(data)
+    with pytest.raises(ValueError, match=r"^Not a readable image: "):
+        images.image_ext(data)
+    assert images.conversion_key(data) in {"", *images.CONVERSION_KEYS}
+
+
+def test_a_damaged_file_gets_its_own_error_over_the_api(client, task_t):
+    """One damaged file among good ones is a per-file error in predictions and uploads, not a
+    failed request."""
+    damaged = [("files", (name, _damaged(name), "image/png")) for name in sorted(DAMAGED)]
+    r = client.post(f"/api/tasks/{task_t}/predict", files=[*damaged, *query_files(1)])
+    assert r.status_code == 200
+    assert [p["error"] is None for p in r.json()] == [False, False, True]
+    r = client.post(f"/api/tasks/{task_t}/examples", data={"label": "red"}, files=[*damaged, *query_files(1)])
+    assert r.status_code == 201
+    assert (len(r.json()["added"]), len(r.json()["errors"])) == (1, 2)
+
+
+def test_high_bit_depth_is_rescaled_without_float_copies_of_the_whole_image(monkeypatch):
+    """A 16-bit image is rescaled a few rows at a time, so a small file holding a large image (a
+    PNG of few values compresses hundreds of times) can't take gigabytes: under 5 bytes a pixel,
+    where whole-image float64 copies took 40."""
+    for name in ("SCALE_CHUNK", "STRETCH_SAMPLE"):  # small next to the image, as for a large one
+        monkeypatch.setattr(images, name, 1 << 16)
+    a = np.random.default_rng(0).integers(0, 65535, (2000, 2000)).astype(np.uint16)
+    im = Image.fromarray(a)
+    tracemalloc.start()
+    try:
+        out = images._to_8bit(im)  # pylint: disable=protected-access
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 5 * a.size
+    top = np.percentile(a.ravel()[:: max(1, a.size // images.STRETCH_SAMPLE)].astype(np.float64),
+                        images.STRETCH_PERCENTILE)
+    expected = np.rint(a * (255 / top)).clip(0, 255).astype(np.uint8)
+    assert np.array_equal(np.asarray(out), expected)

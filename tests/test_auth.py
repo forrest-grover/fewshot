@@ -10,7 +10,7 @@ import fewshot.access
 import fewshot.api
 import fewshot.auth
 import fewshot.guard
-from fewshot.access import NO_TOKEN, exposure_problem
+from fewshot.access import NO_TOKEN, NO_TOKEN_PROXIED, exposure_problem
 from fewshot.auth import Sessions, WrongTokens
 from fewshot.guard import host_allowed
 from fewshot.server_settings import ServerSettings
@@ -179,7 +179,7 @@ def test_a_stranger_guessing_from_a_shared_address_locks_nobody_out(tmp_path, mo
 
 def test_a_proxy_that_isnt_trusted_is_reported_once(tmp_path, caplog):
     """Requests forwarded by a proxy whose X-Forwarded-For isn't trusted log a warning, once;
-    a trusted proxy (the client address is the forwarded one) or no token logs none."""
+    a trusted proxy (the client address is the forwarded one) logs none."""
     c = api_client(tmp_path, token=TOKEN)
     with caplog.at_level("WARNING", logger="fewshot.api"):
         assert c.get("/api/health").status_code == 200
@@ -187,8 +187,6 @@ def test_a_proxy_that_isnt_trusted_is_reported_once(tmp_path, caplog):
         for _ in range(2):
             c.get("/api/health", headers={"X-Forwarded-For": "203.0.113.5, 10.0.0.1"})
         c.get("/api/health", headers={"X-Forwarded-For": "testclient"})  # what uvicorn makes of a trusted one
-        open_server = api_client(tmp_path / "open")
-        open_server.get("/api/health", headers={"X-Forwarded-For": "203.0.113.5"})
     assert [r.getMessage()[:56] for r in caplog.records] == [
         "Requests come through a proxy at testclient whose X-Forw"]
     trusted = api_client(tmp_path / "trusted", token=TOKEN)
@@ -262,9 +260,10 @@ def test_cross_site_writes_are_refused(tmp_path):
 def test_cross_site_check_behind_a_proxy_that_rewrites_host(tmp_path):
     """Behind a proxy sending its own Host (nginx's default), the browser's Origin is compared
     with X-Forwarded-Host too; a refusal says what was compared and how to fix the proxy."""
-    c = host_client(tmp_path, hosts="*")
+    c = api_client(tmp_path, token=TOKEN)
     body = {"name": "t", "embedder": "fake:color"}
-    page = {"Host": "127.0.0.1:8000", "Origin": "https://fewshot.example.com", "Sec-Fetch-Site": "same-origin"}
+    page = {"Authorization": f"Bearer {TOKEN}", "Host": "127.0.0.1:8000", "Origin": "https://fewshot.example.com",
+            "Sec-Fetch-Site": "same-origin"}
     r = c.post("/api/tasks", json=body, headers=page)
     assert r.status_code == 403
     assert r.json()["detail"] == ("Cross-site request refused: its Origin 'https://fewshot.example.com' doesn't "
@@ -306,6 +305,52 @@ def test_a_server_without_token_refuses_other_interfaces(tmp_path, monkeypatch, 
     monkeypatch.setenv("FEWSHOT_HOME", str(app.state.server.settings.home))
     from_env = TestClient(fewshot.api.create_app(ServerSettings.from_env()), base_url="http://172.17.0.2")
     assert from_env.get("/api/tasks").status_code == 200
+
+
+def test_a_server_without_token_refuses_proxied_and_unix_socket_requests(tmp_path, caplog):
+    """A proxy on this machine connects on loopback for clients anywhere, so a server without a token
+    refuses requests carrying forwarding headers, and those on a Unix socket (which uvicorn gives no
+    port), except /healthz; FEWSHOT_ALLOW_NO_TOKEN=1 serves them."""
+    client = api_client(tmp_path, base_url="http://127.0.0.1:8000")
+    assert client.get("/api/tasks").status_code == 200
+    for header in ("X-Forwarded-For", "Forwarded", "X-Forwarded-Host", "X-Real-IP"):
+        r = client.get("/api/tasks", headers={header: "203.0.113.5"})
+        assert r.status_code == 403, header
+        assert r.json()["detail"] == NO_TOKEN_PROXIED.format(header=header.lower())
+    assert client.get("/healthz", headers={"X-Forwarded-For": "203.0.113.5"}).status_code == 200
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1  # logged once
+    allowed = TestClient(fewshot.api.create_app(client.srv.settings, allow_no_token=True))
+    assert allowed.get("/api/tasks", headers={"X-Forwarded-For": "203.0.113.5"}).status_code == 200
+    unix = NO_TOKEN.format(where="was reached on", addr="a Unix socket")
+    for server in (("/run/fewshot.sock", None), None):  # uvicorn --uds; an ASGI server that gives none
+        app = fewshot.api.create_app(client.srv.settings)
+        scope_server = server
+
+        async def on_socket(scope, receive, send, app=app, scope_server=scope_server):
+            await app({**scope, "server": scope_server}, receive, send)
+        r = TestClient(on_socket).get("/api/tasks")
+        assert (r.status_code, r.json()["detail"]) == (403, unix), server
+    tokened = api_client(tmp_path / "b", token=TOKEN)
+    ok = {"X-Forwarded-For": "203.0.113.5", "Authorization": f"Bearer {TOKEN}"}
+    assert tokened.get("/api/tasks", headers=ok).status_code == 200  # the token protects it
+
+
+def test_checks_hold_under_a_root_path(tmp_path):
+    """Served under a prefix (``uvicorn --root-path /fs``, which puts it into the request path too),
+    the token and cross-site checks judge the path the router matches, so /fs/api/... needs the token."""
+    app = api_client(tmp_path, token=TOKEN).app
+    c = TestClient(app, root_path="/fs")
+    assert c.get("/fs/api/tasks").status_code == 401
+    assert c.post("/fs/api/tasks", json={"name": "t", "embedder": "fake:color"}).status_code == 401
+    assert c.get("/fs/api/health").status_code == 200  # still open, as without the prefix
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    assert c.get("/fs/api/tasks", headers=auth).status_code == 200
+    evil = {**auth, "Origin": "https://evil.example"}
+    assert c.post("/fs/api/tasks", json={"name": "t", "embedder": "fake:color"}, headers=evil).status_code == 403
+    assert c.get("/fs/api/tasks", headers=auth).headers["cache-control"] == "no-store"
+    outside = TestClient(api_client(tmp_path / "b").app, base_url="http://172.17.0.2", root_path="/fs")
+    assert outside.get("/fs/healthz").status_code == 200
+    assert outside.get("/fs/api/tasks").status_code == 403
 
 
 def test_exposure_problem():

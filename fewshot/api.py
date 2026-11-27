@@ -449,7 +449,11 @@ def redo(srv: Srv, name: str) -> Response:
 
 def _export(srv: Server, name: str) -> StreamingResponse:
     srv.task(name)
-    buf = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)  # noqa: SIM115  # pylint: disable=consider-using-with  # closed by the response
+    # A large export spills into the workspace, which has room for the task, rather than the
+    # system's temporary folder, often small and in memory (a container's tmpfs); a workspace
+    # this server can only read (which exports still work in) leaves it to the temporary folder.
+    spill = str(srv.ws.root) if os.access(srv.ws.root, os.W_OK) else None
+    buf = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, dir=spill)  # noqa: SIM115  # pylint: disable=consider-using-with  # closed by the response
     try:
         _, skipped = write_export(srv.ws, name, buf)
     except KeyError as e:
@@ -686,8 +690,9 @@ def edit_examples(srv: Srv, name: str, body: BulkEdit) -> Response:
     undo step); an unknown id changes nothing (404)."""
     t = srv.task(name)
     try:
-        for eid in body.ids:
-            t.example(eid)  # 404 for an unknown id, even if the edit is empty
+        # 404 for an unknown id, even if the edit is empty; looked up by dict, as one scan of the
+        # examples per id would take minutes for a long list (of repeats) in a large task
+        t._examples(body.ids)  # pylint: disable=protected-access
         if body.label is not None or body.add_tags or body.remove_tags:
             t.edit_examples(body.ids, label=body.label, add_tags=body.add_tags, remove_tags=body.remove_tags)
     except KeyError as e:

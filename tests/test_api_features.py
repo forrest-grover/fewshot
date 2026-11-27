@@ -1,6 +1,8 @@
 """API endpoints for undo, rename, export/import, example pages, tags, URLs, duplicates and top_k."""
 
 import io
+import os
+import tempfile
 import zipfile
 
 import pytest
@@ -86,6 +88,28 @@ def test_export_and_import(client, task):
     assert (dup.status_code, dup.json()["detail"]) == (400, "Task 'c' already exists")
     assert client.post("/api/tasks/import", files={"file": ("x.zip", b"nope", "application/zip")}).status_code == 400
     assert client.get("/api/tasks/nope/export").status_code == 404
+
+
+def test_a_large_export_spills_into_the_workspace(client, task, monkeypatch):
+    """Past what it keeps in memory, an export spills into the workspace (a container's /tmp is a
+    small tmpfs), or the temporary folder when the server can't write the workspace."""
+    spilled = []
+    real = tempfile.SpooledTemporaryFile
+
+    def spool(max_size, dir=None):  # pylint: disable=redefined-builtin  # tempfile's name
+        spilled.append(dir)
+        assert max_size > 1
+        return real(max_size=1, dir=dir)  # pylint: disable=consider-using-with  # spills at once
+    monkeypatch.setattr(tempfile, "SpooledTemporaryFile", spool)
+    r = client.get(f"/api/tasks/{task}/export")
+    assert r.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        assert "task.json" in z.namelist()
+    assert spilled == [str(client.srv.ws.root)]
+    assert not [p for p in client.srv.ws.root.iterdir() if not p.name.startswith(("cache.sqlite", "tasks", "blobs"))]
+    monkeypatch.setattr(os, "access", lambda *_: False)  # a workspace it can only read
+    assert client.get(f"/api/tasks/{task}/export").status_code == 200
+    assert spilled[-1] is None
 
 
 def test_export_race(client, task, monkeypatch):
@@ -258,6 +282,20 @@ def test_patch_checks_everything_before_changing_anything(client, task):
     assert (t["examples"][0]["label"], t["revision"]) == ("red", rev)
     assert client.patch(f"/api/tasks/{task}/examples/nope", json={}).status_code == 404
     assert client.patch(f"/api/tasks/{task}/examples", json={"ids": ["nope"]}).status_code == 404
+
+
+def test_bulk_edit_checks_ids_without_a_scan_per_id(client, task, monkeypatch):
+    """A long list of ids (here one, repeated) is checked against the task in one pass, not by
+    looking each id up in turn, which took minutes for a large task."""
+    eid = client.get(f"/api/tasks/{task}").json()["examples"][0]["id"]
+
+    def one_by_one(*_):
+        raise AssertionError("looked up one by one")
+    monkeypatch.setattr(fewshot.store.Task, "example", one_by_one)
+    r = client.patch(f"/api/tasks/{task}/examples", json={"ids": [eid] * 50_000, "add_tags": ["x"]})
+    assert r.status_code == 200
+    assert next(e for e in r.json()["examples"] if e["id"] == eid)["tags"] == ["x"]
+    assert client.patch(f"/api/tasks/{task}/examples", json={"ids": [eid] * 50_000 + ["nope"]}).status_code == 404
 
 
 def test_urls_check_the_label_before_downloading(client, task, monkeypatch):

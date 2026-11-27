@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from starlette._utils import get_route_path  # what the router matches by
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -131,14 +132,18 @@ BULK_ROUTES = {"PATCH": re.compile(r"/api/tasks/[^/]+/examples"),
                                   r"|inbox/dismiss)")}
 
 
+def route_path(scope: Scope) -> str:
+    """The path the router matches ``scope`` by: without the ASGI ``root_path`` (``uvicorn
+    --root-path``, or the app mounted under a prefix), which servers put into ``path`` too. The
+    checks must judge the same path as the router, or ``/prefix/api/...`` would pass as no API."""
+    return get_route_path(scope)
+
+
 def body_limit(max_request_bytes: int, scope: Scope) -> int:
     """The largest body the request in ``scope`` may send: ``max_request_bytes`` for a multipart
     body to an upload route, ``MAX_BULK_JSON_BYTES`` for a route taking a list of ids, else
     ``MAX_JSON_BYTES``."""
-    path, method = scope["path"], scope["method"]
-    root = scope.get("root_path", "")
-    if root and path.startswith(root):
-        path = path[len(root):]
+    path, method = route_path(scope), scope["method"]
     if method == "POST" and UPLOAD_ROUTES.fullmatch(path):
         ctype = dict(scope["headers"]).get(b"content-type", b"").lower()
         if ctype.startswith(b"multipart/form-data"):  # any other body there is no upload: small

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
-from .guard import cross_site, host_allowed
+from .guard import cross_site, host_allowed, route_path
 
 if TYPE_CHECKING:
     from .api import Server
@@ -25,9 +25,16 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 ALLOW_NO_TOKEN_ENV = "FEWSHOT_ALLOW_NO_TOKEN"
+_NO_TOKEN_FIX = ("Set FEWSHOT_TOKEN (e.g. to the output of `openssl rand -hex 16`), or set "
+                 "FEWSHOT_ALLOW_NO_TOKEN=1 to serve without one.")
 NO_TOKEN = ("This server has no token, so anyone who can reach it could read and change every task, and it "
-            "{where} {addr}, which isn't this machine's loopback address. Set FEWSHOT_TOKEN (e.g. to "
-            "the output of `openssl rand -hex 16`), or set FEWSHOT_ALLOW_NO_TOKEN=1 to serve without one.")
+            "{where} {addr}, which isn't this machine's loopback address. " + _NO_TOKEN_FIX)
+NO_TOKEN_PROXIED = ("This server has no token, so anyone who can reach it could read and change every task, and "
+                    "this request came through a proxy (it carries {header}), which serves it to other machines. "
+                    + _NO_TOKEN_FIX)
+# Headers a reverse proxy adds for the client it forwards: a request on loopback that carries one
+# came from wherever the proxy serves, not from this machine.
+FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip")
 
 
 def is_loopback(host: str) -> bool | None:
@@ -98,9 +105,23 @@ def _refused_cross_site(request: Request) -> str | None:
     if request.method not in SAFE_METHODS:
         return cross_site(request)
     site = request.headers.get("sec-fetch-site", "same-origin")
-    if site in {"same-origin", "none"} or request.url.path.endswith("/image"):
+    if site in {"same-origin", "none"} or route_path(request.scope).endswith("/image"):
         return None
     return f"Cross-site request refused: the browser sent it from another site (Sec-Fetch-Site: {site})"
+
+
+def _reached_from_elsewhere(request: Request) -> str | None:
+    """Why a request to a server without a token may come from another machine, or None: it
+    arrived on an address other than loopback, on a Unix socket (which only a proxy serving others
+    would use; uvicorn gives it no port), or through a proxy, as forwarding headers show (a proxy on
+    this machine connects on loopback for whoever it serves)."""
+    local = request.scope.get("server")
+    if local is None or local[1] is None:
+        return NO_TOKEN.format(where="was reached on", addr="a Unix socket")
+    if is_loopback(str(local[0])) is False:
+        return NO_TOKEN.format(where="was reached at", addr=local[0])
+    header = next((h for h in FORWARDING_HEADERS if h in request.headers), None)
+    return None if header is None else NO_TOKEN_PROXIED.format(header=header)
 
 
 async def guard(request: Request, call_next: Any) -> Response:
@@ -108,18 +129,18 @@ async def guard(request: Request, call_next: Any) -> Response:
     loopback (unless allowed), requests for another host name (DNS rebinding) and writes from
     other sites (CSRF), then check the token or session."""
     srv: Server = request.app.state.server
-    local = request.scope.get("server") or ("", None)
-    if srv.sessions is None and not srv.allow_no_token and is_loopback(str(local[0])) is False:
-        # Reached on another interface without a token: a container serving on 0.0.0.0 (or
-        # ``uvicorn --host 0.0.0.0``) with FEWSHOT_TOKEN unset. Only the liveness check answers.
+    if srv.sessions is None and not srv.allow_no_token and (why := _reached_from_elsewhere(request)):
+        # Reached from beyond this machine without a token: a container serving on 0.0.0.0 (or
+        # ``uvicorn --host 0.0.0.0``), a Unix socket or a proxy on this machine with FEWSHOT_TOKEN
+        # unset. Only the liveness check answers.
         if not srv.warned_exposed:
             srv.warned_exposed = True
-            log.error("%s", NO_TOKEN.format(where="was reached at", addr=local[0]))
-        if request.url.path != "/healthz":
-            return JSONResponse({"detail": NO_TOKEN.format(where="was reached at", addr=local[0])}, 403)
+            log.error("%s", why)
+        if route_path(request.scope) != "/healthz":
+            return JSONResponse({"detail": why}, 403)
     if not host_allowed(request.headers.get("host", ""), set(srv.settings.allowed_hosts)):
         return JSONResponse({"detail": "Unknown host; see FEWSHOT_ALLOWED_HOSTS"}, 400)
-    path = request.url.path
+    path = route_path(request.scope)
     if path.startswith("/api/") and (why := _refused_cross_site(request)):
         return JSONResponse({"detail": why}, 403)
     if srv.sessions is not None:

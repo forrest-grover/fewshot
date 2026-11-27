@@ -42,13 +42,15 @@ def load_image(data: bytes, draft: int | None = None, max_side: int | None = Non
             raise ValueError(f"Not a readable image: {im.width}x{im.height} is over the "
                              f"{MAX_PIXELS / 1e6:g} megapixel limit")
         im.load()
+        out = to_rgb(ImageOps.exif_transpose(im), white_level(im, data))
+    except ValueError:
+        raise
     except UnidentifiedImageError as e:
         raise ValueError("Not a readable image: unrecognised file format") from e
-    except Image.DecompressionBombError as e:  # not an OSError subclass
-        raise ValueError(f"Not a readable image: {e}") from e
-    except OSError as e:
-        raise ValueError(f"Not a readable image: {e}") from e
-    out = to_rgb(ImageOps.exif_transpose(im), white_level(im, data))
+    except Exception as e:  # pylint: disable=broad-exception-caught  # damaged files raise all sorts
+        # (OSError, DecompressionBombError, SyntaxError for a broken PNG chunk, TypeError or
+        # IndexError for a damaged TIFF, struct.error, ...): each is one unreadable file, not a failed request
+        raise ValueError(f"Not a readable image: {e or type(e).__name__}") from e
     if max_side and max(out.size) > max_side:
         out.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     return out
@@ -85,6 +87,7 @@ PNG_HEAD = 1 << 20  # bytes of a PNG file read for its sBIT chunk (which comes b
 HIGH_DEPTH_MODES = {"I;16", "I;16B", "I;16L", "I;16N", "I", "F"}
 STRETCH_PERCENTILE = 99.9  # without a known white level, this percentile of the pixels is white
 STRETCH_SAMPLE = 1_000_000  # the percentile is taken over about this many evenly spaced pixels
+SCALE_CHUNK = 1 << 18  # pixels rescaled at once by ``_to_8bit``
 
 
 def white_level(im: Image.Image, data: bytes | None = None) -> float | None:
@@ -149,8 +152,8 @@ def _to_8bit(im: Image.Image, white: float | None = None) -> Image.Image:
     are treated as integers are. Images with negative values have no known black either: they are
     stretched from their ``100 - STRETCH_PERCENTILE``-th to their ``STRETCH_PERCENTILE``-th
     percentile."""
-    a = np.asarray(im, dtype=np.float64)
-    values = a[np.isfinite(a)]
+    a = np.asarray(im)  # as stored (2 or 4 bytes a pixel): a 50 MP image as floats would be 400 MB a copy
+    values = a[np.isfinite(a)] if im.mode == "F" else a.ravel()
     values = values if values.size else np.zeros(1)
     lo, hi = float(values.min()), float(values.max())
     if im.mode == "F" and lo >= 0 and hi <= 2:
@@ -158,13 +161,17 @@ def _to_8bit(im: Image.Image, white: float | None = None) -> Image.Image:
     elif white and im.mode != "F":
         lo, hi = 0.0, white
     else:
-        sample = values[:: max(1, values.size // STRETCH_SAMPLE)]
+        sample = values[:: max(1, values.size // STRETCH_SAMPLE)].astype(np.float64)
         lo = float(np.percentile(sample, 100 - STRETCH_PERCENTILE)) if lo < 0 else 0.0
         top = float(np.percentile(sample, STRETCH_PERCENTILE))
         hi = top if top > lo else hi  # (almost) one level: the brightest pixel is white
-    a = np.nan_to_num(a, nan=lo, posinf=hi, neginf=lo)
-    scaled = (a - lo) * (255 / (hi - lo)) if hi > lo else np.zeros_like(a)
-    return Image.fromarray(np.rint(scaled).clip(0, 255).astype(np.uint8))
+    out = np.zeros(a.shape, np.uint8)
+    if hi > lo:
+        rows = max(1, SCALE_CHUNK // max(1, a.shape[1]))
+        for r in range(0, a.shape[0], rows):  # a few rows at a time, so the floats stay small
+            part = np.nan_to_num(a[r : r + rows].astype(np.float64), nan=lo, posinf=hi, neginf=lo)
+            out[r : r + rows] = np.rint((part - lo) * (255 / (hi - lo))).clip(0, 255)
+    return Image.fromarray(out)
 
 
 # Appended to the cache key of an image whose conversion to RGB changed since keys were first
@@ -190,7 +197,7 @@ def conversion_key(source: bytes | str | Path | Image.Image) -> str:
     try:
         with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as im:
             return _changed(im)
-    except (OSError, ValueError, Image.DecompressionBombError):
+    except Exception:  # pylint: disable=broad-exception-caught  # damaged: decoding will say so
         return ""
 
 

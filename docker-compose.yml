@@ -9,17 +9,18 @@ services:
     environment:
       FEWSHOT_TOKEN: ${FEWSHOT_TOKEN:?set FEWSHOT_TOKEN, e.g. FEWSHOT_TOKEN=$(openssl rand -hex 16)}
       # FEWSHOT_ALLOWED_HOSTS: fewshot.example.com   # the names clients use; IP addresses always work
-      # Whose X-Forwarded-For to trust: the reverse proxy's address as the container sees it, so
-      # wrong tokens are counted per client rather than for everyone behind the proxy. A proxy on
-      # this machine connects from a Docker gateway address, which is in 172.16.0.0/12 by default;
-      # set it to the proxy's own address if other containers can reach this one, since anything
-      # trusted can claim to forward for any address.
-      FEWSHOT_FORWARDED_ALLOW_IPS: ${FEWSHOT_FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # Whose X-Forwarded-For to trust: nobody by default, since anything trusted can claim to
+      # forward for any address, and a proxy on this machine connects from the Docker gateway,
+      # as does every other process here. Untrusted, every client behind the proxy shares its
+      # address, so wrong tokens are counted for all of them at once (the right token always
+      # works). To count per client, set it to a proxy container's own address on this network.
+      FEWSHOT_FORWARDED_ALLOW_IPS: ${FEWSHOT_FORWARDED_ALLOW_IPS:-}
     volumes:
       - fewshot-data:/data      # tasks, images and the embedding cache
       - fewshot-models:/models  # downloaded model weights
     # The server writes only to its volumes and to /tmp (uploads larger than 1 MB are spooled
-    # there while they are stored, so give it room for the largest upload, FEWSHOT_MAX_REQUEST_MB).
+    # there while they are stored, so give it room for the largest upload, FEWSHOT_MAX_REQUEST_MB;
+    # exports over 64 MB spill into /data instead).
     read_only: true
     tmpfs: ["/tmp:size=2g,mode=1777"]
     cap_drop: [ALL]
