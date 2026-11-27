@@ -74,7 +74,10 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
       return next;
     });
   };
-  const open = (list: Example[], ex: Example) => { setViewer({ ids: list.map((e) => e.id), index: list.indexOf(ex) }); };
+  // By id: a memoised thumbnail may hold an older object for the same example (see sameThumb).
+  const open = (list: Example[], ex: Example) => {
+    setViewer({ ids: list.map((e) => e.id), index: Math.max(0, list.findIndex((e) => e.id === ex.id)) });
+  };
   const selection = [...picked].filter((id) => labelOf.has(id)); // ids still in the task
 
   const move = async (ids: string[], label: string) => {

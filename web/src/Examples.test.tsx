@@ -63,4 +63,12 @@ describe("Examples thumbnails", () => {
     expect(urls).toHaveBeenCalledTimes(4); // only the tagged one
     expect(urls).toHaveBeenLastCalledWith("pets", "a", expect.any(Number));
   });
+
+  it("open in the viewer after a response brought new objects for the same examples", async () => {
+    const props = { setTask: vi.fn(), run: <T,>(p: Promise<T>) => p, uploads: idleUploads() };
+    const { rerender } = render(<Examples task={pets(1)} {...props} />);
+    rerender(<Examples task={pets(2)} {...props} />); // say, after an undo: the thumbnails keep the old objects
+    fireEvent.click(screen.getByAltText("b.jpg"));
+    expect((await screen.findByRole("dialog")).textContent).toContain("2 / 2");
+  });
 });
