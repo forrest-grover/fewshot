@@ -12,7 +12,7 @@ from PIL import Image
 import fewshot.evaluate as ev
 from fewshot import embedders, pipeline
 from fewshot.cache import FLIP_KEY, prune_unused
-from fewshot.classifiers import KNNClassifier, binomial_tail, names_match, with_names
+from fewshot.classifiers import KNNClassifier, binomial_tail, names_match, names_permutation_p, with_names
 from fewshot.embedders import Embedder, cache_namespace, get_embedder, register_embedder, unregister_embedder
 from fewshot.images import ALPHA_KEY, CONVERSION_KEY, image_id
 from fewshot.pipeline import Pipeline, Prediction
@@ -253,6 +253,24 @@ def test_names_match_allows_for_unbalanced_classes():
     assert _named(one_each.copy(), one_each)
     assert _named(np.array([0, 1, 2, 3, 9]), one_each)  # 9: a described class, never right
     assert not _named(np.array([1, 2, 3, 4, 0]), one_each)
+
+
+def test_names_match_counts_classes_not_examples():
+    """With enough named classes, many examples of a class going to its own name count as one
+    class, not as many lucky draws: codes that happen to catch two classes' tight clusters don't
+    pass, though counting examples they would."""
+    truth = np.repeat(np.arange(5), 8)
+    lucky = np.choose(truth, [0, 1, 3, 4, 2])  # classes 0 and 1 hit, as 2 of 5 random orders often do
+    assert not _named(lucky, truth)
+    assert binomial_tail(16, 40, 0.2) < 0.05  # what the binomial test over examples said
+    assert _named(truth.copy(), truth)
+    many = np.repeat(np.arange(30), 2)  # 30 classes: random orders rather than all of them
+    assert _named(many.copy(), many)
+    assert not _named(np.where(many < 2, many, (many + 1) % 30), many)
+    assert names_permutation_p(many.copy(), many) == pytest.approx(1 / 1000)
+    unbalanced = np.repeat(np.arange(4), [30, 3, 3, 3])
+    assert not _named(np.zeros(39, int), unbalanced)  # all to the largest class
+    assert _named(np.where(np.arange(39) % 3 == 0, 9, unbalanced), unbalanced)  # 9: described, never right
 
 
 def test_names_match_one_undescribed_class():

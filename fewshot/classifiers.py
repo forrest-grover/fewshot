@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import itertools
 import logging
 import math
 import numbers
@@ -110,19 +111,50 @@ def _fitted[T](value: T | None) -> T:
 
 
 NAME_TEST_LEVEL = 0.05  # names are used as text when matching the examples this well is unlikely by chance
+NAME_PERMUTATION_CLASSES = 4  # named classes needed for the permutation test (3 give only 3! = 6 orders)
+NAME_EXACT_CLASSES, NAME_PERMUTATIONS = 6, 999  # every order up to 6 classes (720), else 999 random ones
 
 
 def names_match(guess: Labels, truth: Labels, named: npt.NDArray[np.bool_], texts: int) -> bool:
     """Whether text guesses ``guess`` of every example's class ``truth`` hit it, among the examples
-    of the classes described by their names (``named``), more often than chance would (one-sided
-    binomial test at ``NAME_TEST_LEVEL``). Chance is the hit rate of guesses unrelated to the
-    images: one is class c as often as the guesses for all the examples are, so texts that send
-    every image to the largest class score no better than chance however unbalanced the classes
-    are. With every example in one class that rate can't show whether the text tells the class
-    apart, so chance is then one in the number of ``texts`` (classes with text)."""
+    of the classes described by their names (``named``), more often than chance would, at
+    ``NAME_TEST_LEVEL``. With ``NAME_PERMUTATION_CLASSES`` named classes or more, by a permutation
+    test (``names_permutation_p``): a class's examples lie close together and mostly go to the same
+    name whatever it means, so counting each as a trial, as a binomial test does, passed
+    meaningless names 15-19% of the time with 5-10 classes of 4 images; this passes about 5%.
+    With fewer, by a one-sided binomial test over the examples. Chance is the hit rate of guesses
+    unrelated to the images: one is class c as often as the guesses for all the examples are (so
+    sending every image to the largest class scores no better, and a single class's name can pass
+    among described ones), or with every example in one class, one in the ``texts`` (classes with text)."""
+    if len(np.unique(truth[named])) >= NAME_PERMUTATION_CLASSES:
+        return names_permutation_p(guess[named], truth[named]) < NAME_TEST_LEVEL
     rate = np.bincount(guess, minlength=int(max(guess.max(), truth.max())) + 1) / len(guess)
     chance = 1.0 / texts if len(set(truth.tolist())) == 1 else float(rate[truth[named]].mean())
     return binomial_tail(int((guess == truth)[named].sum()), int(named.sum()), chance) < NAME_TEST_LEVEL
+
+
+def _name_hits(guess: Labels, truth: Labels) -> tuple[Labels, Labels, Scores]:
+    """(class, guess, share of the mean) per pair in ``names_permutation_p``, by index into ``truth``'s classes."""
+    cls, t = np.unique(truth, return_inverse=True)
+    pos = np.searchsorted(cls, guess).clip(0, len(cls) - 1)
+    ok = cls[pos] == guess
+    pair, count = np.unique(t[ok] * len(cls) + pos[ok], return_counts=True)
+    c = pair // len(cls)
+    return c, pair % len(cls), count / np.bincount(t)[c] / len(cls)
+
+
+def names_permutation_p(guess: Labels, truth: Labels) -> float:
+    """P-value of the mean over classes ``truth`` of the share of their examples whose best name
+    ``guess`` is their own, against the names handed round the classes at random (so sending
+    every image to the largest class does no better than any order). Exact up to
+    ``NAME_EXACT_CLASSES`` classes, else from ``NAME_PERMUTATIONS`` seeded orders and the names' own."""
+    n, (c, g, w) = len(np.unique(truth)), _name_hits(guess, truth)
+    exact = n <= NAME_EXACT_CLASSES
+    orders = (np.array(list(itertools.permutations(range(n)))) if exact
+              else np.random.default_rng(0).permuted(np.tile(np.arange(n), (NAME_PERMUTATIONS, 1)), axis=1))
+    rows, seen, own = max(1, PREDICT_CELLS // max(len(w), 1)), float(w[c == g].sum()) - 1e-9, int(not exact)
+    hits = sum(int(((orders[i:i + rows, c] == g) @ w >= seen).sum()) for i in range(0, len(orders), rows)) + own
+    return hits / (len(orders) + own)
 
 
 NAME_FDR = 0.2  # a name is used if the chance that it is meaningless is below this (see ``meaningless_chance``)
@@ -172,7 +204,8 @@ def with_names(data: ClassData) -> ClassData:
     """``data`` with the names of its classes that have images but no text as their text, if
     ``use_names`` is set and they match the examples: meaningless names (codes, numbers) would
     only pull predictions off. The names together must classify the images better than chance
-    would (see ``names_match``, guessing among every class with text or such a name), and then
+    would (see ``names_match``: a permutation test over the classes, or with few of them a
+    binomial test over the examples, guessing among every class with text or such a name), and then
     each is tested on its own, since a task can mix names with codes and real names passing the
     first test would otherwise carry the codes with them (on Food-101 with a fifth of the
     classes named, the coded classes fell from 72% to 23% at 2 images per class). A name is

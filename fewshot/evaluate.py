@@ -291,7 +291,9 @@ def _calibration(h: HeldOut, truth: np.ndarray, current: float) -> dict[str, Any
 
     The error "after" is cross-fitted: each half of the predictions is scored with a temperature
     fitted on the other half, so it isn't flattered by fitting and scoring the same predictions."""
-    rows = np.flatnonzero((h.pred >= 0) & (h.probs[np.arange(len(truth)), truth] > 0))
+    # Rows whose true class its fold trained on: not every row with the true class above 0, which
+    # would also leave out the most confidently wrong ones, whose true class underflowed to 0.
+    rows = np.flatnonzero((h.pred >= 0) & (h.rank < h.probs.shape[1]))
     if len(rows) < MIN_CALIBRATION or h.probs.shape[1] < 2:
         return None
     P, t = h.probs[rows], truth[rows]

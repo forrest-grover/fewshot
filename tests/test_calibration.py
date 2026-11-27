@@ -95,6 +95,28 @@ def test_calibration_when_held_out_predictions_are_all_right():
     assert cal["temperature"] == 0.01  # 0.02 times the fitted one, clamped
 
 
+def test_calibration_counts_wrong_predictions_whose_true_class_underflowed():
+    """A held-out prediction so confidently wrong that its true class's probability is 0 still
+    counts against calibration; only rows whose true class their fold didn't train on are left out."""
+    n = 80
+    truth = np.arange(n) % 3
+    P = np.zeros((n, 3))
+    P[np.arange(n), truth] = 1.0
+    wrong = np.arange(0, n, 4)  # a quarter: certain and wrong, the true class at exactly 0
+    P[wrong] = 0.0
+    P[wrong, (truth[wrong] + 1) % 3] = 1.0
+    h = _held_out(P, truth)
+    cal = ev._calibration(h, truth, 1.0)  # pylint: disable=protected-access
+    assert cal is not None
+    assert sum(b["count"] for b in cal["reliability"]) == n
+    assert cal["ece"] == pytest.approx(0.25, abs=0.01)
+    unknown = np.arange(1, n, 4)  # these rows' true class was missing from their fold
+    h.record(unknown, P[unknown], np.ones(len(unknown)), truth[unknown], np.zeros(len(unknown), bool))
+    cal = ev._calibration(h, truth, 1.0)  # pylint: disable=protected-access
+    assert cal is not None
+    assert sum(b["count"] for b in cal["reliability"]) == n - len(unknown)
+
+
 # ---- API and CLI ---------------------------------------------------------
 @pytest.fixture(name="client")
 def client_fixture(tmp_path):
