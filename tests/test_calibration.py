@@ -157,5 +157,5 @@ def test_cli(tmp_path):
     out = run("predict", t.name, q, "--evidence", "2").output
     assert out.count("    like ") == 2
     assert "temperature: 3" in run("config", t.name, "--temperature", "3").output
-    assert "temperature: 1" in run("config", t.name, "--temperature", "1").output
+    assert "temperature: none (1)" in run("config", t.name, "--temperature", "1").output
     assert "Calibration error" in run("eval", t.name).output

@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from fewshot import cli
+from fewshot import cli_predict
 from fewshot.cli_common import images_in
 from fewshot.store import Workspace
 from tests.conftest import BLUE, RED, api_client, png, write_images
@@ -43,7 +43,7 @@ def test_version_returns_kept_versions(root, task):
 # ---- CLI predict ----------------------------------------------------------
 def test_predict_jsonl_from_file_in_chunks(run, task, tmp_path, monkeypatch):
     """--jsonl prints a line per image as each chunk finishes; --from-file - reads paths from stdin."""
-    monkeypatch.setattr(cli, "PREDICT_CHUNK", 1)
+    monkeypatch.setattr(cli_predict, "PREDICT_CHUNK", 1)
     a, b = tmp_path / "a.png", tmp_path / "b.png"
     a.write_bytes(png(RED, seed=9))
     b.write_bytes(png(BLUE, seed=9))
@@ -156,7 +156,7 @@ def test_watch_waits_for_stable_size_until_interrupted(run, task, tmp_path, monk
         if len(looks) == 3:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr("fewshot.cli.time.sleep", sleep)
+    monkeypatch.setattr("fewshot.cli_predict.time.sleep", sleep)
     r = run("watch", task, inbox, "--out", out, "--copy", "--interval", "0.1")
     assert r.exit_code == 0, r.output
     assert looks == [[], ["r.png"], ["r.png"]]  # first look only notes the size; copied once
@@ -174,7 +174,7 @@ def _watch_looks(monkeypatch, n, each=None):
         if len(looks) == n:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr("fewshot.cli.time.sleep", sleep)
+    monkeypatch.setattr("fewshot.cli_predict.time.sleep", sleep)
 
 
 def test_watch_waits_for_a_task_that_can_predict(run, root, tmp_path, monkeypatch):
@@ -216,7 +216,7 @@ def test_watch_survives_files_that_vanish(run, task, tmp_path, monkeypatch):
     (inbox / "r.png").write_bytes(png(RED, seed=9))
     (inbox / "b.png").write_bytes(png(BLUE, seed=9))
     real_move = shutil.move
-    monkeypatch.setattr("fewshot.cli._images_in",
+    monkeypatch.setattr("fewshot.cli_predict.images_in",
                         lambda folder, recursive: [folder / "gone.png", *images_in(folder, recursive)])
 
     def move(src, dest):
@@ -224,7 +224,7 @@ def test_watch_survives_files_that_vanish(run, task, tmp_path, monkeypatch):
             raise FileNotFoundError(f"No such file: {src}")
         return real_move(src, dest)
 
-    monkeypatch.setattr("fewshot.cli.shutil.move", move)
+    monkeypatch.setattr("fewshot.cli_predict.shutil.move", move)
     r = run("watch", task, inbox, "--out", out, "--once")
     assert r.exit_code == 0, r.output
     assert "b.png: No such file" in r.output
@@ -241,7 +241,7 @@ def test_watch_retries_unreadable_files_until_settled(run, task, tmp_path, monke
     _watch_looks(monkeypatch, 3)
     assert run("watch", task, inbox, "--out", out).exit_code == 0
     assert (inbox / "half.png").exists()
-    monkeypatch.setattr(cli, "WATCH_SETTLE", 0.0)
+    monkeypatch.setattr(cli_predict, "WATCH_SETTLE", 0.0)
     _watch_looks(monkeypatch, 3)
     assert run("watch", task, inbox, "--out", out).exit_code == 0
     assert (out / "_error" / "half.png").exists()
@@ -289,20 +289,20 @@ def test_api_predict_at_a_revision(tmp_path):
 @pytest.mark.usefixtures("task")
 def test_from_file_is_read_as_it_arrives(run, tmp_path, monkeypatch):
     """Each batch is classified as soon as its lines have been read, before the list ends."""
-    monkeypatch.setattr(cli, "PREDICT_CHUNK", 1)
+    monkeypatch.setattr(cli_predict, "PREDICT_CHUNK", 1)
     a, b = tmp_path / "a.png", tmp_path / "b.png"
     a.write_bytes(png(RED, seed=9))
     b.write_bytes(png(BLUE, seed=9))
     order = []
-    real = cli._named_in  # pylint: disable=protected-access
+    real = cli_predict._named_in  # pylint: disable=protected-access
 
     def lines(src):
         for x in real(src):
             order.append(("read", str(x).rsplit("/", 1)[-1]))
             yield x
 
-    monkeypatch.setattr(cli, "_named_in", lines)
-    monkeypatch.setattr(cli, "_output_predictions",
+    monkeypatch.setattr(cli_predict, "_named_in", lines)
+    monkeypatch.setattr(cli_predict, "_output_predictions",
                         lambda part, *_a, **_k: order.append(("out", part[0].name)))
     assert run("predict", "t", "--from-file", "-", "--jsonl", stdin=f"{a}\n{b}\n").exit_code == 0
     assert order == [("read", "a.png"), ("out", "a.png"), ("read", "b.png"), ("out", "b.png")]
@@ -337,14 +337,14 @@ def test_from_file_entries_that_cant_be_read(run, tmp_path):
 # ---- CLI watch: failed moves ---------------------------------------------
 def test_watch_backs_off_from_a_file_it_cannot_move(tmp_path, monkeypatch):
     """Failures double the wait before the next try, up to a maximum."""
-    retry = cli.Backoff(1.0)
+    retry = cli_predict.Backoff(1.0)
     f = tmp_path / "a.png"
     assert not retry.waiting(f)
     assert [retry.failed(f) for _ in range(3)] == [1.0, 2.0, 4.0]
     assert retry.waiting(f)
     for _ in range(20):
         retry.failed(f)
-    assert retry.failed(f) == cli.WATCH_MAX_BACKOFF
+    assert retry.failed(f) == cli_predict.WATCH_MAX_BACKOFF
     retry.keep([])
     assert not retry.waiting(f)
     retry.failed(f)
@@ -368,7 +368,7 @@ def test_watch_retries_a_failed_move_later(run, task, tmp_path, monkeypatch):
         tries.append(f.name)
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(cli, "_place", place)
+    monkeypatch.setattr(cli_predict, "_place", place)
     sleeps = []
 
     def sleep(_s):

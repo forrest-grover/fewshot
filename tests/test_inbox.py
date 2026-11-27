@@ -159,12 +159,15 @@ def test_cli(tmp_path):
         (d / f"{i}.png").write_bytes(png(RED, noise=10, seed=i))
     (d / "bad.png").write_bytes(b"junk")
     r = run("inbox", "add", "t", d)
-    assert "3 images in the inbox" in r.output
+    assert "Added 3 images to the inbox of t; 3 waiting" in r.output
     assert "skip" in r.output
-    assert (r.exit_code, "Error: Not added to the inbox: 1 of 4 images" in r.output) == (1, True)
+    assert (r.exit_code, "Error: Not added: 1 of 4 images" in r.output) == (1, True)
     assert run("inbox", "add", "t", d / "bad.png").exit_code == 1
-    lines = run("inbox", "ls", "t", "--sort", "confident").output.splitlines()
-    assert len(lines) == 4
+    r = run("inbox", "add", "t", d / "0.png")  # waiting already: skipped, which is no failure
+    assert (r.exit_code, "Nothing new: all 1 images are labelled or in the inbox already" in r.output) == (0, True)
+    assert run("inbox", "add", "t", d / "0.png", "--strict").exit_code == 1
+    lines = run("inbox", "ls", "t", "--sort", "confident").stdout.splitlines()
+    assert len(lines) == 3
     assert "red" in lines[0]
     items = json.loads(run("inbox", "ls", "t", "--json").output)
     first = items[0]["id"][:8]

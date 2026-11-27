@@ -20,8 +20,9 @@ def _from_env(var: str, default: str) -> str:
 
 
 def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals  # one per CLI option
-    host: str = "127.0.0.1",
-    port: int = 8000,
+    host: str = typer.Option("127.0.0.1", help="Address to listen on; one other than loopback needs a token "
+                                               "(or --no-token)"),
+    port: int = typer.Option(8000, help="Port to listen on"),
     token: str | None = typer.Option(None, help="Require this token for the API and UI (prefer setting FEWSHOT_TOKEN: "
                                                 "an option is visible to other users in the process list) "
                                                 + _from_env("FEWSHOT_TOKEN", "none")),
@@ -54,13 +55,17 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
                                                                   "uploads) " + _from_env("FEWSHOT_WORKERS", "4")),
     root: Path | None = ROOT_OPT,
 ) -> None:
-    """Run the REST API and web UI. Settings not given as options are read from the environment
-    as for `uvicorn fewshot.api:app` (see fewshot.server_settings)."""
+    """Run the REST API and web UI.
+
+    Settings not given as options are read from the environment as for `uvicorn fewshot.api:app`
+    (see fewshot.server_settings).
+    """
     # uvicorn and the API are only needed here; importing them lazily keeps other commands fast.
     import uvicorn  # pylint: disable=import-outside-toplevel
 
     from .access import exposure_problem  # pylint: disable=import-outside-toplevel
     from .api import create_app  # pylint: disable=import-outside-toplevel
+    from .embedders import report_loading  # pylint: disable=import-outside-toplevel
     from .server_settings import LOCAL_HOSTS, ServerSettings  # pylint: disable=import-outside-toplevel
 
     given: dict[str, Any] = {k: v for k, v in {
@@ -89,5 +94,6 @@ def serve(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
         listed = [*(h for h in LOCAL_HOSTS if h in hosts), *sorted(hosts - set(LOCAL_HOSTS))]
         typer.echo(f"Answering requests by IP address or for: {', '.join(listed)}. Reaching it by another name "
                    "needs --allowed-host NAME.", err=True)
+    report_loading(None)  # the server loads models on several threads: no load reporting (see report_loading)
     server = create_app(settings, _ws(root, create=True), allow_no_token=settings.allow_no_token)
     uvicorn.run(server, host=host, port=port, proxy_headers=True, forwarded_allow_ips=settings.forwarded_allow_ips)

@@ -121,10 +121,12 @@ def test_cli(tmp_path):
     def run(*args):
         return runner.invoke(cli.app, [str(a) for a in args] + ["--root", str(root)])
 
-    assert "      -" in run("list").output
+    assert "        -  " in run("list").stdout
     run("eval", "t")
-    assert "acc 1.00 " in run("list").output
+    assert "   1.00   " in run("list").stdout
     run("class", "add", "t", "green")
-    assert "acc 1.00*" in run("list").output  # changed since
+    r = run("list")
+    assert "   1.00*  " in r.stdout  # changed since
+    assert "* evaluated on an older revision; re-run `fewshot eval TASK`" in r.stderr
     assert run("copy", "t", "u", "--no-examples").output.strip() == "Copied t to u (0 examples)"
     assert run("copy", "t", "u").exit_code == 1

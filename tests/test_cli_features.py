@@ -44,9 +44,9 @@ def test_config_zero_shot_threshold_and_flip(run, task):
     """config sets and clears the zero-shot threshold and switches flip."""
     r = run("config", task, "--reject-below-zero-shot", "0.22", "--flip")
     assert r.exit_code == 0
-    assert "reject_below_zero_shot: 0.22   flip: True" in r.output
+    assert "reject_below_zero_shot: 0.22   flip: on" in r.output
     r = run("config", task, "--clear-reject-zero-shot", "--no-flip")
-    assert "reject_below_zero_shot: None   flip: False" in r.output
+    assert "reject_below_zero_shot: none   flip: off" in r.output
     r = run("config", task, "--clear-reject-zero-shot", "--reject-below-zero-shot", "0.2")
     assert r.exit_code == 2  # a usage error
     assert "either --reject-below-zero-shot or --clear-reject-zero-shot" in r.output
@@ -62,12 +62,13 @@ def test_rename_and_undo(run, task, root):
     run("class", "add", "u", "green")
     r = run("undo", "u")
     assert r.exit_code == 0
-    assert "6 examples" in r.output
+    assert "u: undid add class green" in r.output
+    assert "(6 examples, 3 -> 2 classes)" in r.output
     assert Workspace(root).get("u").class_names() == ["red", "blue"]
     run("create", "empty")
     r = run("undo", "empty")
     assert (r.exit_code, r.output.strip()) == (1, "Error: Nothing to undo")
-    assert run("redo", "u").output.strip() == "u: redid add class green (6 examples)"
+    assert run("redo", "u").output.strip() == "u: redid add class green (6 examples, 2 -> 3 classes)"
     r = run("redo", "u")
     assert (r.exit_code, r.output.strip()) == (1, "Error: Nothing to redo")
 
@@ -101,7 +102,8 @@ def test_example_commands(run, task, root):
     assert line.endswith("[hard]  # too dark")
     data = json.loads(run("example", "ls", task, "--tag", "x", "--json").output)
     assert [e["id"] for e in data] == [ids[1]]
-    assert run("example", "rm", task, ids[0][:8], ids[1]).output.strip() == "Deleted 2 examples"
+    assert run("example", "rm", task, ids[0][:8], ids[1]).output.strip() == (
+        f"Deleted 2 examples (undo with `fewshot undo {task}`)")
     r = run("example", "rm", task, "zzzz")
     assert (r.exit_code, r.output.strip()) == (1, "Error: No example 'zzzz'")
 
@@ -154,14 +156,15 @@ def test_predict_csv_json_and_urls(run, task, tmp_path, monkeypatch):
     assert "skip http://h/bad.png: Could not fetch" in r.output
 
 
-def test_eval_csv_and_metrics(run, task):
+def test_eval_csv_and_metrics(run, task, root):
     """eval prints macro-F1, top-k and a threshold suggestion; --csv lists held-out predictions."""
     r = run("eval", task)
     assert "macro-F1 1.000" in r.output
     assert "Suggested --reject-below" in r.output
     rows = list(csv.DictReader(io.StringIO(run("eval", task, "--csv").output)))
     assert len(rows) == 6
-    assert set(rows[0]) == {"id", "true", "pred", "correct", "confidence", "similarity"}
+    assert set(rows[0]) == {"id", "source", "true", "pred", "correct", "confidence", "similarity"}
+    assert {r["source"] for r in rows} == {e.source for e in Workspace(root).get(task).config.examples}
 
 
 def test_eval_top_k_lines(run, task, tmp_path):
@@ -289,7 +292,7 @@ def test_names_that_arent_utf8_are_printed_as_their_bytes(monkeypatch):
     out = io.TextIOWrapper(raw, encoding="utf-8")
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    cli.pass_file_names_through()
+    cli.run_command(False, None, False, False)
     print(os.fsdecode(b"q\xfe.png"), end="")
     out.flush()
     assert raw.getvalue() == b"q\xfe.png"

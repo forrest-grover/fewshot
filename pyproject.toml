@@ -28,7 +28,7 @@ dev = ["pytest", "httpx", "pytest-cov", "coverage", "pylint", "ruff", "mypy", "p
 siglip = ["transformers"]  # tokenizer of the SigLIP 2 preset
 
 [project.scripts]
-fewshot = "fewshot.cli:main"
+fewshot = "fewshot.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["fewshot*"]

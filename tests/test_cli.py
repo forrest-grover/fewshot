@@ -9,13 +9,14 @@ import shutil
 import socket
 from pathlib import Path
 from typing import get_args
+from unittest import mock
 
 import numpy as np
 import pytest
 from typer.testing import CliRunner
 
 from fewshot import cache as cache_module
-from fewshot import cli, cli_common, embedders
+from fewshot import cli, cli_common, cli_eval, cli_predict, embedders
 from fewshot.classifiers import CLASSIFIERS
 from fewshot.embedders import PRESETS, register_embedder, unregister_embedder
 from fewshot.images import image_id
@@ -45,6 +46,11 @@ def task_fixture(run, photos):
     return "colors"
 
 
+def terminal_stdin():
+    """Within the block, the CLI takes stdin for a terminal."""
+    return mock.patch("fewshot.cli_common.stdin_is_terminal", return_value=True)
+
+
 def load(root, name="colors"):
     """Read a task fresh from disk."""
     return Workspace(root).get(name)
@@ -58,8 +64,8 @@ def load(root, name="colors"):
     (["bench"], f"[default: {embedders.DEFAULT_SPEC}]"),
     (["serve"], "[default: $FEWSHOT_ALLOWED_HOSTS"),
     (["list"], "[default: ./fewshot_data]"),
-    (["predict"], f"{cli.PREDICT_CHUNK} at a time"),
-    (["watch"], f"until it is {cli.WATCH_SETTLE:g} seconds old"),
+    (["predict"], f"{cli_predict.PREDICT_CHUNK} at a time"),
+    (["watch"], f"until it is {cli_predict.WATCH_SETTLE:g} seconds old"),
 ])
 def test_help_shows_text_in_brackets_and_values(command, shown):
     """Help prints hand-written [default: ...] text (Rich markup would drop it) and the values of
@@ -101,9 +107,9 @@ def test_create_list_show(run, root):
     assert load(root, "plain").config.embedder == embedders.DEFAULT_SPEC
 
     r = run("list")
-    lines = [line for line in r.output.splitlines() if not line.startswith("    !")]  # without warnings
+    lines = r.stdout.splitlines()  # warnings go to stderr, and the header is only for a terminal
     assert len(lines) == 2
-    assert "    ! Add classes and examples to start" in r.output
+    assert "pets: Add classes and examples to start" in r.stderr
     assert lines[0].startswith("pets")
     assert "knn" in lines[0]
     assert "fake:color" in lines[0]
@@ -112,8 +118,8 @@ def test_create_list_show(run, root):
     run("class", "add", "pets", "pug")
     r = run("show", "pets")
     assert r.exit_code == 0
-    assert "classifier: knn" in r.output
-    assert "reject_below: None" in r.output
+    assert "classifier:  knn" in r.output
+    assert "reject_below: none" in r.output
     assert '"a small hound"' in r.output
     assert "pug" in r.output
 
@@ -154,7 +160,7 @@ def test_config(run, root, task):
     r = run("config", task, "--classifier", "knn", "--param", "k=3", "--param", "scale=20",
             "--text-weight", "0.5", "--reject-below", "0.7")
     assert r.exit_code == 0
-    assert "classifier: knn" in r.output
+    assert "classifier:  knn k=3 scale=20" in r.output
     c = load(root).config
     assert (c.classifier, c.classifier_params, c.text_weight, c.reject_below) == (
         "knn", {"k": 3, "scale": 20}, 0.5, 0.7)
@@ -216,7 +222,8 @@ def test_config_errors(run, root, task, args, message):
     """Invalid settings and malformed --param values fail without changing the task; values out
     of an option's range are usage errors (2), like malformed ones."""
     r = run("config", task, *args)
-    usage = message.startswith(("Bad --param", "'nope'")) or "Input should be" in message or "than or equal" in message
+    usage = message.startswith(("Bad --param", "'nope'", "Unknown parameter")) or "Input should be" in message or (
+        "than or equal" in message)
     assert r.exit_code == (2 if usage else 1)
     assert message in r.output
     assert load(root).config.classifier == "gda"
@@ -248,20 +255,28 @@ def test_a_task_deleted_meanwhile_is_an_error_not_a_traceback(run, root, task, p
 
 
 def test_delete(run, root, task):
-    """`delete` asks for confirmation unless --yes is given."""
-    r = run("delete", task, stdin="n\n")
+    """`delete` asks for confirmation unless --yes is given, and without a terminal to ask on
+    refuses to go on without it."""
+    r = run("delete", task, stdin="y\n")
     assert r.exit_code == 1
-    assert "Aborted" in r.output
+    assert "Refusing to delete task colors without confirmation; pass --yes" in r.output
+    assert "Aborted" not in r.output
     assert (root / "tasks" / task).exists()
 
-    r = run("delete", task, stdin="y\n")
+    with terminal_stdin():
+        r = run("delete", task, stdin="n\n")
+    assert r.exit_code == 1
+    assert "This can't be undone" in r.output
+    assert (root / "tasks" / task).exists()
+    with terminal_stdin():
+        r = run("delete", task, stdin="y\n")
     assert r.exit_code == 0
     assert "Deleted task colors" in r.output
     assert not (root / "tasks" / task).exists()
 
     run("create", "again", "--embedder", "fake:color")
     assert run("delete", "again", "-y").exit_code == 0
-    assert run("list").output == ""
+    assert run("list").stdout == ""
 
 
 def test_class_rename(run, root, task):
@@ -325,7 +340,8 @@ def test_add(run, root, tmp_path):
 
     r = run("add", "colors", "red", single, tmp_path / "more", bad)
     assert r.exit_code == 1  # failed for some of its inputs
-    assert "colors: 3 examples" in r.output
+    assert "Created class red in colors" in r.output
+    assert "Added 3 to red; colors now has 3 examples" in r.output
     assert "Error: Not added: 1 of 4 images" in r.output
     assert "skip" in r.output
     assert "bad.png" in r.output
@@ -334,9 +350,10 @@ def test_add(run, root, tmp_path):
     assert sorted(e.source for e in t.config.examples) == ["0.png", "1.png", "one.png"]
     assert {e.label for e in t.config.examples} == {"red"}
 
-    r = run("add", "colors", "red", tmp_path / "nope.png")
+    r = run("add", "colors", "red", tmp_path / "nope.png", single)  # a missing file fails as a broken one does
     assert r.exit_code == 1
-    assert "No such file or directory" in r.output
+    assert f"skip {tmp_path / 'nope.png'}: No such file or directory" in r.output
+    assert "Error: No images were added" in r.output  # the other was there already
     assert len(load(root).config.examples) == 3
 
 
@@ -344,9 +361,10 @@ def test_add_says_how_many_moved(run, root, task, photos):
     """Adding images that are examples of another class says they moved, and from where."""
     r = run("add", task, "green", photos / "red" / "0.png", photos / "red" / "1.png", photos / "blue" / "20.png")
     assert r.exit_code == 0
-    assert "3 of them moved from other classes (1 from blue, 2 from red)" in r.output
+    assert "Added 3 to green (3 moved: 1 from blue, 2 from red); colors now has 12 examples" in r.output
     assert load(root).summary()["counts"] == {"blue": 3, "green": 7, "red": 2}
-    assert "moved" not in run("add", task, "green", photos / "green").output
+    r = run("add", task, "green", photos / "green", photos / "red" / "2.png")
+    assert "Added 1 to green (1 moved from red), skipped 4 already in green" in r.output
 
 
 def test_import_is_one_undo_step(run, root, tmp_path):
@@ -380,7 +398,7 @@ def test_import(run, root, photos):
     assert load(root).summary()["counts"] == {"blue": 2, "green": 2, "red": 2}
 
     r = run("import", "colors", photos)
-    assert "Imported 12 images" in r.output  # re-imported duplicates are counted but not stored twice
+    assert "Imported 6 images into colors, skipped 6 already in the task" in r.output  # not stored twice
     assert "skip" in r.output
     assert "broken.png" in r.output
     assert load(root).summary()["counts"] == {"blue": 4, "green": 4, "red": 4}
@@ -518,7 +536,7 @@ def bench_data_fixture(tmp_path, monkeypatch):
         write_images(folder / label, rgb, 4, start=10 * i)
     write_images(folder / "tiny", (128, 128, 128), 1)  # too few images, so never sampled
     embedders.register_embedder("fake:text", TextColorEmbedder())
-    monkeypatch.setattr(cli, "spec_supports_text", lambda spec: spec == "fake:text")
+    monkeypatch.setattr(cli_eval, "spec_supports_text", lambda spec: spec == "fake:text")
     yield folder
     embedders.unregister_embedder("fake:text")
 
@@ -553,7 +571,7 @@ def test_bench_without_template_skips_zero_shot(run, bench_data):
 
 def test_bench_default_embedder_and_errors(run, bench_data, monkeypatch):
     """`bench` defaults to DEFAULT_SPEC and reports too-small datasets."""
-    monkeypatch.setattr(cli, "DEFAULT_SPEC", "fake:color")
+    monkeypatch.setattr(cli_eval, "DEFAULT_SPEC", "fake:color")
     r = run("bench", bench_data, "--way", "3", "--query", "2", "--episodes", "2", "--shot", "1")
     assert r.exit_code == 0
     assert r.output.count("fake:color") == 2  # progress line + result
@@ -849,7 +867,8 @@ def test_cli_reports_file_system_errors_without_a_traceback(monkeypatch, capsys)
 def test_read_only_commands_make_no_workspace(run, root):
     """list and show with a mistyped --root don't create it; create does."""
     r = run("list")
-    assert (r.exit_code, r.output) == (0, "")
+    assert (r.exit_code, r.stdout) == (0, "")
+    assert "No tasks in" in r.stderr
     assert run("show", "x").exit_code == 1
     assert not root.exists()
     assert run("create", "x", "--embedder", "fake:color").exit_code == 0
@@ -878,8 +897,8 @@ def test_cli_temperature_one_and_class_add_keeps_description(run, task):
     assert run("class", "add", task, "red").exit_code == 0
     assert "a photo of a red thing" in run("show", task).output  # not wiped by `class add`
     assert run("config", task, "--temperature", "2").exit_code == 0
-    assert "temperature: 2.0" in run("config", task, "--temperature", "2").output
-    assert "temperature: 1" in run("config", task, "--temperature", "1").output
+    assert "temperature: 2" in run("config", task, "--temperature", "2").output
+    assert "temperature: none (1)" in run("config", task, "--temperature", "1").output
 
 
 def test_usage_errors_exit_2(run, task):
