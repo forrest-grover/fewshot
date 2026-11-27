@@ -8,11 +8,13 @@ images that the new model has not seen before.
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
 import os
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +41,13 @@ def image_keys(image_id: str) -> tuple[str, ...]:
     return tuple(image_id + c + f for c in ("", *CONVERSION_KEYS) for f in ("", FLIP_KEY))
 
 
+def _inode(path: Path) -> int | None:
+    try:
+        return os.stat(path).st_ino
+    except FileNotFoundError:
+        return None
+
+
 # SQLite's primary result codes for a file that isn't a sound database.
 _SQLITE_CORRUPT, _SQLITE_NOTADB = 11, 26
 
@@ -52,23 +61,49 @@ def _damaged(e: sqlite3.DatabaseError) -> bool:
 class EmbeddingCache:
     """Thread-safe embedding store; vectors are float32 blobs."""
 
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, path: Path, read_only: bool = False) -> None:
+        """The cache in file ``path``, made if missing. ``read_only`` opens an existing file
+        without writing anything to it or beside it, so it works where this user can't write
+        (``put_many`` and a pruning that deletes then fail); ``FileNotFoundError`` if it is
+        missing."""
         self.path = path
+        self.read_only = read_only
         self._lock = threading.Lock()
         self._ino: int | None = None  # of the file the connection opened
+        if read_only:
+            self._conn = self._open_read_only()
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ino = _inode(path)
         try:
             self._conn = self._open()
         except sqlite3.DatabaseError as e:
             if not _damaged(e):  # busy, full, unreadable: the file may be fine, and in use
                 raise
             # It is only a cache: move a damaged file aside (for inspection) and start afresh,
-            # rather than leaving the server and CLI unable to start.
-            self._move_aside(e)
+            # rather than leaving the server and CLI unable to start. Another process that found
+            # the damage at the same time may have done so already: then its new cache stays.
+            if _inode(path) == self._ino:
+                self._move_aside(e)
             self._conn = self._open()
 
+    def _open_read_only(self) -> sqlite3.Connection:
+        uri = self.path.resolve().as_uri()
+        if not self.path.is_file():
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(self.path))
+        conn = sqlite3.connect(uri + "?mode=ro", uri=True, check_same_thread=False, timeout=BUSY_TIMEOUT)
+        try:
+            conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            return conn
+        except sqlite3.OperationalError:
+            # A WAL database needs its -shm file to be read, made beside it if missing: where
+            # that can't be written, nobody is writing the cache either, so read the file as it is.
+            conn.close()
+            return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True, check_same_thread=False)
+
     def _move_aside(self, e: sqlite3.DatabaseError) -> None:
-        aside = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}")
+        # Unique, so a second recovery never overwrites the damaged copy saved by the first.
+        aside = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}-{uuid.uuid4().hex[:8]}")
         log.warning("Embedding cache %s is unreadable (%s); moved it to %s and starting a new one", self.path, e, aside)
         for suffix in ("", "-wal", "-shm"):
             with contextlib.suppress(FileNotFoundError):
@@ -79,14 +114,10 @@ class EmbeddingCache:
         move the file aside and continue with a new one; raise ``e`` if it isn't damage. Another
         process that found it first may have done so already: then only reopen. Call holding
         ``_lock``."""
-        if not _damaged(e):
+        if not _damaged(e) or self.read_only:  # read-only: nothing may be moved
             raise e
         self._conn.close()
-        try:
-            same = os.stat(self.path).st_ino == self._ino
-        except FileNotFoundError:
-            same = False
-        if same:
+        if _inode(self.path) == self._ino:
             self._move_aside(e)
         self._conn = self._open()
 
@@ -196,7 +227,10 @@ def prune_unused(ws: Workspace, dry_run: bool = False, vacuum: bool = False) -> 
                 unreadable.append(p.name)
     if unreadable:
         raise ValueError(f"Can't read task(s) {', '.join(unreadable)}; fix or remove them before pruning")
-    cache = EmbeddingCache(ws.cache_path)
+    try:  # a dry run writes nothing, so it works where this user can't write
+        cache = EmbeddingCache(ws.cache_path, read_only=dry_run)
+    except FileNotFoundError:  # nothing cached yet
+        return 0, 0
     with contextlib.ExitStack() as locks:
         for t in list(tasks):
             try:

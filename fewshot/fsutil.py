@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import importlib
 import os
 import shutil
@@ -34,18 +35,23 @@ def stamp(st: os.stat_result) -> FileStamp:
 
 
 @contextlib.contextmanager
-def file_lock(path: Path, shared: bool = False) -> Iterator[None]:
+def file_lock(path: Path, shared: bool = False, guard: Path | None = None) -> Iterator[None]:
     """Hold a lock on ``path`` (created if missing) across processes: ``flock`` on Linux and
     macOS, ``msvcrt.locking`` (always exclusive) on Windows. An exclusive lock waits for every
-    other holder; a ``shared`` one only for exclusive holders, and needs no write access to an
+    other holder; a ``shared`` one only for exclusive holders. Neither needs write access to an
     existing ``path`` (where it can't be created either, as in a read-only folder, nobody can be
-    changing what it guards, and nothing is locked).
+    changing what it guards, and a shared lock locks nothing). A new lock file gets the
+    permissions an ordinary new file does, so the group can lock it in a shared workspace.
 
-    Raises ``FileNotFoundError`` if the folder holding ``path`` is gone.
+    With ``guard``, a missing ``path`` is only created while ``guard`` exists (a task's lock
+    only in a folder holding its task.json): a lock taken late on a deleted task must not leave
+    a file in the empty folder a new task of that name is about to replace.
+
+    Raises ``FileNotFoundError`` if the folder holding ``path`` (or ``guard``) is gone.
     """
     while True:
         try:
-            fd = _open_lock(path, shared)
+            fd = _open_lock(path, shared, guard)
         except PermissionError:
             if not shared or path.exists():
                 raise
@@ -68,12 +74,15 @@ def file_lock(path: Path, shared: bool = False) -> Iterator[None]:
         os.close(fd)  # releases the lock
 
 
-def _open_lock(path: Path, shared: bool) -> int:
-    if shared:
-        with contextlib.suppress(FileNotFoundError):
-            return os.open(path, os.O_RDONLY)  # flock needs no write access
+def _open_lock(path: Path, shared: bool, guard: Path | None = None) -> int:
+    # flock needs no write access; msvcrt.locking (exclusive) wants a file open for writing.
+    mode = os.O_RDONLY if shared or fcntl is not None else os.O_RDWR
+    with contextlib.suppress(FileNotFoundError):
+        return os.open(path, mode)
+    if guard is not None and not guard.exists():
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(guard))
     try:
-        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        return os.open(path, mode | os.O_CREAT, 0o666)  # the umask applies, as to any new file
     except OSError as e:
         if e.errno == errno.EROFS:  # a read-only file system: as for a folder without write access
             raise PermissionError(e.errno, e.strerror, e.filename) from e
@@ -224,6 +233,63 @@ def create_exclusive(path: Path, data: bytes) -> bool:
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+
+
+def create_lock_file(folder: Path) -> None:
+    """Create the lock file of a task being built in ``folder``: from then on, locking the task
+    never creates one (see ``file_lock``'s ``guard``)."""
+    os.close(os.open(folder / ".lock", os.O_RDONLY | os.O_CREAT, 0o666))
+
+
+def replace_reserved(build: Path, p: Path, tries: int = 3) -> None:
+    """Move the finished task folder ``build`` onto its empty reserved folder ``p`` (POSIX
+    replaces an empty folder). A lock file in ``p``, left by a lock on the deleted task of that
+    name taken just as its folder was reserved (a lock is only created beside a task.json, so the
+    window is tiny), is no part of anything: it is removed, and the move tried again."""
+    for _ in range(tries - 1):
+        try:
+            os.replace(build, p)
+            return
+        except OSError as e:
+            if e.errno not in (errno.ENOTEMPTY, errno.EEXIST) or [q.name for q in p.iterdir()] != [".lock"]:
+                raise
+            (p / ".lock").unlink(missing_ok=True)
+    os.replace(build, p)
+
+
+def move_back(dest: Path, src: Path) -> bool:
+    """Move folder ``dest`` back to ``src``, a name it had just given up; returns whether it did.
+    Another process may have reserved ``src`` (an empty folder) for a new task meanwhile, which a
+    plain rename would replace (and whose build would then fail and remove what was moved there):
+    the move only goes onto a folder reserved again by this caller."""
+    try:
+        src.mkdir()
+    except FileExistsError:
+        return False
+    os.replace(dest, src)  # onto our own empty reservation (POSIX)
+    return True
+
+
+@functools.lru_cache(maxsize=64)
+def folds_case(folder: Path) -> bool:
+    """Whether the file system holding ``folder`` ignores case in names (macOS and Windows by
+    default): whether ``folder`` is found under its name in capitals too. Found once per folder."""
+    try:
+        return os.path.samefile(folder, folder.with_name(folder.name.upper()))
+    except OSError:
+        return False
+
+
+def spelt_as_listed(folder: Path, name: str) -> bool:
+    """Whether entry ``name`` of ``folder``, if there is one, is spelt as ``name``. Where case is
+    ignored, opening ``FOO`` would open ``foo``: a task folder would then be opened as a second
+    task under another name (and a save would write that name into its task.json)."""
+    if not folds_case(folder):
+        return True
+    try:
+        return name in os.listdir(folder)
+    except OSError:
+        return True  # the open that follows reports it
 
 
 def os_reason(e: Exception) -> str:

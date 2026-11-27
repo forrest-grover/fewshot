@@ -98,8 +98,39 @@ def test_gc_blobs(ws):
     e = t.add_example(png(RED), "red")
     (t.path / e.file).unlink()
     (ws.blobs / "zz").mkdir()
+    blob = blobs_mod.blob_path(ws.blobs, e.file)
+    assert blob is not None
+    assert ws.gc_blobs() == 0  # written just now: maybe being stored
+    old = blob.stat().st_mtime - 2 * blobs_mod.GC_MIN_AGE
+    os.utime(blob, (old, old))
     assert ws.gc_blobs() == 1
     assert ws.gc_blobs() == 0
+
+
+def test_gc_blobs_spares_a_blob_being_stored(ws, monkeypatch):
+    """A blob written but not yet linked into its task (one link), or the temporary file it is
+    written to, isn't taken for an unused one: a gc meanwhile keeps it, so the task shares it.
+    A temporary file a crash left long ago goes."""
+    t = ws.create("t", embedder="fake:color")
+    real = os.link
+    seen = []
+
+    def link(src, dst, *a, **kw):
+        if Path(src).parent.parent == ws.blobs:  # the blob exists, alone: what gc sees mid-store
+            seen.append(ws.gc_blobs())
+        return real(src, dst, *a, **kw)
+
+    monkeypatch.setattr(os, "link", link)
+    e = t.add_example(png(RED), "red")
+    assert seen == [0, 0]  # create_exclusive's temp-to-blob link, then blob-to-task
+    assert (t.path / e.file).stat().st_nlink == 2  # shared, not a private copy
+    leftover = ws.blobs / "ab" / ".abc.png.x.tmp"
+    leftover.parent.mkdir(exist_ok=True)
+    leftover.write_bytes(b"half")
+    assert ws.gc_blobs() == 0
+    old = leftover.stat().st_mtime - 2 * blobs_mod.GC_MIN_AGE
+    os.utime(leftover, (old, old))
+    assert ws.gc_blobs() == 1
 
 
 def test_without_a_blob_store(tmp_path):

@@ -9,7 +9,7 @@ import shutil
 import pytest
 
 from fewshot import history
-from fewshot.fsutil import write_atomic
+from fewshot.fsutil import fsync_dir, write_atomic
 from fewshot.store import Workspace
 from tests.conftest import BLUE, GREEN, RED, png, red_green_task, red_task, two_each
 
@@ -138,13 +138,30 @@ def test_nothing_to_undo_and_broken_history(ws):
     t.delete_example(e.id)
     assert t.can_undo()
     (t.path / e.file).unlink()
-    with pytest.raises(ValueError, match="1 image files are gone"):
+    with pytest.raises(ValueError, match=r"1 image files of that version are gone.*it was removed"):
         t.undo()
     snaps = sorted((t.path / "history").glob("*.json"))
     snaps[-1].write_text("{broken")
     with pytest.raises(ValueError, match="is invalid"):
         t.undo()
     assert t.config.examples == []
+    assert not t.can_undo()
+
+
+def test_a_step_with_missing_images_is_removed_so_undo_goes_further(ws):
+    """An undo step whose version names an image that is gone (removed by hand) is removed when
+    it fails, so the next undo reaches the versions before it, instead of failing for ever."""
+    t = ws.create("t", embedder="fake:color")
+    t.upsert_class("first")
+    e = t.add_example(png(RED), "red")
+    t.delete_example(e.id)
+    (t.path / e.file).unlink()
+    with pytest.raises(ValueError, match="was removed"):
+        t.undo()
+    assert t.undo_label() == "add 1 example to red"  # the add, whose undo needs no image
+    t.undo()
+    t.undo()
+    assert t.class_names() == []
 
 
 def test_history_is_pruned_and_old_images_deleted(ws, monkeypatch):
@@ -522,3 +539,49 @@ def test_version_is_parsed_once_for_repeated_use(ws, monkeypatch):
     t.upsert_class("y")
     t.version(rev + 1)
     assert parsed == [1]
+
+
+def test_redo_skips_a_step_a_crashed_undo_left(ws):
+    """An undo killed after keeping the current version for redo but before restoring the earlier
+    one leaves a redo step that changes nothing: redo skips it rather than adding a no-op step."""
+    t = red_green_task(ws)
+    with t._writing():  # pylint: disable=protected-access  # the undo's first half, then a crash
+        t._snapshot(t.config.revision, [], t.undo_label(), folder="history/redo")  # pylint: disable=protected-access
+    t = Workspace(ws.root).get("t")
+    assert t.can_redo()
+    with pytest.raises(ValueError, match="Nothing to redo"):
+        t.redo()
+    assert not t.can_redo()
+    n = len(t.config.examples)
+    t.undo()  # the real step is still there
+    assert len(t.config.examples) == n - 1
+    t.redo()
+    assert len(t.config.examples) == n
+
+
+def test_moving_redo_aside_is_durable_before_the_commit(ws, monkeypatch):
+    """The undone versions are moved aside, and that move synced, before the new task.json
+    replaces the old: a power cut can't keep the new change together with the old redo/."""
+    t = red_green_task(ws)
+    t.undo()
+    events = []
+    real_fsync, real_replace, real_rename = fsync_dir, os.replace, os.rename
+
+    def fsync(path):
+        events.append(("sync", path.name))
+        real_fsync(path)
+
+    def replace(src, dst):
+        events.append(("replace", os.path.basename(dst)))
+        real_replace(src, dst)
+
+    def rename(src, dst):
+        events.append(("rename", os.path.basename(dst)[:6]))
+        real_rename(src, dst)
+
+    monkeypatch.setattr(history, "_fsync_dir", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "rename", rename)
+    t.upsert_class("x")
+    aside, commit = events.index(("rename", ".redo-")), events.index(("replace", "task.json"))
+    assert ("sync", "history") in events[aside:commit]

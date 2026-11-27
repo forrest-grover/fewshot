@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from fewshot import fsutil, store
+from fewshot.models import TaskConfig
 from fewshot.store import Workspace
 from tests.conftest import BLUE, RED, png
 
@@ -323,3 +324,135 @@ def test_gc_skips_a_task_deleted_meanwhile(ws, monkeypatch):
     monkeypatch.setattr(ws, "list_tasks", lambda: listed)
     assert b not in Workspace(ws.root).list_tasks()
     assert ws.gc()["folders"] == 0
+
+
+# ---- creates and renames racing each other ------------------------------
+def test_a_failed_rename_never_moves_the_task_onto_a_new_task_of_its_old_name(ws, monkeypatch):
+    """A rename moves the folder, then its save fails (a full disk). If another process reserved
+    the freed old name for a new task meanwhile, the rename doesn't move the task back onto that
+    folder (which the other's build would then fail to replace and remove, task and all): the
+    task stays under the new name, and the other's create succeeds."""
+    t = ws.create("foo")
+    t.add_example(png(RED), "a")
+    other = Workspace(ws.root)
+    reserved = threading.Event()
+    go = threading.Event()
+    made: list[Any] = []
+
+    def images():
+        reserved.set()
+        go.wait(5)
+        yield from ()
+
+    def create():
+        made.append(other.build_task(TaskConfig(name="foo"), images()))
+
+    creator = threading.Thread(target=create)
+    real_save = store.Task._save  # pylint: disable=protected-access
+
+    def failing_save(self, *a, **kw):
+        if self.path.name == "bar":
+            creator.start()
+            assert reserved.wait(5)
+            raise OSError(28, "No space left on device")
+        return real_save(self, *a, **kw)
+
+    monkeypatch.setattr(store.Task, "_save", failing_save)
+    with pytest.raises(OSError, match="No space"):
+        ws.rename("foo", "bar")
+    monkeypatch.setattr(store.Task, "_save", real_save)
+    go.set()
+    creator.join(5)
+    assert made
+    assert made[0].config.examples == []  # the new, empty "foo"
+    fresh = Workspace(ws.root)
+    assert [x.name for x in fresh.list_tasks()] == ["bar", "foo"]
+    assert len(fresh.get("bar").config.examples) == 1  # the task survives under the folder's name
+    assert len(ws.get("bar").config.examples) == 1
+
+
+def test_a_failed_rename_moves_the_task_back(ws, monkeypatch):
+    """Without a competing create, a rename whose save fails puts the folder back under its name."""
+    ws.create("foo").add_example(png(RED), "a")
+    real_save = store.Task._save  # pylint: disable=protected-access
+
+    def failing_save(self, *a, **kw):
+        if self.path.name == "bar":
+            raise OSError(28, "No space left on device")
+        return real_save(self, *a, **kw)
+
+    monkeypatch.setattr(store.Task, "_save", failing_save)
+    with pytest.raises(OSError, match="No space"):
+        ws.rename("foo", "bar")
+    assert sorted(p.name for p in (ws.root / "tasks").iterdir()) == ["foo"]
+    assert ws.get("foo").path.name == "foo"
+
+
+def test_an_interrupt_after_a_build_is_in_place_keeps_the_task(ws, monkeypatch):
+    """An interrupt arriving just after a create moved its finished folder into place doesn't
+    delete the task: the clean-up only ever removes its own empty reservation."""
+    real_move = fsutil.replace_reserved
+
+    def interrupted(build, p):
+        real_move(build, p)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(store, "replace_reserved", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        ws.create("t")
+    monkeypatch.setattr(store, "replace_reserved", real_move)
+    assert Workspace(ws.root).get("t").name == "t"
+
+
+def test_a_late_lock_on_a_deleted_task_leaves_nothing_in_a_new_one_s_folder(ws):
+    """An object for a deleted task (an evaluation finishing late, say) that locks it while a new
+    task of the same name is being built doesn't create a lock file in the new task's reserved
+    folder, which would make the build fail to move into place."""
+    t = ws.create("foo")
+    t.add_example(png(RED), "a")
+    stale = Workspace(ws.root).get("foo")
+    ws.delete("foo")
+    before = []
+
+    def images():
+        stale.record_evaluation({"revision": 1, "accuracy": 1.0})  # does nothing: the task is gone
+        with pytest.raises(KeyError):
+            stale.upsert_class("x")
+        before.append(sorted(p.name for p in (ws.root / "tasks" / "foo").iterdir()))
+        yield from ()
+
+    new = ws.build_task(TaskConfig(name="foo"), images())
+    assert before == [[]]
+    assert new.config.examples == []
+    assert not (new.path / "eval.json").exists()
+
+
+def test_a_stray_lock_file_in_a_reserved_folder_is_cleared(ws, monkeypatch):
+    """A lock file that still got into a reserved folder (a lock taken in the instant between a
+    deletion and the reservation) is removed so the build moves into place; anything else there
+    is an error, and the reservation (with what is in it) is left for gc."""
+    t = ws.build_task(TaskConfig(name="foo"), _into(ws, "foo", ".lock"))
+    assert (t.path / "task.json").exists()
+    with pytest.raises(OSError, match="not empty"):
+        ws.build_task(TaskConfig(name="bar"), _into(ws, "bar", "junk"))
+    assert (ws.root / "tasks" / "bar" / "junk").exists()
+    assert not [p for p in (ws.root / "tasks").iterdir() if p.name.startswith(".tmp-")]
+    calls = []
+    real = os.replace
+
+    def busy(src, dst):  # a lock file reappears every time: give up after a few tries
+        if dst == ws.root / "tasks" / "baz":
+            calls.append(dst)
+            (dst / ".lock").touch()
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", busy)
+    with pytest.raises(OSError, match="not empty"):
+        ws.build_task(TaskConfig(name="baz"))
+    assert len(calls) == 3
+
+
+def _into(ws, name, extra):
+    """No images, but first a file ``extra`` in task ``name``'s reserved folder."""
+    (ws.root / "tasks" / name / extra).write_text("")
+    yield from ()

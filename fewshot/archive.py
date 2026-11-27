@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
 import uuid
@@ -19,6 +20,8 @@ from .settings import check_settings, for_new_embedder
 from .store import Task, Workspace
 from .text import check_class_name, check_description
 
+log = logging.getLogger(__name__)
+
 # Limits on what an export zip may unpack to (guards against zip bombs): per image, for task.json,
 # and for all images together.
 MAX_IMPORT_IMAGE = 50 * 1024 * 1024
@@ -27,6 +30,11 @@ MAX_IMPORT_TOTAL = 10 * 1024 * 1024 * 1024
 # Files an export zip may list (its images and task.json): checked before zipfile reads the zip's
 # directory, which costs about half a kilobyte of memory per file.
 MAX_IMPORT_FILES = 250_000
+# Images are compressed already (exports store them as they are), so their unpacked size is close
+# to their size in the zip: beyond this many times that (plus an allowance for small exports
+# compressed by hand) the zip is padded images, made to fill the disk from a small upload.
+MAX_IMPORT_RATIO = 20
+MAX_IMPORT_SLACK = 256 * 1024 * 1024
 
 _EOCD, _EOCD64, _LOCATOR64, _CENTRAL = b"PK\x05\x06", b"PK\x06\x06", b"PK\x06\x07", b"PK\x01\x02"
 
@@ -41,6 +49,7 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
     was damaged) is left out with its example.
     """
     t = ws.get(name)
+    total, largest = 0, 0
     with t.locked() as cfg, zipfile.ZipFile(out, "w") as z:
         kept: dict[str, list[Any]] = {"examples": [], "inbox": []}
         for field, items in (("examples", cfg.examples), ("inbox", cfg.inbox)):
@@ -51,9 +60,24 @@ def export_task(ws: Workspace, name: str, out: IO[bytes]) -> tuple[int, int]:
                     continue
                 z.writestr(e.file, data, zipfile.ZIP_STORED)  # images are compressed already
                 kept[field].append(e)
+                total, largest = total + len(data), max(largest, len(data))
         z.writestr("task.json", cfg.model_copy(update=kept).model_dump_json(indent=2), zipfile.ZIP_DEFLATED)
         skipped = len(cfg.examples) + len(cfg.inbox) - len(kept["examples"]) - len(kept["inbox"])
+    if over := _over_import_limits(len(kept["examples"]) + len(kept["inbox"]), total, largest):
+        log.warning("The export of %s %s, more than import accepts: it can't be imported again as it is", name, over)
     return len(kept["examples"]), skipped
+
+
+def _over_import_limits(images: int, total: int, largest: int) -> str:
+    """How an export of ``images`` images, ``total`` bytes in all and the largest ``largest``,
+    exceeds what ``import_task`` accepts ("" if it doesn't)."""
+    if images + 1 > MAX_IMPORT_FILES:
+        return f"holds {images + 1:,} files"
+    if total > MAX_IMPORT_TOTAL:
+        return f"holds {total / 1024 ** 3:.1f} GB of images"
+    if largest > MAX_IMPORT_IMAGE:
+        return f"holds an image of {largest / 1024 ** 2:.0f} MB"
+    return ""
 
 
 def import_task(ws: Workspace, src: IO[bytes] | Path, name: str | None = None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -175,6 +199,18 @@ def _check_member(z: zipfile.ZipFile, info: zipfile.ZipInfo) -> None:
         raise ValueError(f"Not a valid task export: {filename} is really a .{ext} image")
 
 
+def _check_unpacked(images: list[zipfile.ZipInfo]) -> None:
+    """``ValueError`` if the image members unpack to more than ``MAX_IMPORT_TOTAL``, or to far
+    more than their size in the zip (see ``MAX_IMPORT_RATIO``)."""
+    unpacked = sum(m.file_size for m in images)
+    if unpacked > MAX_IMPORT_TOTAL:
+        raise ValueError(f"Not imported: the images unpack to more than {MAX_IMPORT_TOTAL // 1024 ** 3} GB")
+    packed = sum(m.compress_size for m in images)
+    if unpacked > MAX_IMPORT_RATIO * packed + MAX_IMPORT_SLACK:
+        raise ValueError(f"Not imported: the images unpack to {unpacked // max(packed, 1):,} times their size in "
+                         "the zip, which images (compressed already) don't")
+
+
 def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipInfo]]:
     """The checked config of an export zip and its image members by file name.
 
@@ -206,8 +242,7 @@ def _read_export(z: zipfile.ZipFile) -> tuple[TaskConfig, dict[str, zipfile.ZipI
     missing = next((f for f in files if f not in members), None)
     if missing:
         raise ValueError(f"Not a valid task export: {missing} is missing")
-    if sum(members[f].file_size for f in files) > MAX_IMPORT_TOTAL:
-        raise ValueError(f"Not imported: the images unpack to more than {MAX_IMPORT_TOTAL // 1024 ** 3} GB")
+    _check_unpacked([members[f] for f in files])
     for f in files:
         _check_member(z, members[f])
     return cfg.model_copy(update={"classes": list(classes.values()), "examples": examples, "inbox": inbox}), members

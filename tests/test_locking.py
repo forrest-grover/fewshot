@@ -300,12 +300,12 @@ def test_reads_need_no_write_access(tmp_path):
     ws = Workspace(tmp_path / "ws")
     ws.create("t").add_example(png(RED), "red")
     ws.create("fresh")
+    (ws.root / "tasks" / "fresh" / ".lock").unlink()  # as in a task made before tasks were built with one
     EmbeddingCache(ws.cache_path).put_many("x", {"k": np.ones(1, np.float32)})
     folders = [p for p in ws.root.rglob("*") if p.is_dir()] + [ws.root]
     for p in folders:
         p.chmod(0o555)
     try:
-        assert not (ws.root / "tasks" / "fresh" / ".lock").exists()
         ro = Workspace(ws.root, create=False)
         for name in ("t", "fresh"):
             export_task(ro, name, io.BytesIO())
@@ -338,3 +338,68 @@ def test_a_read_only_file_system_is_like_a_read_only_folder(tmp_path, monkeypatc
     monkeypatch.setattr(os, "open", broken)
     with pytest.raises(OSError, match="I/O error"), fsutil.file_lock(tmp_path / ".lock"):
         pass  # pragma: no cover
+
+
+# ---- lock files ----------------------------------------------------------
+def test_lock_files_follow_the_umask_and_need_no_write_access(tmp_path):
+    """A new lock file gets the permissions any new file does (group-writable with umask 002),
+    and an existing one locks exclusively without write access, so others in the group sharing
+    a workspace can change its tasks."""
+    old = os.umask(0o002)
+    try:
+        with fsutil.file_lock(tmp_path / ".lock"):
+            pass
+    finally:
+        os.umask(old)
+    assert (tmp_path / ".lock").stat().st_mode & 0o777 == 0o664
+    (tmp_path / ".lock").chmod(0o444)
+    with fsutil.file_lock(tmp_path / ".lock"):
+        pass
+
+
+def test_a_task_lock_is_only_created_beside_its_task_json(ws):
+    """Tasks are built with their lock file; a task made without one (by an older version) gets
+    it on its first change, but a lock on a task whose folder has no task.json (deleted, its name
+    reserved for a new task) creates nothing and reports the task gone."""
+    t = ws.create("t")
+    assert (t.path / ".lock").exists()
+    (t.path / ".lock").unlink()
+    t.upsert_class("x")
+    assert (t.path / ".lock").exists()
+    stale = Workspace(ws.root).get("t")
+    ws.delete("t")
+    (ws.root / "tasks" / "t").mkdir()  # reserved by a create
+    with pytest.raises(KeyError):
+        stale.upsert_class("y")
+    with pytest.raises(KeyError), stale.locked():
+        pass  # pragma: no cover
+    assert not list((ws.root / "tasks" / "t").iterdir())
+
+
+def test_where_case_is_ignored_a_task_opens_only_under_its_own_spelling(ws, monkeypatch):
+    """On a file system that ignores case (macOS, Windows), FOO would open folder foo as a
+    second task; it is no task instead. Other file systems are left alone."""
+    ws.create("FOO")
+    tasks = ws.root / "tasks"
+    assert not fsutil.folds_case(tasks)  # Linux
+    fsutil.folds_case.cache_clear()
+    monkeypatch.setattr(os.path, "samefile", lambda a, b: True)
+    fresh = Workspace(ws.root)
+    assert fsutil.folds_case(tasks)
+    monkeypatch.setattr(os, "listdir", lambda _: ["foo"])  # FOO opens the folder listed as foo
+    with pytest.raises(KeyError, match="No task 'FOO'"):
+        fresh.get("FOO")
+    monkeypatch.setattr(os, "listdir", lambda _: ["FOO"])
+    assert fresh.get("FOO").name == "FOO"
+
+    def unreadable(*_):
+        raise PermissionError("no")
+
+    fresh._tasks.clear()  # pylint: disable=protected-access
+    monkeypatch.setattr(os, "listdir", unreadable)
+    assert fresh.get("FOO").name == "FOO"  # can't tell: the open decides
+    fsutil.folds_case.cache_clear()
+    monkeypatch.setattr(os.path, "samefile", unreadable)
+    assert not fsutil.folds_case(tasks)
+    monkeypatch.undo()  # before the fixtures' clean-up lists folders
+    fsutil.folds_case.cache_clear()

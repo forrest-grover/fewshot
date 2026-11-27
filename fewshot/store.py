@@ -49,7 +49,7 @@ from . import blobs as _blobs
 from .classifiers import CLASSIFIERS
 from .embedders import check_embedder, loaded_embedders
 from .folders import class_folders, read_or_empty, readable_name
-from .fsutil import FileStamp, os_reason, reclaim
+from .fsutil import FileStamp, create_lock_file, move_back, os_reason, reclaim, replace_reserved, spelt_as_listed
 from .fsutil import dir_lock as _dir_lock
 from .fsutil import file_lock as _file_lock
 from .fsutil import fsync_dir as _fsync_dir
@@ -195,7 +195,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                 raise RuntimeError(f"Can't change task {self.name!r} while reading it in Task.locked")
             with contextlib.ExitStack() as stack:
                 try:
-                    stack.enter_context(_file_lock(self.path / ".lock"))
+                    stack.enter_context(_file_lock(self.path / ".lock", guard=self.path / "task.json"))
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
                     raise KeyError(f"No task {self.name!r}") from e
@@ -221,7 +221,7 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
                 return
             with contextlib.ExitStack() as stack:
                 try:
-                    stack.enter_context(_file_lock(self.path / ".lock", shared=True))
+                    stack.enter_context(_file_lock(self.path / ".lock", shared=True, guard=self.path / "task.json"))
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
                     raise KeyError(f"No task {self.name!r}") from e
@@ -833,7 +833,7 @@ class Workspace:
                 del self._tasks[name]
                 t = None
             if t is None:
-                if not NAME_RE.fullmatch(name):
+                if not NAME_RE.fullmatch(name) or not spelt_as_listed(self.root / "tasks", name):
                     raise KeyError(f"No task {name!r}")
                 p = self.root / "tasks" / name
                 try:
@@ -882,14 +882,16 @@ class Workspace:
             build.mkdir()
             with _dir_lock(p), _dir_lock(build):
                 (build / "images").mkdir()
+                create_lock_file(build)
                 t = Task(build, cfg, blobs=self.blobs, embedder_ok=self.embedder_ok)
                 for file, source in images:
                     t._add_file(file, source)  # pylint: disable=protected-access  # a task only we can see yet
                 t._save(record=False)  # pylint: disable=protected-access
-                os.replace(build, p)  # replaces the empty reserved folder (POSIX)
+                replace_reserved(build, p)
         except BaseException:
             shutil.rmtree(build, ignore_errors=True)
-            shutil.rmtree(p, ignore_errors=True)
+            with contextlib.suppress(OSError):  # only our empty reservation: never a task moved in
+                p.rmdir()
             raise
         t.path = p
         _fsync_dir(p.parent)
@@ -963,8 +965,10 @@ class Workspace:
             try:
                 t._save(record=False)  # pylint: disable=protected-access
             except BaseException:
-                os.rename(dest, src)
-                t.path = src
+                if move_back(dest, src):
+                    t.path = src
+                else:  # another process took the old name meanwhile: the task opens under the new one
+                    log.warning("%s: the rename failed to save, and its name was taken since: now %s", src, dest)
                 raise
             _fsync_dir(dest.parent)
         with self._lock:

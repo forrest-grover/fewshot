@@ -191,6 +191,8 @@ def test_cache_prune_removes_unused_images(run, task, root):
     """cache prune also deletes stored images no task links to."""
     t = Workspace(root).get(task)
     (t.path / t.config.examples[0].file).unlink()
+    for blob in (root / "blobs").glob("*/*"):  # written long ago, so no store may be under way
+        os.utime(blob, (0, 0))
     r = run("cache", "prune")
     assert "Deleted 1 stored images no task uses" in r.output
     assert "stored images" not in run("cache", "prune", "--dry-run").output

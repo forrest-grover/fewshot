@@ -94,6 +94,7 @@ def test_gc(ws, monkeypatch):
     (tasks / ".tmp-young").mkdir()
     (ws.blobs / "zz").mkdir(parents=True)
     (ws.blobs / "zz" / "zz.png").write_bytes(b"x")
+    _age(ws.blobs / "zz" / "zz.png")
     assert ws.gc() == {"folders": 3, "images": 1, "blobs": 1}
     assert sorted(p.name for p in tasks.iterdir()) == [".tmp-young", "t"]
     assert not stray.exists()
@@ -252,3 +253,25 @@ def test_new_files_get_the_umask_not_0600(ws, monkeypatch, tmp_path):
     with pytest.raises(PermissionError):
         fsutil.write_atomic(tmp_path / "y", b"data")
     assert sorted(p.name for p in tmp_path.iterdir() if p.name != "ws") == ["x"]
+
+
+def test_a_full_disk_part_way_through_an_inbox_add_leaves_no_images(ws, monkeypatch):
+    """As for examples: storing the third inbox image fails, and the two stored before it, named
+    by no version, go again (shared copies too)."""
+    t = red_task(ws, n=1)
+    before = sorted(p.name for p in (t.path / "images").iterdir())
+    blobs = sorted(ws.blobs.glob("*/*"))
+    real, calls = store.Task._store_image, []  # pylint: disable=protected-access
+
+    def filling(self, file, data):
+        calls.append(file)
+        if len(calls) == 3:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, file, data)
+
+    monkeypatch.setattr(store.Task, "_store_image", filling)
+    with pytest.raises(OSError, match="No space"):
+        t.add_to_inbox([(png(GREEN, noise=10, seed=i), "") for i in range(5)])
+    assert sorted(p.name for p in (t.path / "images").iterdir()) == before
+    assert sorted(ws.blobs.glob("*/*")) == blobs
+    assert t.config.inbox == []

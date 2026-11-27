@@ -247,6 +247,9 @@ class TaskHistory:
             return None
         aside = self.path / "history" / f".redo-{uuid.uuid4().hex}"
         os.rename(redo, aside)
+        # Durable before the commit: else a power cut could keep the new task.json with the old
+        # redo/, and a redo would then overwrite the change.
+        _fsync_dir(aside.parent)
         return aside
 
     def _clear_redo(self, aside: Path) -> None:
@@ -439,11 +442,17 @@ class TaskHistory:
         """Make the last undone change again; returns the revision it had. Raises ``ValueError``
         if there is nothing to redo (a change since the undo discards what was undone)."""
         with self._writing():
-            redo = self._redo_list()
-            if not redo:
-                raise ValueError("Nothing to redo")
-            rev, snap = redo[-1]
-            new = self._restorable(snap, "redo")
+            while True:
+                redo = self._redo_list()
+                if not redo:
+                    raise ValueError("Nothing to redo")
+                rev, snap = redo[-1]
+                new = self._restorable(snap, "redo")
+                if not self._same(new):
+                    break
+                # A step that changes nothing: left by an undo that crashed after keeping the
+                # current version for redo but before restoring the earlier one. Skip it.
+                self._forget(snap)
             # The version redo replaces is kept for undo: name the files the redo stops using.
             self._restore(new, label=self._label(snap), gone=self.config.files() - new.files())
             self._forget(snap)
@@ -459,8 +468,10 @@ class TaskHistory:
             raise ValueError(f"Can't {what}: {snap.name} is invalid and was removed; {what} again to go "
                              "further") from e
         missing = [f for f in sorted(cfg.files()) if not (self.path / f).exists()]
-        if missing:
-            raise ValueError(f"Can't {what}: {len(missing)} image files are gone, e.g. {missing[0]}")
+        if missing:  # removed by hand or damage: the step could never be taken, and would block the rest
+            self._forget(snap)
+            raise ValueError(f"Can't {what}: {len(missing)} image files of that version are gone, e.g. "
+                             f"{missing[0]}; it was removed, {what} again to go further")
         return cfg
 
     def _restore(self, cfg: TaskConfig, label: str | None = None, gone: Iterable[str] = ()) -> None:

@@ -81,6 +81,9 @@ class TaskInbox:
     def _ensure_class(self, label: str) -> None:  # pragma: no cover  # Task's
         raise NotImplementedError
 
+    def _new_files(self, created: list[str]) -> contextlib.AbstractContextManager[None]:  # pragma: no cover
+        raise NotImplementedError
+
     def add_to_inbox(self, items: Iterable[tuple[bytes, str]], chunk: int = INBOX_CHUNK,
                      undo_group: str | None = None) -> list[InboxItem | ValueError]:
         """Store ``(image bytes, source)`` items in the inbox, one save per ``chunk`` and one undo
@@ -99,7 +102,7 @@ class TaskInbox:
         out: list[InboxItem | ValueError] = []
         created: list[str] = []  # files this call wrote (an image kept for undo may be there already)
         new = 0
-        with self._writing():
+        with self._writing(), self._new_files(created):  # storing some may fail (a full disk)
             # 16 characters: an example from a task made before 32-character ids, same content
             labelled = {e.id: e.label for e in self.config.examples}
             short = {e.id: e.label for e in self.config.examples if len(e.id) == 16}
@@ -122,12 +125,14 @@ class TaskInbox:
                 self._save_in_group(created, group, new, [], lambda n, _: f"add {plural(n)} to the inbox")
         return out
 
-    def inbox_item(self, iid: str) -> InboxItem:
-        """The inbox image with id ``iid``; ``KeyError`` if it isn't waiting there."""
-        for x in self.config.inbox:
-            if x.id == iid:
-                return x
-        raise KeyError(f"No inbox image {iid!r}")
+    def _inbox_items(self, ids: Iterable[str]) -> list[InboxItem]:
+        """The inbox images with these ids, looked up at once (labelling a whole inbox at a time
+        is common); ``KeyError`` names the first that isn't waiting there."""
+        by_id = {x.id: x for x in self.config.inbox}
+        try:
+            return [by_id[iid] for iid in ids]
+        except KeyError as e:
+            raise KeyError(f"No inbox image {e.args[0]!r}") from None
 
     def accept(self, labels: Mapping[str, str]) -> int:
         """Label inbox images (``{id: class}``), moving them to the examples in one save and undo
@@ -135,7 +140,7 @@ class TaskInbox:
         ``ValueError`` for a bad class name, changing nothing; returns how many moved."""
         clean = {iid: check_class_name(label) for iid, label in labels.items()}
         with self._writing():
-            items = [self.inbox_item(iid) for iid in clean]
+            items = self._inbox_items(clean)
             for item in items:
                 self._ensure_class(clean[item.id])
                 self.config.examples.append(Example(id=item.id, file=item.file, source=item.source,
@@ -149,7 +154,7 @@ class TaskInbox:
         ``KeyError`` for an id not in the inbox, changing nothing; returns how many went."""
         wanted = set(ids)
         with self._writing():
-            gone = [self.inbox_item(iid).file for iid in wanted]
+            gone = [x.file for x in self._inbox_items(wanted)]
             self.config.inbox = [x for x in self.config.inbox if x.id not in wanted]
             self._save(gone=gone, label=f"dismiss {plural(len(gone))} from the inbox")
             return len(gone)

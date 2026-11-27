@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
+import time
 from pathlib import Path
 
 from .fsutil import create_exclusive, write_atomic
@@ -100,12 +102,20 @@ def drop_file(task_dir: Path, file: str, blobs: Path | None) -> None:
     release(blob_path(blobs, file))
 
 
-def gc_blobs(blobs: Path) -> int:
-    """Delete shared image copies that no task links to any more; returns how many."""
+# A shared copy written this recently may be one being stored right now, not yet linked into its
+# task (or the temporary file it is written to): gc leaves it for next time.
+GC_MIN_AGE = 60.0
+
+
+def gc_blobs(blobs: Path, min_age: float = GC_MIN_AGE) -> int:
+    """Delete shared image copies that no task links to any more, and temporary files a crashed
+    write left, if written over ``min_age`` seconds ago; returns how many."""
     n = 0
+    now = time.time()
     for f in blobs.glob("*/*") if blobs.is_dir() else []:
         with contextlib.suppress(FileNotFoundError):
-            if f.is_file() and f.stat().st_nlink == 1:
+            st = f.stat()
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and now - st.st_mtime > min_age:
                 f.unlink()
                 n += 1
     return n

@@ -249,3 +249,74 @@ def test_prune_skips_a_task_deleted_meanwhile(ws, monkeypatch):
 
     monkeypatch.setattr(ws, "get", get_then_delete)
     assert prune_unused(ws) == (0, 0)
+
+
+# ---- read-only use and concurrent recovery ---------------------------------
+def test_a_read_only_cache_is_read_without_writing(tmp_path):
+    """A cache opened read-only needs no write access to the file or its folder, even with its
+    WAL side files gone (as after the last writer closed it); it never moves a damaged file."""
+    path = tmp_path / "c" / "cache.sqlite"
+    writer = EmbeddingCache(path)
+    writer.put_many("s", {"a": np.ones(3, np.float32), "b": np.ones(3, np.float32)})
+    writer._conn.close()  # pylint: disable=protected-access
+    assert sorted(p.name for p in path.parent.iterdir()) == ["cache.sqlite"]
+    path.chmod(0o444)
+    path.parent.chmod(0o555)
+    try:
+        ro = EmbeddingCache(path, read_only=True)
+        assert set(ro.get_many("s", ["a", "b"])) == {"a", "b"}
+        assert ro.prune({"a"}, dry_run=True) == 1
+    finally:
+        path.parent.chmod(0o755)
+        path.chmod(0o644)
+    live = EmbeddingCache(path)  # with a writer's side files there, read-only use reads them
+    live.put_many("s", {"c": np.ones(3, np.float32)})
+    assert set(EmbeddingCache(path, read_only=True).get_many("s", ["a", "c"])) == {"a", "c"}
+    with pytest.raises(FileNotFoundError):
+        EmbeddingCache(tmp_path / "missing.sqlite", read_only=True)
+    ro = EmbeddingCache(path, read_only=True)
+    _break(ro, 11)
+    with pytest.raises(sqlite3.DatabaseError):
+        ro.get_many("s", ["a"])
+    assert not [p for p in path.parent.iterdir() if "corrupt" in p.name]
+
+
+def test_a_dry_run_prune_works_without_write_access(ws):
+    """``prune_unused(dry_run=True)`` works where nothing in the workspace can be written, the
+    cache file included; without a cache there is nothing to prune."""
+    two_each(ws)
+    assert prune_unused(ws, dry_run=True) == (0, 0)
+    assert not ws.cache_path.exists()  # a dry run doesn't make one
+    EmbeddingCache(ws.cache_path).put_many("x", {"gone": np.ones(1, np.float32)})
+    paths = [*sorted(ws.root.rglob("*"), reverse=True), ws.root]
+    for p in paths:
+        p.chmod(0o555 if p.is_dir() else 0o444)
+    try:
+        assert prune_unused(Workspace(ws.root, create=False), dry_run=True) == (1, 0)
+    finally:
+        for p in reversed(paths):
+            p.chmod(0o755 if p.is_dir() else 0o644)
+
+
+def test_two_processes_finding_the_damage_at_once_keep_one_new_cache(tmp_path, monkeypatch):
+    """Two processes open a damaged cache at the same time: the first moves it aside and starts a
+    new one; the second, finding the file already replaced, uses that one instead of moving it
+    aside too. Each move keeps its damaged copy under its own name."""
+    path = tmp_path / "cache.sqlite"
+    path.write_bytes(b"this is not a database" * 100)
+    real_open = EmbeddingCache._open  # pylint: disable=protected-access
+    raced: list[bool] = []
+
+    def racing(self):
+        if not raced:  # this process's open fails on the damaged file, once the other has recovered
+            raced.append(True)
+            EmbeddingCache(self.path).put_many("s", {"k": np.ones(3, np.float32)})
+            e = sqlite3.DatabaseError("file is not a database")
+            e.sqlite_errorcode = 26
+            raise e
+        return real_open(self)
+
+    monkeypatch.setattr(EmbeddingCache, "_open", racing)
+    second = EmbeddingCache(path)
+    assert set(second.get_many("s", ["k"])) == {"k"}  # the first's new cache, not moved aside
+    assert len([p for p in tmp_path.iterdir() if "corrupt" in p.name]) == 1

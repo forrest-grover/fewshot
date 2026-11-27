@@ -14,6 +14,7 @@ from fewshot import archive, store
 from fewshot.archive import export_task, import_task
 from fewshot.embedders import DEFAULT_SPEC
 from fewshot.images import image_id
+from fewshot.models import Example, TaskConfig
 from fewshot.store import Workspace
 from fewshot.text import MAX_PROMPTS
 from tests.conftest import BLUE, RED, host_client, png, red_blue_task, red_green_task, red_task, two_each, zip_of
@@ -368,3 +369,43 @@ def test_failed_import_leaves_nothing(ws, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         import_task(ws, buf, name="copy")
     assert [p.name for p in (ws.root / "tasks").iterdir()] == ["t"]
+
+
+# ---- size limits -----------------------------------------------------------
+def test_an_export_of_padded_images_is_refused(ws, monkeypatch):
+    """Images are compressed already, so ones unpacking to many times their size in the zip are
+    padding made to fill the disk from a small upload: refused before anything is written."""
+    monkeypatch.setattr(archive, "MAX_IMPORT_SLACK", 0)
+    data = png(RED) + b"\0" * 100_000  # a valid PNG with trailing padding
+    iid = image_id(data)
+    cfg = TaskConfig(name="pad", examples=[Example(id=iid, file=f"images/{iid}.png", label="a")])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(f"images/{iid}.png", data, zipfile.ZIP_DEFLATED)
+        z.writestr("task.json", cfg.model_dump_json())
+    buf.seek(0)
+    with pytest.raises(ValueError, match="times their size in the zip"):
+        import_task(ws, buf, embedder_ok=lambda _: None)
+    assert ws.list_tasks() == []
+    red_task(ws, "plain")  # an ordinary export (images stored as they are) is fine
+    out = io.BytesIO()
+    export_task(ws, "plain", out)
+    out.seek(0)
+    assert len(import_task(ws, out, name="again", embedder_ok=lambda _: None).config.examples) == 2
+
+
+def test_an_export_too_large_to_import_again_is_reported(ws, monkeypatch, caplog):
+    """An export holding more files, bytes or a larger image than import accepts is written, with
+    a warning that it can't be imported again as it is."""
+    red_task(ws, n=2)
+    for limit, value, said in (("MAX_IMPORT_FILES", 2, "holds 3 files"), ("MAX_IMPORT_TOTAL", 10, "GB of images"),
+                               ("MAX_IMPORT_IMAGE", 10, "holds an image of")):
+        with monkeypatch.context() as m:
+            m.setattr(archive, limit, value)
+            caplog.clear()
+            assert export_task(ws, "t", io.BytesIO()) == (2, 0)
+            assert said in caplog.text
+            assert "can't be imported again" in caplog.text
+    caplog.clear()
+    export_task(ws, "t", io.BytesIO())
+    assert "can't be imported" not in caplog.text
