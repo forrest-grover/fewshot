@@ -51,13 +51,14 @@ describe("useUploads", () => {
     expect(stops).toEqual([]);
   });
 
-  it("gives each drop its own undo group, shared by all of its batches", async () => {
+  it("gives drops sent at the same time one undo group, and a later drop its own", async () => {
     const { hook } = setup("pets");
     const sent: { slot: string; group: string }[] = [];
     const sendTo = (slot: string): SendBatch => (batch, _signal, group) => {
       sent.push({ slot, group });
       return Promise.resolve({ added: batch, errors: [], task: taskDetail() });
     };
+    // Batches to two classes go in turn: in one group, the server joins them into one undo step.
     await act(() => Promise.all([hook.result.current.start("cat", files(5), sendTo("cat")),
       hook.result.current.start("dog", files(3), sendTo("dog"))]));
     await act(() => hook.result.current.start("cat", files(3), sendTo("again")));
@@ -65,7 +66,8 @@ describe("useUploads", () => {
     expect(sent.map((s) => s.slot).sort()).toEqual(["again", "again", "cat", "cat", "cat", "dog", "dog"]);
     const [cat, dog, again] = ["cat", "dog", "again"].map(groupsOf);
     expect([cat.size, dog.size, again.size]).toEqual([1, 1, 1]);
-    expect(new Set([...cat, ...dog, ...again]).size).toBe(3);
+    expect(new Set([...cat, ...dog]).size).toBe(1);
+    expect(again.has([...cat][0])).toBe(false);
   });
 
   it("goes on while the task stays open, and stops when another opens, counting the batch in flight", async () => {
@@ -105,21 +107,46 @@ describe("useUploads", () => {
     expect(stops).toEqual([]);
   });
 
-  it("stop() stops after the batch in flight and says how many got in", async () => {
+  it("stop() stops after the batch in flight and says what got in, by undo group", async () => {
     const { hook, stops } = setup("pets");
-    const { send, release } = gatedSend();
+    const { send, groups, release } = gatedSend();
     act(() => { void hook.result.current.start("cat", files(5), send); });
     await waitFor(() => { expect(send).toHaveBeenCalledTimes(1); });
     expect(hook.result.current.busy).toBe(true);
-    let added: number | null = null;
-    act(() => { void hook.result.current.stop().then((n) => { added = n; }); });
+    let stopped: Map<string, number[]> | null = null;
+    act(() => { void hook.result.current.stop().then((m) => { stopped = m; }); });
     expect(hook.result.current.slots.cat?.progress?.stopping).toBe(true);
-    expect(added).toBeNull();
+    expect(stopped).toBeNull();
     release();
-    await waitFor(() => { expect(added).toBe(2); });
+    await waitFor(() => { expect(stopped).toEqual(new Map([[groups[0], [3]]])); }); // the batch in flight's revision
     expect(send).toHaveBeenCalledTimes(1);
     expect(stops).toEqual([{ task: "pets", added: 2, total: 5, error: null }]);
     expect(hook.result.current.busy).toBe(false);
+  });
+
+  it("stop() reports nothing when no batch had landed, and the batches of a group's earlier upload", async () => {
+    const { hook } = setup("pets");
+    let fail: () => void = () => { /* set below */ };
+    const failing = vi.fn<SendBatch>(() => new Promise((_res, rej) => { fail = () => { rej(new Error("offline")); }; }));
+    act(() => { void hook.result.current.start("cat", files(5), failing); });
+    await waitFor(() => { expect(failing).toHaveBeenCalledTimes(1); });
+    let first: Map<string, number[]> | null = null;
+    act(() => { void hook.result.current.stop().then((m) => { first = m; }); });
+    act(() => { fail(); }); // the batch in flight fails: none of the upload landed
+    await waitFor(() => { expect(first).toEqual(new Map()); });
+    // A drop that ended while another of its group goes on still counts.
+    const done = vi.fn<SendBatch>((batch) => Promise.resolve({ added: batch, errors: [], task: taskDetail({ revision: 7 }) }));
+    const held = gatedSend();
+    let fast: Promise<unknown> = Promise.resolve();
+    act(() => { void hook.result.current.start("dog", files(4), held.send); });
+    await waitFor(() => { expect(held.send).toHaveBeenCalledTimes(1); });
+    act(() => { fast = hook.result.current.start("cat", files(1), done); });
+    await act(() => fast);
+    let second: Map<string, number[]> | null = null;
+    act(() => { void hook.result.current.stop().then((m) => { second = m; }); });
+    held.release();
+    await waitFor(() => { expect(second).toEqual(new Map([[held.groups[0], [7, 3]]])); });
+    expect(done.mock.calls[0][2]).toBe(held.groups[0]); // the cat drop joined the dog drop's group
   });
 
   it("keeps how many images were moved from other classes", async () => {

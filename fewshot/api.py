@@ -279,6 +279,7 @@ def _detail(t: Task) -> dict[str, Any]:
         "can_undo": t.can_undo(),
         "can_redo": t.can_redo(),
         "undo_label": t.undo_label(),
+        "undo_group": t.undo_group(),
         "redo_label": t.redo_label(),
         "classes": [{"name": k.name, "description": k.description, "count": counts.get(k.name, 0),
                      "reject_below": k.reject_below} for k in c.classes],

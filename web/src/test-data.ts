@@ -14,5 +14,5 @@ export function taskDetail(over: Partial<TaskDetail> = {}): TaskDetail {
 /** Uploads (see useUploads) with nothing being sent, and ``slots`` as given. */
 export function idleUploads(slots: Uploads["slots"] = {}): Uploads {
   const nothing = () => { /* nothing to do */ };
-  return { slots, start: () => Promise.resolve([]), dismiss: nothing, stop: () => Promise.resolve(0), rename: nothing, busy: false };
+  return { slots, start: () => Promise.resolve([]), dismiss: nothing, stop: () => Promise.resolve(new Map()), rename: nothing, busy: false };
 }

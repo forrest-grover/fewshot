@@ -29,8 +29,10 @@ describe("usePredictResults", () => {
     act(() => { result.current.rename("a2"); });
     rerender({ task: "a2" });
     expect(first.signal.aborted).toBe(false);
+    expect(result.current.taskName.current).toBe("a2");
     rerender({ task: "b" });
     expect(first.signal.aborted).toBe(true);
+    expect(result.current.taskName.current).toBe("b");
     const second = result.current.abortable();
     act(() => { result.current.cancel(); });
     expect(second.signal.aborted).toBe(true);

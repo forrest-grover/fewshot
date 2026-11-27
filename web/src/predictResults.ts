@@ -36,6 +36,10 @@ export function usePredictResults(task: string | null) {
     setResults({ task: name, items: [], batch: null, current: null });
     setEpoch((e) => e + 1);
   }
+  // The task's current name, for a classification's later batches: renaming the task meanwhile
+  // changes it at once (before the route follows), so they don't go to the old name.
+  const taskName = useRef(name);
+  taskName.current = moving ? results.task : name;
   // Preview URLs of results no longer shown are released. In an effect, not during render, which
   // React may repeat or throw away.
   useEffect(() => {
@@ -64,9 +68,10 @@ export function usePredictResults(task: string | null) {
   /** Keep the results when their task is renamed. */
   const rename = (to: string) => {
     renamed.current = { from: name, to };
+    if (taskName.current === name) taskName.current = to;
     setResults((r) => (r.task === name ? { ...r, task: to } : r));
   };
-  return { results, setResults, urls, rename, abortable, cancel };
+  return { results, setResults, urls, rename, abortable, cancel, taskName };
 }
 
 function revoke(urls: Set<string>) {

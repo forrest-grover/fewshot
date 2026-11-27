@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { isAbort, sendInBatches, splitBytes } from "./upload";
+import { isAbort, sendInBatches, splitBytes, uploadSteps } from "./upload";
 
 const file = (name: string, size: number) => new File([new Uint8Array(size)], name);
 const names = (fs: File[]) => fs.map((f) => f.name).join("");
+
+describe("uploadSteps", () => {
+  it("counts a step wherever a batch doesn't directly follow one of its own group", () => {
+    expect(uploadSteps(new Map())).toBe(0);
+    expect(uploadSteps(new Map([["a", [4, 5, 6]]]))).toBe(1); // joined: one step
+    expect(uploadSteps(new Map([["a", [4, 5, 8]]]))).toBe(2); // other changes at 6 and 7 in between
+    expect(uploadSteps(new Map([["a", [4, 6]], ["b", [5, 7]]]))).toBe(4); // examples and inbox in turn
+    expect(uploadSteps(new Map([["a", [6, 4, 5]]]))).toBe(1); // in any order
+  });
+});
 
 describe("splitBytes", () => {
   it("keeps order and starts a new run before the limit is passed", () => {

@@ -46,6 +46,14 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
     return t !== undefined;
   };
   const fail = (message: string) => { void run(Promise.reject(new Error(message))); };
+  // Examples a key in the viewer is changing: a second press before the answer (which would
+  // still see the old image shown) is ignored, rather than sent again for the same example.
+  const changing = useRef(new Set<string>());
+  const once = (id: string, change: () => Promise<TaskDetail>) => {
+    if (changing.current.has(id)) return;
+    changing.current.add(id);
+    void save(change()).finally(() => { changing.current.delete(id); });
+  };
 
   // Derived from the examples once per task version (and filter), not on every render: a task
   // can have thousands, and a tick or a keystroke re-renders the page.
@@ -209,11 +217,12 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
             const ex = viewed[i];
             if (/^[1-9]$/.test(e.key)) {
               const c = task.classes[Number(e.key) - 1] as TaskDetail["classes"][number] | undefined;
-              if (c && c.name !== ex.label) void save(api.relabel(task.name, ex.id, c.name));
+              // A held key acts once, not on each image that comes into view as the last one goes.
+              if (c && c.name !== ex.label && !e.repeat) once(ex.id, () => api.relabel(task.name, ex.id, c.name));
               return true;
             }
             if (e.key === "Delete" || e.key === "Backspace") {
-              void save(api.deleteExample(task.name, ex.id));
+              if (!e.repeat) once(ex.id, () => api.deleteExample(task.name, ex.id));
               return true;
             }
             return false;
@@ -359,11 +368,12 @@ export default function Examples({ task, setTask, run, uploads }: Props) {
                   });
                 }}>{allPicked ? "Untick all" : "Tick all"}</button>
               )}
-              <button className="ghost small" onClick={() => {
+              {/* Not while images are uploaded to the class: its later batches would bring the old name back. */}
+              <button className="ghost small" disabled={!!up} title={up ? "Wait for the upload to this class, or cancel it" : undefined} onClick={() => {
                 const n = prompt("Rename class", c.name);
                 if (n && n !== c.name) void save(api.patchClass(task.name, c.name, { name: n }));
               }}>Rename</button>
-              <button className="ghost small danger" onClick={() => {
+              <button className="ghost small danger" disabled={!!up} title={up ? "Wait for the upload to this class, or cancel it" : undefined} onClick={() => {
                 if (confirm(`Delete class "${c.name}" and its ${String(c.count)} example(s)?`)) void save(api.deleteClass(task.name, c.name));
               }}>Delete</button>
             </header>

@@ -1425,6 +1425,8 @@ export interface components {
             temperature: number | null;
             /** Text Weight */
             text_weight: number;
+            /** Undo Group */
+            undo_group?: string | null;
             /** Undo Label */
             undo_label: string;
         };

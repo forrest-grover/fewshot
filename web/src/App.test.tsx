@@ -55,9 +55,49 @@ function holdUploads() {
   };
   return { route, release: () => { waiting.shift()?.(); } };
 }
-/** Drop ``n`` images on the first class. */
-function drop(container: HTMLElement, n: number) {
-  const input = container.querySelector<HTMLInputElement>(".class-card input[type=file]");
+/** A server holding "pets" whose undo steps behave as the real one's: an upload batch joins the
+ * step on top when that is its undo group's and nothing was saved since. Uploads are answered only
+ * when ``release`` is called, a batch at a time; ``other`` makes another change meanwhile. */
+function historyServer() {
+  let rev = 3;
+  const steps: { group: string | null; count: number; rev: number; label: string }[] = [];
+  const waiting: (() => void)[] = [];
+  const detail = () => {
+    const top = steps[steps.length - 1] as (typeof steps)[number] | undefined;
+    return { ...pets, revision: rev, can_undo: !!top, undo_label: top?.label ?? "", undo_group: top?.group ?? null, can_redo: false, redo_label: "" };
+  };
+  const change = (group: string | null, count: number, label: (n: number) => string) => {
+    const top = steps[steps.length - 1] as (typeof steps)[number] | undefined;
+    if (group && top?.group === group && top.rev === rev) {
+      top.count += count;
+      top.label = label(top.count);
+      top.rev = ++rev;
+    } else steps.push({ group, count, label: label(count), rev: ++rev });
+  };
+  const route: Route = (c) => {
+    if (c.method === "POST" && c.url === "/api/tasks/pets/examples") {
+      const form = c.body as FormData;
+      const n = form.getAll("files").length, group = String(form.get("undo_group"));
+      return new Promise<Response>((res) => {
+        waiting.push(() => {
+          change(group, n, (k) => `add ${String(k)} examples`);
+          res(json({ added: Array.from({ length: n }, () => ({})), errors: [], task: detail() }, 201));
+        });
+      });
+    }
+    if (c.method === "POST" && c.url === "/api/tasks/pets/undo") {
+      const undone = steps.pop();
+      rev++;
+      return json({ ...detail(), can_redo: true, redo_label: undone?.label ?? "" });
+    }
+    if (c.method === "GET" && c.url === "/api/tasks/pets") return json(detail());
+    return undefined;
+  };
+  return { route, steps, release: () => { waiting.shift()?.(); }, other: (label: string) => { change(null, 1, () => label); } };
+}
+/** Drop ``n`` images on the class card at ``card`` (the first). */
+function drop(container: HTMLElement, n: number, card = 0) {
+  const input = container.querySelectorAll<HTMLInputElement>(".class-card input[type=file]")[card] as HTMLInputElement | undefined;
   if (!input) throw new Error("no file input");
   const files = Array.from({ length: n }, (_, i) => new File(["x"], `${String(i)}.png`, { type: "image/png" }));
   fireEvent.change(input, { target: { files } });
@@ -142,24 +182,63 @@ describe("App", () => {
   });
 
   it("Ctrl+Z during an upload stops it after the batch in flight, then undoes all of it", async () => {
-    const held = holdUploads();
-    serve((c) => held.route(c) ?? (c.url === "/api/tasks/pets/undo" ? json({ ...pets, revision: 1000, can_redo: true, redo_label: "add 200 examples to cat" }) : undefined));
+    const server = historyServer();
+    serve(server.route);
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: "cat" });
     drop(container, 250);
     await screen.findByText(/Uploading 0 \/ 250/);
-    act(() => { held.release(); });
+    act(() => { server.release(); });
     await screen.findByText(/Uploading 100 \/ 250/);
     expect(screen.getByRole("button", { name: "↶ Undo" }).title).toBe("Stop the upload and undo it (Ctrl+Z)");
     fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
     await screen.findByText(/Stopping 100 \/ 250/);
     expect(calls.some((c) => c.url.endsWith("/undo"))).toBe(false); // not before the batch in flight lands
-    act(() => { held.release(); });
-    expect(await screen.findByText("Stopped the upload. Undid add 200 examples to cat")).toBeDefined();
+    act(() => { server.release(); });
+    expect(await screen.findByText("Stopped the upload. Undid add 200 examples")).toBeDefined();
     const posts = calls.filter((c) => c.method === "POST").map((c) => c.url);
     expect(posts).toEqual(["/api/tasks/pets/examples", "/api/tasks/pets/examples", "/api/tasks/pets/undo"]);
+    expect(server.steps).toEqual([]);
     // The toast offers Redo, until the task changes again (then it would redo nothing).
     expect(screen.getByRole("button", { name: "Redo" })).toBeDefined();
+  });
+
+  it("Ctrl+Z during uploads to two classes at once undoes both", async () => {
+    const server = historyServer();
+    serve(server.route);
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "cat" });
+    drop(container, 250);
+    drop(container, 150, 1); // to "dog", while "cat" is uploading: their batches alternate
+    await screen.findByText(/Uploading 0 \/ 150/);
+    act(() => { server.release(); });
+    act(() => { server.release(); });
+    await screen.findByText(/Uploading 100 \/ 150/);
+    fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
+    await screen.findByText(/Stopping 100 \/ 150/);
+    act(() => { server.release(); });
+    act(() => { server.release(); });
+    expect(await screen.findByText("Stopped the upload. Undid add 350 examples")).toBeDefined();
+    expect(calls.filter((c) => c.url.endsWith("/undo"))).toHaveLength(1); // one shared undo group: one step
+    expect(server.steps).toEqual([]);
+  });
+
+  it("Ctrl+Z during an upload stops at a change made meanwhile, and says the rest of the upload is under it", async () => {
+    const server = historyServer();
+    serve(server.route);
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "cat" });
+    drop(container, 250);
+    await screen.findByText(/Uploading 0 \/ 250/);
+    act(() => { server.release(); });
+    await screen.findByText(/Uploading 100 \/ 250/);
+    server.other("relabel 1 example"); // say, in another tab: the next batch starts a new step
+    fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
+    await screen.findByText(/Stopping 100 \/ 250/);
+    act(() => { server.release(); });
+    expect(await screen.findByText("Stopped the upload. Undid add 100 examples. The rest of it is under a change made "
+      + "meanwhile (relabel 1 example): undo that to reach it.")).toBeDefined();
+    expect(server.steps.map((s) => s.label)).toEqual(["add 100 examples", "relabel 1 example"]);
   });
 
   it("signing in again keeps the page, and says what uploads stopped meanwhile", async () => {
@@ -205,6 +284,22 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Log out" }));
     await waitFor(() => { expect(reload).toHaveBeenCalled(); });
     expect(calls.filter((c) => c.url === "/api/logout").map((c) => c.method)).toEqual(["POST"]);
+  });
+
+  it("Log out after the session already ended just starts afresh, with no error", async () => {
+    serve((c) => {
+      if (c.url === "/api/health") {
+        return json({ status: "ok", auth_required: true, models_loaded: [], jobs_running: 0, url_fetch: false, max_request_bytes: 1 << 30, max_upload_bytes: 1 << 26 });
+      }
+      if (c.url === "/api/logout") return json({ detail: "Not signed in" }, 401);
+      return undefined;
+    });
+    const reload = vi.fn();
+    vi.spyOn(window, "location", "get").mockReturnValue({ ...window.location, reload, hash: "#/pets/examples" } as Location);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Log out" }));
+    await waitFor(() => { expect(reload).toHaveBeenCalled(); });
+    expect(screen.queryByText("Not signed in")).toBeNull();
   });
 
   it("drops the toast's Redo once the task changed", async () => {

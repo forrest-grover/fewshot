@@ -18,7 +18,7 @@ export interface UploadStop { task: string; added: number; total: number; error:
  * of another class, and were moved to this one (example uploads only; the inbox has none). */
 interface Uploaded { added: unknown[]; errors: Skip[]; task: TaskDetail; moved?: readonly unknown[] }
 /** Sends one batch to task ``task`` (its current name), all of whose requests carry ``undoGroup``,
- * so the drop is one undo step. */
+ * so the drop is one undo step (with the other uploads to the task running at the same time). */
 export type SendBatch = (batch: File[], signal: AbortSignal, undoGroup: string, task: string) => Promise<Uploaded>;
 
 interface UploadOptions {
@@ -28,9 +28,14 @@ interface UploadOptions {
   prepare?: (files: File[]) => Promise<File[]>; // default: scale images down
 }
 
+/** The undo groups of the uploads ``stop`` stopped, each with the task revisions its batches
+ * made (see ``uploadSteps``); none if no batch of theirs landed. */
+export type Stopped = Map<string, number[]>;
+
 /** An upload being sent. */
 interface Running {
   task: string; // its task's name (updated if the task is renamed meanwhile)
+  group: string; // its undo group: shared by the uploads to the task running at the same time
   added: number; // images the server confirmed so far
   stop: () => void; // after the batch in flight
   abort: () => void; // at once
@@ -60,6 +65,8 @@ export function useUploads(task: string | null, options: UploadOptions) {
     setEpoch((e) => e + 1);
   }
   const live = useRef(new Set<Running>());
+  // The task revisions made by the batches of each undo group a running upload uses.
+  const revisions = useRef(new Map<string, number[]>());
   useEffect(() => {
     const set = live.current;
     return () => { set.forEach((r) => { r.stop(); }); };
@@ -79,8 +86,12 @@ export function useUploads(task: string | null, options: UploadOptions) {
   const start = useCallback(async (slot: string, files: File[], send: SendBatch): Promise<Skip[] | null> => {
     const hard = new AbortController(), soft = new AbortController();
     let finished: () => void = () => { /* set below */ };
+    const task = current.current;
+    // Uploads running at the same time share one undo group, so that batches to two classes,
+    // sent in turn, still make one undo step.
+    const group = [...live.current].find((x) => x.task === task)?.group ?? newUndoGroup();
     const r: Running = {
-      task: current.current, added: 0,
+      task, group, added: 0,
       stop: () => {
         if (soft.signal.aborted) return;
         soft.abort();
@@ -90,7 +101,7 @@ export function useUploads(task: string | null, options: UploadOptions) {
       done: new Promise((res) => { finished = res; }),
     };
     live.current.add(r);
-    const group = newUndoGroup();
+    if (!revisions.current.has(group)) revisions.current.set(group, []);
     const skips: Skip[] = [];
     let moved = 0;
     setSlot(r.task, slot, () => ({ skipped: [] }));
@@ -114,6 +125,7 @@ export function useUploads(task: string | null, options: UploadOptions) {
         onBatch: (b) => {
           if (!b) return;
           r.added += b.added.length;
+          revisions.current.get(group)?.push(b.task.revision);
           moved += b.moved?.length ?? 0;
           skips.push(...b.errors);
           opts.current.onTask(b.task);
@@ -126,6 +138,7 @@ export function useUploads(task: string | null, options: UploadOptions) {
       return null;
     } finally {
       live.current.delete(r);
+      if (![...live.current].some((x) => x.group === group)) revisions.current.delete(group);
       setSlot(r.task, slot, () => ({ skipped: skips, ...(moved ? { moved } : {}) }));
       finished();
     }
@@ -134,12 +147,14 @@ export function useUploads(task: string | null, options: UploadOptions) {
   /** Forget what ``slot``'s last upload skipped or moved. */
   const dismiss = useCallback((slot: string) => { setSlot(current.current, slot, () => ({ skipped: [] })); }, [setSlot]);
   /** Stop every upload of the open task after its batch in flight; resolves, once they have
-   * ended, to how many images they added in all. */
-  const stop = useCallback(async (): Promise<number> => {
+   * ended, to their undo groups and the revisions their batches made (those of uploads in the
+   * same group that ended earlier too, since they are part of the same undo steps). */
+  const stop = useCallback(async (): Promise<Stopped> => {
     const mine = [...live.current].filter((r) => r.task === current.current);
+    const groups = new Map(mine.map((r) => [r.group, revisions.current.get(r.group) ?? []]));
     mine.forEach((r) => { r.stop(); });
     await Promise.all(mine.map((r) => r.done));
-    return mine.reduce((n, r) => n + r.added, 0);
+    return new Map([...groups].filter(([, revs]) => revs.length > 0));
   }, []);
   /** Keep uploads (and their slots) going when their task is renamed to ``to``. */
   const rename = useCallback((to: string) => {

@@ -8,14 +8,14 @@ import NewTask from "./NewTask";
 import { taskUndoKey, topModal, typingAt } from "./keys";
 import { usePredictResults } from "./predictResults";
 import { Gate, Latest, stepToast, useByTask } from "./state";
-import { useUploads, type UploadStop } from "./useUploads";
+import { useUploads, type Stopped, type UploadStop } from "./useUploads";
 import Predict from "./Predict";
 import Settings from "./Settings";
 import Shortcuts from "./Shortcuts";
 import SignIn from "./SignIn";
 import { compareAfter, evalAfter, jobLost, type CompareRun, type EvalRun } from "./runs";
 import { ErrorBox, JobPoller } from "./ui";
-import { BATCH, batchLimits, isAbort } from "./upload";
+import { BATCH, batchLimits, isAbort, uploadSteps } from "./upload";
 
 const TABS = ["examples", "inbox", "predict", "evaluate", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -207,29 +207,58 @@ export default function App() {
   /** Undo or redo the task's last change, and say what it was in a toast that offers the reverse.
    * One step at a time: presses while one is in flight are ignored, so a double press or a held
    * key doesn't walk back several versions. Undo while images are being uploaded to the task
-   * stops the upload first (after its batch in flight, so none lands after the undo) and then
-   * undoes all of it, as one step; if none of it had landed, nothing is undone. */
+   * stops the uploads first (after their batches in flight, so none lands after the undo) and
+   * then undoes all of them: every undo step on top that their batches made (uploads running at
+   * once share an undo group, so these are usually one, but an inbox upload alongside example
+   * uploads, or a rename meanwhile, makes more). A change made meanwhile (a relabel, say) is not
+   * undone with them: undoing stops there and says how much of the upload is under it. If none
+   * of the uploads had landed, nothing is undone. */
   const stepGate = useRef(new Gate()).current;
   const step = (which: "undo" | "redo") => stepGate.run(async () => {
     if (!task) return;
     let shown = task;
-    const stopping = which === "undo" && (exampleUploads.busy || inboxUploads.busy);
-    if (stopping) {
-      const added = (await Promise.all([exampleUploads.stop(), inboxUploads.stop()])).reduce((a, b) => a + b, 0);
+    if (which === "undo" && (exampleUploads.busy || inboxUploads.busy)) {
+      const [a, b] = await Promise.all([exampleUploads.stop(), inboxUploads.stop()]);
+      const batches = new Map([...a, ...b]);
       if (currentTask.current !== shown.name) return;
-      if (!added) { setToast({ text: "Stopped the upload; none of it had been added", key: Date.now() }); return; }
+      if (!batches.size) { setToast({ text: "Stopped the upload; none of it had been added", key: Date.now() }); return; }
       const fresh = await run(api.task(shown.name)); // with every batch that landed
       if (!fresh) return;
       updateTask(fresh);
       shown = fresh;
+      await undoUploads(shown, batches);
+      return;
     }
     if (!(which === "undo" ? shown.can_undo : shown.can_redo)) return;
     const t = await run(which === "undo" ? api.undo(shown.name) : api.redo(shown.name));
     if (!t) return;
     updateTask(t);
     const said = stepToast(which, t, which === "undo" ? shown.undo_label : shown.redo_label);
-    setToast({ ...said, text: stopping ? `Stopped the upload. ${said.text}` : said.text, task: t.name, rev: t.revision, key: Date.now() });
+    setToast({ ...said, task: t.name, rev: t.revision, key: Date.now() });
   });
+  /** Undo the steps on top of ``shown`` that the stopped uploads' ``batches`` made (see ``step``). */
+  const undoUploads = async (shown: TaskDetail, batches: Stopped) => {
+    const steps = uploadSteps(batches);
+    let t = shown, undone = 0;
+    const firstLabel = shown.undo_label;
+    while (t.can_undo && t.undo_group && batches.has(t.undo_group)) {
+      const next = await run(api.undo(t.name));
+      if (!next) break; // the error shows
+      updateTask(next);
+      t = next;
+      undone++;
+      if (currentTask.current !== t.name) return;
+    }
+    const left = steps - undone;
+    const under = left > 0 ? ` ${left === steps ? "It is" : "The rest of it is"} under a change made meanwhile${t.undo_label ? ` (${t.undo_label})` : ""}: undo that to reach it.` : "";
+    if (undone === 1) {
+      const said = stepToast("undo", t, firstLabel);
+      setToast({ ...said, text: `Stopped the upload. ${said.text}${under ? `.${under}` : ""}`, task: t.name, rev: t.revision, key: Date.now() });
+    } else {
+      // Redo would make only the last of several steps again: not offered.
+      setToast({ text: `Stopped the upload.${undone ? ` Undid it (${String(undone)} steps).` : ""}${under}`, key: Date.now() });
+    }
+  };
   const undo = () => step("undo");
   useEffect(() => { // the toast goes after a few seconds
     if (!toast) return;
@@ -262,8 +291,11 @@ export default function App() {
   const logOut = () => {
     if ((exampleUploads.busy || inboxUploads.busy) && !confirm("An upload is still running. Log out and stop it?")) return;
     // A fresh page after it: nothing of the session is left on screen.
-    void api.logout().then(() => { location.hash = ""; location.reload(); }, (e: unknown) => {
-      setError(e instanceof Error ? e.message : String(e));
+    const fresh = () => { location.hash = ""; location.reload(); };
+    void api.logout().then(fresh, (e: unknown) => {
+      // 401: the session had already ended, so there is nothing left to log out of.
+      if (e instanceof HttpError && e.status === 401) fresh();
+      else setError(e instanceof Error ? e.message : String(e));
     });
   };
 

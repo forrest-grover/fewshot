@@ -118,6 +118,7 @@ class TaskDetail(BaseModel):
     can_undo: bool
     can_redo: bool
     undo_label: str  # what undo would take back, e.g. "delete 3 examples" ("" if unknown)
+    undo_group: str | None = None  # the ``undo_group`` id the change undo would take back was sent with, if any
     redo_label: str
     classes: list[ClassOut]
     examples: list[ExampleOut]

@@ -20,6 +20,16 @@ let nextKey = 0;
 /** The http(s) URLs in text separated by whitespace. */
 const urlsIn = (text: string) => text.split(/\s+/).filter((u) => /^https?:\/\/\S+/i.test(u));
 
+/** A result's image. One classified from a URL has no local copy, and the page's content policy
+ * keeps it from loading images from other sites (which would also tell them who looks), so it
+ * shows the URL's host instead. */
+function Preview({ it }: { it: Item }) {
+  if (it.file) return <img src={it.url} alt={it.name} />;
+  let host = it.url;
+  try { host = new URL(it.url).host; } catch { /* shown as given */ }
+  return <div className="url-preview" title={it.url} role="img" aria-label={it.name}><span>Linked image</span><span>{host}</span></div>;
+}
+
 export default function Predict({ task, setTask, run, state, urlFetch, limits = BATCH }: Props) {
   const [urlText, setUrlText] = useState("");
   const { setResults, urls } = state;
@@ -71,7 +81,8 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
     const mine = new Set<number>();
     let sent = 0;
     try {
-      await run(sendInBatches(originals, (fs, signal) => api.predict(task.name, fs, signal), {
+      // To the task's name at each batch: it may be renamed meanwhile (Settings), and the rest go on.
+      await run(sendInBatches(originals, (fs, signal) => api.predict(state.taskName.current, fs, signal), {
         signal: req.signal, prepare: shrinkImages, limits,
         onProgress: (done, total) => { finish(batch, (r) => ({ ...r, progress: { done, total } })); },
         onBatch: (preds, files) => {
@@ -124,6 +135,8 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
     const added = r?.added[0];
     patch(it.key, added ? { adding: false, added: { label, id: added.id } } : { adding: false }); // a failure shows in the error box
     if (r) setTask(r.task);
+    // Answered, but nothing added (a URL that failed to download this time): say why.
+    if (r && !added) void run(Promise.reject(new Error(`Not added: ${r.errors[0]?.error ?? "the server added nothing"}`)));
   };
   const clear = () => { update((r) => ({ ...r, items: [], current: null })); }; // their preview URLs are released
 
@@ -197,7 +210,7 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
           if (it.pred.error) {
             return (
               <article key={it.key} className="result">
-                <img src={it.url} alt={it.name} />
+                <Preview it={it} />
                 <div className="result-body">
                   <strong className="unknown">Could not read image</strong>
                   <div className="muted file">{it.name}</div>
@@ -217,7 +230,7 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
               onFocus={() => { if (actionable(it) && it !== current) update((r) => ({ ...r, current: it.key })); }}
               onClick={() => { if (actionable(it)) update((r) => ({ ...r, current: it.key })); }}
             >
-              <img src={it.url} alt={it.name} />
+              <Preview it={it} />
               <div className="result-body">
                 <div className="result-head">
                   <strong className={it.pred.rejected ? "unknown" : ""}>

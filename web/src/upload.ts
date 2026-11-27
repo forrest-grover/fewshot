@@ -20,6 +20,18 @@ export function newUndoGroup(): string {
   return Array.from(c.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** How many undo steps the batches of some uploads made, from the task revision each batch made,
+ * by undo group: the server joins a batch to the step before when that step is the same group's
+ * and nothing was saved since (no other change, nor a rename), so each batch whose revision
+ * doesn't directly follow one of its own group's starts a step. */
+export function uploadSteps(batches: Map<string, number[]>): number {
+  const groupAt = new Map<number, string>();
+  batches.forEach((revs, g) => { revs.forEach((r) => groupAt.set(r, g)); });
+  let steps = 0;
+  groupAt.forEach((g, r) => { if (groupAt.get(r - 1) !== g) steps++; });
+  return steps;
+}
+
 /** ``files`` split, in order, into runs of at most ``maxBytes`` bytes (a larger file goes alone). */
 export function splitBytes<T extends { size: number }>(files: T[], maxBytes: number): T[][] {
   const out: T[][] = [];

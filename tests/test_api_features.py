@@ -314,7 +314,7 @@ def test_redo(client, task):
     t = client.get(f"/api/tasks/{task}").json()
     eid = t["examples"][0]["id"]
     t = client.delete(f"/api/tasks/{task}/examples/{eid}").json()
-    assert t["undo_label"] == "delete 1 example"
+    assert (t["undo_label"], t["undo_group"]) == ("delete 1 example", None)  # not sent in a group
     t = client.post(f"/api/tasks/{task}/undo").json()
     assert (t["can_redo"], t["redo_label"], len(t["examples"])) == (True, "delete 1 example", 6)
     t = client.post(f"/api/tasks/{task}/redo").json()
@@ -348,7 +348,10 @@ def test_uploads_with_an_undo_group_are_one_undo_step(client):
                  for j in range(2)]
         r = client.post("/api/tasks/t/inbox", data={"undo_group": "drop-2"}, files=files)
     assert r.json()["task"]["undo_label"] == "add 4 images to the inbox"
-    assert client.post("/api/tasks/t/undo").json()["inbox_count"] == 0
-    assert client.post("/api/tasks/t/undo").json()["examples"] == []
+    assert r.json()["task"]["undo_group"] == "drop-2"  # so a client can tell its own steps
+    t = client.post("/api/tasks/t/undo").json()
+    assert (t["inbox_count"], t["undo_group"]) == (0, "drop-1")
+    t = client.post("/api/tasks/t/undo").json()
+    assert (t["examples"], t["undo_group"]) == ([], None)
     r = client.post("/api/tasks/t/examples", data={"label": "red", "undo_group": "x" * 65}, files=query_files(1))
     assert r.status_code == 422

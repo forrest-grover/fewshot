@@ -384,6 +384,14 @@ class TaskHistory:
         snaps = self._history()
         return self._label(snaps[-1][1]) if snaps else ""
 
+    def undo_group(self) -> str | None:
+        """The client's undo group id of the change the next undo takes back, if it was made in one
+        (see ``_save_in_group``): a client that sent an upload in several groups' requests can undo
+        while the next step is one of its own."""
+        snaps = self._history()
+        info = self._group_of(snaps[-1][1]) if snaps else None
+        return info["group"] if info else None
+
     def redo_label(self) -> str:
         """What the next redo makes again ("" if unknown or nothing)."""
         redo = self._redo_list()
