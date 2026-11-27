@@ -4,6 +4,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from fewshot import errors
 from fewshot.api import mount_ui
 
 
@@ -23,6 +24,7 @@ def dist_fixture(tmp_path):
 def ui_fixture(dist):
     """A client for an app with only the UI mounted."""
     app = FastAPI()
+    errors.install(app)
     mount_ui(app, dist)
     return TestClient(app)
 
@@ -71,7 +73,8 @@ def test_unknown_api_route_is_404(ui):
     assert ui.get("/api").status_code == 404
     r = ui.get("/api/nope")
     assert r.status_code == 404
-    assert r.json() == {"detail": "Not Found"}
+    assert r.json() == {"type": "about:blank", "title": "Not Found", "status": 404, "code": "ROUTE_NOT_FOUND",
+                        "detail": "No route /api/nope; see /docs for the API's routes", "instance": "/api/nope"}
     assert ui.get("/apiary").text == "<html>INDEX</html>"
 
 

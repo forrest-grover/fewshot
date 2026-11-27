@@ -61,7 +61,7 @@ describe("Examples on a big task", () => {
 describe("Evaluate on a big task", () => {
   it("lists mistakes a page at a time", () => {
     const mistakes: HeldOut[] = Array.from({ length: 500 }, (_, i) => ({
-      id: `e${String(i)}`, true: "a", pred: "b", correct: false, confidence: 1 - i / 1000, similarity: 0.5,
+      id: `e${String(i)}`, source: `e${String(i)}.jpg`, true: "a", pred: "b", correct: false, confidence: 1 - i / 1000, similarity: 0.5,
     }));
     const report = {
       accuracy: 0.5, macro_f1: 0.5, calibration: null, classes: ["a", "b"], confusion: [[0, 500], [0, 0]], method: "loo",

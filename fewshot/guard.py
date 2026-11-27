@@ -6,12 +6,11 @@ import ipaddress
 import re
 from collections.abc import Callable
 
-from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
 from starlette._utils import get_route_path  # what the router matches by
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from .errors import PAYLOAD_TOO_LARGE, problem_response
 
 MAX_JSON_BYTES = 1024 * 1024  # request bodies other than uploads and lists of ids
 MAX_BULK_JSON_BYTES = 16 * 1024 * 1024  # JSON bodies listing ids (bulk edit, delete, accept, dismiss)
@@ -120,7 +119,8 @@ class LimitBody:  # pylint: disable=too-few-public-methods  # an ASGI middleware
     @staticmethod
     async def _refuse(limit: int, scope: Scope, receive: Receive, send: Send) -> None:
         mb = limit / 1024 / 1024
-        await JSONResponse({"detail": f"Request is larger than the {mb:.3g} MB limit"}, 413)(scope, receive, send)
+        await problem_response(413, PAYLOAD_TOO_LARGE, f"Request is larger than the {mb:.3g} MB limit",
+                               Request(scope).url.path, limit_bytes=limit)(scope, receive, send)
 
 
 # Routes whose bodies may be large: uploads (multipart only) and JSON lists of ids. The limit
@@ -152,11 +152,3 @@ def body_limit(max_request_bytes: int, scope: Scope) -> int:
     if bulk is not None and bulk.fullmatch(path):
         return MAX_BULK_JSON_BYTES
     return MAX_JSON_BYTES
-
-
-async def without_input(_: Request, exc: Exception) -> JSONResponse:
-    """422 for a request that doesn't validate, like FastAPI's own but without each error's
-    ``input``, so a large bad body isn't sent back."""
-    assert isinstance(exc, RequestValidationError)
-    errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
-    return JSONResponse({"detail": jsonable_encoder(errors)}, 422)

@@ -114,7 +114,7 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
     }
   };
   const exportCsv = () => {
-    const round4 = (x: number) => Number(x.toFixed(4)); // a number, so a spreadsheet reads it as one
+    const round4 = (x: number | null) => (x === null ? "" : Number(x.toFixed(4))); // a number, so a spreadsheet reads it as one
     const row = (it: Item) => {
       const p: Prediction = it.pred;
       return [it.name, p.label, p.labels.join(";"), p.top_label, round4(p.confidence), round4(p.similarity), p.rejected, p.error];
@@ -132,7 +132,8 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
     if (it.adding || addedAs(it)) return;
     patch(it.key, { adding: true });
     const r = await run(it.file ? api.addExamples(task.name, label, [it.file]) : api.addExampleUrls(task.name, label, [it.url]));
-    const added = r?.added[0];
+    // Already an example (of this class, or moved from another) counts as added too.
+    const added = r?.added[0] ?? r?.unchanged[0] ?? r?.moved[0];
     patch(it.key, added ? { adding: false, added: { label, id: added.id } } : { adding: false }); // a failure shows in the error box
     if (r) setTask(r.task);
     // Answered, but nothing added (a URL that failed to download this time): say why.
@@ -160,7 +161,7 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
       void addAs(current, c.name);
       move = 1;
     } else if (e.key === "Enter") {
-      if (current.pred.rejected) return; // "unknown": a number key says which class it is
+      if (current.pred.rejected || !current.pred.top_label) return; // "unknown": a number key says which class it is
       void addAs(current, current.pred.top_label);
       move = 1;
     } else if (e.key === "ArrowDown" || e.key === "j") move = 1;
@@ -234,10 +235,10 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
               <div className="result-body">
                 <div className="result-head">
                   <strong className={it.pred.rejected ? "unknown" : ""}>
-                    {it.pred.rejected ? `Unknown (closest: ${it.pred.top_label})` : it.pred.label}
+                    {it.pred.rejected ? `Unknown (closest: ${it.pred.top_label ?? "?"})` : it.pred.label}
                   </strong>
                   <span className="muted" title="Cosine similarity to the closest prototype or example. Low values suggest the image fits none of the classes.">
-                    sim {it.pred.similarity.toFixed(3)}
+                    sim {it.pred.similarity?.toFixed(3) ?? "–"}
                   </span>
                 </div>
                 <div className="muted file">{it.name}</div>
@@ -263,11 +264,11 @@ export default function Predict({ task, setTask, run, state, urlFetch, limits = 
                     <span className="ok">Added as {addedAs(it)}</span>
                   ) : (
                     <>
-                      {!it.pred.rejected && (
-                        <button className="small" disabled={it.adding} onClick={() => { void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
+                      {!it.pred.rejected && it.pred.top_label && (
+                        <button className="small" disabled={it.adding} onClick={() => { if (it.pred.top_label) void addAs(it, it.pred.top_label); }}>Add as {it.pred.top_label}</button>
                       )}
                       <ClassSelect className="small" classes={classNames} numbered disabled={it.adding} aria-label="Add as another class"
-                        placeholder={it.pred.rejected ? "Add as…" : "Add as other…"} exclude={it.pred.rejected ? undefined : it.pred.top_label}
+                        placeholder={it.pred.rejected ? "Add as…" : "Add as other…"} exclude={it.pred.rejected ? undefined : it.pred.top_label ?? undefined}
                         onPick={(c) => { void addAs(it, c); }} />
                     </>
                   )}

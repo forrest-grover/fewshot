@@ -102,7 +102,7 @@ def test_api(tmp_path, monkeypatch):
     assert s["last_evaluation"]["revision"] == s["revision"]
     r = client.post("/api/tasks/t/duplicate", json={"name": "u", "examples": False})
     assert (r.status_code, r.json()["examples"]) == (201, [])
-    assert client.post("/api/tasks/t/duplicate", json={"name": "u"}).status_code == 400
+    assert client.post("/api/tasks/t/duplicate", json={"name": "u"}).status_code == 409
     assert client.post("/api/tasks/nope/duplicate", json={"name": "v"}).status_code == 404
 
     def gone(*_a):

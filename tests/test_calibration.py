@@ -157,7 +157,7 @@ def test_api(client):
     assert client.patch("/api/tasks/c", json={"clear_temperature": True}).json()["temperature"] is None
     r = client.patch("/api/tasks/c", json={"clear_temperature": True, "temperature": 2})
     assert r.status_code == 400
-    assert client.patch("/api/tasks/c", json={"temperature": 1000}).status_code == 400
+    assert client.patch("/api/tasks/c", json={"temperature": 1000}).status_code == 422
 
 
 def test_cli(tmp_path):

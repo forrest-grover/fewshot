@@ -14,9 +14,10 @@ export interface UploadSlot { progress?: UploadProgress; skipped: Skip[]; moved?
 /** An upload that stopped before the end: cancelled (``error`` null), or failed. ``added`` counts
  * the images the server confirmed adding. */
 export interface UploadStop { task: string; added: number; total: number; error: Error | null }
-/** What the server answers each upload batch with. ``moved``: images that were already examples
- * of another class, and were moved to this one (example uploads only; the inbox has none). */
-interface Uploaded { added: unknown[]; errors: Skip[]; task: TaskDetail; moved?: readonly unknown[] }
+/** What the server answers each upload batch with: the images new to the task (``added``), there
+ * already (``unchanged``), and already examples of another class, now moved to this one
+ * (``moved``: example uploads only; the inbox has none). */
+interface Uploaded { added: unknown[]; unchanged?: unknown[]; errors: Skip[]; task: TaskDetail; moved?: readonly unknown[] }
 /** Sends one batch to task ``task`` (its current name), all of whose requests carry ``undoGroup``,
  * so the drop is one undo step (with the other uploads to the task running at the same time). */
 export type SendBatch = (batch: File[], signal: AbortSignal, undoGroup: string, task: string) => Promise<Uploaded>;
@@ -124,7 +125,7 @@ export function useUploads(task: string | null, options: UploadOptions) {
         },
         onBatch: (b) => {
           if (!b) return;
-          r.added += b.added.length;
+          r.added += b.added.length + (b.unchanged?.length ?? 0) + (b.moved?.length ?? 0); // each is there now
           revisions.current.get(group)?.push(b.task.revision);
           moved += b.moved?.length ?? 0;
           skips.push(...b.errors);

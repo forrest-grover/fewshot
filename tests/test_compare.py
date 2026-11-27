@@ -127,14 +127,16 @@ def test_api_compare_refusals(client, monkeypatch):
 
     assert post({"embedders": []}).status_code == 400
     assert post({"embedders": [f"fake:{i}" for i in range(9)]}).status_code == 400
-    assert post({"embedders": ["fake:color"], "folds": 1}).status_code == 400
+    assert post({"embedders": ["fake:color"], "folds": 1}).status_code == 422
     client.post("/api/tasks", json={"name": "empty", "embedder": "fake:color"})
-    assert post({"embedders": ["fake:color"]}, task="empty").status_code == 400
+    r = post({"embedders": ["fake:color"]}, task="empty")
+    assert (r.status_code, r.json()["code"]) == (400, "NO_EXAMPLES")
     r = post({"embedders": ["openclip:nope@nowhere"]})
     assert (r.status_code, "not a preset" in r.json()["detail"]) == (403, True)
     assert post({"embedders": ["fake:color"], "extra": 1}).status_code == 422
     monkeypatch.setattr(fewshot.api, "MAX_JOBS", 0)
-    assert post({"embedders": ["fake:color"]}).status_code == 429
+    r = post({"embedders": ["fake:color"]})
+    assert (r.status_code, r.json()["code"], r.headers["retry-after"]) == (429, "TOO_MANY_JOBS", "5")
 
 
 # ---- CLI ------------------------------------------------------------------------

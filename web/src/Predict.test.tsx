@@ -25,7 +25,7 @@ function Host({ task, errors, onState }: { task: TaskDetail; errors: string[]; o
 describe("Predict", () => {
   it("shows a URL's host instead of loading the remote image, and says why Add as added nothing", async () => {
     vi.spyOn(api, "predictUrls").mockResolvedValue([pred("cat")]);
-    const add = vi.spyOn(api, "addExampleUrls").mockResolvedValue({ added: [], errors: [{ file: "https://example.com/c.jpg", error: "timed out" }], task: pets, moved: [] });
+    const add = vi.spyOn(api, "addExampleUrls").mockResolvedValue({ added: [], unchanged: [], created_classes: [], errors: [{ file: "https://example.com/c.jpg", error: "timed out" }], task: pets, moved: [] });
     const errors: string[] = [];
     const { container } = render(<Host task={pets} errors={errors} />);
     fireEvent.change(screen.getByRole("textbox", { name: "Image URLs to classify" }), { target: { value: "https://example.com/c.jpg" } });

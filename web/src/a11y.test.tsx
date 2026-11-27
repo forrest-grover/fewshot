@@ -17,7 +17,7 @@ const pets = taskDetail({
 
 describe("Threshold chart", () => {
   const preds: HeldOut[] = Array.from({ length: 40 }, (_, i) => ({
-    id: String(i), true: "a", pred: "a", correct: i % 4 !== 0, confidence: 0.9, similarity: 0.5 + i / 100,
+    id: String(i), source: `${String(i)}.jpg`, true: "a", pred: "a", correct: i % 4 !== 0, confidence: 0.9, similarity: 0.5 + i / 100,
   }));
 
   it("is one tab stop whose arrow keys choose a bar and Enter picks it", () => {

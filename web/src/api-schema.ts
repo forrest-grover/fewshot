@@ -14,9 +14,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Health
-         * @description Liveness check; also lists loaded models and running jobs. Needs no token, and no thread, so
-         *     it answers even while every thread is busy.
+         * Server status and version
+         * @description Liveness check; also gives the server's ``version`` and ``api_version``, and lists loaded
+         *     models and running jobs. Needs no token, and no thread, so it answers even while every thread
+         *     is busy.
          */
         get: operations["health"];
         put?: never;
@@ -35,14 +36,15 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get Job
-         * @description A job's status, progress and (once done) result.
+         * Get a job's progress and result
+         * @description A job's status, progress and (once done) result; while it runs, Retry-After says when to
+         *     poll again. A failed job has ``error`` and ``problem`` (with its ``code``).
          */
         get: operations["get_job"];
         put?: never;
         post?: never;
         /**
-         * Cancel Job
+         * Cancel a job
          * @description Ask a running job to stop: its status becomes "cancelling", then "cancelled" at its next
          *     progress step. Until then it still counts towards the job limit.
          */
@@ -62,7 +64,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Login
+         * Sign in with the token
          * @description Check the server token and start a session: an HttpOnly, SameSite=Strict cookie (Secure over
          *     HTTPS) holding a signed session id, never the token, valid for 30 days or until logout.
          *
@@ -87,7 +89,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Logout
+         * End the session
          * @description End the session: the cookie is deleted, and its session refused from now on.
          */
         post: operations["logout"];
@@ -105,7 +107,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Models
+         * List embedder presets and classifiers
          * @description List embedder presets and classifier names.
          */
         get: operations["models"];
@@ -125,14 +127,15 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List Tasks
+         * List tasks
          * @description Summaries of all tasks.
          */
         get: operations["list_tasks"];
         put?: never;
         /**
-         * Create Task
-         * @description Create a task, validating the embedder spec (which loads the model) first.
+         * Create a task
+         * @description Create a task, validating the embedder spec (which loads the model) first; 409
+         *     TASK_EXISTS if the name is taken.
          */
         post: operations["create_task"];
         delete?: never;
@@ -151,9 +154,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Import Task
-         * @description Create a task from a zip made by .../export, named ``name`` or as exported, optionally
-         *     with another ``embedder`` (say, a preset, when the exported one isn't allowed here).
+         * Import a task from a zip
+         * @description Create a task from a zip made by .../export, named ``name`` or as exported (409
+         *     TASK_EXISTS if that name is taken), optionally with another ``embedder`` (say, a preset,
+         *     when the exported one isn't allowed here).
          */
         post: operations["import_task"];
         delete?: never;
@@ -170,24 +174,26 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get Task
-         * @description Full detail of one task.
+         * Get a task
+         * @description Full detail of one task. The ETag header is its revision, for If-Match on changes.
          */
         get: operations["get_task"];
         put?: never;
         post?: never;
         /**
-         * Delete Task
-         * @description Delete a task and its images.
+         * Delete a task
+         * @description Delete a task and its images (this can't be undone).
          */
         delete: operations["delete_task"];
         options?: never;
         head?: never;
         /**
-         * Update Task
-         * @description Change task settings. ``classifier_params`` replaces the params; switching classifier starts
-         *     its params afresh unless they are given. A temperature of 1 means none. A new embedder is
-         *     loaded first, on the heavy-work threads.
+         * Change a task's settings
+         * @description Change task settings, as a JSON Merge Patch: omitted fields are unchanged, and null clears
+         *     ``reject_below``, ``reject_below_zero_shot`` or ``temperature`` (null for another field is a
+         *     422). ``classifier_params`` replaces the params; switching classifier starts its params afresh
+         *     unless they are given. A temperature of 1 means none. A new embedder is loaded first, on the
+         *     heavy-work threads.
          */
         patch: operations["update_task"];
         trace?: never;
@@ -201,9 +207,9 @@ export interface paths {
         };
         get?: never;
         /**
-         * Set Class Thresholds
+         * Set classes' reject thresholds
          * @description Set or clear the reject thresholds of the named classes (one undoable change); classes not
-         *     named keep theirs. An unknown class (404) or a value outside -1..1 (400) changes nothing.
+         *     named keep theirs. An unknown class (404) or a value outside -1..1 (422) changes nothing.
          */
         put: operations["set_class_thresholds"];
         post?: never;
@@ -223,8 +229,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Add Class
-         * @description Add a class, or update the description of an existing one.
+         * Add a class (or set its description)
+         * @description Add a class (201), or update the description of an existing one (200).
          */
         post: operations["add_class"];
         delete?: never;
@@ -244,16 +250,16 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Delete Class
-         * @description Delete a class and all of its examples.
+         * Delete a class and its examples
+         * @description Delete a class and all of its examples (undo brings them back).
          */
         delete: operations["delete_class"];
         options?: never;
         head?: never;
         /**
-         * Patch Class
-         * @description Rename a class (relabelling its examples) and/or set its description, as one change (one
-         *     undo step).
+         * Rename a class or set its description
+         * @description Rename a class (relabelling its examples; 409 CLASS_EXISTS if the new name is taken)
+         *     and/or set its description, as one change (one undo step).
          */
         patch: operations["patch_class"];
         trace?: never;
@@ -268,10 +274,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Start Comparison
+         * Start comparing embedders on a task
          * @description Start cross-validating the task with each of ``embedders`` in the background (the same
          *     allowlist as choosing a task's embedder applies); the job's result compares their accuracy.
-         *     Stages are like "2/3 embedding".
+         *     Stages are like "2/3 embedding". Refused at once as POST .../evaluate/jobs is.
          */
         post: operations["start_comparison"];
         delete?: never;
@@ -290,7 +296,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Describe Classes
+         * Describe classes from a template
          * @description Fill class descriptions from a template such as 'a photo of a {}'.
          */
         post: operations["describe_classes"];
@@ -310,9 +316,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Duplicate Task
-         * @description Copy a task under a new name, e.g. to try other settings without touching it (400 if the
-         *     name is bad or taken).
+         * Copy a task under a new name
+         * @description Copy a task under a new name, e.g. to try other settings without touching it: 400 if the
+         *     name is bad, 409 TASK_EXISTS if it is taken.
          */
         post: operations["duplicate_task"];
         delete?: never;
@@ -329,7 +335,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Duplicates
+         * Find near-duplicate examples
          * @description Pairs of near-identical examples (cosine similarity >= ``threshold``), most similar first.
          */
         get: operations["duplicates"];
@@ -351,9 +357,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Evaluate
-         * @description Cross-validate the task (leave-one-out unless ``folds`` is given). For a large task, prefer
-         *     POST .../evaluate/jobs, which reports progress and can be cancelled.
+         * Cross-validate a task (synchronous)
+         * @description Cross-validate the task and answer with the report, which can take minutes for a large
+         *     task: prefer POST .../evaluate/jobs, which reports progress and can be cancelled. 400
+         *     NO_EXAMPLES for a task without examples.
          */
         post: operations["evaluate"];
         delete?: never;
@@ -372,9 +379,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Start Evaluation
-         * @description Start cross-validating the task in the background; poll GET /api/jobs/{id} for progress
-         *     (stage "embedding" counts images, "evaluating" counts folds) and the report. The same
+         * Start cross-validating a task
+         * @description Start cross-validating the task in the background; poll the job its Location header names
+         *     (GET /api/jobs/{id}) for progress (stage "embedding" counts images, "evaluating" counts folds)
+         *     and the report. A task that can't be evaluated is refused at once (400 NO_EXAMPLES). The same
          *     evaluation of the same version already running is shared rather than started again.
          */
         post: operations["start_evaluation"];
@@ -392,25 +400,28 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List Examples
-         * @description One page of the task's examples, optionally only those with ``label`` and/or ``tag``.
+         * List examples, a page at a time
+         * @description One page of the task's examples, optionally only those with ``label`` (404 CLASS_NOT_FOUND
+         *     if the task has no such class) and/or ``tag``; ``total`` counts every match.
          */
         get: operations["list_examples"];
         put?: never;
         /**
-         * Add Examples
-         * @description Upload images as examples of ``label``; unreadable files are reported in ``errors``.
-         *
-         *     Returns 400 when the label is blank or no file could be added.
+         * Upload labelled images
+         * @description Upload images as examples of ``label``, creating the class if needed (a new name close to
+         *     an existing class's needs ``new_class``). Images are deduplicated by content, so sending an
+         *     upload again is safe: 201 if anything was new, 200 if every image was there already, 400
+         *     NO_IMAGES_ADDED if none could be read; unreadable files are listed in ``errors``.
          */
         post: operations["add_examples"];
         delete?: never;
         options?: never;
         head?: never;
         /**
-         * Edit Examples
+         * Relabel or tag several examples
          * @description Move several examples to another (possibly new) class and/or tag them, as one change (one
-         *     undo step); an unknown id changes nothing (404).
+         *     undo step); an unknown id changes nothing (404). A new class name close to an existing
+         *     class's needs ``new_class``.
          */
         patch: operations["edit_examples"];
         trace?: never;
@@ -425,7 +436,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Delete Examples
+         * Delete several examples
          * @description Delete several examples; an unknown id deletes nothing (404).
          */
         post: operations["delete_examples"];
@@ -445,8 +456,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Add Examples By Url
-         * @description Download images (server started with --allow-urls) and add them as examples of ``label``.
+         * Add labelled images by URL
+         * @description Download images (server started with --allow-urls) and add them as examples of ``label``,
+         *     as uploads are added.
          */
         post: operations["add_examples_by_url"];
         delete?: never;
@@ -466,16 +478,16 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Delete Example
+         * Delete an example
          * @description Delete one example.
          */
         delete: operations["delete_example"];
         options?: never;
         head?: never;
         /**
-         * Edit Example
+         * Relabel, tag or annotate an example
          * @description Move an example to another (possibly new) class, and/or set its tags or note, as one change
-         *     (one undo step).
+         *     (one undo step). A new class name close to an existing class's needs ``new_class``.
          */
         patch: operations["edit_example"];
         trace?: never;
@@ -488,7 +500,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Example Image
+         * Get an example's image or thumbnail
          * @description Serve an example's image file, or with ``size`` a JPEG scaled down to fit in that many pixels.
          */
         get: operations["example_image"];
@@ -508,7 +520,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Export Task
+         * Export a task as a zip
          * @description Download the task (settings, classes, labels and images) as a zip, for backup or to move it.
          */
         get: operations["export_task"];
@@ -528,15 +540,18 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List Inbox
-         * @description The inbox with suggestions: ``uncertain`` first (the most useful to label), ``confident``
-         *     first (to accept in bulk), ``novel`` first (unlike any example), or as ``added``.
+         * List the inbox with suggestions
+         * @description One page (``limit`` items from ``offset``; ``total`` counts all) of the inbox with
+         *     suggestions: ``uncertain`` first (the most useful to label), ``confident`` first (to accept
+         *     in bulk), ``novel`` first (unlike any example), or as ``added``.
          */
         get: operations["list_inbox"];
         put?: never;
         /**
-         * Add To Inbox
+         * Upload unlabelled images
          * @description Upload unlabelled images to the task's inbox, to label later with the model's suggestions.
+         *     Deduplicated by content, as examples are: 201 if anything was new, 200 if every image was
+         *     waiting already; an image that is an example already is listed in ``errors``.
          */
         post: operations["add_to_inbox"];
         delete?: never;
@@ -555,8 +570,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Accept Inbox
-         * @description Label inbox images, moving them to the examples (one undo step); 404 if an id isn't waiting.
+         * Label inbox images
+         * @description Label inbox images, moving them to the examples (one undo step); 404 if an id isn't
+         *     waiting. A new class name close to an existing class's needs ``new_class``.
          */
         post: operations["accept_inbox"];
         delete?: never;
@@ -575,7 +591,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Accept Confident
+         * Accept the confident suggestions
          * @description Label as the model suggests every inbox image (of ``ids``, if given) it is at least
          *     ``min_confidence`` sure of and doesn't reject, in one undo step.
          */
@@ -596,7 +612,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Dismiss Inbox
+         * Dismiss inbox images
          * @description Remove images from the inbox without labelling them (undo brings them back).
          */
         post: operations["dismiss_inbox"];
@@ -616,7 +632,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Add Urls To Inbox
+         * Add unlabelled images by URL
          * @description Download images (server started with --allow-urls) into the task's inbox.
          */
         post: operations["add_urls_to_inbox"];
@@ -636,9 +652,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Predict
-         * @description Classify uploaded images; an unreadable file gets ``error`` set instead of a label. Each
-         *     prediction says which ``revision`` of the task made it.
+         * Classify uploaded images
+         * @description Classify uploaded images, in the order sent; an unreadable file gets ``error`` set and its
+         *     other fields empty (null scores). Each prediction says which ``revision`` of the task made it.
          */
         post: operations["predict"];
         delete?: never;
@@ -657,7 +673,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Predict Urls
+         * Classify images by URL
          * @description Download images (server started with --allow-urls) and classify them; ``file`` is the URL.
          */
         post: operations["predict_urls"];
@@ -677,8 +693,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Redo
-         * @description Make the last undone change again (400 if there is nothing to redo, as after any new change).
+         * Redo the last undone change
+         * @description Make the last undone change again (409 NOTHING_TO_REDO if there is none, as after any new change).
          */
         post: operations["redo"];
         delete?: never;
@@ -697,8 +713,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Rename Task
-         * @description Rename a task (400 if the new name is bad or taken).
+         * Rename a task
+         * @description Rename a task: 400 if the new name is bad, 409 TASK_EXISTS if it is taken.
          */
         post: operations["rename_task"];
         delete?: never;
@@ -717,9 +733,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Undo
-         * @description Undo the task's last change (400 if there is nothing to undo); ``undo_label`` in the task
-         *     says what it was before the call.
+         * Undo the last change
+         * @description Undo the task's last change (409 NOTHING_TO_UNDO if there is none); ``undo_label`` in the
+         *     task says what it was before the call.
          */
         post: operations["undo"];
         delete?: never;
@@ -744,17 +760,23 @@ export interface components {
         };
         /**
          * AddResult
-         * @description POST .../examples. ``added`` is every example the request stored, including those that were
-         *     in another class before and are listed again in ``moved``.
+         * @description POST .../examples. Images are deduplicated by content: ``added`` lists the examples new to
+         *     the task, ``unchanged`` those that were examples of this class already (so sending an upload
+         *     again is safe), and ``moved`` those that were examples of another class and now are of this
+         *     one. ``created_classes`` names the class, if the upload created it.
          */
         AddResult: {
             /** Added */
             added: components["schemas"]["ExampleOut"][];
+            /** Created Classes */
+            created_classes: string[];
             /** Errors */
             errors: components["schemas"]["FileError"][];
             /** Moved */
             moved: components["schemas"]["MovedExample"][];
             task: components["schemas"]["TaskDetail"];
+            /** Unchanged */
+            unchanged: components["schemas"]["ExampleOut"][];
         };
         /** Body_add_examples */
         Body_add_examples: {
@@ -762,6 +784,12 @@ export interface components {
             files: string[];
             /** Label */
             label: string;
+            /**
+             * New Class
+             * @description Create the class even if its name is close to an existing class's (which is otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)
+             * @default false
+             */
+            new_class: boolean;
             /**
              * Undo Group
              * @description Any id the client chooses for one upload it sends in several requests: consecutive uploads to the task with the same id, with no other change in between, are one undo step
@@ -803,6 +831,12 @@ export interface components {
             ids: string[];
             /** Label */
             label?: string | null;
+            /**
+             * New Class
+             * @description Create the class even if its name is close to an existing class's (which is otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)
+             * @default false
+             */
+            new_class: boolean;
             /** Remove Tags */
             remove_tags?: string[];
         };
@@ -985,6 +1019,8 @@ export interface components {
             same_label: boolean;
             /** Similarity */
             similarity: number;
+            /** Sources */
+            sources: string[];
         };
         /**
          * EmbedderOut
@@ -1060,6 +1096,12 @@ export interface components {
         ExampleEdit: {
             /** Label */
             label?: string | null;
+            /**
+             * New Class
+             * @description Create the class even if its name is close to an existing class's (which is otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)
+             * @default false
+             */
+            new_class: boolean;
             /** Note */
             note?: string | null;
             /** Tags */
@@ -1115,16 +1157,13 @@ export interface components {
             /** File */
             file: string | null;
         };
-        /** HTTPValidationError */
-        HTTPValidationError: {
-            /** Detail */
-            detail?: components["schemas"]["ValidationError"][];
-        };
         /**
          * Health
          * @description GET /api/health.
          */
         Health: {
+            /** Api Version */
+            api_version: string;
             /** Auth Required */
             auth_required: boolean;
             /** Jobs Cancelling */
@@ -1141,6 +1180,8 @@ export interface components {
             status: string;
             /** Url Fetch */
             url_fetch: boolean;
+            /** Version */
+            version: string;
         };
         /**
          * HeldOutPrediction
@@ -1157,12 +1198,15 @@ export interface components {
             pred: string;
             /** Similarity */
             similarity: number;
+            /** Source */
+            source: string;
             /** True */
             true: string;
         };
         /**
          * InboxAdded
-         * @description POST .../inbox.
+         * @description POST .../inbox. Images are deduplicated by content: ``added`` lists the images new to the
+         *     inbox, ``unchanged`` those waiting there already.
          */
         InboxAdded: {
             /** Added */
@@ -1170,6 +1214,8 @@ export interface components {
             /** Errors */
             errors: components["schemas"]["FileError"][];
             task: components["schemas"]["TaskDetail"];
+            /** Unchanged */
+            unchanged: components["schemas"]["InboxItemOut"][];
         };
         /**
          * InboxEntry
@@ -1211,6 +1257,12 @@ export interface components {
             labels: {
                 [key: string]: string;
             };
+            /**
+             * New Class
+             * @description Create the class even if its name is close to an existing class's (which is otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)
+             * @default false
+             */
+            new_class: boolean;
         };
         /**
          * InboxPage
@@ -1226,7 +1278,8 @@ export interface components {
         };
         /**
          * JobOut
-         * @description A background job.
+         * @description A background job: poll it while ``status`` is running or cancelling (the response says how
+         *     soon in Retry-After).
          */
         JobOut: {
             /** Done */
@@ -1242,12 +1295,16 @@ export interface components {
             id: string;
             /** Kind */
             kind: string;
+            problem?: components["schemas"]["Problem"] | null;
             /** Result */
             result: components["schemas"]["EvalReport"] | components["schemas"]["CompareReport"] | null;
             /** Stage */
             stage: string;
-            /** Status */
-            status: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "cancelling" | "done" | "failed" | "cancelled";
             /** Task */
             task: string;
             /** Total */
@@ -1260,6 +1317,12 @@ export interface components {
         LabelledUrls: {
             /** Label */
             label: string;
+            /**
+             * New Class
+             * @description Create the class even if its name is close to an existing class's (which is otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)
+             * @default false
+             */
+            new_class: boolean;
             /** Urls */
             urls: string[];
         };
@@ -1313,11 +1376,13 @@ export interface components {
         };
         /**
          * PredictionOut
-         * @description The result for one image.
+         * @description The result for one image. When ``error`` is set (the image couldn't be read), the other
+         *     fields are empty: ``label``, ``top_label``, ``confidence`` and ``similarity`` are null,
+         *     ``scores`` and ``labels`` empty, and ``rejected`` false.
          */
         PredictionOut: {
             /** Confidence */
-            confidence: number;
+            confidence: number | null;
             /** Error */
             error: string | null;
             /** Evidence */
@@ -1337,17 +1402,48 @@ export interface components {
                 [key: string]: number;
             };
             /** Similarity */
-            similarity: number;
+            similarity: number | null;
             /** Top Label */
-            top_label: string;
+            top_label: string | null;
         };
         /**
          * Problem
-         * @description An error: what FastAPI's ``HTTPException`` and the server's access checks answer.
+         * @description An error (RFC 9457, sent as ``application/problem+json``). ``code`` is stable and meant for
+         *     programs; ``detail`` is one line for people. The other members are present when they apply.
          */
         Problem: {
+            /** Code */
+            code: string;
             /** Detail */
             detail: string;
+            /** Errors */
+            errors?: components["schemas"]["Violation"][] | null;
+            /** Example Id */
+            example_id?: string | null;
+            /** Instance */
+            instance: string;
+            /** Job Id */
+            job_id?: string | null;
+            /** Label */
+            label?: string | null;
+            /** Limit Bytes */
+            limit_bytes?: number | null;
+            /** Pointer */
+            pointer?: string | null;
+            /** Revision */
+            revision?: number | null;
+            /** Similar To */
+            similar_to?: string[] | null;
+            /** Status */
+            status: number;
+            /** Task */
+            task?: string | null;
+            /** Title */
+            title: string;
+            /** Type */
+            type: string;
+        } & {
+            [key: string]: unknown;
         };
         /**
          * ReliabilityBin
@@ -1434,7 +1530,8 @@ export interface components {
         };
         /**
          * TaskSettings
-         * @description Body of PATCH /api/tasks/{name}; omitted fields are left unchanged.
+         * @description Body of PATCH /api/tasks/{name} (JSON Merge Patch): omitted fields are left unchanged, and
+         *     null clears ``reject_below``, ``reject_below_zero_shot`` or ``temperature``.
          */
         TaskSettings: {
             /** Classifier */
@@ -1445,16 +1542,19 @@ export interface components {
             } | null;
             /**
              * Clear Reject
+             * @deprecated
              * @default false
              */
             clear_reject: boolean;
             /**
              * Clear Reject Zero Shot
+             * @deprecated
              * @default false
              */
             clear_reject_zero_shot: boolean;
             /**
              * Clear Temperature
+             * @deprecated
              * @default false
              */
             clear_temperature: boolean;
@@ -1510,18 +1610,29 @@ export interface components {
             /** Urls */
             urls: string[];
         };
-        /** ValidationError */
-        ValidationError: {
-            /** Context */
-            ctx?: Record<string, never>;
-            /** Input */
-            input?: unknown;
-            /** Location */
+        /**
+         * Violation
+         * @description One problem of a request that doesn't validate (an entry of a 422's ``errors``).
+         */
+        Violation: {
+            /** Code */
+            code: string;
+            /** Detail */
+            detail: string;
+            /**
+             * Loc
+             * @deprecated
+             */
             loc: (string | number)[];
-            /** Message */
+            /**
+             * Msg
+             * @deprecated
+             */
             msg: string;
-            /** Error Type */
-            type: string;
+            /** Parameter */
+            parameter?: string | null;
+            /** Pointer */
+            pointer?: string | null;
         };
     };
     responses: never;
@@ -1550,7 +1661,16 @@ export interface operations {
                     "application/json": components["schemas"]["Health"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1559,7 +1679,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1568,7 +1688,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1577,8 +1715,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1608,7 +1764,16 @@ export interface operations {
                     "application/json": components["schemas"]["JobOut"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1617,7 +1782,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1626,7 +1791,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1635,17 +1818,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1675,7 +1867,16 @@ export interface operations {
                     "application/json": components["schemas"]["JobOut"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1684,7 +1885,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1693,7 +1894,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1702,17 +1921,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1742,7 +1970,16 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1751,7 +1988,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1760,7 +1997,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1769,17 +2024,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1805,7 +2069,16 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1814,7 +2087,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1823,7 +2096,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1832,8 +2123,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1861,7 +2170,16 @@ export interface operations {
                     "application/json": components["schemas"]["ModelsOut"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1870,7 +2188,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1879,7 +2197,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1888,8 +2224,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1917,7 +2271,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskSummary"][];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1926,7 +2289,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1935,7 +2298,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1944,8 +2325,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1977,7 +2376,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1986,7 +2394,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1995,7 +2403,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2004,17 +2430,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2046,7 +2481,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2055,7 +2499,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2064,7 +2508,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2073,17 +2535,35 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not a multipart/form-data body (application/problem+json) */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2113,7 +2593,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2122,7 +2611,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2131,7 +2620,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2140,17 +2647,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2178,7 +2694,16 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2187,7 +2712,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2196,7 +2721,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2205,17 +2757,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2249,7 +2810,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2258,7 +2828,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2267,7 +2837,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2276,17 +2873,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2320,7 +2926,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2329,7 +2944,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2338,7 +2953,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2347,17 +2989,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2382,6 +3033,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description The class existed: its description was set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskDetail"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {
@@ -2391,7 +3051,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2400,7 +3069,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2409,7 +3078,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2418,17 +3114,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2459,7 +3164,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2468,7 +3182,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2477,7 +3191,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2486,17 +3227,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2531,7 +3281,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2540,7 +3299,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2549,7 +3308,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2558,17 +3344,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2596,13 +3391,26 @@ export interface operations {
             /** @description Successful Response */
             202: {
                 headers: {
+                    /** @description The job, to poll */
+                    Location?: string;
+                    /** @description Seconds to wait before polling */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["JobOut"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2611,7 +3419,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2620,7 +3428,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2629,17 +3455,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2673,7 +3508,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2682,7 +3526,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2691,7 +3535,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2700,17 +3571,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2744,7 +3624,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2753,7 +3642,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2762,7 +3651,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2771,17 +3678,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2814,7 +3730,16 @@ export interface operations {
                     "application/json": components["schemas"]["DuplicatePair"][];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2823,7 +3748,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2832,7 +3757,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2841,17 +3784,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2864,6 +3816,7 @@ export interface operations {
     evaluate: {
         parameters: {
             query?: {
+                /** @description Cross-validation folds (default: leave-one-out up to 100 or 300 examples, then 10- or 5-fold) */
                 folds?: number | null;
             };
             header?: never;
@@ -2883,7 +3836,16 @@ export interface operations {
                     "application/json": components["schemas"]["EvalReport"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2892,7 +3854,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2901,7 +3863,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2910,17 +3890,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2933,6 +3922,7 @@ export interface operations {
     start_evaluation: {
         parameters: {
             query?: {
+                /** @description Cross-validation folds (default: leave-one-out up to 100 or 300 examples, then 10- or 5-fold) */
                 folds?: number | null;
             };
             header?: never;
@@ -2946,13 +3936,26 @@ export interface operations {
             /** @description Successful Response */
             202: {
                 headers: {
+                    /** @description The job, to poll */
+                    Location?: string;
+                    /** @description Seconds to wait before polling */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["JobOut"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2961,7 +3964,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2970,7 +3973,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2979,17 +4000,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3024,7 +4054,16 @@ export interface operations {
                     "application/json": components["schemas"]["ExamplePage"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3033,7 +4072,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3042,7 +4081,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3051,17 +4108,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3086,6 +4152,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Nothing new: every image was there already (see unchanged, moved) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddResult"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {
@@ -3095,7 +4170,16 @@ export interface operations {
                     "application/json": components["schemas"]["AddResult"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3104,7 +4188,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3113,7 +4197,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3122,17 +4233,35 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not a multipart/form-data body (application/problem+json) */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3166,7 +4295,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3175,7 +4313,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3184,7 +4322,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3193,17 +4358,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3237,7 +4411,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3246,7 +4429,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3255,7 +4438,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3264,17 +4474,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3299,6 +4518,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Nothing new: every image was there already (see unchanged, moved) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddResult"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {
@@ -3308,7 +4536,16 @@ export interface operations {
                     "application/json": components["schemas"]["AddResult"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3317,7 +4554,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3326,7 +4563,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3335,17 +4599,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3376,7 +4649,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3385,7 +4667,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3394,7 +4676,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3403,17 +4712,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3448,7 +4766,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3457,7 +4784,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3466,7 +4793,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3475,17 +4829,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3518,7 +4881,16 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3527,7 +4899,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3536,7 +4908,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3545,17 +4935,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3585,7 +4984,16 @@ export interface operations {
                     "application/zip": unknown;
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3594,7 +5002,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3603,7 +5011,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3612,17 +5038,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3635,7 +5070,7 @@ export interface operations {
     list_inbox: {
         parameters: {
             query?: {
-                sort?: string;
+                sort?: "uncertain" | "confident" | "novel" | "added";
                 offset?: number;
                 limit?: number;
             };
@@ -3656,7 +5091,16 @@ export interface operations {
                     "application/json": components["schemas"]["InboxPage"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3665,7 +5109,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3674,7 +5118,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3683,17 +5145,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3718,6 +5189,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Nothing new: every image was waiting already */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboxAdded"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {
@@ -3727,7 +5207,16 @@ export interface operations {
                     "application/json": components["schemas"]["InboxAdded"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3736,7 +5225,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3745,7 +5234,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3754,17 +5270,35 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not a multipart/form-data body (application/problem+json) */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3798,7 +5332,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3807,7 +5350,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3816,7 +5359,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3825,17 +5395,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3869,7 +5448,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3878,7 +5466,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3887,7 +5475,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3896,17 +5511,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3940,7 +5564,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -3949,7 +5582,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3958,7 +5591,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -3967,17 +5627,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4002,6 +5671,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Nothing new: every image was waiting already */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboxAdded"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {
@@ -4011,7 +5689,16 @@ export interface operations {
                     "application/json": components["schemas"]["InboxAdded"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -4020,7 +5707,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4029,7 +5716,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -4038,17 +5752,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4089,7 +5812,16 @@ export interface operations {
                     "application/json": components["schemas"]["PredictionOut"][];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -4098,7 +5830,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4107,7 +5839,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -4116,17 +5866,35 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not a multipart/form-data body (application/problem+json) */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4167,7 +5935,16 @@ export interface operations {
                     "application/json": components["schemas"]["PredictionOut"][];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -4176,7 +5953,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4185,7 +5962,25 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -4194,17 +5989,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4234,7 +6038,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -4243,7 +6056,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4252,7 +6065,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -4261,17 +6101,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4305,7 +6154,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -4314,7 +6172,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4323,7 +6181,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -4332,17 +6217,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4372,7 +6266,16 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
-            /** @description Not signed in (a server with a token) */
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) (application/problem+json) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) (application/problem+json) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -4381,7 +6284,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Cross-site request, or a server without a token reached from another machine */
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses (application/problem+json) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4390,7 +6293,34 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Request body over its size limit */
+            /** @description No such task, class, example, job or route (application/problem+json) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo (application/problem+json) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match doesn't name the task's revision (application/problem+json) */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit (application/problem+json) */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -4399,17 +6329,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The request doesn't validate: errors lists every problem (application/problem+json) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many wrong tokens from this address */
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After (application/problem+json) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error (application/problem+json) */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

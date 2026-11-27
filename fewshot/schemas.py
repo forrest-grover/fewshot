@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .classifiers import CLASSIFIERS, SETTING_MAX
 from .models import MAX_NOTE
+from .responses import Problem
 from .text import MAX_DESCRIPTION
 
 MAX_URLS = 100  # per request
@@ -16,6 +18,8 @@ class Health(BaseModel):
     """GET /api/health."""
 
     status: str
+    version: str  # of fewshot
+    api_version: str  # within one, responses only gain fields (see the README's compatibility policy)
     auth_required: bool
     models_loaded: list[str]
     jobs_running: int
@@ -147,12 +151,16 @@ class MovedExample(BaseModel):
 
 
 class AddResult(BaseModel):
-    """POST .../examples. ``added`` is every example the request stored, including those that were
-    in another class before and are listed again in ``moved``."""
+    """POST .../examples. Images are deduplicated by content: ``added`` lists the examples new to
+    the task, ``unchanged`` those that were examples of this class already (so sending an upload
+    again is safe), and ``moved`` those that were examples of another class and now are of this
+    one. ``created_classes`` names the class, if the upload created it."""
 
     added: list[ExampleOut]
+    unchanged: list[ExampleOut]
     moved: list[MovedExample]
     errors: list[FileError]
+    created_classes: list[str]
     task: TaskDetail
 
 
@@ -165,15 +173,22 @@ class Evidence(BaseModel):
 
 
 class PredictionOut(BaseModel):
-    """The result for one image."""
+    """The result for one image. When ``error`` is set (the image couldn't be read), the other
+    fields are empty: ``label``, ``top_label``, ``confidence`` and ``similarity`` are null,
+    ``scores`` and ``labels`` empty, and ``rejected`` false."""
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "file": "new.jpg", "label": "Beagle", "labels": ["Beagle"], "top_label": "Beagle",
+        "scores": {"Beagle": 0.91, "Basset_Hound": 0.09}, "confidence": 0.91, "similarity": 0.83, "rejected": False,
+        "evidence": [], "error": None, "revision": 12}]})
 
     file: str | None = None  # the uploaded file's name or URL (not given for inbox suggestions)
     label: str | None  # None when rejected as unknown, or on error
     labels: list[str]  # every class the image matches (multi-label), ``label`` first unless rejected
-    top_label: str  # the most probable class, even if rejected
+    top_label: str | None  # the most probable class, even if rejected (None on error)
     scores: dict[str, float]  # probability per class, highest first
-    confidence: float
-    similarity: float
+    confidence: float | None  # None on error
+    similarity: float | None  # None on error
     rejected: bool
     evidence: list[Evidence]  # the most similar labelled examples, when asked for (?evidence=N)
     error: str | None
@@ -196,9 +211,11 @@ class InboxPage(BaseModel):
 
 
 class InboxAdded(BaseModel):
-    """POST .../inbox."""
+    """POST .../inbox. Images are deduplicated by content: ``added`` lists the images new to the
+    inbox, ``unchanged`` those waiting there already."""
 
     added: list[InboxItemOut]
+    unchanged: list[InboxItemOut]
     errors: list[FileError]
     task: TaskDetail
 
@@ -210,6 +227,7 @@ class DuplicatePair(BaseModel):
     b: str
     similarity: float
     labels: list[str]
+    sources: list[str]  # the two images' file names, as added
     same_label: bool
 
 
@@ -225,6 +243,7 @@ class HeldOutPrediction(BaseModel):
     """An example's prediction by a classifier that didn't see it."""
 
     id: str
+    source: str  # the image's file name, as added
     true: str
     pred: str
     confidence: float
@@ -294,18 +313,28 @@ class CompareReport(BaseModel):
     best: str | None  # the most accurate embedder
 
 
+InboxSort = Literal["uncertain", "confident", "novel", "added"]  # GET .../inbox's orders
+JobStatus = Literal["running", "cancelling", "done", "failed", "cancelled"]
+
+
 class JobOut(BaseModel):
-    """A background job."""
+    """A background job: poll it while ``status`` is running or cancelling (the response says how
+    soon in Retry-After)."""
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "id": "3f2a9c01d4e5", "task": "pets", "kind": "evaluate", "status": "running", "stage": "embedding",
+        "done": 120, "total": 400, "result": None, "error": None, "problem": None, "expired": False}]})
 
     id: str
     task: str
     kind: str
-    status: str  # running | cancelling | done | failed | cancelled
+    status: JobStatus
     stage: str
     done: int
     total: int
     result: EvalReport | CompareReport | None
-    error: str | None
+    error: str | None  # why it failed, for people
+    problem: Problem | None = None  # why it failed, with its stable ``code``
     expired: bool = False  # finished long enough ago that ``result`` is no longer kept
 
 
@@ -322,29 +351,51 @@ class Login(_Body):
     token: str
 
 
+def _classifier(v: str | None) -> str | None:
+    if v is not None and v not in CLASSIFIERS:
+        raise ValueError(f"classifier must be one of {', '.join(sorted(CLASSIFIERS))}; got {v!r}")
+    return v
+
+
+Similarity = Annotated[float, Field(ge=-1, le=1)]
+CLEARABLE = ("reject_below", "reject_below_zero_shot", "temperature")  # settings null clears
+CLEAR_FLAGS = {"reject_below": "clear_reject", "reject_below_zero_shot": "clear_reject_zero_shot",
+               "temperature": "clear_temperature"}  # the deprecated fields that clear them
+
+
 class TaskCreate(_Body):
     """Body of POST /api/tasks."""
 
+    model_config = ConfigDict(json_schema_extra={"examples": [{"name": "pets", "embedder": "openclip:PE-Core-B-16"}]})
+
     name: str
-    embedder: str | None = None
-    classifier: str = "gda"
+    embedder: str | None = None  # default: the server's default model
+    classifier: str = "gda"  # one of GET /api/models' classifiers
+
+    _check_classifier = field_validator("classifier")(_classifier)
 
 
 class TaskSettings(_Body):
-    """Body of PATCH /api/tasks/{name}; omitted fields are left unchanged."""
+    """Body of PATCH /api/tasks/{name} (JSON Merge Patch): omitted fields are left unchanged, and
+    null clears ``reject_below``, ``reject_below_zero_shot`` or ``temperature``."""
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{"classifier": "knn", "reject_below": 0.6},
+                                                              {"temperature": None}]})
 
     embedder: str | None = None
     classifier: str | None = None
     classifier_params: dict[str, Any] | None = None
-    text_weight: float | None = None
-    reject_below: float | None = None
-    clear_reject: bool = False
-    reject_below_zero_shot: float | None = None
-    clear_reject_zero_shot: bool = False
+    text_weight: float | None = Field(None, ge=0, le=SETTING_MAX["text_weight"])
+    reject_below: Similarity | None = None
+    clear_reject: bool = Field(False, json_schema_extra={"deprecated": True})  # send reject_below: null instead
+    reject_below_zero_shot: Similarity | None = None
+    clear_reject_zero_shot: bool = Field(False, json_schema_extra={"deprecated": True})  # send ..._zero_shot: null
     flip: bool | None = None
     names_as_text: bool | None = None
-    temperature: float | None = None
-    clear_temperature: bool = False
+    temperature: float | None = Field(None, ge=0.01, le=100)  # 1 means none
+    clear_temperature: bool = Field(False, json_schema_extra={"deprecated": True})  # send temperature: null instead
+
+    _check_classifier = field_validator("classifier")(_classifier)
 
 
 class Rename(_Body):
@@ -385,7 +436,7 @@ class Describe(_Body):
 class ClassThresholds(_Body):
     """Body of PUT .../class-thresholds."""
 
-    thresholds: dict[str, float | None]  # class -> similarity (-1 to 1), or null to use the task's
+    thresholds: dict[str, Similarity | None] = Field(min_length=1)  # class -> similarity, or null for the task's
 
 
 class Urls(_Body):
@@ -394,16 +445,22 @@ class Urls(_Body):
     urls: list[str] = Field(min_length=1, max_length=MAX_URLS)
 
 
+NEW_CLASS = Field(False, description="Create the class even if its name is close to an existing class's (which "
+                                      "is otherwise refused as a likely typo, 422 CLASS_NAME_NEAR_MISS)")
+
+
 class LabelledUrls(Urls):
     """Body of POST .../examples/urls."""
 
     label: str
+    new_class: bool = NEW_CLASS
 
 
 class ExampleEdit(_Body):
     """Body of PATCH .../examples/{eid}: any of a new label, tags (replacing them) and a note."""
 
     label: str | None = None
+    new_class: bool = NEW_CLASS
     tags: list[str] | None = None
     note: str | None = Field(None, max_length=MAX_NOTE)
 
@@ -418,6 +475,7 @@ class BulkEdit(ExampleIds):
     """Body of PATCH .../examples: a new label and/or tags to add or remove."""
 
     label: str | None = None
+    new_class: bool = NEW_CLASS
     add_tags: list[str] = Field(default_factory=list)
     remove_tags: list[str] = Field(default_factory=list)
 
@@ -426,6 +484,7 @@ class InboxLabels(_Body):
     """Body of POST .../inbox/accept: the class for each inbox image to label."""
 
     labels: dict[str, str] = Field(min_length=1)
+    new_class: bool = NEW_CLASS
 
 
 class AcceptConfident(_Body):
@@ -439,4 +498,4 @@ class Compare(_Body):
     """Body of POST .../compare/jobs."""
 
     embedders: list[str]
-    folds: int | None = None
+    folds: int | None = Field(None, ge=2)  # default: as POST .../evaluate chooses

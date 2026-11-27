@@ -12,7 +12,8 @@ export type Example = S["ExampleOut"];
 export type TaskDetail = S["TaskDetail"];
 /** ``scores`` are highest first; ``labels`` is every class the image matches (label first unless
  * rejected); ``evidence`` the most similar labelled examples, if asked for; ``error`` is set when
- * the image could not be read (the other fields are then empty); ``revision`` the task version used. */
+ * the image could not be read (``top_label``, ``confidence`` and ``similarity`` are then null, the
+ * lists empty); ``revision`` the task version used. */
 export type Prediction = S["PredictionOut"];
 /** An example's prediction by a classifier fitted without it. */
 export type HeldOut = S["HeldOutPrediction"];
@@ -29,14 +30,15 @@ export type DuplicatePair = S["DuplicatePair"];
 export type Health = S["Health"];
 /** An upload that couldn't be used: its file name (or URL, when known) and why. */
 export type FileError = S["FileError"];
-/** ``moved`` lists the images that were already examples of another class, and were moved to
- * this one (they are in ``added`` too). */
+/** Uploads are deduplicated by content: ``added`` lists the examples new to the task,
+ * ``unchanged`` those already in this class, and ``moved`` those that were examples of another
+ * class and were moved to this one. */
 export type AddResult = S["AddResult"];
 export type ModelInfo = S["ModelsOut"];
-/** PATCH /api/tasks/{name}: every field is optional (the schema marks the clear_* flags required
- * only because they have defaults). */
-export type TaskSettings = Partial<S["TaskSettings"]>;
-export type JobStatus = "running" | "cancelling" | "done" | "failed" | "cancelled";
+/** PATCH /api/tasks/{name}, a JSON Merge Patch: every field is optional, and null clears
+ * reject_below, reject_below_zero_shot or temperature (the clear_* flags are deprecated). */
+export type TaskSettings = Partial<Omit<S["TaskSettings"], "clear_reject" | "clear_reject_zero_shot" | "clear_temperature">>;
+export type JobStatus = S["JobOut"]["status"];
 
 /** Whether a job is still working (a cancelled one runs until its next progress step). */
 export const jobActive = (j: { status: JobStatus }): boolean => j.status === "running" || j.status === "cancelling";
@@ -46,18 +48,13 @@ export type Job<T> = Omit<S["JobOut"], "status" | "result"> & { status: JobStatu
 /** Fired on window when a request is refused for want of the server's token. */
 export const AUTH_EVENT = "fewshot:auth-required";
 
-/** A request the server answered with an error status. */
-export class HttpError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
-}
+/** An error the server answers (application/problem+json; see the README's error codes). */
+export type Problem = S["Problem"];
 
-/** A FastAPI error ``detail``: a message, or (422) a list of {loc, msg} problems. */
-function detailText(d: unknown): string {
-  if (typeof d === "string") return d;
-  if (Array.isArray(d)) {
-    return d.map((p: { loc?: unknown[]; msg?: string }) => [p.loc?.filter((x) => x !== "body").join("."), p.msg].filter(Boolean).join(": ")).join("; ");
-  }
-  return JSON.stringify(d);
+/** A request the server answered with an error status; ``code`` is the problem's stable code
+ * (such as TASK_NOT_FOUND or CLASS_NAME_NEAR_MISS), when the server gave one. */
+export class HttpError extends Error {
+  constructor(readonly status: number, message: string, readonly code?: string) { super(message); }
 }
 
 async function req<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
@@ -74,13 +71,16 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
     throw new HttpError(401, "Not signed in");
   }
   if (!r.ok) {
-    let msg: unknown = `${String(r.status)} ${r.statusText}`;
+    let msg = `${String(r.status)} ${r.statusText}`;
+    let code: string | undefined;
     try {
-      // Error bodies are FastAPI's {"detail": ...}; anything else falls back to the status line.
-      const body = (await r.json()) as { detail?: unknown } | null;
-      msg = body?.detail ?? msg;
+      // Error bodies are problems ({code, detail, ...}, detail one line); anything else (a
+      // proxy's page) falls back to the status line.
+      const body = (await r.json()) as Partial<Problem> | null;
+      if (typeof body?.detail === "string") msg = body.detail;
+      code = body?.code;
     } catch { /* not JSON */ }
-    throw new HttpError(r.status, detailText(msg));
+    throw new HttpError(r.status, msg, code);
   }
   // The server's response schemas are mirrored by the interfaces above; this is the one untyped boundary.
   return r.status === 204 ? (undefined as T) : ((await r.json()) as T);
@@ -118,7 +118,7 @@ export const api = {
   /** Add ``fs`` to class ``label``; uploads given the same ``undoGroup`` are undone as one step. */
   addExamples: (n: string, label: string, fs: File[], signal?: AbortSignal, undoGroup?: string) =>
     req<AddResult>("POST", `${t(n)}/examples`,
-      files(fs, { label, undo_group: undoGroup } satisfies UploadFields<S["Body_add_examples"]>), signal),
+      files(fs, { label, undo_group: undoGroup } satisfies Partial<UploadFields<S["Body_add_examples"]>>), signal),
   addExampleUrls: (n: string, label: string, urls: string[]) => req<AddResult>("POST", `${t(n)}/examples/urls`, { label, urls }),
   relabel: (n: string, id: string, label: string) => req<TaskDetail>("PATCH", ex(n, id), { label }),
   annotate: (n: string, id: string, p: { tags?: string[]; note?: string }) => req<TaskDetail>("PATCH", ex(n, id), p),

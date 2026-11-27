@@ -35,7 +35,7 @@ def test_undo(client, task):
     assert client.get(f"/api/tasks/{task}/examples/{eid}/image").status_code == 200
     client.post("/api/tasks", json={"name": "fresh", "embedder": "fake:color"})
     r = client.post("/api/tasks/fresh/undo")
-    assert (r.status_code, r.json()["detail"]) == (400, "Nothing to undo")
+    assert (r.status_code, r.json()["code"], r.json()["detail"]) == (409, "NOTHING_TO_UNDO", "Nothing to undo")
     assert client.post("/api/tasks/nope/undo").status_code == 404
 
 
@@ -50,13 +50,13 @@ def test_undo_of_a_task_deleted_meanwhile(client, task, monkeypatch):
 
 
 def test_rename(client, task):
-    """Renaming returns the task under its new name; bad or taken names are 400."""
+    """Renaming returns the task under its new name; a bad name is 400, a taken one 409."""
     t = client.post(f"/api/tasks/{task}/rename", json={"name": "d"}).json()
     assert t["name"] == "d"
     assert client.get("/api/tasks/c").status_code == 404
     assert len(client.get("/api/tasks/d").json()["examples"]) == 6
     client.post("/api/tasks", json={"name": "e", "embedder": "fake:color"})
-    assert client.post("/api/tasks/d/rename", json={"name": "e"}).status_code == 400
+    assert client.post("/api/tasks/d/rename", json={"name": "e"}).status_code == 409
     assert client.post("/api/tasks/d/rename", json={"name": "a b"}).status_code == 400
     assert client.post("/api/tasks/nope/rename", json={"name": "x"}).status_code == 404
 
@@ -85,7 +85,8 @@ def test_export_and_import(client, task):
     assert up.json()["name"] == "copy"
     assert len(up.json()["examples"]) == 6
     dup = client.post("/api/tasks/import", files={"file": ("c.zip", r.content, "application/zip")})
-    assert (dup.status_code, dup.json()["detail"]) == (400, "Task 'c' already exists")
+    assert (dup.status_code, dup.json()["code"]) == (409, "TASK_EXISTS")
+    assert dup.json()["detail"] == "Task 'c' already exists"
     assert client.post("/api/tasks/import", files={"file": ("x.zip", b"nope", "application/zip")}).status_code == 400
     assert client.get("/api/tasks/nope/export").status_code == 404
 
@@ -320,7 +321,7 @@ def test_redo(client, task):
     t = client.post(f"/api/tasks/{task}/redo").json()
     assert (t["can_redo"], len(t["examples"])) == (False, 5)
     r = client.post(f"/api/tasks/{task}/redo")
-    assert (r.status_code, r.json()["detail"]) == (400, "Nothing to redo")
+    assert (r.status_code, r.json()["code"], r.json()["detail"]) == (409, "NOTHING_TO_REDO", "Nothing to redo")
     assert client.post("/api/tasks/nope/redo").status_code == 404
 
 

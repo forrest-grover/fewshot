@@ -132,8 +132,9 @@ def test_validation_errors_dont_echo_the_body(client):
     r = client.post("/api/tasks", json={"name": "x", "junk": "y" * 500_000})
     assert r.status_code == 422
     assert len(r.content) < 1000
-    assert r.json()["detail"] == [{"type": "extra_forbidden", "loc": ["body", "junk"],
-                                   "msg": "Extra inputs are not permitted"}]
+    assert r.json()["detail"] == "1 problem with the request: unknown field 'junk'"
+    assert r.json()["errors"] == [{"pointer": "/junk", "detail": "unknown field 'junk'", "code": "extra_forbidden",
+                                   "loc": ["body", "junk"], "msg": "Extra inputs are not permitted"}]
 
 
 def _asgi(chunks, inner):

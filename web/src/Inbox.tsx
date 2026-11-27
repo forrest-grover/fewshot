@@ -202,7 +202,7 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
         <Lightbox
           items={list.map((i) => ({
             url: api.imageUrl(task.name, i.id, 1024), title: i.source || i.id.slice(0, 12),
-            details: [i.prediction ? `Suggestion: ${suggested(i) ?? `unknown (closest ${i.prediction.top_label})`}, ${pct(i.prediction.confidence)}` : ""].filter(Boolean),
+            details: [i.prediction ? `Suggestion: ${suggested(i) ?? `unknown (closest ${i.prediction.top_label ?? "?"})`}, ${pct(i.prediction.confidence)}` : ""].filter(Boolean),
           }))}
           index={Math.min(viewing, list.length - 1)} onIndex={setViewing} onClose={() => { setViewing(null); }}
           onKey={(e, k) => {
@@ -265,7 +265,7 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
               const s = suggested(i);
               return (
                 <article key={i.id} className={`inbox-card ${cur?.id === i.id ? "current" : ""} ${picked.has(i.id) ? "picked" : ""}`}
-                  aria-label={`${i.source || i.id}: ${p ? (s ? `suggested ${s}, ${pct(p.confidence)}` : `unknown, closest ${p.top_label}`) : "no suggestion"}`}
+                  aria-label={`${i.source || i.id}: ${p ? (s ? `suggested ${s}, ${pct(p.confidence)}` : `unknown, closest ${p.top_label ?? "?"}`) : "no suggestion"}`}
                   aria-current={cur?.id === i.id ? "true" : undefined}
                   tabIndex={cur?.id === i.id ? 0 : -1} ref={(el) => { if (el) cards.current.set(i.id, el); else cards.current.delete(i.id); }}
                   onClick={() => { setCurrentNow(i.id); }} onFocus={() => { if (currentNow.current !== i.id) setCurrentNow(i.id); }}>
@@ -284,7 +284,7 @@ export default function Inbox({ task, setTask, run, uploads }: Props) {
                   <div className="inbox-body">
                     {p ? (
                       <span className={s ? "" : "unknown"}>
-                        {s ?? `Unknown (closest: ${p.top_label})`} <span className="muted">{pct(p.confidence)}</span>
+                        {s ?? `Unknown (closest: ${p.top_label ?? "?"})`} <span className="muted">{pct(p.confidence)}</span>
                       </span>
                     ) : <span className="muted">No classes yet</span>}
                     <div className="row">

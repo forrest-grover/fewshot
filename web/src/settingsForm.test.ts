@@ -21,7 +21,7 @@ describe("settingsPatch", () => {
 
   it("sends a changed threshold, and clears one blanked", () => {
     const { patch } = settingsPatch(fitted, { ...formOf(fitted), reject: "0.65", temperature: "", rejectZero: "0.22" });
-    expect(patch).toEqual({ reject_below: 0.65, clear_temperature: true });
+    expect(patch).toEqual({ reject_below: 0.65, temperature: null });
   });
 
   it("doesn't clear what is already off", () => {

@@ -38,14 +38,16 @@ def task_fixture(client):
 def test_end_to_end(client):
     """Create, upload, predict, evaluate, relabel, configure and delete a task."""
     assert client.post("/api/tasks", json={"name": "c", "embedder": "fake:color"}).status_code == 201
-    assert client.post("/api/tasks", json={"name": "c"}).status_code == 400
+    r = client.post("/api/tasks", json={"name": "c"})
+    assert (r.status_code, r.json()["code"], r.json()["task"]) == (409, "TASK_EXISTS", "c")
+    assert r.headers["content-type"] == "application/problem+json"
     for label, rgb in [("red", RED), ("blue", BLUE)]:
         r = _upload(client, "c", label, rgb)
         assert r.status_code == 201
         assert len(r.json()["added"]) == 3
     junk = [("files", ("x.png", b"junk", "image/png"))]
     bad = client.post("/api/tasks/c/examples", data={"label": "red"}, files=junk)
-    assert bad.status_code == 400
+    assert (bad.status_code, bad.json()["code"]) == (400, "NO_IMAGES_ADDED")
     assert bad.json()["detail"].startswith("No images added: x.png: Not a readable image")
 
     r = client.post("/api/tasks/c/predict", files=_query((210, 40, 40)))
@@ -66,7 +68,7 @@ def test_end_to_end(client):
     t = client.patch("/api/tasks/c", json={"classifier": "knn", "reject_below": 0.5}).json()
     assert t["classifier"] == "knn"
     assert t["reject_below"] == 0.5
-    assert client.patch("/api/tasks/c", json={"classifier": "nope"}).status_code == 400
+    assert client.patch("/api/tasks/c", json={"classifier": "nope"}).status_code == 422
     assert client.get("/api/tasks/missing").status_code == 404
     assert client.delete("/api/tasks/c").status_code == 204
     assert client.get("/api/tasks").json() == []
@@ -82,7 +84,7 @@ def test_models(client):
 
 
 def test_create_task_default_embedder_and_bad_name(client):
-    """Default embedder is used when omitted; invalid names/classifiers are 400."""
+    """Default embedder is used when omitted; an invalid name is a 400, an unknown classifier a 422."""
     r = client.post("/api/tasks", json={"name": "plain"})
     assert r.status_code == 201
     assert r.json()["embedder"] == client.srv.ws.get("plain").config.embedder
@@ -92,8 +94,10 @@ def test_create_task_default_embedder_and_bad_name(client):
     assert r.status_code == 400
     assert "Task names" in r.json()["detail"]
     r = client.post("/api/tasks", json={"name": "x", "embedder": "fake:color", "classifier": "nope"})
-    assert r.status_code == 400
-    assert "nope" in r.json()["detail"]
+    assert r.status_code == 422
+    assert r.json()["errors"][0]["pointer"] == "/classifier"
+    assert r.json()["errors"][0]["detail"].startswith("classifier must be one of ")
+    assert "got 'nope'" in r.json()["detail"]
     assert [t["name"] for t in client.get("/api/tasks").json()] == ["plain"]
 
 
@@ -201,7 +205,7 @@ def test_patch_class(client, task):
     assert (r.status_code, r.json()["detail"]) == (400, "Class name is empty")
 
     r = client.patch(f"{url}/crimson", json={"name": "blue", "description": "clobbered?"})
-    assert r.status_code == 400
+    assert (r.status_code, r.json()["code"], r.json()["label"]) == (409, "CLASS_EXISTS", "blue")
     assert "already exists" in r.json()["detail"]
     r = client.patch(f"{url}/crimson", json={"name": "   "})
     assert r.status_code == 400
@@ -238,7 +242,7 @@ def test_delete_class(client, task, tmp_path, monkeypatch):
     assert {e["label"] for e in t["examples"]} == {"blue"}
     assert len(list((tmp_path / "ws" / "tasks" / task / "images").iterdir())) == 3
     r = client.delete(f"/api/tasks/{task}/classes/red")
-    assert r.status_code == 404
+    assert (r.status_code, r.json()["code"], r.json()["label"]) == (404, "CLASS_NOT_FOUND", "red")
     assert r.json()["detail"] == "No class 'red'"
     assert client.delete("/api/tasks/missing/classes/red").status_code == 404
 
@@ -246,14 +250,15 @@ def test_delete_class(client, task, tmp_path, monkeypatch):
 def test_examples_errors(client, task):
     """Unknown tasks/examples are 404 for upload, relabel and image endpoints."""
     assert _upload(client, "missing", "red", RED).status_code == 404
-    # re-uploading an identical image moves it rather than duplicating it
+    # re-uploading an identical image moves it rather than duplicating it: nothing new, so 200
     r = _upload(client, task, "blue", RED, seeds=[0])
-    assert r.status_code == 201
-    assert r.json()["added"][0]["label"] == "blue"
+    assert r.status_code == 200
+    assert r.json()["added"] == []
+    assert r.json()["moved"][0]["previous_label"] == "red"
     assert len(r.json()["task"]["examples"]) == 6
 
     r = client.patch(f"/api/tasks/{task}/examples/nope", json={"label": "red"})
-    assert r.status_code == 404
+    assert (r.status_code, r.json()["code"], r.json()["example_id"]) == (404, "EXAMPLE_NOT_FOUND", "nope")
     assert r.json()["detail"] == "No example 'nope'"
     assert client.patch("/api/tasks/missing/examples/nope", json={"label": "red"}).status_code == 404
     assert client.get(f"/api/tasks/{task}/examples/nope/image").status_code == 404
@@ -287,16 +292,20 @@ def test_bulk_relabel_and_delete(client, task, tmp_path, monkeypatch):
 
 
 def test_add_reports_moved_examples(client, task):
-    """Re-adding images that are examples of another class moves them, and the response says so."""
+    """Re-adding images that are examples of another class moves them, and the response says so;
+    images are deduplicated by content, so an upload sent again stores nothing new (200)."""
     r = _upload(client, task, "blue", RED, seeds=[0, 1, 99])
     assert r.status_code == 201
     body = r.json()
-    assert len(body["added"]) == 3
+    assert len(body["added"]) == 1  # only seed 99 is new
     moved_ids = {m["id"] for m in body["moved"]}
     assert len(moved_ids) == 2
     assert all(m["previous_label"] == "red" for m in body["moved"])
-    assert moved_ids <= {e["id"] for e in body["added"]}
-    assert _upload(client, task, "blue", RED, seeds=[0]).json()["moved"] == []  # already blue
+    assert not moved_ids & {e["id"] for e in body["added"]}
+    assert (body["unchanged"], body["created_classes"]) == ([], [])
+    again = _upload(client, task, "blue", RED, seeds=[0])  # already blue
+    assert (again.status_code, again.json()["moved"], again.json()["added"]) == (200, [], [])
+    assert [e["id"] for e in again.json()["unchanged"]] == [body["moved"][0]["id"]]
 
 
 def test_image_thumbnails(client, task, tmp_path):
@@ -384,13 +393,13 @@ def test_predict_ignores_empty_class(client, task):
 @pytest.mark.parametrize(("settings", "message"), [
     ({"classifier_params": {"bogus": 1}}, "Unknown parameter 'bogus' for gda"),
     ({"classifier": "knn", "classifier_params": {"k": "abc"}}, "'k' must be an integer"),
-    ({"text_weight": -1}, "text_weight must be between 0 and 100, got -1"),
-    ({"reject_below": 99}, "reject_below must be between -1 and 1"),
+    ({"text_weight": -1}, "text_weight must be greater than or equal to 0; got -1"),
+    ({"reject_below": 99}, "reject_below must be less than or equal to 1; got 99"),
 ])
 def test_update_task_rejects_bad_settings(client, task, settings, message):
-    """Invalid settings are a 400 and leave the task predicting as before."""
+    """Invalid settings are a 400 (422 for a field out of its range) and leave the task predicting as before."""
     r = client.patch(f"/api/tasks/{task}", json=settings)
-    assert r.status_code == 400
+    assert r.status_code == (422 if "got" in message else 400)
     assert message in r.json()["detail"]
     assert client.post(f"/api/tasks/{task}/predict", files=_query(BLUE)).status_code == 200
 
@@ -404,7 +413,9 @@ def test_bad_input_is_400_not_500(client, task):
     assert (r.status_code, r.json()["detail"]) == (400, "Class name is empty")
     for folds in (1, 0, -1):
         r = client.post(f"/api/tasks/{task}/evaluate", params={"folds": folds})
-        assert (r.status_code, r.json()["detail"]) == (400, f"folds must be at least 2, got {folds}")
+        assert (r.status_code, r.json()["errors"][0]["detail"]) == (
+            422, f"folds must be greater than or equal to 2; got {folds}")
+        assert r.json()["errors"][0]["parameter"] == "folds"
     r = client.post(f"/api/tasks/{task}/describe", json={"template": "{x} {} {}", "overwrite": True})
     assert r.status_code == 200
     assert r.json()["classes"][0]["description"] == "{x} red red"
@@ -418,7 +429,7 @@ def test_evaluate(client, task):
     assert client.post("/api/tasks/missing/evaluate").status_code == 404
     client.post("/api/tasks", json={"name": "empty", "embedder": "fake:color"})
     r = client.post("/api/tasks/empty/evaluate")
-    assert r.status_code == 400
+    assert (r.status_code, r.json()["code"]) == (400, "NO_EXAMPLES")
     assert r.json()["detail"] == "Task has no examples to evaluate"
 
 
@@ -448,7 +459,9 @@ def test_settings_bodies_are_strict(client, task):
     """Unknown fields, contradictory options and an empty embedder are errors, not silent no-ops."""
     r = client.patch(f"/api/tasks/{task}", json={"reject_bellow": 0.5})
     assert r.status_code == 422
-    assert r.json()["detail"][0]["loc"] == ["body", "reject_bellow"]
+    assert r.json()["errors"][0]["loc"] == ["body", "reject_bellow"]
+    assert r.json()["errors"][0]["pointer"] == "/reject_bellow"
+    assert r.json()["errors"][0]["detail"] == "unknown field 'reject_bellow'"
     r = client.patch(f"/api/tasks/{task}", json={"clear_reject": True, "reject_below": 0.5})
     assert (r.status_code, r.json()["detail"]) == (400, "Give either reject_below or clear_reject, not both")
     for body in ({"embedder": ""}, {"embedder": "  "}):

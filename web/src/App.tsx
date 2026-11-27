@@ -95,7 +95,7 @@ export default function App() {
       if (currentTask.current !== from || isAbort(e) || (e instanceof HttpError && e.status === 401)) return undefined;
       setError(e instanceof Error ? e.message : String(e));
       // Refused (say, an example or class that is gone): the task may have changed elsewhere.
-      if (e instanceof HttpError && [400, 404, 409].includes(e.status)) {
+      if (e instanceof HttpError && [400, 404, 409, 412].includes(e.status)) {
         reloadTask();
         if (e.status === 404) {
           setError(`That is no longer there (${e.message}): it was probably changed in another tab or by the CLI. The task now shows as it is.`);

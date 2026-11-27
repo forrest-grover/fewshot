@@ -27,13 +27,15 @@ def test_evaluation_job(client):
 
 
 def test_evaluation_job_errors(client):
-    """Bad arguments fail at once; errors during the work are reported on the job."""
+    """Bad arguments and a task that can't be evaluated fail at once, as without a job."""
     assert client.post("/api/tasks/nope/evaluate/jobs").status_code == 404
     client.post("/api/tasks", json={"name": "empty", "embedder": "fake:color"})
-    assert client.post("/api/tasks/empty/evaluate/jobs", params={"folds": 1}).status_code == 400
-    job = wait_for_job(client, client.post("/api/tasks/empty/evaluate/jobs").json()["id"])
-    assert (job["status"], job["error"]) == ("failed", "Task has no examples to evaluate")
-    assert client.get("/api/jobs/nope").status_code == 404
+    assert client.post("/api/tasks/empty/evaluate/jobs", params={"folds": 1}).status_code == 422
+    r = client.post("/api/tasks/empty/evaluate/jobs")
+    assert (r.status_code, r.json()["code"]) == (400, "NO_EXAMPLES")
+    assert r.json()["detail"] == "Task has no examples to evaluate"
+    r = client.get("/api/jobs/nope")
+    assert (r.status_code, r.json()["code"], r.json()["job_id"]) == (404, "JOB_NOT_FOUND", "nope")
     assert client.delete("/api/jobs/nope").status_code == 404
 
 

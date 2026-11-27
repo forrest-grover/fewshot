@@ -149,11 +149,18 @@ describe("useUploads", () => {
     expect(done.mock.calls[0][2]).toBe(held.groups[0]); // the cat drop joined the dog drop's group
   });
 
-  it("keeps how many images were moved from other classes", async () => {
-    const { hook } = setup("pets");
-    const moving: SendBatch = (batch) => Promise.resolve({ added: batch, errors: [], task: taskDetail(), moved: [{ id: "a", previous_label: "dog" }] });
+  it("keeps how many images were moved from other classes, and counts them and those already there as added", async () => {
+    const { hook, stops } = setup("pets");
+    const moving: SendBatch = (batch) => Promise.resolve({
+      added: batch.slice(2), unchanged: batch.slice(1, 2), errors: [], task: taskDetail(), moved: [{ id: "a", previous_label: "dog" }],
+    });
     await act(async () => { await hook.result.current.start("cat", files(3), moving); });
     expect(hook.result.current.slots.cat).toEqual({ skipped: [], moved: 2 });
+    await act(async () => {
+      const stopping = hook.result.current.start("cat", files(3), (batch) => Promise.reject(new Error(String(batch.length))));
+      await stopping;
+    });
+    expect(stops).toEqual([{ task: "pets", added: 0, total: 3, error: new Error("2") }]);
   });
 
   it("Cancel stops the rest; a failure part-way is reported with its error", async () => {

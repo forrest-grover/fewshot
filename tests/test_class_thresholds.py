@@ -146,8 +146,8 @@ def test_api_class_thresholds(client):
     t = client.put("/api/tasks/t/class-thresholds", json={"thresholds": {"red": None}}).json()
     assert t["classes"][0]["reject_below"] is None
     assert client.put("/api/tasks/t/class-thresholds", json={"thresholds": {"x": 0.5}}).status_code == 404
-    assert client.put("/api/tasks/t/class-thresholds", json={"thresholds": {"red": 2}}).status_code == 400
-    assert client.put("/api/tasks/t/class-thresholds", json={"thresholds": {}}).status_code == 400
+    assert client.put("/api/tasks/t/class-thresholds", json={"thresholds": {"red": 2}}).status_code == 422
+    assert client.put("/api/tasks/t/class-thresholds", json={"thresholds": {}}).status_code == 422
     r = client.post("/api/tasks/t/evaluate").json()
     assert set(r["suggested_class_thresholds"]) == {"red", "blue"}
 

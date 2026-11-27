@@ -61,18 +61,18 @@ export function settingsPatch(task: TaskDetail, form: SettingsForm): { patch: Ta
 
   const reject = parseNumber(form.reject);
   if (reject !== null && !Number.isFinite(reject)) problems.push("Reject below must be a number, or blank for off");
-  else if (reject === null && task.reject_below !== null) patch.clear_reject = true;
+  else if (reject === null && task.reject_below !== null) patch.reject_below = null; // null clears (JSON Merge Patch)
   else if (reject !== null && reject !== task.reject_below) patch.reject_below = reject;
 
   const rejectZero = parseNumber(form.rejectZero);
   if (rejectZero !== null && !Number.isFinite(rejectZero)) problems.push("Zero-shot reject below must be a number, or blank for off");
-  else if (rejectZero === null && task.reject_below_zero_shot !== null) patch.clear_reject_zero_shot = true;
+  else if (rejectZero === null && task.reject_below_zero_shot !== null) patch.reject_below_zero_shot = null;
   else if (rejectZero !== null && rejectZero !== task.reject_below_zero_shot) patch.reject_below_zero_shot = rejectZero;
 
   const temperature = parseNumber(form.temperature);
   if (temperature !== null && !(temperature >= 0.01 && temperature <= 100)) {
     problems.push("Temperature must be between 0.01 and 100, or blank for none");
-  } else if (temperature === null && task.temperature !== null) patch.clear_temperature = true;
+  } else if (temperature === null && task.temperature !== null) patch.temperature = null;
   else if (temperature !== null && temperature !== task.temperature) patch.temperature = temperature;
 
   if (form.flip !== task.flip) patch.flip = form.flip;

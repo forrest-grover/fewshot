@@ -11,7 +11,13 @@
 """
 
 import importlib
+from importlib import metadata
 from typing import TYPE_CHECKING, Any
+
+try:
+    __version__ = metadata.version("fewshot")
+except metadata.PackageNotFoundError:  # pragma: no cover  # run from a source tree that isn't installed
+    __version__ = "0+unknown"
 
 if TYPE_CHECKING:  # Static view of the lazy exports below, for type checkers and linters.
     from .classifiers import CLASSIFIERS, ClassData, make_classifier
