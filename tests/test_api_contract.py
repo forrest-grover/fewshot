@@ -19,7 +19,7 @@ from fewshot.errors import CODES, violation
 from fewshot.exceptions import NoExamples, RevisionChanged, error_code, http_status
 from fewshot.jobs import Job, Jobs
 from fewshot.server_settings import ServerSettings
-from tests.conftest import BLUE, RED, api_client, api_task, png, query_files, wait_for_job
+from tests.conftest import BLUE, GREEN, RED, api_client, api_task, png, query_files, wait_for_job
 
 PROBLEM_KEYS = {"type", "title", "status", "detail", "instance", "code"}
 
@@ -377,15 +377,20 @@ def test_concurrent_changes_with_one_if_match_make_one_change(client, task):
     assert client.get(f"/api/tasks/{task}").json()["revision"] == rev + 1
 
 
-def test_an_if_match_is_checked_by_the_first_change_to_its_task_only():
-    """Outside a request nothing is checked; inside one, the first change to the task named."""
+def test_an_if_match_is_checked_until_a_change_to_its_task_saves():
+    """Outside a request nothing is checked; inside one, each change to the task named, until one
+    of them has saved."""
 
     def changes():
         preconditions.check("a", 1)  # nothing expected
         preconditions.expect("a", '"1"')
         preconditions.check("b", 5)  # another task
         preconditions.check("a", 1)
-        preconditions.check("a", 7)  # checked once: the first change moved the revision on
+        with pytest.raises(RevisionChanged):  # nothing saved yet: still checked
+            preconditions.check("a", 7)
+        preconditions.settle("b")
+        preconditions.settle("a")
+        preconditions.check("a", 7)  # a change saved: it moved the revision on
         preconditions.expect("a", 'W/"1"')
         with pytest.raises(RevisionChanged, match="at revision 2, not W/\"1\"") as e:
             preconditions.check("a", 2)
@@ -393,6 +398,32 @@ def test_an_if_match_is_checked_by_the_first_change_to_its_task_only():
             {"task": "a", "revision": 2}, 412, "PRECONDITION_FAILED")
 
     contextvars.copy_context().run(changes)
+
+
+def test_an_upload_in_chunks_is_checked_until_one_saves(ws):
+    """A large upload is stored in chunks, each under the lock in turn: while the chunks so far
+    changed nothing (images it has already), each later one is checked against If-Match too, so
+    a change made meanwhile by someone else refuses the rest; once one has saved, the rest go on."""
+    t = ws.create("t", embedder="fake:color")
+    old = png(RED, noise=10, seed=1)
+    t.add_example(old, "red")
+    rev = t.config.revision
+
+    def items(change):
+        yield old, "red", "old.png"  # already there: this chunk saves nothing
+        if change:  # between chunks, outside the lock, another client changes the task
+            contextvars.Context().run(ws.get("t").upsert_class, "other")
+        yield png(GREEN, noise=10, seed=2), "red", "new.png"
+
+    def upload(change, if_match):
+        preconditions.expect("t", if_match)
+        return t.add_examples(items(change), chunk=1)
+
+    with pytest.raises(RevisionChanged):
+        contextvars.copy_context().run(upload, True, f'"{rev}"')
+    assert (len(t.config.examples), t.config.revision) == (1, rev + 1)  # only the other client's change
+    added = contextvars.copy_context().run(upload, False, f'"{rev + 1}"')
+    assert (len(added), len(t.config.examples)) == (2, 2)
 
 
 # ---- jobs ---------------------------------------------------------------------------------

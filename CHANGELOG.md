@@ -72,4 +72,5 @@ Responses
 - Methods return `TypedDict`s mirroring the API's schemas (`Prediction`, `TaskDetail`, `AddResult`, `InboxPage`, `EvalReport`, `JobInfo`...); they are plain dicts at runtime.
 
 ### Web UI
+- A drop made while a cancelled upload's last batch is still being sent (or after switching tasks and back meanwhile) is its own undo step: it joined the cancelled upload's, so undoing it also undid the images the cancel said got in.
 - Clearing a setting sends `null`. An "Add as" of an image that is an example already counts it as added, and a refused change reloads the task on 412 too.

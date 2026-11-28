@@ -199,7 +199,8 @@ class Task(TaskEvaluations, TaskHistory, TaskInbox):  # pylint: disable=too-many
                     self.refresh()
                 except FileNotFoundError as e:  # deleted by another process
                     raise exc.TaskNotFound(f"No task {self.name!r}", task=self.name) from e
-                preconditions.check(self._published.name, self._published.revision)  # If-Match, atomically
+                name, commits = self._published.name, self._commits
+                preconditions.check(name, self._published.revision)  # If-Match, atomically
                 self._draft = _copy_config(self._published)
                 self._writer = threading.get_ident()
                 self._depth = 1
@@ -209,6 +210,8 @@ class Task(TaskEvaluations, TaskHistory, TaskInbox):  # pylint: disable=too-many
                     self._writer = None
                     self._draft = None
                     self._depth = 0
+                    if self._committed_since(commits):  # (even if it failed after) it moved the revision on
+                        preconditions.settle(name)
 
     @contextlib.contextmanager
     def locked(self) -> Iterator[TaskConfig]:

@@ -39,6 +39,7 @@ interface Running {
   group: string; // its undo group: shared by the uploads to the task running at the same time
   added: number; // images the server confirmed so far
   stop: () => void; // after the batch in flight
+  stopping: AbortSignal; // aborted once it has been asked to stop
   abort: () => void; // at once
   done: Promise<void>; // once it has ended, however
 }
@@ -89,10 +90,12 @@ export function useUploads(task: string | null, options: UploadOptions) {
     let finished: () => void = () => { /* set below */ };
     const task = current.current;
     // Uploads running at the same time share one undo group, so that batches to two classes,
-    // sent in turn, still make one undo step.
-    const group = [...live.current].find((x) => x.task === task)?.group ?? newUndoGroup();
+    // sent in turn, still make one undo step. Not one that is stopping: its last batch may still
+    // land, and a drop made now would join the part of it the user was told got in, so that
+    // undoing the new drop would undo that too.
+    const group = [...live.current].find((x) => x.task === task && !x.stopping.aborted)?.group ?? newUndoGroup();
     const r: Running = {
-      task, group, added: 0,
+      task, group, added: 0, stopping: soft.signal,
       stop: () => {
         if (soft.signal.aborted) return;
         soft.abort();

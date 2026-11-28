@@ -70,6 +70,21 @@ describe("useUploads", () => {
     expect(again.has([...cat][0])).toBe(false);
   });
 
+  it("doesn't give a new drop the undo group of an upload that is stopping", async () => {
+    const { hook } = setup("pets");
+    const { send, groups, release } = gatedSend();
+    act(() => { void hook.result.current.start("cat", files(5), send); });
+    await waitFor(() => { expect(send).toHaveBeenCalledTimes(1); });
+    hook.rerender({ t: "birds" }); // stops it after the batch in flight, which may still land
+    hook.rerender({ t: "pets" });
+    const later = gatedSend();
+    act(() => { void hook.result.current.start("dog", files(1), later.send); });
+    await waitFor(() => { expect(later.send).toHaveBeenCalledTimes(1); });
+    expect(later.groups[0]).not.toBe(groups[0]); // else undoing the new drop would undo what got in of the old
+    release();
+    later.release();
+  });
+
   it("goes on while the task stays open, and stops when another opens, counting the batch in flight", async () => {
     const { hook, stops } = setup("pets");
     const { send, release } = gatedSend();
