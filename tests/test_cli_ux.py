@@ -532,8 +532,8 @@ def test_bench_machine_readable_output(run, bench_data):
 
 def test_bench_with_too_few_images_says_what_to_lower(run, bench_data):
     """Too few classes with enough images: the error names the options to lower."""
-    r = run("bench", bench_data, "-e", "fake:color", "--query", "10")
-    assert "lower --way (0 = all), --shots or --query" in r.output
+    r = run("bench", bench_data, "-e", "fake:color", "--shots", "4")
+    assert "lower --way (0 = all) or --shots" in r.output
 
 
 # ---- maintenance ------------------------------------------------------------------------

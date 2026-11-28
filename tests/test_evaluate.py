@@ -9,7 +9,7 @@ import fewshot.evaluate as ev
 from fewshot import Pipeline, benchmark, evaluate_task
 from fewshot.classifiers import ClassData
 from fewshot.embedders import cache_namespace, register_embedder, unregister_embedder
-from fewshot.evaluate import _folds, _subset, load_folder_dataset  # pylint: disable=protected-access  # unit tests
+from fewshot.evaluate import _EpisodeSampler, _folds, _subset, load_folder_dataset  # pylint: disable=protected-access  # unit tests
 from tests.conftest import BLUE, GREEN, RED, ColorEmbedder, png, red_blue_task
 
 COLORS = {"red": (220, 30, 30), "green": (30, 220, 30), "blue": (30, 30, 220), "yellow": (220, 220, 30)}
@@ -180,7 +180,7 @@ def test_benchmark_separable_colours(ws, tmp_path):
     assert r.pop("flip") is False
     assert r == {
         "embedder": "fake:color", "classifier": "gda", "way": 3, "shot": 2, "query": 3,
-        "episodes": 5, "seed": 0, "text_template": None, "accuracy": 1.0, "std": 0.0, "ci95": 0.0,
+        "episodes": 5, "seed": 0, "text_template": None, "names": False, "accuracy": 1.0, "std": 0.0, "ci95": 0.0,
     }
     assert messages == ["Embedding 24 images with fake:color (cached after first run)"]
 
@@ -219,12 +219,12 @@ def test_benchmark_ci_from_varying_episodes(ws, tmp_path):
 
 
 def test_benchmark_too_few_classes(ws, tmp_path):
-    """Too few classes with shot + query images raises with counts."""
+    """Too few classes with more images than shot raises with counts."""
     folder = make_folder(tmp_path / "data", per_class=4, classes=("red", "green"))
-    with pytest.raises(ValueError, match=r"Only 2 classes have >= 4 images; need 3"):
+    with pytest.raises(ValueError, match=r"Only 2 classes have >= 2 images; need 3"):
         benchmark(Pipeline(ws), folder, "fake:color", way=3, shot=1, query=3)
     with pytest.raises(ValueError, match=r"Only 0 classes have >= 5 images; need 2"):
-        benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=2, query=3)
+        benchmark(Pipeline(ws), folder, "fake:color", way=2, shot=4, query=3)
 
 
 def test_benchmark_zero_shot_with_text_template(ws, tmp_path, text_embedder):
@@ -257,10 +257,39 @@ def test_benchmark_rejects_meaningless_arguments(ws, tmp_path, arg, value):
 
 
 def test_benchmark_every_class(ws, tmp_path):
-    """way=0 uses every class with enough images in each episode."""
+    """way=0 uses every class with more images than shot, each with up to query test images (the
+    README's protocol); classes with too few are left out and named."""
     folder = make_folder(tmp_path / "data", per_class=4, classes=("red", "green", "blue"))
-    r = benchmark(Pipeline(ws), folder, "fake:color", way=0, shot=1, query=3, episodes=2)
-    assert (r["way"], r["accuracy"]) == (3, 1.0)
+    for f in sorted((folder / "blue").iterdir())[1:]:
+        f.unlink()  # blue: 1 image, too few for 1 shot
+    messages: list[str] = []
+    r = benchmark(Pipeline(ws), folder, "fake:color", way=0, shot=1, query=50, episodes=2, progress=messages.append)
+    assert (r["way"], r["accuracy"]) == (2, 1.0)
+    assert messages[0] == "Leaving out 1 classes with 1 images or fewer: blue"
+
+
+def test_benchmark_episodes_take_up_to_query_images_per_class():
+    """A class with fewer than shot + query images gives all its other images to classify, and
+    each query image is labelled with its own class."""
+    sampler = _EpisodeSampler(["a", "b"], [3, 6], np.eye(9), None)  # image i is the unit vector e_i
+    data, Q, yq = sampler.sample(np.random.default_rng(0), 2, 1, 4)
+    assert (len(data.y), np.bincount(yq).tolist(), data.use_names) == (2, [2, 4], False)
+    a = data.classes.index("a")
+    assert all((Q[i].argmax() < 3) == (yq[i] == a) for i in range(len(Q)))  # a's images are e_0..e_2
+
+
+def test_benchmark_offers_names_as_a_task_does(ws, tmp_path, text_embedder):
+    """names=True gives the classifier each class's name ("a photo of a <name>.") as a task
+    with names-as-text does, only without a template and with a text embedder."""
+    folder = make_folder(tmp_path / "data", per_class=3, classes=("red", "green", "blue"))
+    pipe = Pipeline(ws)
+    r = benchmark(pipe, folder, text_embedder, way=0, shot=1, query=2, episodes=2, names=True)
+    assert (r["names"], r["accuracy"]) == (True, 1.0)
+    assert len(pipe.cache.get_many(cache_namespace(text_embedder), ["text:a photo of a red."])) == 1
+    with_template = benchmark(pipe, folder, text_embedder, way=0, shot=1, query=2, episodes=1, names=True,
+                              text_template="a photo of a {}")
+    image_only = benchmark(pipe, folder, "fake:color", way=0, shot=1, query=2, episodes=1, names=True)
+    assert (with_template["names"], image_only["names"]) == (False, False)
 
 
 @pytest.mark.parametrize(("classifier", "n", "method"), [

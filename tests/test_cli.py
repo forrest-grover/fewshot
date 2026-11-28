@@ -541,7 +541,7 @@ def bench_data_fixture(tmp_path, monkeypatch):
     folder = tmp_path / "bench"
     for i, (label, rgb) in enumerate(COLORS.items()):
         write_images(folder / label, rgb, 4, start=10 * i)
-    write_images(folder / "tiny", (128, 128, 128), 1)  # too few images, so never sampled
+    write_images(folder / "tiny", (128, 128, 128), 1)  # too few images for a 1-shot run, so left out of those
     embedders.register_embedder("fake:text", TextColorEmbedder())
     monkeypatch.setattr(cli_eval, "spec_supports_text", lambda spec: spec == "fake:text")
     yield folder
@@ -576,6 +576,14 @@ def test_bench_without_template_skips_zero_shot(run, bench_data):
     assert "+text" not in results[0]
 
 
+def test_bench_names(run, bench_data):
+    """--names offers the class names as text in runs without a template, with text embedders only."""
+    r = run("bench", bench_data, "--embedder", "fake:text", "--embedder", "fake:color", "--names", *BENCH)
+    results = [line for line in r.output.splitlines() if " acc " in line]
+    assert [line.split()[0] for line in results if "+names" in line] == ["fake:text"]
+    assert "Leaving out 1 classes with 1 images or fewer: tiny" in r.output
+
+
 def test_bench_default_embedder_and_errors(run, bench_data, monkeypatch):
     """`bench` defaults to DEFAULT_SPEC and reports too-small datasets."""
     monkeypatch.setattr(cli_eval, "DEFAULT_SPEC", "fake:color")
@@ -585,7 +593,7 @@ def test_bench_default_embedder_and_errors(run, bench_data, monkeypatch):
 
     r = run("bench", bench_data, "--embedder", "fake:color", "--way", "5", "--shot", "1", "--query", "2")
     assert r.exit_code == 1
-    assert "Only 3 classes have >= 3 images; need 5" in r.output
+    assert "Only 3 classes have >= 2 images; need 5" in r.output
 
     r = run("bench", bench_data / "missing", "--embedder", "fake:color")
     assert r.exit_code == 1

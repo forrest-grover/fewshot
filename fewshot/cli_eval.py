@@ -210,7 +210,7 @@ def dupes(
 
 # ---- bench ---------------------------------------------------------------------
 BENCH_FIELDS = ["embedder", "classifier", "way", "shot", "query", "episodes", "seed", "text_template", "flip",
-                "accuracy", "std", "ci95"]
+                "names", "accuracy", "std", "ci95"]
 
 
 def _bench_runs(specs: list[str], classifiers: list[str], shots: list[int], text_template: str | None
@@ -235,12 +235,12 @@ def _bench_one(pipe: Pipeline, folder: Path, run: tuple[str, str, int, str | Non
         r = benchmark(pipe, folder, e, c, shot=s, text_template=tt, progress=say, **opts)
     except ValueError as err:
         msg = explained(err)
-        fail(f"{msg}; lower --way (0 = all), --shots or --query" if msg.startswith("Only ") else msg)
+        fail(f"{msg}; lower --way (0 = all) or --shots" if msg.startswith("Only ") else msg)
     return {k: r[k] for k in BENCH_FIELDS}
 
 
 def _bench_row(r: dict[str, Any]) -> str:
-    text = " +text" if r["text_template"] else "      "
+    text = " +text " if r["text_template"] else " +names" if r["names"] else "       "
     return (f"{r['embedder']:42} {r['classifier']:9} {r['way']}-way {r['shot']}-shot{text}  "
             f"acc {r['accuracy']:.3f} ± {r['ci95']:.3f} (95% CI)  seed {r['seed']}")
 
@@ -256,17 +256,20 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
                                        help=f"Embedder spec(s) to compare [default: {DEFAULT_SPEC}]"),
     classifier: list[str] = typer.Option(["gda"], callback=classifier_names,
                                          help=f"Classifier(s) to compare: {CLASSIFIER_LIST}"),
-    way: int = typer.Option(5, min=0, help="Classes per episode; 0 for every class with enough images"),
+    way: int = typer.Option(5, min=0, help="Classes per episode; 0 for every class with more images than --shots"),
     shots: list[int] = typer.Option(None, "--shots", min=0, help="Labelled examples per class (repeatable) "
                                                                   "[default: 1 and 5]"),
     shot: list[int] = typer.Option(None, "--shot", min=0, hidden=True),  # the old spelling of --shots
-    query: int = typer.Option(15, min=1, help="Images per class to classify in each episode"),
+    query: int = typer.Option(15, min=1, help="Up to this many of each class's other images to classify in each "
+                                               "episode"),
     episodes: int = typer.Option(200, min=1, help="Random episodes per run, averaged"),
     seed: int = typer.Option(0, help="Seed of the random episodes; the same seed gives the same episodes"),
     text_template: list[str] = typer.Option(
         None, help="e.g. 'a photo of a {}' to use class names as text (CLIP only). Repeat to average "
                    "several prompts."),
     flip: bool = typer.Option(False, "--flip", help="Average each image with its mirror image"),
+    names: bool = typer.Option(False, "--names", help="Offer the class names as text, as a task does (names-as-text), "
+                                                       "in runs without --text-template (text embedders only)"),
     as_json: bool = typer.Option(False, "--json", help="Print a JSON list: one object per run"),
     as_jsonl: bool = typer.Option(False, "--jsonl", help="Print one JSON object per run as it finishes"),
     as_csv: bool = typer.Option(False, "--csv", help="Print CSV: one row per run"),
@@ -275,8 +278,11 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
     """Episodic N-way K-shot benchmark over a folder of class folders.
 
     Each run (embedder x classifier x shots) samples random episodes of --way classes with --shots
-    labelled and --query test images each, and reports the mean accuracy with its 95% confidence
-    interval (1.96 standard errors over episodes). Results are reproducible for a given --seed.
+    labelled and up to --query test images each, and reports the mean accuracy with its 95%
+    confidence interval (1.96 standard errors over episodes). A class needs more images than
+    --shots; those with fewer are left out, and named. `--way 0 --query 50 --episodes 3` is the
+    protocol of the README's accuracy tables (with --names for its names-as-text numbers).
+    Results are reproducible for a given --seed.
     Embeddings go into the workspace's cache, so a second run is fast; `fewshot cache prune`
     removes them once no task uses them.
     """
@@ -285,7 +291,7 @@ def bench(  # pylint: disable=too-many-arguments,too-many-positional-arguments,t
         fail(f"Not a directory: {folder}")
     _FLAGS.interrupt_note = "no task was changed"
     pipe = make_pipeline(workspace(root, create=True))
-    opts = {"way": way, "query": query, "episodes": episodes, "flip": flip, "seed": seed}
+    opts = {"way": way, "query": query, "episodes": episodes, "flip": flip, "seed": seed, "names": names}
     template = "\n".join(text_template) if text_template else None
     results = []
     for n, run in enumerate(_bench_runs(embedder or [DEFAULT_SPEC], classifier, [*(shots or []), *(shot or [])]

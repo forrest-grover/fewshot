@@ -23,11 +23,11 @@ from .classifiers import (
     temper,
     top_k,
 )
-from .embedders import preset_label
+from .embedders import preset_label, spec_supports_text
 from .exceptions import http_status, message
 from .folders import class_folders
 from .models import TaskConfig, _now, check_evaluable
-from .pipeline import Pipeline, new_classifier
+from .pipeline import NAME_TEMPLATE, Pipeline, new_classifier
 from .store import Task
 from .text import fill_template
 
@@ -490,36 +490,45 @@ class _EpisodeSampler:
     sizes: list[int]  # number of images per class
     E: np.ndarray  # embeddings of every image, grouped by class in ``names`` order
     T: np.ndarray | None  # one text embedding per class, or None
+    N: np.ndarray | None = None  # one embedding of each class's name ("a photo of a <name>."), or None
 
     @classmethod
     def embed(cls, pipe: Pipeline, ds: dict[str, list[Path]], embedder: str,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-              text_template: str | None, progress: Callable[[str], None] | None, flip: bool = False
-              ) -> _EpisodeSampler:
+              text_template: str | None, progress: Callable[[str], None] | None, flip: bool = False,
+              names: bool = False) -> _EpisodeSampler:
         """Embed every image in ``ds`` (and each class's ``text_template`` text, if given; a
-        template of several lines gives several prompts, which are averaged)."""
-        names = sorted(ds)
-        files = [f for c in names for f in ds[c]]
+        template of several lines gives several prompts, which are averaged; with ``names``,
+        each class's name as a task would offer it to its classifier)."""
+        classes = sorted(ds)
+        files = [f for c in classes for f in ds[c]]
         if progress:
             progress(f"Embedding {len(files)} images with {embedder} (cached after first run)")
         E = pipe.embed_files(embedder, files, flip=flip)
-        T = None
+        T = N = None
         if text_template:
-            T = pipe.embed_descriptions(embedder, [fill_template(text_template, c) for c in names])
-        return cls(names, [len(ds[c]) for c in names], E, T)
+            T = pipe.embed_descriptions(embedder, [fill_template(text_template, c) for c in classes])
+        if names:
+            N = pipe.embed_descriptions(embedder, [fill_template(NAME_TEMPLATE, c) for c in classes])
+        return cls(classes, [len(ds[c]) for c in classes], E, T, N)
 
     def sample(self, rng: np.random.Generator, way: int, shot: int, query: int
                ) -> tuple[ClassData, np.ndarray, np.ndarray]:
-        """Return support ClassData, query embeddings and query labels for one episode."""
+        """Return support ClassData, query embeddings and query labels for one episode: ``shot``
+        examples of each class and up to ``query`` of its other images to classify."""
         cls = rng.choice(len(self.names), way, replace=False)
-        Xs, Xq, text = [], [], {}
+        Xs, Xq, yq, text, names = [], [], [], {}, {}
         for j, ci in enumerate(cls):
-            pick = rng.choice(self.sizes[ci], shot + query, replace=False) + sum(self.sizes[:ci])
+            pick = rng.choice(self.sizes[ci], min(shot + query, self.sizes[ci]), replace=False) + sum(self.sizes[:ci])
             Xs.append(self.E[pick[:shot]])
             Xq.append(self.E[pick[shot:]])
+            yq += [j] * (len(pick) - shot)
             if self.T is not None:
                 text[j] = self.T[ci]
-        data = ClassData([self.names[c] for c in cls], np.concatenate(Xs), np.repeat(np.arange(way), shot), text)
-        return data, np.concatenate(Xq), np.repeat(np.arange(way), query)
+            if self.N is not None:
+                names[j] = self.N[ci]
+        data = ClassData([self.names[c] for c in cls], np.concatenate(Xs), np.repeat(np.arange(way), shot), text,
+                         names, use_names=self.N is not None)
+        return data, np.concatenate(Xq), np.array(yq, int)
 
 
 # The many arguments are benchmark's public API (the CLI passes them positionally); pylint also
@@ -538,12 +547,20 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     seed: int = 0,
     progress: Callable[[str], None] | None = None,
     flip: bool = False,
+    names: bool = False,
     **classifier_params: Any,
 ) -> dict[str, Any]:
-    """Mean accuracy over random N-way K-shot episodes from ``folder/<class>/*``.
+    """Mean accuracy over random N-way K-shot episodes from ``folder/<class>/*``: each episode
+    draws ``way`` classes (0: every class), ``shot`` examples of each and up to ``query`` of its
+    other images to classify. A class needs ``shot + 1`` images; those with fewer are left out,
+    and ``progress`` names them. With ``way=0``, ``query=50`` and a few episodes this is the
+    protocol of the README's accuracy tables.
 
     ``shot=0`` with a ``text_template`` such as ``"a photo of a {}"`` measures
-    CLIP zero-shot accuracy. ``flip`` averages each image with its mirror image.
+    CLIP zero-shot accuracy. ``flip`` averages each image with its mirror image. ``names``
+    offers the classifier each class's name as text, as a task does by default (``names_as_text``),
+    for runs without a ``text_template`` with an embedder that has text; the result's ``names``
+    says whether they were offered (the classifier still decides whether they match).
     """
     for arg, value, low in (("shot", shot, 0), ("query", query, 1), ("episodes", episodes, 1)):
         if value < low:
@@ -552,11 +569,16 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         raise ValueError(f"way must be at least 2, or 0 for every class; got {way}")
     if shot == 0 and not text_template:  # checked before embedding the whole dataset
         raise ValueError("shot=0 (zero-shot) needs a text_template such as 'a photo of a {}'")
-    ds = {c: fs for c, fs in load_folder_dataset(folder).items() if len(fs) >= shot + query}
+    found = load_folder_dataset(folder)
+    ds = {c: fs for c, fs in found.items() if len(fs) > shot}  # at least one image to classify
     way = way or len(ds)  # 0: every class with enough images
     if len(ds) < max(way, 2):
-        raise ValueError(f"Only {len(ds)} classes have >= {shot + query} images; need {max(way, 2)}")
-    sampler = _EpisodeSampler.embed(pipe, ds, embedder, text_template, progress, flip)
+        raise ValueError(f"Only {len(ds)} classes have >= {shot + 1} images; need {max(way, 2)}")
+    if (left := sorted(set(found) - set(ds))) and progress:
+        progress(f"Leaving out {len(left)} classes with {shot} images or fewer: {', '.join(left[:5])}"
+                 + (", ..." if len(left) > 5 else ""))
+    names = names and not text_template and spec_supports_text(embedder)
+    sampler = _EpisodeSampler.embed(pipe, ds, embedder, text_template, progress, flip, names)
 
     rng = np.random.default_rng(seed)
     accs = []
@@ -567,7 +589,7 @@ def benchmark(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     a = np.array(accs)
     return {
         "embedder": embedder, "classifier": classifier, "way": way, "shot": shot, "query": query,
-        "episodes": episodes, "seed": seed, "text_template": text_template, "flip": flip,
+        "episodes": episodes, "seed": seed, "text_template": text_template, "flip": flip, "names": names,
         "accuracy": float(a.mean()),
         "std": float(a.std(ddof=1)) if len(a) > 1 else 0.0,  # over episodes
         "ci95": float(1.96 * a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0,
