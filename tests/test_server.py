@@ -16,6 +16,7 @@ import pytest
 import fewshot.api
 import fewshot.guard
 import fewshot.responses
+import fewshot.server
 import fewshot.server_settings
 import fewshot.services
 from fewshot.embedders import DEFAULT_SPEC, PRESETS
@@ -92,6 +93,7 @@ ROUTE_BODIES = {
     ("POST", "/api/tasks/{name}/predict"): UPLOAD, ("POST", "/api/tasks/{name}/predict/urls"): SMALL,
     ("GET", "/api/tasks/{name}/duplicates"): SMALL, ("POST", "/api/tasks/{name}/evaluate"): SMALL,
     ("POST", "/api/tasks/{name}/evaluate/jobs"): SMALL, ("POST", "/api/tasks/{name}/compare/jobs"): SMALL,
+    ("GET", "/api/tasks/{name}/jobs"): SMALL, ("GET", "/api/tasks/{name}/evaluation"): SMALL,
     ("GET", "/api/jobs/{jid}"): SMALL, ("DELETE", "/api/jobs/{jid}"): SMALL,
 }
 
@@ -197,7 +199,7 @@ def test_only_known_models_by_default(client, monkeypatch):
     them or the server allows any model."""
     loads: list[str] = []
     monkeypatch.setattr("fewshot.store.check_embedder", lambda spec: None)  # tasks whose model no longer loads
-    monkeypatch.setattr(fewshot.api, "check_embedder", loads.append)
+    monkeypatch.setattr(fewshot.server, "check_embedder", loads.append)
     r = client.post("/api/tasks", json={"name": "x", "embedder": "timm:some_model"})
     assert r.status_code == 403
     assert "--allow-any-model" in r.json()["detail"]
@@ -223,7 +225,7 @@ def test_warm_models(client, monkeypatch):
             raise RuntimeError("no such model")
         loaded.append(spec)
 
-    monkeypatch.setattr(fewshot.api, "get_embedder", fake_get)
+    monkeypatch.setattr(fewshot.server, "get_embedder", fake_get)
     assert client.srv.warm_models() == [DEFAULT_SPEC]
     ws = client.srv.ws
     ws.create("a", embedder="fake:color")

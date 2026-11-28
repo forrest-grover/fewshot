@@ -308,6 +308,22 @@ class EvalReport(TypedDict):
     suggested_class_thresholds: dict[str, float]
     calibration: Calibration | None
     warnings: list[str]
+    embedder: str | None  # how it was made (None in reports from older servers)
+    embedder_label: str | None
+    classifier: str | None
+    classifier_params: dict[str, Any]
+    folds: int | None
+    finished_at: str | None
+
+
+class EvalHeadline(LastEvaluation):
+    """One evaluation in a task's history, with how it was made."""
+
+    embedder: str | None
+    embedder_label: str | None
+    classifier: str | None
+    classifier_params: dict[str, Any]
+    folds: int | None
 
 
 class CompareResult(TypedDict):
@@ -331,6 +347,16 @@ class CompareReport(TypedDict):
     n_examples: int
     results: list[CompareResult]
     best: str | None
+
+
+class Evaluation(TypedDict):
+    """``last_evaluation()``: the task's revision now, its last evaluation report (None if
+    none), the last 20 evaluations' headlines (newest first) and its last comparison."""
+
+    revision: int
+    report: EvalReport | None
+    history: list[EvalHeadline]
+    comparison: CompareReport | None
 
 
 class JobInfo(TypedDict):
@@ -870,6 +896,16 @@ class Client:  # pylint: disable=too-many-public-methods  # one method per commo
     def job(self, job_id: str) -> Job[Any]:
         """The background job ``job_id``, as it is now (``NotFoundError`` if the server doesn't know it)."""
         return Job(self, self.request("GET", f"/jobs/{_seg(job_id)}"))
+
+    def task_jobs(self, task: str) -> list[Job[Any]]:
+        """The task's evaluation and comparison jobs the server remembers (running and recently
+        finished), newest first: to come back to one after losing its id."""
+        return [Job(self, info) for info in self.request("GET", f"/tasks/{_seg(task)}/jobs")]
+
+    def last_evaluation(self, task: str) -> Evaluation:
+        """The task's last evaluation report, its recent evaluations' headlines and its last
+        comparison, as kept by the server (each with the ``revision`` it was made at)."""
+        return cast(Evaluation, self.request("GET", f"/tasks/{_seg(task)}/evaluation"))
 
     def start_evaluate(self, task: str, folds: int | None = None) -> Job[EvalReport]:
         """Start cross-validating the task in the background (leave-one-out unless ``folds``);

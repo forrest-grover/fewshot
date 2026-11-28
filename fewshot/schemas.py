@@ -289,6 +289,30 @@ class EvalReport(BaseModel):
     suggested_class_thresholds: dict[str, float]  # the same per class, for classes with 5+ correct
     calibration: Calibration | None  # None with fewer than 50 scored examples
     warnings: list[str]  # what makes the numbers misleading, such as a task with one class
+    # How it was made, to compare or reproduce it (missing from reports made by older versions).
+    embedder: str | None = None  # spec
+    embedder_label: str | None = None  # the preset's friendly name, if it is one
+    classifier: str | None = None
+    classifier_params: dict[str, Any] = {}
+    folds: int | None = None  # folds used (the number of examples for leave-one-out)
+    finished_at: str | None = None
+
+
+class EvalHeadline(BaseModel):
+    """One evaluation in a task's history: how well, and how it was made."""
+
+    at: str
+    revision: int | None
+    method: str | None
+    accuracy: float | None
+    macro_f1: float | None
+    n_scored: int | None
+    n_examples: int | None
+    embedder: str | None = None
+    embedder_label: str | None = None
+    classifier: str | None = None
+    classifier_params: dict[str, Any] = {}
+    folds: int | None = None
 
 
 class CompareResult(BaseModel):
@@ -312,6 +336,16 @@ class CompareReport(BaseModel):
     n_examples: int
     results: list[CompareResult]  # in the order asked for
     best: str | None  # the most accurate embedder
+
+
+class EvaluationOut(BaseModel):
+    """GET .../evaluation: the task's last evaluation and comparison, kept across restarts. Each
+    has the ``revision`` it was made at: if that isn't the task's, the task changed since."""
+
+    revision: int  # the task's, now
+    report: EvalReport | None  # the last evaluation's report (None if never, or only a headline was kept)
+    history: list[EvalHeadline]  # the last 20 evaluations, newest first
+    comparison: CompareReport | None  # the last comparison of embedders
 
 
 InboxSort = Literal["uncertain", "confident", "novel", "added"]  # GET .../inbox's orders
@@ -417,7 +451,8 @@ class ClassBody(_Body):
     """Body of POST .../classes. A description holds at most ``MAX_PROMPTS`` prompts (lines)."""
 
     name: str
-    description: str | None = Field(None, max_length=MAX_DESCRIPTION)
+    description: str | None = Field(None, max_length=MAX_DESCRIPTION)  # null or left out: an existing class's stays
+    new_class: bool = False  # create it even if its name is close to an existing class's (else 422)
 
 
 class ClassPatch(_Body):

@@ -69,7 +69,8 @@ def test_compare_embedders(ws):
     assert color["accuracy"] == 1.0
     assert color["method"] == "leave-one-out"
     assert noise["accuracy"] < 1.0
-    assert broken == {"embedder": "fake:broken", "error": "CUDA out of memory"}
+    assert broken == {"embedder": "fake:broken", "error": "RuntimeError (see the server log)",
+                      "error_detail": "CUDA out of memory"}
     assert (r["best"], r["current"], r["n_examples"]) == ("fake:color", "fake:color", 8)
     assert r["revision"] == t.config.revision
     assert {"1/3 embedding", "1/3 evaluating", "2/3 embedding"} <= set(stages)
@@ -85,6 +86,8 @@ def test_compare_errors(ws):
     with pytest.raises(ValueError, match="no examples"):
         compare_embedders(Pipeline(ws), ws.create("empty", embedder="fake:color"), ["fake:color"])
     assert compare_embedders(Pipeline(ws), t, ["fake:broken"])["best"] is None
+    unknown = compare_embedders(Pipeline(ws), t, ["fake:nope"])["results"][0]  # a refusal is told in full
+    assert ("error_detail" in unknown, "Unknown embedder" in unknown["error"]) == (False, True)
 
     def cancel(*_):
         raise Cancelled
@@ -118,6 +121,19 @@ def test_api_compare_job(client):
     assert job["status"] == "done", job
     assert [x["embedder"] for x in job["result"]["results"]] == ["fake:color", "fake:noise"]
     assert job["result"]["best"] == "fake:color"
+
+
+def test_api_keeps_an_internal_error_s_details_in_the_log(client, caplog):
+    """A model that fails with an internal error is reported to API clients only by the kind of
+    error, in the job and in GET .../evaluation; the server log has the message."""
+    r = client.post("/api/tasks/t/compare/jobs", json={"embedders": ["fake:color", "fake:broken"]})
+    job = _wait(client, r.json()["id"])
+    kept = client.get("/api/tasks/t/evaluation").json()["comparison"]
+    for report in (job["result"], kept):
+        assert report["results"][1] == {**report["results"][1], "embedder": "fake:broken",
+                                        "error": "RuntimeError (see the server log)"}
+        assert "error_detail" not in report["results"][1]
+    assert any("fake:broken failed: CUDA out of memory" in m for m in caplog.messages)
 
 
 def test_api_compare_refusals(client, monkeypatch):

@@ -309,6 +309,17 @@ def evaluate(pipe: Pipeline, task: Task, folds: int | None = None, progress: Pro
     return report
 
 
+def compare(pipe: Pipeline, task: Task, specs: Sequence[str], folds: int | None = None,
+            progress: Progress | None = None) -> dict[str, Any]:
+    """Compare embedders ``specs`` on ``task`` (see ``evaluate.compare_embedders``) and record the
+    result, so it can be shown again later."""
+    from .evaluate import compare_embedders  # pylint: disable=import-outside-toplevel  # torch-backed
+
+    report = compare_embedders(pipe, task, specs, folds, progress=progress)
+    task.record_comparison(report)
+    return report
+
+
 # ---- inbox ------------------------------------------------------------------
 def confident_suggestions(pipe: Pipeline, task: Task, min_confidence: float,
                           ids: Iterable[str] | None = None) -> dict[str, str]:

@@ -23,8 +23,10 @@ from .classifiers import (
     temper,
     top_k,
 )
+from .embedders import preset_label
+from .exceptions import http_status, message
 from .folders import class_folders
-from .models import TaskConfig, check_evaluable
+from .models import TaskConfig, _now, check_evaluable
 from .pipeline import Pipeline, new_classifier
 from .store import Task
 from .text import fill_template
@@ -416,6 +418,13 @@ def evaluate_task(pipe: Pipeline, task: Task, folds: int | None = None, seed: in
         "warnings": [f"Only one class ({data.classes[0]}): every example is predicted as it, so accuracy is "
                      "always 1.0; what this tells is how far its images reach (suggested_reject_below, for "
                      "one-class detection)"] if C == 1 else [],
+        # How it was made, to compare or reproduce it.
+        "embedder": cfg.embedder,
+        "embedder_label": preset_label(cfg.embedder),
+        "classifier": cfg.classifier,
+        "classifier_params": cfg.classifier_params,
+        "folds": min(k, n),
+        "finished_at": _now(),
     }
 
 
@@ -450,12 +459,18 @@ def compare_embedders(pipe: Pipeline, task: Task, embedders: Sequence[str], fold
 
 def _compare_one(run: Callable[[], dict[str, Any]], spec: str) -> dict[str, Any]:
     """The headline of ``run()``, an evaluation with embedder ``spec``, timed; or the error that
-    stopped it, for a model that can't load or run."""
+    stopped it, for a model that can't load or run. ``error`` tells it as a failed job's error
+    is told: a refusal (``ValueError``) in full, anything else (an OSError or a torch error, which
+    may name paths on the server) only by its kind; then ``error_detail`` has the whole message,
+    for the command line and the server log (the API's response models leave it out)."""
     start = time.perf_counter()
     try:
         r = run()
     except (ValueError, OSError, RuntimeError) as e:
-        return {"embedder": spec, "error": str(e) or type(e).__name__}
+        detail = message(e) or type(e).__name__
+        if http_status(e) < 500:
+            return {"embedder": spec, "error": detail}
+        return {"embedder": spec, "error": f"{type(e).__name__} (see the server log)", "error_detail": detail}
     return {"embedder": spec, "accuracy": r["accuracy"], "macro_f1": r["macro_f1"],
             "top_k_accuracy": r["top_k_accuracy"], "n_scored": r["n_scored"],
             "seconds": round(time.perf_counter() - start, 2), "method": r["method"]}

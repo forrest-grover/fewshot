@@ -10,6 +10,7 @@ import zipfile
 import pytest
 
 import fewshot.api
+import fewshot.server
 from fewshot import archive, store
 from fewshot.archive import export_task, import_task
 from fewshot.embedders import DEFAULT_SPEC
@@ -146,7 +147,7 @@ def test_api_import_applies_the_model_allowlist(tmp_path, monkeypatch):
     """Importing over the API can't bring in a model the server wouldn't otherwise load."""
     c = host_client(tmp_path, hosts="*")
     loads: list[str] = []
-    monkeypatch.setattr(fewshot.api, "check_embedder", loads.append)
+    monkeypatch.setattr(fewshot.server, "check_embedder", loads.append)
     data = png(RED)
     eid = image_id(data)
     zip_ = _task_zip([{"id": eid, "label": "red", "file": f"images/{eid}.png"}], {f"images/{eid}.png": data},

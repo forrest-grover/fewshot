@@ -91,6 +91,11 @@ PRESETS: list[EmbedderInfo] = [
 DEFAULT_SPEC = PRESETS[0].spec
 
 
+def preset_label(spec: str) -> str | None:
+    """The friendly name of preset ``spec`` (e.g. "PE Core B/16 (Meta)"), or None for another spec."""
+    return next((p.label for p in PRESETS if p.spec == spec), None)
+
+
 def check_device(device: str, name: str = "FEWSHOT_DEVICE") -> str:
     """``device`` (e.g. ``cpu``, ``cuda:1``, ``mps``) if it is a torch device this machine has;
     else ``ValueError`` saying why, naming the setting it came from (``name``)."""

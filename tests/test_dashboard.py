@@ -1,8 +1,11 @@
 """Recorded evaluations, warnings for the dashboard, and duplicating tasks."""
 
+import json
+
 import pytest
 from typer.testing import CliRunner
 
+import fewshot.evaluations
 import fewshot.store
 from fewshot import cli
 from fewshot.store import Workspace
@@ -46,6 +49,86 @@ def test_recorded_evaluation(ws):
     assert t.last_evaluation() is None
     (t.path / "eval.json").write_text("{bad")
     assert t.last_evaluation() is None
+
+
+def test_evaluation_report_and_history(ws, monkeypatch):
+    """record_evaluation keeps the whole report and a short history of headlines with how each
+    was made; a task evaluated by an older version (headline only) reads as no report."""
+    t = _task(ws)
+    assert (t.evaluation_report(), t.evaluation_history(), t.last_comparison()) == (None, [], None)
+    t.record_evaluation({"revision": 6, "accuracy": 0.5})
+    assert t.evaluation_report()["accuracy"] == 0.5
+    (t.path / "eval-report.json").unlink()
+    (t.path / "eval-history.json").unlink()
+    assert t.evaluation_report() is None  # headline only, as older versions kept
+    assert [h["accuracy"] for h in t.evaluation_history()] == [0.5]
+    monkeypatch.setattr(fewshot.evaluations, "EVAL_HISTORY", 3)
+    for i in range(4):
+        t.record_evaluation({"revision": 6, "accuracy": i / 4, "embedder": "fake:color", "folds": 2,
+                             "finished_at": f"2026-01-0{i + 1}T00:00:00Z", "confusion": [[1]]})
+    h = t.evaluation_history()
+    assert [x["accuracy"] for x in h] == [0.25, 0.5, 0.75]
+    assert [x["at"][:10] for x in h] == ["2026-01-02", "2026-01-03", "2026-01-04"]
+    assert (h[-1]["embedder"], h[-1]["folds"], "confusion" in h[-1]) == ("fake:color", 2, False)
+    assert t.evaluation_report()["confusion"] == [[1]]
+    (t.path / "eval-history.json").write_text('[1, {"at": "x"}]')
+    assert t.evaluation_history() == [{"at": "x"}]
+    t.record_comparison({"revision": 6, "best": "fake:color"})
+    assert t.last_comparison()["best"] == "fake:color"
+
+
+def test_thresholds_carry_the_evaluation_report(ws):
+    """A change evaluation doesn't measure moves the headline and the report to the new revision."""
+    t = _task(ws)
+    rev = t.config.revision
+    t.record_evaluation({"revision": rev, "accuracy": 1.0})
+    t.update_settings(reject_below=0.5)
+    assert t.last_evaluation()["revision"] == t.evaluation_report()["revision"] == t.config.revision != rev
+    (t.path / "eval-report.json").write_text("[]")
+    t.set_class_thresholds({"red": 0.4})
+    assert t.last_evaluation()["revision"] == t.config.revision
+
+
+def test_records_skip_a_deleted_task(ws):
+    """An evaluation or comparison finishing after its task was deleted is dropped."""
+    t = _task(ws)
+    ws.delete("t")
+    t.record_evaluation({"revision": 1})
+    t.record_comparison({"revision": 1})
+    assert not (t.path / "eval-report.json").exists()
+    assert not (t.path / "compare.json").exists()
+    again = _task(ws)  # a new task of the same name
+    t.record_comparison({"revision": 1})
+    assert again.last_comparison() is None
+
+
+def test_records_that_cant_be_written_are_logged(ws, monkeypatch, caplog):
+    """A task this process can't write to keeps no evaluation or comparison, and says so in the
+    log, rather than failing the evaluation or comparison that has been made."""
+    t = _task(ws)
+
+    def refuse(path, _data):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(fewshot.evaluations, "_write_atomic", refuse)
+    t.record_evaluation({"revision": 1, "accuracy": 1.0})
+    t.record_comparison({"revision": 1, "best": "fake:color"})
+    assert (t.evaluation_report(), t.last_comparison()) == (None, None)
+    assert ["evaluation couldn't be kept" in m or "comparison couldn't be kept" in m
+            for m in caplog.messages] == [True, True]
+
+
+def test_kept_files_that_dont_fit_are_left_out(tmp_path):
+    """GET .../evaluation leaves out a kept report, headline or comparison that doesn't fit this
+    version's schema (another version's, or edited by hand), and answers with the rest."""
+    client = api_client(tmp_path)
+    t = _task(client.srv.ws)
+    client.post("/api/tasks/t/evaluate")
+    (t.path / "eval-history.json").write_text(json.dumps([{"at": "x"}, t.evaluation_history()[-1]]))
+    (t.path / "compare.json").write_text('{"best": 3}')
+    (t.path / "eval-report.json").write_text('{"revision": 1, "accuracy": 1.0}')
+    ev = client.get("/api/tasks/t/evaluation").json()
+    assert (ev["report"], len(ev["history"]), ev["comparison"]) == (None, 1, None)
 
 
 def test_duplicate(ws):
@@ -100,6 +183,14 @@ def test_api(tmp_path, monkeypatch):
     s = client.get("/api/tasks").json()[0]
     assert s["last_evaluation"]["accuracy"] == 1.0
     assert s["last_evaluation"]["revision"] == s["revision"]
+    ev = client.get("/api/tasks/t/evaluation").json()
+    assert (ev["revision"], ev["report"]["accuracy"], ev["report"]["embedder"]) == (s["revision"], 1.0, "fake:color")
+    assert (len(ev["history"]), ev["history"][0]["method"], ev["comparison"]) == (1, "leave-one-out", None)
+    assert client.get("/api/tasks/t/jobs").json() == []
+    r = client.post("/api/tasks/t/evaluate/jobs", json={"folds": 2})
+    jobs = client.get("/api/tasks/t/jobs").json()
+    assert [j["id"] for j in jobs] == [r.json()["id"]]
+    assert client.get("/api/tasks/nope/evaluation").status_code == 404
     r = client.post("/api/tasks/t/duplicate", json={"name": "u", "examples": False})
     assert (r.status_code, r.json()["examples"]) == (201, [])
     assert client.post("/api/tasks/t/duplicate", json={"name": "u"}).status_code == 409

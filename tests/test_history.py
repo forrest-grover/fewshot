@@ -380,6 +380,57 @@ def test_an_undo_group_is_one_undo_step(ws):
     assert not t.can_undo()
 
 
+def test_a_change_that_changes_nothing_makes_no_undo_step(ws):
+    """Moving an example to its own class, or adding a class that exists, saves nothing, so the
+    next undo takes back the change before it, the one it names."""
+    t = red_task(ws)
+    rev, x = t.config.revision, t.config.examples[0]
+    t.relabel(x.id, "red")
+    t.upsert_class("red")
+    assert (t.config.revision, t.undo_label()) == (rev, "add 1 example to red")
+    t.undo()
+    assert [e.id for e in t.config.examples] == [x.id]
+
+
+def test_an_undo_group_back_where_it_began_makes_no_undo_step(ws):
+    """An image moved to another class and back within one undo group leaves no step: undo then
+    takes back the change before the group, as it says, and a later add in the group is a step."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 1))
+    t.add_examples(_items(BLUE, "blue", 1))
+    t.add_examples(_items(RED, "blue", 1), undo_group="g")
+    t.add_examples(_items(RED, "red", 1), undo_group="g")
+    assert t.undo_label() == "add 1 example to blue"
+    t.add_examples(_items(GREEN, "green", 1), undo_group="g")
+    assert t.undo_label() == "add 1 example to green"
+    t.undo()
+    t.undo()
+    assert [e.label for e in t.config.examples] == ["red"]
+
+
+def test_one_upload_that_moves_an_image_and_back_makes_no_undo_step(ws):
+    """An upload naming the same image twice, for another class and then its own, changes
+    nothing: no step, and the next undo takes back the change before it."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 1))
+    t.upsert_class("blue")
+    rev = t.config.revision
+    t.add_examples([*_items(RED, "blue", 1), *_items(RED, "red", 1)], undo_group="g")
+    assert (t.config.revision, t.undo_label()) == (rev, "add class blue")
+
+
+def test_an_undo_group_with_a_damaged_first_version_goes_on(ws):
+    """If the version before an undo group began can't be read, the group's next upload is
+    still saved and joins the group."""
+    t = ws.create("t", embedder="fake:color")
+    t.add_examples(_items(RED, "red", 1))
+    t.add_examples(_items(RED, "blue", 1), undo_group="g")
+    base = history.TaskHistory._history(t)[-1][1]  # pylint: disable=protected-access
+    base.write_text("{damaged")
+    t.add_examples(_items(RED, "red", 1), undo_group="g")
+    assert (t.config.examples[0].label, t.undo_label()) == ("red", "add 2 examples to blue, red")
+
+
 def test_any_other_change_ends_an_undo_group(ws):
     """A change in between (even one not kept for undo, like a rename) ends the group, and so
     does undoing its step."""

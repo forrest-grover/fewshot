@@ -440,6 +440,9 @@ def test_jobs(server):
     assert (report["method"], job.status(), job.result()["accuracy"]) == ("3-fold", "done", 1.0)
     assert set(seen) <= {"running"}
     assert fs.job(job.id).result() == report
+    assert [j.id for j in fs.task_jobs("jobs")] == [job.id]
+    last = fs.last_evaluation("jobs")
+    assert (last["report"], last["history"][0]["folds"], last["comparison"]) == (report, 3, None)
     assert fs.evaluate("jobs", None, 0.01, timeout=30)["n_examples"] == 6  # poll stays positional, as it was
     assert fs.compare("jobs", ["fake:color"], 2, 0.01)["best"] == "fake:color"
     assert fs.start_compare("jobs", ["fake:color"]).wait(poll=0.01)["results"][0]["embedder"] == "fake:color"

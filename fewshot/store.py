@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import json
 import logging
 import os
 import re
@@ -48,6 +47,7 @@ from . import exceptions as exc
 from . import preconditions
 from .classifiers import CLASSIFIERS
 from .embedders import check_embedder, loaded_embedders
+from .evaluations import TaskEvaluations
 from .folders import class_folders, read_or_empty, readable_name
 from .fsutil import FileStamp, create_lock_file, move_back, os_reason, reclaim, replace_reserved, spelt_as_listed
 from .fsutil import abandoned as _abandoned
@@ -56,7 +56,6 @@ from .fsutil import file_lock as _file_lock
 from .fsutil import fsync_dir as _fsync_dir
 from .fsutil import mkstemp as _mkstemp
 from .fsutil import stamp as _stamp
-from .fsutil import write_atomic as _write_atomic
 from .history import TaskHistory
 from .images import image_ext, image_id
 from .inbox import TaskInbox, chunked, listed, plural
@@ -108,7 +107,7 @@ def _check_item(data: bytes, label: str, source: str) -> _NewImage | ValueError:
     return _NewImage(data, image_id(data), ext, label, source)
 
 
-class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,too-many-instance-attributes  # the whole editing API of a task
+class Task(TaskEvaluations, TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,too-many-instance-attributes  # the whole editing API of a task
     """A task folder: its config plus example images. Every mutation is saved immediately.
 
     Mutations are serialised across threads and processes, and start from the latest
@@ -245,8 +244,15 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
         that, nothing changed and the error is raised; the clean-up after it (forgetting undone
         changes, pruning history, deleting unused images) is logged if it fails, never raised,
         because the change has been made.
+
+        A recorded change, inside ``_writing``, that leaves the task as it was saved (moving an
+        example to its own class, say) isn't saved: an undo step that changes nothing looks like
+        one a crash left, which ``undo`` skips, so it would undo the change before it instead.
         """
         cfg = self.config
+        if (record and self._writer == threading.get_ident()
+                and cfg.model_copy(update={"revision": self._published.revision}) == self._published):
+            return
         old_rev = cfg.revision
         cfg.revision += 1
         made: list[Path] = []
@@ -713,38 +719,6 @@ class Task(TaskHistory, TaskInbox):  # pylint: disable=too-many-public-methods,t
             if x.id == eid:
                 return self.path / x.file
         return self.path / self.example(eid).file
-
-    def record_evaluation(self, report: dict[str, Any]) -> None:
-        """Remember the headline of an evaluation (in ``eval.json``, outside undo history) for the
-        dashboard: when, at which revision, and how well.
-
-        Does nothing if the task was deleted, or deleted and made again, since this object read it:
-        an evaluation that finishes late must not land on a different task of the same name."""
-        keep = ("revision", "method", "accuracy", "macro_f1", "n_scored", "n_examples")
-        uid = self.config.uid
-        try:
-            with self._writing():
-                if self.config.uid == uid:
-                    _write_atomic(self.path / "eval.json",
-                                  json.dumps({"at": _now(), **{k: report.get(k) for k in keep}}).encode())
-        except KeyError:  # deleted
-            pass
-
-    def _carry_evaluation(self, before: int) -> None:
-        """After a change that evaluation doesn't measure (reject thresholds), an evaluation of
-        revision ``before`` still describes the task: move it to the new revision, so it doesn't
-        show as out of date. Call inside ``_writing``, after ``_save``."""
-        ev = self.last_evaluation()
-        if ev is not None and ev.get("revision") == before:
-            _write_atomic(self.path / "eval.json", json.dumps({**ev, "revision": self.config.revision}).encode())
-
-    def last_evaluation(self) -> dict[str, Any] | None:
-        """What ``record_evaluation`` last stored, or None."""
-        try:
-            data = json.loads((self.path / "eval.json").read_text())
-        except (OSError, ValueError):
-            return None
-        return data if isinstance(data, dict) else None
 
     def warnings(self, counts: dict[str, int]) -> list[str]:
         """Problems worth fixing, given the examples per class: classes that can't be scored or

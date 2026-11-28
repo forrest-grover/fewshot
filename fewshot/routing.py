@@ -25,7 +25,7 @@ from .store import Task
 from .text import check_class_name, closest
 
 if TYPE_CHECKING:
-    from .api import Server
+    from .server import Server
 
 log = logging.getLogger(__name__)
 

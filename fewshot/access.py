@@ -25,7 +25,7 @@ from .errors import (
 from .guard import cross_site, host_allowed, route_path
 
 if TYPE_CHECKING:
-    from .api import Server
+    from .server import Server
 
 log = logging.getLogger(__name__)
 

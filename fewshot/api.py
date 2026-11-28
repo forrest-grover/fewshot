@@ -15,49 +15,39 @@ serialised in those threads too (``_json``), not on the event loop as FastAPI wo
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
 import functools
 import logging
 import mimetypes
 import os
 import tempfile
 import threading
-from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, TypeVar
+from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ValidationError
 
 from . import __version__, errors, services
 from .access import SESSION_COOKIE, TOO_MANY_TOKENS, check_token, client_address, guard
 from .archive import export_task as write_export
 from .archive import import_task as read_export
-from .auth import SESSION_DAYS, Sessions, WrongTokens
+from .auth import SESSION_DAYS
 from .classifiers import CLASSIFIERS
 from .embedders import (
-    DEFAULT_SPEC,
     PRESETS,
-    check_embedder,
-    get_embedder,
-    is_registered,
     loaded_embedders,
-    max_models,
 )
 from .errors import ApiProblem, from_error, problem_body, refusals
-from .exceptions import TaskNotFound, message
 from .guard import LimitBody, body_limit
 from .images import thumbnail
 from .inbox import chunked
-from .jobs import Job, Jobs, TooManyJobs
+from .jobs import Job, TooManyJobs
 from .models import check_evaluable
-from .pipeline import Pipeline
 from .responses import ERRORS, PRECONDITION, UI_HEADERS, UPLOAD, json_response
 from .routing import (
     ADDED,
@@ -88,10 +78,13 @@ from .schemas import (
     ClassPatch,
     ClassThresholds,
     Compare,
+    CompareReport,
     Describe,
     Duplicate,
     DuplicatePair,
+    EvalHeadline,
     EvalReport,
+    EvaluationOut,
     ExampleEdit,
     ExampleIds,
     ExamplePage,
@@ -113,8 +106,9 @@ from .schemas import (
     TaskSummary,
     Urls,
 )
+from .server import Server, Srv
 from .server_settings import ServerSettings, requested_processes
-from .store import Task, Workspace
+from .store import Workspace
 from .text import closest
 
 log = logging.getLogger(__name__)
@@ -126,106 +120,6 @@ PREDICT_CHUNK = 64  # uploaded images read and classified at a time
 API_VERSION = "1"  # within one, responses only gain fields (see the README's compatibility policy)
 POLL_SECONDS = 1  # Retry-After of a running job
 JOBS_RETRY_SECONDS = 5  # Retry-After when too many jobs are running
-T = TypeVar("T")
-
-
-# ---- the server's state ---------------------------------------------------
-class Server:  # pylint: disable=too-many-instance-attributes  # the server's parts, one each
-    """Everything one app serves: its settings, workspace, pipeline, jobs and access control."""
-
-    def __init__(self, settings: ServerSettings, workspace: Workspace | None = None,
-                 allow_no_token: bool = False) -> None:
-        self.settings = settings
-        self.allow_no_token = allow_no_token  # see access.guard
-        self.ws = workspace or Workspace(settings.home)
-        self.pipe = Pipeline(self.ws)
-        self.jobs = Jobs()
-        self.wrong_tokens = WrongTokens()
-        self.sessions = Sessions(settings.token) if settings.token else None
-        self.warned_proxy = False  # see access._note_untrusted_proxy
-        self.warned_exposed = False  # see access.guard
-        self._heavy: ThreadPoolExecutor | None = None  # made when first needed, after each shutdown too
-        self._heavy_lock = threading.Lock()
-
-    @property
-    def heavy(self) -> ThreadPoolExecutor:
-        """The threads for heavy work (``settings.workers`` of them)."""
-        with self._heavy_lock:
-            if self._heavy is None:
-                self._heavy = ThreadPoolExecutor(self.settings.workers, thread_name_prefix="fewshot-work")
-            return self._heavy
-
-    def stop_heavy(self) -> None:
-        """Stop the heavy-work threads, dropping work not started yet (the app is shutting down); the
-        next heavy request, if the app is started again, gets new ones."""
-        with self._heavy_lock:
-            pool, self._heavy = self._heavy, None
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
-
-    async def run(self, fn: Callable[..., T], *args: Any) -> T:
-        """``fn(*args)`` on the heavy-work threads, so it waits there, not in Starlette's pool."""
-        ctx = contextvars.copy_context()  # the request's (see ``preconditions``), as Starlette's pool does
-        return await asyncio.get_running_loop().run_in_executor(self.heavy, ctx.run, functools.partial(fn, *args))
-
-    async def render(self, model: Any, fn: Callable[..., Any], *args: Any, status: int = 200) -> Response:
-        """``fn(*args)`` on the heavy-work threads, as JSON validated as ``model`` (see ``_json``)."""
-        return await self.run(lambda: json_response(model, fn(*args), status))
-
-    def task(self, name: str) -> Task:
-        """Task ``name``; 404 if there is none, naming the closest ones."""
-        try:
-            return self.ws.get(name)
-        except TaskNotFound as e:
-            near = closest(name, [p.name for p in self.ws.task_folders()])
-            hint = f"; did you mean {' or '.join(map(repr, near))}? Or create it" if near else "; create it"
-            raise ApiProblem(404, errors.TASK_NOT_FOUND, f"No task {name!r}{hint} with POST /api/tasks "
-                             "(fewshot.client: create_task)", task=name, similar_to=near) from e
-        except KeyError as e:
-            raise from_error(e) from e
-
-    def warm_models(self) -> list[str]:
-        """Load the embedders the most tasks use (up to the loaded-model limit), or the default one
-        if there are no tasks, so the first request doesn't wait for a model; returns those loaded."""
-        counts = Counter(t.config.embedder for t in self.ws.list_tasks())
-        specs = [s for s, _ in counts.most_common(max_models())] or [DEFAULT_SPEC]
-        loaded = []
-        for spec in specs:
-            try:
-                get_embedder(spec)
-            except Exception:  # pylint: disable=broad-exception-caught  # a bad model mustn't stop the server
-                log.exception("Could not preload embedder %r", spec)
-            else:
-                loaded.append(spec)
-        return loaded
-
-    def allowed_embedder(self, spec: str) -> None:
-        """Refuse an empty spec (400), or (403) one that isn't a preset, registered, or used by a
-        task already, unless the server allows any model. Specs in use are checked last, as that
-        reads every task."""
-        if not spec.strip():
-            raise ApiProblem(400, errors.INVALID_EMBEDDER, "Embedder spec is empty")
-        if not (self.settings.allow_any_model or spec in {p.spec for p in PRESETS} or is_registered(spec)
-                or any(t.config.embedder == spec for t in self.ws.list_tasks())):
-            raise ApiProblem(403, errors.EMBEDDER_NOT_ALLOWED, f"Embedder {spec!r} is not a preset (see GET "
-                             "/api/models). To use other models, start the server with --allow-any-model "
-                             "(FEWSHOT_ALLOW_ANY_MODEL=1).")
-
-    def check_embedder(self, spec: str) -> None:
-        """``allowed_embedder``, then load the embedder so a bad spec fails now (400), not at predict time."""
-        self.allowed_embedder(spec)
-        try:
-            check_embedder(spec)
-        except ValueError as e:
-            raise ApiProblem(400, errors.INVALID_EMBEDDER, message(e)) from e
-
-
-async def _server(request: Request) -> Server:
-    server: Server = request.app.state.server
-    return server
-
-
-Srv = Annotated[Server, Depends(_server)]  # async, so resolving it takes no thread
 
 
 # ---- the app -------------------------------------------------------------
@@ -490,15 +384,26 @@ async def import_task(srv: Srv, file: UploadFile = File(...), name: str | None =
 # ---- classes ------------------------------------------------------------
 @router.post("/api/tasks/{name}/classes", status_code=201, response_model=TaskDetail, tags=["classes"],
              summary="Add a class (or set its description)", dependencies=IF_MATCH,
-             responses={200: {"model": TaskDetail, "description": "The class existed: its description was set"},
+             responses={200: {"model": TaskDetail, "description": "The class existed: its description was set if "
+                                                                 "one was given, else nothing changed"},
                         **PRECONDITION})
 def add_class(srv: Srv, name: str, body: ClassBody) -> Response:
-    """Add a class (201), or update the description of an existing one (200)."""
+    """Add a class (201), or update the description of an existing one (200). An existing class
+    without a ``description`` (left out or null) is left as it is (200, no undo step). A new name
+    close to an existing class's (the same but for case, or a likely typo) is refused with 422
+    CLASS_NAME_NEAR_MISS unless ``new_class`` is true, as on every route that labels images."""
     t = srv.task(name)
-    existed = body.name.strip() in t.class_names()
+    label = body.name.strip()
+    if label in t.class_names():
+        if body.description is None:
+            return task_json(t, 200)
+        with refusals():
+            t.upsert_class(label, body.description)
+        return task_json(t, 200)
+    check_label(t, label, body.new_class, "/name")
     with refusals():
-        t.upsert_class(body.name, body.description)
-    return task_json(t, 200 if existed else 201)
+        t.upsert_class(label, body.description)
+    return task_json(t, 201)
 
 
 @router.patch("/api/tasks/{name}/classes/{label}", response_model=TaskDetail, tags=["classes"],
@@ -885,11 +790,17 @@ def _job(srv: Server, jid: str) -> Job:
     return job
 
 
-def _job_json(job: Job, status: int = 200) -> Response:
-    """The job as a response; while it runs, Retry-After says when to poll again."""
+def _job_dict(job: Job) -> dict[str, Any]:
+    """The job as ``JobOut``."""
     out = job.to_dict()
     out["problem"] = None if job.code is None else problem_body(
         job.error_status or 500, job.code, job.error or "", f"/api/jobs/{job.id}", job_id=job.id, task=job.task)
+    return out
+
+
+def _job_json(job: Job, status: int = 200) -> Response:
+    """The job as a response; while it runs, Retry-After says when to poll again."""
+    out = _job_dict(job)
     headers = {"Retry-After": str(POLL_SECONDS)} if out["status"] in {"running", "cancelling"} else {}
     if status == 202:
         headers["Location"] = f"/api/jobs/{job.id}"
@@ -930,8 +841,6 @@ def start_comparison(srv: Srv, name: str, body: Compare) -> Response:
     """Start cross-validating the task with each of ``embedders`` in the background (the same
     allowlist as choosing a task's embedder applies); the job's result compares their accuracy.
     Stages are like "2/3 embedding". Refused at once as POST .../evaluate/jobs is."""
-    from .evaluate import compare_embedders  # pylint: disable=import-outside-toplevel  # with evaluate's other imports
-
     t = srv.task(name)
     with refusals():
         specs = services.check_specs(body.embedders, MAX_COMPARED)
@@ -940,7 +849,53 @@ def start_comparison(srv: Srv, name: str, body: Compare) -> Response:
         srv.allowed_embedder(s)  # loaded by the job: a model that fails is reported in its result
     job = Job(task=name, kind="compare", revision=t.config.revision, uid=t.config.uid,
               key=f"{body.folds}:" + "\n".join(specs))
-    return _start(srv, job, lambda progress: compare_embedders(srv.pipe, t, specs, body.folds, progress=progress))
+    return _start(srv, job, lambda progress: _logged(services.compare(srv.pipe, t, specs, body.folds, progress)))
+
+
+def _logged(report: dict[str, Any]) -> dict[str, Any]:
+    """``report``, a comparison, after logging the errors whose details it keeps from clients."""
+    for r in report["results"]:
+        if r.get("error_detail"):
+            log.warning("Comparing with %s failed: %s", r["embedder"], r["error_detail"])
+    return report
+
+
+@router.get("/api/tasks/{name}/jobs", response_model=list[JobOut], tags=["evaluate", "jobs"],
+            summary="List a task's background jobs")
+def task_jobs(srv: Srv, name: str) -> Response:
+    """The task's evaluation and comparison jobs this server remembers, running and recently
+    finished, newest first: a client that lost track of one (a page reloaded) finds it here."""
+    t = srv.task(name)
+    return json_response(list[JobOut], [_job_dict(j) for j in srv.jobs.for_task(t.config.uid)])
+
+
+@router.get("/api/tasks/{name}/evaluation", response_model=EvaluationOut, tags=["evaluate"],
+            summary="Get the task's last evaluation and comparison")
+def last_evaluation(srv: Srv, name: str) -> Response:
+    """The last evaluation's report (``report``, null if there is none), the headlines of the
+    last 20 evaluations with how each was made (``history``, newest first) and the last comparison
+    of embedders (``comparison``). Kept across restarts; compare each one's ``revision`` with the
+    task's to see whether the task has changed since."""
+    t = srv.task(name)
+    history = [h for h in t.evaluation_history()[::-1] if _fits(EvalHeadline, h, t.name)]
+    return json_response(EvaluationOut, {
+        "revision": t.config.revision, "history": history,
+        "report": _fits(EvalReport, t.evaluation_report(), t.name),
+        "comparison": _fits(CompareReport, t.last_comparison(), t.name)})
+
+
+def _fits(model: type[BaseModel], data: dict[str, Any] | None, task: str) -> dict[str, Any] | None:
+    """``data`` if it is a valid ``model``, else None (logged): a file kept by another version,
+    or edited by hand, must not make the whole answer fail."""
+    if data is None:
+        return None
+    try:
+        model.model_validate(data)
+    except ValidationError as e:
+        log.warning("Task %r: ignoring a kept %s that doesn't fit this version (%d errors)",
+                    task, model.__name__, e.error_count())
+        return None
+    return data
 
 
 @router.get("/api/jobs/{jid}", response_model=JobOut, tags=["jobs"], summary="Get a job's progress and result")

@@ -195,6 +195,19 @@ def test_adding_a_class_is_201_and_describing_one_200(client, task):
     r = client.post(f"/api/tasks/{task}/classes", json={"name": "green", "description": "a green thing"})
     assert r.status_code == 200
     assert [c["description"] for c in r.json()["classes"] if c["name"] == "green"] == ["a green thing"]
+    rev = r.json()["revision"]
+    for body in ({"name": "green"}, {"name": " green ", "description": None}):  # no description: nothing changes
+        r = client.post(f"/api/tasks/{task}/classes", json=body)
+        assert (r.status_code, r.json()["revision"]) == (200, rev)
+        assert [c["description"] for c in r.json()["classes"] if c["name"] == "green"] == ["a green thing"]
+
+
+def test_a_class_name_close_to_another_is_refused_unless_new_class(client, task):
+    """POST .../classes refuses a likely typo of an existing class, as the labelling routes do."""
+    body = _problem(client.post(f"/api/tasks/{task}/classes", json={"name": "Red"}), 422, "CLASS_NAME_NEAR_MISS")
+    assert (body["similar_to"], body["pointer"]) == (["red"], "/name")
+    r = client.post(f"/api/tasks/{task}/classes", json={"name": "Red", "new_class": True})
+    assert (r.status_code, [c["name"] for c in r.json()["classes"]]) == (201, ["red", "blue", "Red"])
 
 
 def test_unknown_query_parameters_are_refused(client, task):
@@ -355,7 +368,7 @@ def test_concurrent_changes_with_one_if_match_make_one_change(client, task):
     rev = client.get(f"/api/tasks/{task}").json()["revision"]
 
     def add(i):
-        return client.post(f"/api/tasks/{task}/classes", json={"name": f"class {i}"},
+        return client.post(f"/api/tasks/{task}/classes", json={"name": f"class {i}", "new_class": True},
                            headers={"If-Match": f'"{rev}"'}).status_code
 
     with ThreadPoolExecutor(8) as pool:

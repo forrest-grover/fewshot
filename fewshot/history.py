@@ -210,7 +210,11 @@ class TaskHistory:
         before = self.config.revision
         label = describe(count, names)
         self._save_new(created, not joined, label)
+        if self.config.revision == before:  # it changed nothing, so nothing was saved
+            return
         snap = snaps[-1][1] if joined else self.path / "history" / f"{before:010d}.json"
+        if joined and not created and self._undoes_group(snap):
+            return
         record = {"kind": kind, "group": gid, "revision": self.config.revision, "count": count,
                   "names": names[:GROUP_NAMES]}
         try:  # the change is saved: failing to note the group only ends it
@@ -220,6 +224,20 @@ class TaskHistory:
                 _write_atomic(snap.with_suffix(".group"), json.dumps(record).encode())
         except OSError:
             log.exception("%s: the change was saved, but its undo group was not noted", self.path)
+
+    def _undoes_group(self, snap: Path) -> bool:
+        """Whether the task is back at ``snap``, the version before its undo group began (its
+        images moved to other classes and back, say); if so the group's step, which would change
+        nothing, is forgotten (see ``undo``). Only checked for a change that stored no new image
+        file, since one that did can't be back at a version kept before that file existed."""
+        try:
+            back = self._same(type(self.config).stored(snap.read_bytes()))
+        except (OSError, ValidationError):
+            return False
+        if back:
+            self._forget(snap)
+            _fsync_dir(snap.parent)
+        return back
 
     @staticmethod
     def _group_of(snap: Path) -> dict[str, Any] | None:
@@ -430,7 +448,8 @@ class TaskHistory:
                     break
                 # A step that changes nothing: left by a crash (after a version was kept but
                 # before the save replaced task.json, or after an undo but before it forgot the
-                # version it restored), or a save that changed nothing. Skip it.
+                # version it restored). Skip it. A change that changes nothing makes no step
+                # (``_save``, ``_save_in_group``), so this never skips one that was made.
                 self._forget(snap)
             # The current version becomes the next redo, under the undone change's description.
             redo = self._snapshot(self.config.revision, [], self._label(snap), folder="history/redo")

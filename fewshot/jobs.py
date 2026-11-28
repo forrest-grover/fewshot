@@ -135,6 +135,11 @@ class Jobs:
         with self._lock:
             return self._jobs.get(jid)
 
+    def for_task(self, uid: str) -> list[Job]:
+        """The jobs of the task with ``uid`` (whatever it is called now), newest first."""
+        with self._lock:
+            return [j for j in reversed(self._jobs.values()) if j.uid == uid]
+
     def running(self) -> list[Job]:
         """Jobs running and not asked to stop."""
         with self._lock:

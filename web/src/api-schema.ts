@@ -230,7 +230,10 @@ export interface paths {
         put?: never;
         /**
          * Add a class (or set its description)
-         * @description Add a class (201), or update the description of an existing one (200).
+         * @description Add a class (201), or update the description of an existing one (200). An existing class
+         *     without a ``description`` (left out or null) is left as it is (200, no undo step). A new name
+         *     close to an existing class's (the same but for case, or a likely typo) is refused with 422
+         *     CLASS_NAME_NEAR_MISS unless ``new_class`` is true, as on every route that labels images.
          */
         post: operations["add_class"];
         delete?: never;
@@ -386,6 +389,29 @@ export interface paths {
          *     evaluation of the same version already running is shared rather than started again.
          */
         post: operations["start_evaluation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{name}/evaluation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the task's last evaluation and comparison
+         * @description The last evaluation's report (``report``, null if there is none), the headlines of the
+         *     last 20 evaluations with how each was made (``history``, newest first) and the last comparison
+         *     of embedders (``comparison``). Kept across restarts; compare each one's ``revision`` with the
+         *     task's to see whether the task has changed since.
+         */
+        get: operations["last_evaluation"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -644,6 +670,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{name}/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a task's background jobs
+         * @description The task's evaluation and comparison jobs this server remembers, running and recently
+         *     finished, newest first: a client that lost track of one (a page reloaded) finds it here.
+         */
+        get: operations["task_jobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{name}/predict": {
         parameters: {
             query?: never;
@@ -869,6 +916,11 @@ export interface components {
             description?: string | null;
             /** Name */
             name: string;
+            /**
+             * New Class
+             * @default false
+             */
+            new_class: boolean;
         };
         /**
          * ClassMetrics
@@ -1039,6 +1091,41 @@ export interface components {
             supports_text: boolean;
         };
         /**
+         * EvalHeadline
+         * @description One evaluation in a task's history: how well, and how it was made.
+         */
+        EvalHeadline: {
+            /** Accuracy */
+            accuracy: number | null;
+            /** At */
+            at: string;
+            /** Classifier */
+            classifier?: string | null;
+            /**
+             * Classifier Params
+             * @default {}
+             */
+            classifier_params: {
+                [key: string]: unknown;
+            };
+            /** Embedder */
+            embedder?: string | null;
+            /** Embedder Label */
+            embedder_label?: string | null;
+            /** Folds */
+            folds?: number | null;
+            /** Macro F1 */
+            macro_f1: number | null;
+            /** Method */
+            method: string | null;
+            /** N Examples */
+            n_examples: number | null;
+            /** N Scored */
+            n_scored: number | null;
+            /** Revision */
+            revision: number | null;
+        };
+        /**
          * EvalReport
          * @description Cross-validation report.
          */
@@ -1048,8 +1135,25 @@ export interface components {
             calibration: components["schemas"]["Calibration"] | null;
             /** Classes */
             classes: string[];
+            /** Classifier */
+            classifier?: string | null;
+            /**
+             * Classifier Params
+             * @default {}
+             */
+            classifier_params: {
+                [key: string]: unknown;
+            };
             /** Confusion */
             confusion: number[][];
+            /** Embedder */
+            embedder?: string | null;
+            /** Embedder Label */
+            embedder_label?: string | null;
+            /** Finished At */
+            finished_at?: string | null;
+            /** Folds */
+            folds?: number | null;
             /** Macro F1 */
             macro_f1: number | null;
             /** Method */
@@ -1080,6 +1184,19 @@ export interface components {
             };
             /** Warnings */
             warnings: string[];
+        };
+        /**
+         * EvaluationOut
+         * @description GET .../evaluation: the task's last evaluation and comparison, kept across restarts. Each
+         *     has the ``revision`` it was made at: if that isn't the task's, the task changed since.
+         */
+        EvaluationOut: {
+            comparison: components["schemas"]["CompareReport"] | null;
+            /** History */
+            history: components["schemas"]["EvalHeadline"][];
+            report: components["schemas"]["EvalReport"] | null;
+            /** Revision */
+            revision: number;
         };
         /**
          * Evidence
@@ -3146,7 +3263,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The class existed: its description was set */
+            /** @description The class existed: its description was set if one was given, else nothing changed */
             200: {
                 headers: {
                     /** @description The task's revision, such as "12", to send back as If-Match */
@@ -4123,6 +4240,109 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JobOut"];
+                };
+            };
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such task, class, example, job or route */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request doesn't validate: errors lists every problem */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    last_evaluation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationOut"];
                 };
             };
             /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) */
@@ -6059,6 +6279,109 @@ export interface operations {
             };
             /** @description Not an application/json body (application/problem+json) */
             415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request doesn't validate: errors lists every problem */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many wrong tokens from this address, or too many jobs running; see Retry-After */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Internal error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    task_jobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobOut"][];
+                };
+            };
+            /** @description Well-formed, but can't be done as asked (an unreadable image, a bad name) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not signed in, or a wrong token (a server with a token) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Cross-site request, a server without a token reached from another machine, or a setting this server refuses */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such task, class, example, job or route */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Conflicts with the current state: a name taken, nothing to undo or redo */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request body over its size limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

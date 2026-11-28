@@ -142,8 +142,6 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     changes until you switch with `fewshot config TASK --embedder ...`. Exits 1 if any embedder
     failed (the others are still reported).
     """
-    from .evaluate import compare_embedders  # pylint: disable=import-outside-toplevel  # torch-backed
-
     t = get_task(root, name)
     specs = services.check_specs([t.config.embedder, *embedder, *([p.spec for p in PRESETS] if presets else [])])
     if len(specs) < 2:
@@ -151,8 +149,8 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     _FLAGS.interrupt_note = "no task was changed"
     try:
         with progress("Comparing") as update:
-            r = compare_embedders(make_pipeline(workspace(root)), t, specs, folds,
-                                  progress=lambda stage, done, total: update(done, total, stage))
+            r = services.compare(make_pipeline(workspace(root)), t, specs, folds,
+                                 progress=lambda stage, done, total: update(done, total, stage))
     except ValueError as e:
         fail_on(e, name)
     if as_json:
@@ -162,7 +160,7 @@ def compare(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     for x in r["results"]:
         mark = ("*" if x["embedder"] == r["best"] else " ") + ("<" if x["embedder"] == r["current"] else " ")
         if x.get("error"):
-            typer.echo(f"{mark} {'failed':>8}  {x['embedder']}: {x['error']}")
+            typer.echo(f"{mark} {'failed':>8}  {x['embedder']}: {x.get('error_detail') or x['error']}")
         elif x["accuracy"] is None:
             typer.echo(f"{mark} {'-':>8}  {x['embedder']}: nothing scored")
         else:
